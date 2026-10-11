@@ -16,7 +16,10 @@ from efso_radar.domain import (
     DeliveryStatus,
     EditorialAssessment,
     EditorialKind,
+    Market,
     NotificationRecord,
+    OwnerFeedback,
+    OwnerFeedbackRating,
     Story,
     StoryCategory,
     StoryUpdate,
@@ -169,6 +172,83 @@ class TursoStateRepository(StateRepository):
                 ],
             )
             for a in articles
+        ]
+        self.client.execute_transaction(stmts)
+
+    # --- Candidate Backlog & Lifecycle Integrity ---
+    def save_pending_candidates(self, candidates: list[Article]) -> None:
+        """Persist fresh candidates into durable backlog in Turso."""
+        if not candidates:
+            return
+        now_iso = utc_now().isoformat()
+        stmts: list[tuple[str, list[Any]]] = [
+            (
+                """
+                INSERT OR IGNORE INTO candidate_backlog
+                (article_id, url, canonical_url, title, source, market, category_hint,
+                 snippet, image_url, published_at, discovered_at, status, priority_score)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    a.id,
+                    a.url,
+                    a.canonical_url,
+                    a.title,
+                    a.source,
+                    a.market.value,
+                    a.source_category or "",
+                    a.snippet,
+                    a.image_url,
+                    a.published_at.isoformat(),
+                    now_iso,
+                    "QUEUED",
+                    float(a.raw_metadata.get("priority_score", 0.0)),
+                ],
+            )
+            for a in candidates
+        ]
+        self.client.execute_transaction(stmts)
+
+    def get_pending_candidates(self, max_age_hours: int = 16) -> list[Article]:
+        """Retrieve unexpired candidates from backlog that are still awaiting evaluation."""
+        cutoff = (utc_now() - timedelta(hours=max_age_hours)).isoformat()
+        res = self.client.execute(
+            """
+            SELECT cb.article_id, cb.url, cb.canonical_url, cb.title, cb.source, cb.market,
+                   cb.category_hint, cb.snippet, cb.image_url, cb.published_at, cb.priority_score
+            FROM candidate_backlog cb
+            LEFT JOIN processed_articles pa ON cb.article_id = pa.article_id
+            WHERE cb.status = 'QUEUED'
+              AND cb.published_at >= ?
+              AND pa.article_id IS NULL
+            ORDER BY cb.priority_score DESC, cb.published_at DESC
+            """,
+            [cutoff],
+        )
+        return [
+            Article(
+                id=r["article_id"],
+                title=r["title"],
+                url=r["url"],
+                canonical_url=r["canonical_url"],
+                source=r["source"],
+                market=Market(r["market"]),
+                published_at=datetime.fromisoformat(r["published_at"]),
+                source_category=r["category_hint"] or None,
+                image_url=r["image_url"],
+                snippet=r["snippet"] or "",
+                raw_metadata={"priority_score": float(r["priority_score"]), "from_backlog": True},
+            )
+            for r in res.fetchall()
+        ]
+
+    def mark_candidates_evaluated(self, article_ids: list[str]) -> None:
+        """Transition candidates in backlog to EVALUATED status."""
+        if not article_ids:
+            return
+        stmts: list[tuple[str, list[Any]]] = [
+            ("UPDATE candidate_backlog SET status = 'EVALUATED' WHERE article_id = ?", [aid])
+            for aid in article_ids
         ]
         self.client.execute_transaction(stmts)
 
@@ -565,3 +645,49 @@ class TursoStateRepository(StateRepository):
             [cutoff],
         )
         return res.affected_row_count
+
+    # --- Editorial Feedback & Calibration ---
+    def record_owner_feedback(self, feedback: OwnerFeedback) -> None:
+        """Store explicit owner editorial feedback in Turso."""
+        self.client.execute(
+            """
+            INSERT OR REPLACE INTO owner_feedback
+            (feedback_id, story_id, article_id, rating, notes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                feedback.feedback_id,
+                feedback.story_id,
+                feedback.article_id,
+                feedback.rating.value,
+                feedback.notes,
+                feedback.created_at.isoformat(),
+            ],
+        )
+
+    def get_owner_feedback(self, limit: int = 100) -> list[OwnerFeedback]:
+        """Retrieve recorded editorial feedback from Turso ordered by newest first."""
+        res = self.client.execute(
+            """
+            SELECT feedback_id, story_id, article_id, rating, notes, created_at
+            FROM owner_feedback
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            [limit],
+        )
+        results: list[OwnerFeedback] = []
+        for row in res.rows:
+            f_id, s_id, a_id, rating_str, notes, created_str = row
+            results.append(
+                OwnerFeedback(
+                    feedback_id=f_id,
+                    story_id=s_id,
+                    article_id=a_id,
+                    rating=OwnerFeedbackRating(rating_str),
+                    notes=notes or "",
+                    created_at=datetime.fromisoformat(created_str),
+                )
+            )
+        return results
+

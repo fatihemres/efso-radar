@@ -12,7 +12,7 @@ import uuid
 from datetime import datetime
 from typing import NamedTuple, Optional
 
-from efso_radar.ai.client import AIEditorialEngine, GeminiEditorialEngine
+from efso_radar.ai.client import AIEvaluationError, AIEditorialEngine, GeminiEditorialEngine
 from efso_radar.config import Settings
 from efso_radar.deduplication.engine import DeduplicationEngine
 from efso_radar.domain import (
@@ -187,14 +187,30 @@ class RadarOrchestrator:
                     discovery_metrics=discovery_metrics,
                 )
 
+            # 4b. Retrieve unexpired pending candidates from durable backlog to prevent feed-rotation loss
+            pending_backlog = self.repository.get_pending_candidates(max_age_hours=self.settings.max_age_hours)
+            if pending_backlog:
+                logger.info("Retrieved %d pending candidates from durable backlog", len(pending_backlog))
+                seen_ids = {a.id for a in articles}
+                for back_item in pending_backlog:
+                    if back_item.id not in seen_ids:
+                        articles.append(back_item)
+                        seen_ids.add(back_item.id)
+
             # 5. Deduplication, cross-publisher clustering, and candidate prioritization
             candidates = self.deduper.filter_fresh_candidates(
                 articles, max_candidates=self.settings.max_candidates
             )
+            deprioritized = getattr(self.deduper, "last_deprioritized", [])
+
+            # Persist deprioritized candidates into durable backlog so they survive RSS feed expiration
+            if not dry_run and deprioritized:
+                self.repository.save_pending_candidates(deprioritized)
+
             if discovery_metrics:
                 discovery_metrics.story_clusters_formed = getattr(self.deduper, "last_clusters_count", len(candidates))
                 discovery_metrics.selected_for_ai = len(candidates)
-                discovery_metrics.deprioritized_by_limit = len(getattr(self.deduper, "last_deprioritized", []))
+                discovery_metrics.deprioritized_by_limit = len(deprioritized)
                 logger.info("Updated %s", discovery_metrics.summary())
 
             logger.info(
@@ -238,7 +254,23 @@ class RadarOrchestrator:
                     )
 
             # 6. AI Editorial Evaluation
-            picks = self.ai_engine.evaluate(candidates, recent_stories, now)
+            try:
+                picks = self.ai_engine.evaluate(candidates, recent_stories, now)
+            except AIEvaluationError as exc:
+                msg = f"AI editorial evaluation aborted: {exc}"
+                logger.error(msg)
+                return RadarRunResult(
+                    success=False,
+                    sources_succeeded=successes,
+                    articles_collected=len(articles),
+                    candidates_evaluated=len(candidates),
+                    picks_approved=0,
+                    notifications_dispatched=notifications_dispatched,
+                    dry_run=dry_run,
+                    duration_seconds=time.monotonic() - start_time,
+                    message=msg,
+                    discovery_metrics=discovery_metrics,
+                )
             logger.info("Editorial evaluation approved %d stories", len(picks))
 
             for pick in picks:
@@ -299,9 +331,10 @@ class RadarOrchestrator:
                     # Mark supporting articles as processed immediately
                     self.repository.mark_articles_processed(pick.supporting_articles)
 
-            # 9. Mark all ingested articles from this run as processed so they won't repeat
-            if not dry_run and articles:
-                self.repository.mark_articles_processed(articles)
+            # 9. Mark evaluated candidates as processed and transition backlog state
+            if not dry_run and candidates:
+                self.repository.mark_articles_processed(candidates)
+                self.repository.mark_candidates_evaluated([c.id for c in candidates])
 
             duration = time.monotonic() - start_time
             return RadarRunResult(

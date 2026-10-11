@@ -15,6 +15,7 @@ from efso_radar.domain import (
     EditorialAssessment,
     EditorialKind,
     NotificationRecord,
+    OwnerFeedback,
     Story,
     StoryUpdate,
 )
@@ -48,6 +49,22 @@ class StateRepository(ABC):
     @abstractmethod
     def mark_articles_processed(self, articles: list[Article]) -> None:
         """Record articles as processed to prevent redundant reprocessing."""
+        pass
+
+    # --- Candidate Backlog & Lifecycle Integrity ---
+    @abstractmethod
+    def save_pending_candidates(self, candidates: list[Article]) -> None:
+        """Persist fresh candidates into durable backlog so deprioritized items survive feed rotation."""
+        pass
+
+    @abstractmethod
+    def get_pending_candidates(self, max_age_hours: int = 16) -> list[Article]:
+        """Retrieve unexpired candidates from backlog that are still awaiting evaluation."""
+        pass
+
+    @abstractmethod
+    def mark_candidates_evaluated(self, article_ids: list[str]) -> None:
+        """Transition candidates in backlog to EVALUATED status."""
         pass
 
     # --- Story Intelligence & Lineage ---
@@ -142,3 +159,15 @@ class StateRepository(ABC):
     def get_schema_version(self) -> int:
         """Return the current database schema version."""
         pass
+
+    # --- Editorial Feedback & Calibration ---
+    @abstractmethod
+    def record_owner_feedback(self, feedback: OwnerFeedback) -> None:
+        """Store explicit owner editorial feedback (APPROVE, REJECT, TOO_WEAK, DUPLICATE, IMPORTANT_UPDATE)."""
+        pass
+
+    @abstractmethod
+    def get_owner_feedback(self, limit: int = 100) -> list[OwnerFeedback]:
+        """Retrieve recorded editorial feedback for calibration and prompt tuning."""
+        pass
+

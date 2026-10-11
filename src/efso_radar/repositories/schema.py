@@ -10,7 +10,7 @@ from typing import NamedTuple
 
 logger = logging.getLogger("efso-radar.repository.schema")
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 4
 
 
 class MigrationStep(NamedTuple):
@@ -128,8 +128,53 @@ MIGRATIONS: list[MigrationStep] = [
             CREATE INDEX IF NOT EXISTS idx_assessments_story_id
                 ON editorial_assessments (story_id);
             """,
-            # Note: For SQLite/Turso compatibility, we use safe table alter / column addition checks
-            # or recreate notifications table with lease columns if not present.
+        ],
+    ),
+    MigrationStep(
+        version=3,
+        description="Owner feedback storage for AI calibration",
+        statements=[
+            """
+            CREATE TABLE IF NOT EXISTS owner_feedback (
+                feedback_id TEXT PRIMARY KEY,
+                story_id TEXT,
+                article_id TEXT,
+                rating TEXT NOT NULL,
+                notes TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_owner_feedback_rating
+                ON owner_feedback (rating);
+            """,
+        ],
+    ),
+    MigrationStep(
+        version=4,
+        description="Candidate backlog persistence to prevent premature loss of deprioritized stories",
+        statements=[
+            """
+            CREATE TABLE IF NOT EXISTS candidate_backlog (
+                article_id TEXT PRIMARY KEY,
+                url TEXT NOT NULL,
+                canonical_url TEXT,
+                title TEXT NOT NULL,
+                source TEXT NOT NULL,
+                market TEXT NOT NULL,
+                category_hint TEXT,
+                snippet TEXT NOT NULL,
+                image_url TEXT,
+                published_at TEXT NOT NULL,
+                discovered_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'QUEUED',
+                priority_score REAL NOT NULL DEFAULT 0.0
+            );
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_candidate_backlog_status
+                ON candidate_backlog (status, discovered_at);
+            """,
         ],
     ),
 ]
@@ -254,6 +299,41 @@ def get_all_init_statements() -> list[str]:
         """
         CREATE INDEX IF NOT EXISTS idx_notifications_story_id
             ON notifications (story_id);
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS owner_feedback (
+            feedback_id TEXT PRIMARY KEY,
+            story_id TEXT,
+            article_id TEXT,
+            rating TEXT NOT NULL,
+            notes TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_owner_feedback_rating
+            ON owner_feedback (rating);
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS candidate_backlog (
+            article_id TEXT PRIMARY KEY,
+            url TEXT NOT NULL,
+            canonical_url TEXT,
+            title TEXT NOT NULL,
+            source TEXT NOT NULL,
+            market TEXT NOT NULL,
+            category_hint TEXT,
+            snippet TEXT NOT NULL,
+            image_url TEXT,
+            published_at TEXT NOT NULL,
+            discovered_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'QUEUED',
+            priority_score REAL NOT NULL DEFAULT 0.0
+        );
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_candidate_backlog_status
+            ON candidate_backlog (status, discovered_at);
         """,
     ]
     return stmts

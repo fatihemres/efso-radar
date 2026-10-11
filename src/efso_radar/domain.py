@@ -46,6 +46,19 @@ class Market(str, Enum):
 class EditorialKind(str, Enum):
     NEW = "NEW"
     UPDATE = "UPDATE"
+    DUPLICATE = "DUPLICATE"
+    IGNORE = "IGNORE"
+
+
+class VerificationStatus(str, Enum):
+    """Factual confidence and source attribution category for an event."""
+    OFFICIAL_CONFIRMATION = "OFFICIAL_CONFIRMATION"  # Resmî onay / ajans / menajer beyanı
+    FIRST_PARTY_STATEMENT = "FIRST_PARTY_STATEMENT"  # Ünlü / sanatçı / yapımcı kendi beyanı
+    REPUTABLE_REPORTING = "REPUTABLE_REPORTING"      # Saygın haber kuruluşlarının teyitli haberi
+    ATTRIBUTED_CLAIM = "ATTRIBUTED_CLAIM"            # Belirli kaynağa dayandırılan haber
+    UNVERIFIED_RUMOR = "UNVERIFIED_RUMOR"            # Teyitsiz söylenti / magazin dedikodusu
+    SPECULATION = "SPECULATION"                      # Sosyal medya tahmini / temelsiz iddia
+
 
 
 class SuggestedFormat(str, Enum):
@@ -173,12 +186,36 @@ class EditorialAssessment(BaseModel):
     parent_story_id: Optional[str] = None
     development_tr: Optional[str] = None
     headline_tr: str = Field(min_length=5, max_length=200)
-    cover_title_tr: str = Field(min_length=3, max_length=150)
-    caption_idea_tr: str = Field(min_length=10, max_length=600)
-    why_efso_tr: str = Field(min_length=5, max_length=300)
-    suggested_format: SuggestedFormat
-    category: StoryCategory
+    cover_title_tr: str = Field(default="", max_length=150)
+    caption_idea_tr: str = Field(default="", max_length=800)
+    relevance_reason_tr: str = Field(default="", max_length=500)
+    why_efso_tr: str = Field(default="", max_length=500)
+    uncertainties_tr: Optional[str] = None
+    suggested_format: SuggestedFormat = SuggestedFormat.POST
+    category: StoryCategory = StoryCategory.GLOBAL
+    verification_status: VerificationStatus = VerificationStatus.REPUTABLE_REPORTING
+    source_urls: list[str] = Field(default_factory=list)
     supporting_articles: list[Article] = Field(default_factory=list)
+
+
+class OwnerFeedbackRating(str, Enum):
+    """Owner review labels for calibrating AI editorial precision."""
+    APPROVE = "APPROVE"
+    REJECT = "REJECT"
+    TOO_WEAK = "TOO_WEAK"
+    DUPLICATE = "DUPLICATE"
+    IMPORTANT_UPDATE = "IMPORTANT_UPDATE"
+
+
+class OwnerFeedback(BaseModel):
+    """Explicit human owner feedback record for offline evaluation and calibration."""
+    feedback_id: str
+    story_id: Optional[str] = None
+    article_id: Optional[str] = None
+    rating: OwnerFeedbackRating
+    notes: str = ""
+    created_at: datetime = Field(default_factory=utc_now)
+
 
 
 class NotificationRecord(BaseModel):

@@ -18,7 +18,10 @@ from efso_radar.domain import (
     DeliveryStatus,
     EditorialAssessment,
     EditorialKind,
+    Market,
     NotificationRecord,
+    OwnerFeedback,
+    OwnerFeedbackRating,
     Story,
     StoryCategory,
     StoryUpdate,
@@ -184,6 +187,86 @@ class SqliteStateRepository(StateRepository):
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 records,
+            )
+
+    # --- Candidate Backlog & Lifecycle Integrity ---
+    def save_pending_candidates(self, candidates: list[Article]) -> None:
+        """Persist fresh candidates into durable backlog so deprioritized items survive feed rotation."""
+        if not candidates:
+            return
+        now_iso = utc_now().isoformat()
+        records = [
+            (
+                a.id,
+                a.url,
+                a.canonical_url,
+                a.title,
+                a.source,
+                a.market.value,
+                a.source_category or "",
+                a.snippet,
+                a.image_url,
+                a.published_at.isoformat(),
+                now_iso,
+                "QUEUED",
+                float(a.raw_metadata.get("priority_score", 0.0)),
+            )
+            for a in candidates
+        ]
+        with self._connection() as conn:
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO candidate_backlog
+                (article_id, url, canonical_url, title, source, market, category_hint,
+                 snippet, image_url, published_at, discovered_at, status, priority_score)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                records,
+            )
+
+    def get_pending_candidates(self, max_age_hours: int = 16) -> list[Article]:
+        """Retrieve unexpired candidates from backlog that are still awaiting evaluation."""
+        cutoff = (utc_now() - timedelta(hours=max_age_hours)).isoformat()
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT cb.article_id, cb.url, cb.canonical_url, cb.title, cb.source, cb.market,
+                       cb.category_hint, cb.snippet, cb.image_url, cb.published_at, cb.priority_score
+                FROM candidate_backlog cb
+                LEFT JOIN processed_articles pa ON cb.article_id = pa.article_id
+                WHERE cb.status = 'QUEUED'
+                  AND cb.published_at >= ?
+                  AND pa.article_id IS NULL
+                ORDER BY cb.priority_score DESC, cb.published_at DESC
+                """,
+                (cutoff,),
+            )
+            rows = cursor.fetchall()
+            return [
+                Article(
+                    id=row["article_id"],
+                    title=row["title"],
+                    url=row["url"],
+                    canonical_url=row["canonical_url"],
+                    source=row["source"],
+                    market=Market(row["market"]),
+                    published_at=datetime.fromisoformat(row["published_at"]),
+                    source_category=row["category_hint"] or None,
+                    image_url=row["image_url"],
+                    snippet=row["snippet"] or "",
+                    raw_metadata={"priority_score": row["priority_score"], "from_backlog": True},
+                )
+                for row in rows
+            ]
+
+    def mark_candidates_evaluated(self, article_ids: list[str]) -> None:
+        """Transition candidates in backlog to EVALUATED status."""
+        if not article_ids:
+            return
+        with self._connection() as conn:
+            conn.executemany(
+                "UPDATE candidate_backlog SET status = 'EVALUATED' WHERE article_id = ?",
+                [(aid,) for aid in article_ids],
             )
 
     # --- Story Intelligence & Lineage ---
@@ -621,3 +704,50 @@ class SqliteStateRepository(StateRepository):
 
         logger.info("Migrated %d legacy records from %s to SQLite", migrated_count, json_path)
         return migrated_count
+
+    # --- Editorial Feedback & Calibration ---
+    def record_owner_feedback(self, feedback: OwnerFeedback) -> None:
+        """Store explicit owner editorial feedback."""
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO owner_feedback
+                (feedback_id, story_id, article_id, rating, notes, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    feedback.feedback_id,
+                    feedback.story_id,
+                    feedback.article_id,
+                    feedback.rating.value,
+                    feedback.notes,
+                    feedback.created_at.isoformat(),
+                ),
+            )
+
+    def get_owner_feedback(self, limit: int = 100) -> list[OwnerFeedback]:
+        """Retrieve recorded editorial feedback ordered by newest first."""
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT feedback_id, story_id, article_id, rating, notes, created_at
+                FROM owner_feedback
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            results: list[OwnerFeedback] = []
+            for row in cursor.fetchall():
+                results.append(
+                    OwnerFeedback(
+                        feedback_id=row["feedback_id"],
+                        story_id=row["story_id"],
+                        article_id=row["article_id"],
+                        rating=OwnerFeedbackRating(row["rating"]),
+                        notes=row["notes"] or "",
+                        created_at=datetime.fromisoformat(row["created_at"]),
+                    )
+                )
+            return results
+
