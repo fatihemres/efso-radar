@@ -1,0 +1,28 @@
+# Environments and secrets
+.env*
+!.env.example
+*.pem
+*.key
+
+# Python runtime & caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+env/
+venv/
+
+# Databases and operational state
+data/*.db*
+data/*.sqlite*
+data/*.tmp
+data/*.json
+data/state.json
+
+# OS and logs
+*.log
+.DS_Store
+Thumbs.db
