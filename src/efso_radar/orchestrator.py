@@ -28,6 +28,8 @@ from efso_radar.repositories.base import StateRepository
 from efso_radar.repositories.sqlite import SqliteStateRepository
 from efso_radar.sources.base import NewsSource
 from efso_radar.sources.google_news import GoogleNewsSource
+from efso_radar.sources.models import DiscoveryMetrics
+from efso_radar.sources.multi_source import MultiSourceDiscoveryEngine
 
 logger = logging.getLogger("efso-radar.orchestrator")
 
@@ -42,6 +44,7 @@ class RadarRunResult(NamedTuple):
     dry_run: bool
     duration_seconds: float
     message: str = ""
+    discovery_metrics: Optional[DiscoveryMetrics] = None
 
 
 class RadarOrchestrator:
@@ -57,7 +60,7 @@ class RadarOrchestrator:
     ):
         self.settings = settings
         self.repository = repository or SqliteStateRepository(settings.sqlite_db_path)
-        self.source = source or GoogleNewsSource(timeout_seconds=settings.http_timeout_seconds)
+        self.source = source or MultiSourceDiscoveryEngine(include_google_news=True)
         self.ai_engine = ai_engine or GeminiEditorialEngine(settings)
         self.notifier = notifier or TelegramNotificationChannel(settings)
         self.deduper = DeduplicationEngine(self.repository)
@@ -167,6 +170,7 @@ class RadarOrchestrator:
 
             # 4. Ingestion: Fetch candidates from external news sources
             articles, successes = self.source.fetch_candidates(now, max_age_hours=self.settings.max_age_hours)
+            discovery_metrics = getattr(self.source, "last_metrics", None)
             if successes == 0:
                 msg = "All news feeds failed to respond; aborting run to prevent state corruption."
                 logger.error(msg)
@@ -180,12 +184,19 @@ class RadarOrchestrator:
                     dry_run=dry_run,
                     duration_seconds=time.monotonic() - start_time,
                     message=msg,
+                    discovery_metrics=discovery_metrics,
                 )
 
-            # 5. Deduplication and cross-publisher clustering
+            # 5. Deduplication, cross-publisher clustering, and candidate prioritization
             candidates = self.deduper.filter_fresh_candidates(
                 articles, max_candidates=self.settings.max_candidates
             )
+            if discovery_metrics:
+                discovery_metrics.story_clusters_formed = getattr(self.deduper, "last_clusters_count", len(candidates))
+                discovery_metrics.selected_for_ai = len(candidates)
+                discovery_metrics.deprioritized_by_limit = len(getattr(self.deduper, "last_deprioritized", []))
+                logger.info("Updated %s", discovery_metrics.summary())
+
             logger.info(
                 "Feeds responded: %d, Articles gathered: %d, Fresh candidates: %d",
                 successes,
@@ -205,6 +216,7 @@ class RadarOrchestrator:
                     dry_run=dry_run,
                     duration_seconds=time.monotonic() - start_time,
                     message="No new candidates found. Remained silent.",
+                    discovery_metrics=discovery_metrics,
                 )
 
             # Lease renewal before AI call to prevent lock expiry during model generation
@@ -302,6 +314,7 @@ class RadarOrchestrator:
                 dry_run=dry_run,
                 duration_seconds=duration,
                 message=f"Completed successfully in {duration:.2f}s",
+                discovery_metrics=discovery_metrics,
             )
 
         finally:

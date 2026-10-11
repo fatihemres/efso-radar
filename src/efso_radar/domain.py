@@ -74,7 +74,13 @@ class DeliveryStatus(str, Enum):
 
 
 class Article(BaseModel):
-    """An individual piece of news from a specific publisher/feed."""
+    """An individual piece of news from a specific publisher/feed.
+    
+    Note on Media Rights:
+    `image_url` and associated media metadata are extracted from publicly syndicated RSS/Atom
+    enclosures solely for editorial radar assessment and link preview indexing. Capturing this metadata
+    does NOT grant, imply, or substitute for copyright redistribution, publication, or commercial reuse rights.
+    """
     model_config = ConfigDict(frozen=True)
 
     id: str
@@ -84,6 +90,10 @@ class Article(BaseModel):
     source: str = Field(default="Kaynak belirtilmemiş", max_length=150)
     market: Market = Market.TR
     published_at: datetime
+    discovered_at: Optional[datetime] = None
+    source_category: Optional[str] = None
+    image_url: Optional[str] = None
+    reliability_score: Optional[float] = None
     snippet: str = Field(default="", max_length=1000)
     raw_metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -97,6 +107,10 @@ class Article(BaseModel):
         snippet: str = "",
         market: Market = Market.TR,
         canonical_url: Optional[str] = None,
+        discovered_at: Optional[datetime] = None,
+        source_category: Optional[str] = None,
+        image_url: Optional[str] = None,
+        reliability_score: Optional[float] = None,
         raw_metadata: Optional[dict[str, Any]] = None,
     ) -> Article:
         article_id = compute_article_id(canonical_url or url, title, source)
@@ -108,9 +122,25 @@ class Article(BaseModel):
             source=source.strip() or "Kaynak belirtilmemiş",
             market=market,
             published_at=published_at,
+            discovered_at=discovered_at or utc_now(),
+            source_category=(source_category.strip() if source_category else None),
+            image_url=(image_url.strip() if image_url else None),
+            reliability_score=reliability_score,
             snippet=snippet.strip(),
             raw_metadata=raw_metadata or {},
         )
+
+    @property
+    def priority_score(self) -> float:
+        """Heuristic priority score assigned during discovery ranking (if ranked)."""
+        return float(self.raw_metadata.get("priority_score", 0.0))
+
+    @property
+    def priority_reasons(self) -> list[str]:
+        """Heuristic signals contributing to priority score."""
+        return list(self.raw_metadata.get("priority_reasons", []))
+
+
 
 
 class Story(BaseModel):
