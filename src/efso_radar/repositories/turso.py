@@ -209,9 +209,10 @@ class TursoStateRepository(StateRepository):
         ]
         self.client.execute_transaction(stmts)
 
-    def get_pending_candidates(self, max_age_hours: int = 16) -> list[Article]:
+    def get_pending_candidates(self, max_age_hours: int = 16, now: Optional[datetime] = None) -> list[Article]:
         """Retrieve unexpired candidates from backlog that are still awaiting evaluation."""
-        cutoff = (utc_now() - timedelta(hours=max_age_hours)).isoformat()
+        ref_now = now or utc_now()
+        cutoff = (ref_now - timedelta(hours=max_age_hours)).isoformat()
         res = self.client.execute(
             """
             SELECT cb.article_id, cb.url, cb.canonical_url, cb.title, cb.source, cb.market,
@@ -442,7 +443,7 @@ class TursoStateRepository(StateRepository):
                 """
                 SELECT 1 FROM notifications
                 WHERE story_id = ? AND kind = 'NEW'
-                  AND status IN ('SENT', 'HELD_QUIET_HOURS', 'DISPATCHING')
+                  AND status IN ('SENT', 'HELD_QUIET_HOURS', 'DISPATCHING', 'QUEUED_FOR_DIGEST', 'HELD_FOR_VERIFICATION')
                 LIMIT 1
                 """,
                 [story_id],
@@ -572,9 +573,12 @@ class TursoStateRepository(StateRepository):
             [DeliveryStatus.FAILED.value, error_message, notification_id],
         )
 
-    def get_held_notifications(self, max_age_hours: Optional[int] = None) -> list[NotificationRecord]:
+    def get_held_notifications(
+        self, max_age_hours: Optional[int] = None, now: Optional[datetime] = None
+    ) -> list[NotificationRecord]:
         if max_age_hours is not None:
-            cutoff = (utc_now() - timedelta(hours=max_age_hours)).isoformat()
+            ref_now = now or utc_now()
+            cutoff = (ref_now - timedelta(hours=max_age_hours)).isoformat()
             res = self.client.execute(
                 """
                 SELECT notification_id, story_id, update_id, kind, channel, sent_at,
@@ -612,8 +616,11 @@ class TursoStateRepository(StateRepository):
             for r in res.fetchall()
         ]
 
-    def expire_stale_held_notifications(self, max_age_hours: int) -> int:
-        cutoff = (utc_now() - timedelta(hours=max_age_hours)).isoformat()
+    def expire_stale_held_notifications(
+        self, max_age_hours: int, now: Optional[datetime] = None
+    ) -> int:
+        ref_now = now or utc_now()
+        cutoff = (ref_now - timedelta(hours=max_age_hours)).isoformat()
         res = self.client.execute(
             """
             UPDATE notifications
@@ -665,29 +672,271 @@ class TursoStateRepository(StateRepository):
             ],
         )
 
+    def import_owner_feedback_batch(self, feedbacks: list[OwnerFeedback]) -> int:
+        """Atomically and idempotently import a batch of owner feedback records into Turso."""
+        if not feedbacks:
+            return 0
+        sql = """
+        INSERT OR REPLACE INTO owner_feedback
+        (feedback_id, story_id, article_id, rating, notes, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """
+        statements = [
+            (
+                sql,
+                [
+                    fb.feedback_id,
+                    fb.story_id,
+                    fb.article_id,
+                    fb.rating.value,
+                    fb.notes,
+                    fb.created_at.isoformat(),
+                ],
+            )
+            for fb in feedbacks
+        ]
+        self.client.execute_transaction(statements)
+        return len(feedbacks)
+
     def get_owner_feedback(self, limit: int = 100) -> list[OwnerFeedback]:
         """Retrieve recorded editorial feedback from Turso ordered by newest first."""
         res = self.client.execute(
             """
             SELECT feedback_id, story_id, article_id, rating, notes, created_at
             FROM owner_feedback
-            ORDER BY created_at DESC
+            ORDER BY created_at DESC, feedback_id ASC
             LIMIT ?
             """,
             [limit],
         )
         results: list[OwnerFeedback] = []
-        for row in res.rows:
-            f_id, s_id, a_id, rating_str, notes, created_str = row
+        for r in res.fetchall():
             results.append(
                 OwnerFeedback(
-                    feedback_id=f_id,
-                    story_id=s_id,
-                    article_id=a_id,
-                    rating=OwnerFeedbackRating(rating_str),
-                    notes=notes or "",
-                    created_at=datetime.fromisoformat(created_str),
+                    feedback_id=r["feedback_id"],
+                    story_id=r.get("story_id"),
+                    article_id=r.get("article_id"),
+                    rating=OwnerFeedbackRating(r["rating"]),
+                    notes=r.get("notes") or "",
+                    created_at=datetime.fromisoformat(r["created_at"]),
                 )
             )
         return results
+
+    # --- Digest Queue & Verification Hold Persistence ---
+    def get_queued_digest_notifications(
+        self, max_age_hours: Optional[int] = None, now: Optional[datetime] = None
+    ) -> list[NotificationRecord]:
+        if max_age_hours is not None:
+            ref_now = now or utc_now()
+            cutoff = (ref_now - timedelta(hours=max_age_hours)).isoformat()
+            res = self.client.execute(
+                """
+                SELECT notification_id, story_id, update_id, kind, channel, sent_at,
+                       status, message_text, headline_tr, score, error_message
+                FROM notifications
+                WHERE status = 'QUEUED_FOR_DIGEST' AND sent_at >= ?
+                ORDER BY score DESC, sent_at ASC, notification_id ASC
+                """,
+                [cutoff],
+            )
+        else:
+            res = self.client.execute(
+                """
+                SELECT notification_id, story_id, update_id, kind, channel, sent_at,
+                       status, message_text, headline_tr, score, error_message
+                FROM notifications
+                WHERE status = 'QUEUED_FOR_DIGEST'
+                ORDER BY score DESC, sent_at ASC, notification_id ASC
+                """
+            )
+        return [
+            NotificationRecord(
+                notification_id=r["notification_id"],
+                story_id=r["story_id"],
+                update_id=r.get("update_id"),
+                kind=EditorialKind(r["kind"]),
+                channel=r["channel"],
+                sent_at=datetime.fromisoformat(r["sent_at"]),
+                status=DeliveryStatus(r["status"]),
+                message_text=r["message_text"],
+                headline_tr=r["headline_tr"],
+                score=int(r["score"]),
+                error_message=r.get("error_message"),
+            )
+            for r in res.fetchall()
+        ]
+
+    def mark_digest_notifications_dispatched(
+        self, notification_ids: list[str], delivered_at: datetime
+    ) -> int:
+        if not notification_ids:
+            return 0
+        delivered_iso = delivered_at.isoformat()
+        placeholders = ",".join("?" for _ in notification_ids)
+        res = self.client.execute(
+            f"""
+            UPDATE notifications
+            SET status = ?, delivered_at = ?, channel = 'TELEGRAM_DIGEST',
+                lease_worker_id = NULL, lease_expires_at = NULL, error_message = NULL
+            WHERE notification_id IN ({placeholders})
+            """,
+            [DeliveryStatus.SENT.value, delivered_iso, *notification_ids],
+        )
+        return res.affected_row_count
+
+    def get_verification_held_notifications(
+        self, max_age_hours: Optional[int] = None, now: Optional[datetime] = None
+    ) -> list[NotificationRecord]:
+        if max_age_hours is not None:
+            ref_now = now or utc_now()
+            cutoff = (ref_now - timedelta(hours=max_age_hours)).isoformat()
+            res = self.client.execute(
+                """
+                SELECT notification_id, story_id, update_id, kind, channel, sent_at,
+                       status, message_text, headline_tr, score, error_message
+                FROM notifications
+                WHERE status = 'HELD_FOR_VERIFICATION' AND sent_at >= ?
+                ORDER BY sent_at ASC, notification_id ASC
+                """,
+                [cutoff],
+            )
+        else:
+            res = self.client.execute(
+                """
+                SELECT notification_id, story_id, update_id, kind, channel, sent_at,
+                       status, message_text, headline_tr, score, error_message
+                FROM notifications
+                WHERE status = 'HELD_FOR_VERIFICATION'
+                ORDER BY sent_at ASC, notification_id ASC
+                """
+            )
+        return [
+            NotificationRecord(
+                notification_id=r["notification_id"],
+                story_id=r["story_id"],
+                update_id=r.get("update_id"),
+                kind=EditorialKind(r["kind"]),
+                channel=r["channel"],
+                sent_at=datetime.fromisoformat(r["sent_at"]),
+                status=DeliveryStatus(r["status"]),
+                message_text=r["message_text"],
+                headline_tr=r["headline_tr"],
+                score=int(r["score"]),
+                error_message=r.get("error_message"),
+            )
+            for r in res.fetchall()
+        ]
+
+    def get_daily_sent_message_count(self, now: Optional[datetime] = None) -> int:
+        ref_now = (now or utc_now()).astimezone(timezone.utc)
+        day_prefix = ref_now.strftime("%Y-%m-%d")
+        res = self.client.execute(
+            """
+            SELECT channel, delivered_at, sent_at, notification_id
+            FROM notifications
+            WHERE status = 'SENT'
+              AND (COALESCE(delivered_at, sent_at) LIKE ?)
+            """,
+            [f"{day_prefix}%"],
+        )
+        individual_count = 0
+        digest_batches: set[str] = set()
+        for r in res.fetchall():
+            if r.get("channel") == "TELEGRAM_DIGEST":
+                batch_key = r.get("delivered_at") or r.get("sent_at") or ""
+                digest_batches.add(str(batch_key))
+            else:
+                individual_count += 1
+        return individual_count + len(digest_batches)
+
+    def get_last_digest_sent_at(self) -> Optional[datetime]:
+        res = self.client.execute(
+            """
+            SELECT COALESCE(delivered_at, sent_at) AS ts
+            FROM notifications
+            WHERE status = 'SENT' AND channel = 'TELEGRAM_DIGEST'
+            ORDER BY COALESCE(delivered_at, sent_at) DESC
+            LIMIT 1
+            """
+        )
+        row = res.fetchone()
+        if row and row.get("ts"):
+            return datetime.fromisoformat(str(row["ts"]))
+        return None
+
+    # --- Persistent AI Token & Cost Accounting ---
+    def record_ai_usage(
+        self,
+        usage_id: str,
+        run_mode: str,
+        model_name: str,
+        batch_hash: str,
+        candidate_count: int,
+        input_tokens: int,
+        output_tokens: int,
+        estimated_cost_usd: float,
+        response_json: Optional[str] = None,
+        created_at: Optional[datetime] = None,
+    ) -> None:
+        ts_iso = (created_at or utc_now()).isoformat()
+        self.client.execute(
+            """
+            INSERT OR REPLACE INTO ai_usage_ledger
+            (usage_id, run_mode, model_name, batch_hash, candidate_count,
+             input_tokens, output_tokens, estimated_cost_usd, response_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                usage_id,
+                run_mode,
+                model_name,
+                batch_hash,
+                candidate_count,
+                input_tokens,
+                output_tokens,
+                estimated_cost_usd,
+                response_json,
+                ts_iso,
+            ],
+        )
+
+    def get_monthly_ai_usage(
+        self, year_month_prefix: Optional[str] = None, now: Optional[datetime] = None
+    ) -> dict[str, float | int]:
+        ref_now = (now or utc_now()).astimezone(timezone.utc)
+        ym = year_month_prefix or ref_now.strftime("%Y-%m")
+        res = self.client.execute(
+            """
+            SELECT COUNT(*) AS call_count,
+                   COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                   COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                   COALESCE(SUM(estimated_cost_usd), 0.0) AS total_cost_usd
+            FROM ai_usage_ledger
+            WHERE created_at LIKE ?
+            """,
+            [f"{ym}%"],
+        )
+        row = res.fetchone() or {}
+        return {
+            "call_count": int(row.get("call_count") or 0),
+            "input_tokens": int(row.get("input_tokens") or 0),
+            "output_tokens": int(row.get("output_tokens") or 0),
+            "total_cost_usd": round(float(row.get("total_cost_usd") or 0.0), 6),
+        }
+
+    def get_cached_ai_batch_response(self, batch_hash: str, model_name: str) -> Optional[str]:
+        res = self.client.execute(
+            """
+            SELECT response_json
+            FROM ai_usage_ledger
+            WHERE batch_hash = ? AND model_name = ? AND response_json IS NOT NULL
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            [batch_hash, model_name],
+        )
+        row = res.fetchone()
+        return str(row["response_json"]) if row and row.get("response_json") else None
+
 

@@ -224,9 +224,10 @@ class SqliteStateRepository(StateRepository):
                 records,
             )
 
-    def get_pending_candidates(self, max_age_hours: int = 16) -> list[Article]:
+    def get_pending_candidates(self, max_age_hours: int = 16, now: Optional[datetime] = None) -> list[Article]:
         """Retrieve unexpired candidates from backlog that are still awaiting evaluation."""
-        cutoff = (utc_now() - timedelta(hours=max_age_hours)).isoformat()
+        ref_now = now or utc_now()
+        cutoff = (ref_now - timedelta(hours=max_age_hours)).isoformat()
         with self._connection() as conn:
             cursor = conn.execute(
                 """
@@ -416,7 +417,7 @@ class SqliteStateRepository(StateRepository):
                     """
                     SELECT 1 FROM notifications
                     WHERE story_id = ? AND kind = 'NEW'
-                      AND status IN ('SENT', 'HELD_QUIET_HOURS', 'DISPATCHING')
+                      AND status IN ('SENT', 'HELD_QUIET_HOURS', 'DISPATCHING', 'QUEUED_FOR_DIGEST', 'HELD_FOR_VERIFICATION')
                     LIMIT 1
                     """,
                     (story_id,),
@@ -556,10 +557,13 @@ class SqliteStateRepository(StateRepository):
                 (DeliveryStatus.FAILED.value, error_message, notification_id),
             )
 
-    def get_held_notifications(self, max_age_hours: Optional[int] = None) -> list[NotificationRecord]:
+    def get_held_notifications(
+        self, max_age_hours: Optional[int] = None, now: Optional[datetime] = None
+    ) -> list[NotificationRecord]:
         with self._connection() as conn:
             if max_age_hours is not None:
-                cutoff = (utc_now() - timedelta(hours=max_age_hours)).isoformat()
+                ref_now = now or utc_now()
+                cutoff = (ref_now - timedelta(hours=max_age_hours)).isoformat()
                 cursor = conn.execute(
                     """
                     SELECT notification_id, story_id, update_id, kind, channel, sent_at,
@@ -598,8 +602,11 @@ class SqliteStateRepository(StateRepository):
                 for r in rows
             ]
 
-    def expire_stale_held_notifications(self, max_age_hours: int) -> int:
-        cutoff = (utc_now() - timedelta(hours=max_age_hours)).isoformat()
+    def expire_stale_held_notifications(
+        self, max_age_hours: int, now: Optional[datetime] = None
+    ) -> int:
+        ref_now = now or utc_now()
+        cutoff = (ref_now - timedelta(hours=max_age_hours)).isoformat()
         with self._connection() as conn:
             cursor = conn.execute(
                 """
@@ -725,6 +732,31 @@ class SqliteStateRepository(StateRepository):
                 ),
             )
 
+    def import_owner_feedback_batch(self, feedbacks: list[OwnerFeedback]) -> int:
+        """Atomically and idempotently import a batch of owner feedback records into SQLite."""
+        if not feedbacks:
+            return 0
+        with self._connection() as conn:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO owner_feedback
+                (feedback_id, story_id, article_id, rating, notes, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        fb.feedback_id,
+                        fb.story_id,
+                        fb.article_id,
+                        fb.rating.value,
+                        fb.notes,
+                        fb.created_at.isoformat(),
+                    )
+                    for fb in feedbacks
+                ],
+            )
+        return len(feedbacks)
+
     def get_owner_feedback(self, limit: int = 100) -> list[OwnerFeedback]:
         """Retrieve recorded editorial feedback ordered by newest first."""
         with self._connection() as conn:
@@ -732,7 +764,7 @@ class SqliteStateRepository(StateRepository):
                 """
                 SELECT feedback_id, story_id, article_id, rating, notes, created_at
                 FROM owner_feedback
-                ORDER BY created_at DESC
+                ORDER BY created_at DESC, feedback_id ASC
                 LIMIT ?
                 """,
                 (limit,),
@@ -750,4 +782,232 @@ class SqliteStateRepository(StateRepository):
                     )
                 )
             return results
+
+    # --- Digest Queue & Verification Hold Persistence ---
+    def get_queued_digest_notifications(
+        self, max_age_hours: Optional[int] = None, now: Optional[datetime] = None
+    ) -> list[NotificationRecord]:
+        with self._connection() as conn:
+            if max_age_hours is not None:
+                ref_now = now or utc_now()
+                cutoff = (ref_now - timedelta(hours=max_age_hours)).isoformat()
+                cursor = conn.execute(
+                    """
+                    SELECT notification_id, story_id, update_id, kind, channel, sent_at,
+                           status, message_text, headline_tr, score, error_message
+                    FROM notifications
+                    WHERE status = 'QUEUED_FOR_DIGEST' AND sent_at >= ?
+                    ORDER BY score DESC, sent_at ASC, notification_id ASC
+                    """,
+                    (cutoff,),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    SELECT notification_id, story_id, update_id, kind, channel, sent_at,
+                           status, message_text, headline_tr, score, error_message
+                    FROM notifications
+                    WHERE status = 'QUEUED_FOR_DIGEST'
+                    ORDER BY score DESC, sent_at ASC, notification_id ASC
+                    """
+                )
+            rows = cursor.fetchall()
+            return [
+                NotificationRecord(
+                    notification_id=r["notification_id"],
+                    story_id=r["story_id"],
+                    update_id=r["update_id"] if "update_id" in r.keys() else None,
+                    kind=EditorialKind(r["kind"]),
+                    channel=r["channel"],
+                    sent_at=datetime.fromisoformat(r["sent_at"]),
+                    status=DeliveryStatus(r["status"]),
+                    message_text=r["message_text"],
+                    headline_tr=r["headline_tr"],
+                    score=r["score"],
+                    error_message=r["error_message"],
+                )
+                for r in rows
+            ]
+
+    def mark_digest_notifications_dispatched(
+        self, notification_ids: list[str], delivered_at: datetime
+    ) -> int:
+        if not notification_ids:
+            return 0
+        delivered_iso = delivered_at.isoformat()
+        placeholders = ",".join("?" for _ in notification_ids)
+        with self._connection() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE notifications
+                SET status = ?, delivered_at = ?, channel = 'TELEGRAM_DIGEST',
+                    lease_worker_id = NULL, lease_expires_at = NULL, error_message = NULL
+                WHERE notification_id IN ({placeholders})
+                """,
+                [DeliveryStatus.SENT.value, delivered_iso, *notification_ids],
+            )
+            return cursor.rowcount
+
+    def get_verification_held_notifications(
+        self, max_age_hours: Optional[int] = None, now: Optional[datetime] = None
+    ) -> list[NotificationRecord]:
+        with self._connection() as conn:
+            if max_age_hours is not None:
+                ref_now = now or utc_now()
+                cutoff = (ref_now - timedelta(hours=max_age_hours)).isoformat()
+                cursor = conn.execute(
+                    """
+                    SELECT notification_id, story_id, update_id, kind, channel, sent_at,
+                           status, message_text, headline_tr, score, error_message
+                    FROM notifications
+                    WHERE status = 'HELD_FOR_VERIFICATION' AND sent_at >= ?
+                    ORDER BY sent_at ASC, notification_id ASC
+                    """,
+                    (cutoff,),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    SELECT notification_id, story_id, update_id, kind, channel, sent_at,
+                           status, message_text, headline_tr, score, error_message
+                    FROM notifications
+                    WHERE status = 'HELD_FOR_VERIFICATION'
+                    ORDER BY sent_at ASC, notification_id ASC
+                    """
+                )
+            rows = cursor.fetchall()
+            return [
+                NotificationRecord(
+                    notification_id=r["notification_id"],
+                    story_id=r["story_id"],
+                    update_id=r["update_id"] if "update_id" in r.keys() else None,
+                    kind=EditorialKind(r["kind"]),
+                    channel=r["channel"],
+                    sent_at=datetime.fromisoformat(r["sent_at"]),
+                    status=DeliveryStatus(r["status"]),
+                    message_text=r["message_text"],
+                    headline_tr=r["headline_tr"],
+                    score=r["score"],
+                    error_message=r["error_message"],
+                )
+                for r in rows
+            ]
+
+    def get_daily_sent_message_count(self, now: Optional[datetime] = None) -> int:
+        ref_now = (now or utc_now()).astimezone(timezone.utc)
+        day_prefix = ref_now.strftime("%Y-%m-%d")
+        with self._connection() as conn:
+            # Individual SENT messages + distinct digest batches delivered today
+            cursor = conn.execute(
+                """
+                SELECT channel, delivered_at, sent_at, notification_id
+                FROM notifications
+                WHERE status = 'SENT'
+                  AND (COALESCE(delivered_at, sent_at) LIKE ?)
+                """,
+                (f"{day_prefix}%",),
+            )
+            individual_count = 0
+            digest_batches: set[str] = set()
+            for r in cursor.fetchall():
+                if r["channel"] == "TELEGRAM_DIGEST":
+                    batch_key = r["delivered_at"] or r["sent_at"]
+                    digest_batches.add(batch_key)
+                else:
+                    individual_count += 1
+            return individual_count + len(digest_batches)
+
+    def get_last_digest_sent_at(self) -> Optional[datetime]:
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT COALESCE(delivered_at, sent_at) AS ts
+                FROM notifications
+                WHERE status = 'SENT' AND channel = 'TELEGRAM_DIGEST'
+                ORDER BY COALESCE(delivered_at, sent_at) DESC
+                LIMIT 1
+                """
+            )
+            row = cursor.fetchone()
+            if row and row["ts"]:
+                return datetime.fromisoformat(row["ts"])
+            return None
+
+    # --- Persistent AI Token & Cost Accounting ---
+    def record_ai_usage(
+        self,
+        usage_id: str,
+        run_mode: str,
+        model_name: str,
+        batch_hash: str,
+        candidate_count: int,
+        input_tokens: int,
+        output_tokens: int,
+        estimated_cost_usd: float,
+        response_json: Optional[str] = None,
+        created_at: Optional[datetime] = None,
+    ) -> None:
+        ts_iso = (created_at or utc_now()).isoformat()
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO ai_usage_ledger
+                (usage_id, run_mode, model_name, batch_hash, candidate_count,
+                 input_tokens, output_tokens, estimated_cost_usd, response_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    usage_id,
+                    run_mode,
+                    model_name,
+                    batch_hash,
+                    candidate_count,
+                    input_tokens,
+                    output_tokens,
+                    estimated_cost_usd,
+                    response_json,
+                    ts_iso,
+                ),
+            )
+
+    def get_monthly_ai_usage(
+        self, year_month_prefix: Optional[str] = None, now: Optional[datetime] = None
+    ) -> dict[str, float | int]:
+        ref_now = (now or utc_now()).astimezone(timezone.utc)
+        ym = year_month_prefix or ref_now.strftime("%Y-%m")
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT COUNT(*) AS call_count,
+                       COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                       COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                       COALESCE(SUM(estimated_cost_usd), 0.0) AS total_cost_usd
+                FROM ai_usage_ledger
+                WHERE created_at LIKE ?
+                """,
+                (f"{ym}%",),
+            )
+            row = cursor.fetchone()
+            return {
+                "call_count": int(row["call_count"] or 0),
+                "input_tokens": int(row["input_tokens"] or 0),
+                "output_tokens": int(row["output_tokens"] or 0),
+                "total_cost_usd": round(float(row["total_cost_usd"] or 0.0), 6),
+            }
+
+    def get_cached_ai_batch_response(self, batch_hash: str, model_name: str) -> Optional[str]:
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT response_json
+                FROM ai_usage_ledger
+                WHERE batch_hash = ? AND model_name = ? AND response_json IS NOT NULL
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (batch_hash, model_name),
+            )
+            row = cursor.fetchone()
+            return row["response_json"] if row else None
+
 

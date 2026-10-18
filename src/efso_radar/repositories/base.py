@@ -58,7 +58,7 @@ class StateRepository(ABC):
         pass
 
     @abstractmethod
-    def get_pending_candidates(self, max_age_hours: int = 16) -> list[Article]:
+    def get_pending_candidates(self, max_age_hours: int = 16, now: Optional[datetime] = None) -> list[Article]:
         """Retrieve unexpired candidates from backlog that are still awaiting evaluation."""
         pass
 
@@ -135,12 +135,16 @@ class StateRepository(ABC):
         pass
 
     @abstractmethod
-    def get_held_notifications(self, max_age_hours: Optional[int] = None) -> list[NotificationRecord]:
+    def get_held_notifications(
+        self, max_age_hours: Optional[int] = None, now: Optional[datetime] = None
+    ) -> list[NotificationRecord]:
         """Fetch notifications held during quiet hours waiting to be delivered."""
         pass
 
     @abstractmethod
-    def expire_stale_held_notifications(self, max_age_hours: int) -> int:
+    def expire_stale_held_notifications(
+        self, max_age_hours: int, now: Optional[datetime] = None
+    ) -> int:
         """Expire held notifications that exceed the freshness window so stale news is not sent."""
         pass
 
@@ -166,8 +170,77 @@ class StateRepository(ABC):
         """Store explicit owner editorial feedback (APPROVE, REJECT, TOO_WEAK, DUPLICATE, IMPORTANT_UPDATE)."""
         pass
 
+    def import_owner_feedback_batch(self, feedbacks: list[OwnerFeedback]) -> int:
+        """Idempotently store a batch of explicit owner editorial feedback records."""
+        for fb in feedbacks:
+            self.record_owner_feedback(fb)
+        return len(feedbacks)
+
     @abstractmethod
     def get_owner_feedback(self, limit: int = 100) -> list[OwnerFeedback]:
         """Retrieve recorded editorial feedback for calibration and prompt tuning."""
         pass
+
+    # --- Digest Queue & Verification Hold Persistence ---
+    @abstractmethod
+    def get_queued_digest_notifications(
+        self, max_age_hours: Optional[int] = None, now: Optional[datetime] = None
+    ) -> list[NotificationRecord]:
+        """Fetch notifications queued for the periodic consolidated digest."""
+        pass
+
+    @abstractmethod
+    def mark_digest_notifications_dispatched(
+        self, notification_ids: list[str], delivered_at: datetime
+    ) -> int:
+        """Transition a batch of queued digest notifications to SENT once the digest is delivered."""
+        pass
+
+    @abstractmethod
+    def get_verification_held_notifications(
+        self, max_age_hours: Optional[int] = None, now: Optional[datetime] = None
+    ) -> list[NotificationRecord]:
+        """Fetch notifications held due to unverified rumor or single-source uncertainty."""
+        pass
+
+    @abstractmethod
+    def get_daily_sent_message_count(self, now: Optional[datetime] = None) -> int:
+        """Count distinct Telegram messages delivered in the current UTC day."""
+        pass
+
+    @abstractmethod
+    def get_last_digest_sent_at(self) -> Optional[datetime]:
+        """Return the UTC timestamp of the most recently delivered digest batch, if any."""
+        pass
+
+    # --- Persistent AI Token & Cost Accounting ---
+    @abstractmethod
+    def record_ai_usage(
+        self,
+        usage_id: str,
+        run_mode: str,
+        model_name: str,
+        batch_hash: str,
+        candidate_count: int,
+        input_tokens: int,
+        output_tokens: int,
+        estimated_cost_usd: float,
+        response_json: Optional[str] = None,
+        created_at: Optional[datetime] = None,
+    ) -> None:
+        """Persist token usage, estimated cost, and optional cached response for a Gemini API call."""
+        pass
+
+    @abstractmethod
+    def get_monthly_ai_usage(
+        self, year_month_prefix: Optional[str] = None, now: Optional[datetime] = None
+    ) -> dict[str, float | int]:
+        """Return cumulative monthly AI calls, input/output tokens, and estimated USD cost."""
+        pass
+
+    @abstractmethod
+    def get_cached_ai_batch_response(self, batch_hash: str, model_name: str) -> Optional[str]:
+        """Retrieve cached JSON response for an identical candidate batch and model, if available."""
+        pass
+
 

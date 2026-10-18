@@ -117,6 +117,7 @@ class TestQuietHoursQueueAndIdempotency(unittest.TestCase):
         night_time = datetime(2026, 10, 11, 23, 0, tzinfo=timezone.utc)
         night_settings = Settings(
             sqlite_db_path=self.db_path,
+            ai_evaluation_enabled=True,
             quiet_hours_enabled=True,
             quiet_hours_start_utc="21:00",
             quiet_hours_end_utc="05:30",
@@ -142,6 +143,7 @@ class TestQuietHoursQueueAndIdempotency(unittest.TestCase):
         morning_time = datetime(2026, 10, 12, 9, 0, tzinfo=timezone.utc)
         morning_settings = Settings(
             sqlite_db_path=self.db_path,
+            ai_evaluation_enabled=True,
             quiet_hours_enabled=True,
             quiet_hours_start_utc="21:00",
             quiet_hours_end_utc="05:30",

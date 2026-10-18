@@ -21,6 +21,8 @@ from efso_radar.domain import (
     EditorialAssessment,
     EditorialKind,
     NotificationRecord,
+    OwnerFeedback,
+    OwnerFeedbackRating,
     Story,
     StoryCategory,
     StoryUpdate,
@@ -321,6 +323,113 @@ class RepositoryContractTestMixin:
         # Ensure both distinct notification records exist in repository
         self.assertNotEqual(notif1.notification_id, notif2.notification_id)
         self.assertEqual(notif2.update_id, update_id)
+
+    def test_import_owner_feedback_batch_idempotency(self):
+        """Batch owner feedback import is atomic, idempotent, and preserves original labels/comments."""
+        batch = [
+            OwnerFeedback(
+                feedback_id="CALIB-01",
+                story_id=None,
+                article_id="art_calib_01",
+                rating=OwnerFeedbackRating.APPROVE,
+                notes="Hayran kitlesi ortalamanın çok üstünde.",
+                created_at=self.now,
+            ),
+            OwnerFeedback(
+                feedback_id="CALIB-03",
+                story_id=None,
+                article_id="art_calib_03",
+                rating=OwnerFeedbackRating.REJECT,
+                notes="Olumsuz ve can sıkıcı bir haber.",
+                created_at=self.now,
+            ),
+        ]
+
+        count1 = self.repo.import_owner_feedback_batch(batch)
+        self.assertEqual(count1, 2)
+
+        # Re-importing the exact same batch must be idempotent (still 2 rows, no duplicates)
+        count2 = self.repo.import_owner_feedback_batch(batch)
+        self.assertEqual(count2, 2)
+
+        stored = self.repo.get_owner_feedback(limit=10)
+        self.assertEqual(len(stored), 2)
+        self.assertEqual(stored[0].feedback_id, "CALIB-01")
+        self.assertEqual(stored[0].rating, OwnerFeedbackRating.APPROVE)
+        self.assertEqual(stored[0].notes, "Hayran kitlesi ortalamanın çok üstünde.")
+        self.assertEqual(stored[1].feedback_id, "CALIB-03")
+        self.assertEqual(stored[1].rating, OwnerFeedbackRating.REJECT)
+        self.assertEqual(stored[1].notes, "Olumsuz ve can sıkıcı bir haber.")
+
+    def test_digest_queue_and_verification_hold_parity(self):
+        """Both SQLite and Turso persist digest queues, verification holds, and daily sent counters."""
+        q_notif = NotificationRecord(
+            notification_id="DIGEST-Q-1",
+            story_id="STORY-DIG-1",
+            kind=EditorialKind.NEW,
+            sent_at=self.now,
+            status=DeliveryStatus.QUEUED_FOR_DIGEST,
+            message_text="Digest item 1",
+            headline_tr="Özet Haber 1",
+            score=85,
+        )
+        h_notif = NotificationRecord(
+            notification_id="HOLD-V-1",
+            story_id="STORY-HOLD-1",
+            kind=EditorialKind.NEW,
+            sent_at=self.now,
+            status=DeliveryStatus.HELD_FOR_VERIFICATION,
+            message_text="Rumor item 1",
+            headline_tr="İddia Haber 1",
+            score=87,
+        )
+        self.repo.record_notification(q_notif)
+        self.repo.record_notification(h_notif)
+
+        # Both QUEUED_FOR_DIGEST and HELD_FOR_VERIFICATION count as already alerted/queued
+        self.assertTrue(self.repo.has_story_been_alerted("STORY-DIG-1", kind=EditorialKind.NEW))
+        self.assertTrue(self.repo.has_story_been_alerted("STORY-HOLD-1", kind=EditorialKind.NEW))
+
+        queued = self.repo.get_queued_digest_notifications()
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0].notification_id, "DIGEST-Q-1")
+
+        held = self.repo.get_verification_held_notifications()
+        self.assertEqual(len(held), 1)
+        self.assertEqual(held[0].notification_id, "HOLD-V-1")
+
+        # Mark digest notification dispatched
+        dispatch_time = self.now + timedelta(hours=6)
+        updated = self.repo.mark_digest_notifications_dispatched(
+            ["DIGEST-Q-1"], delivered_at=dispatch_time
+        )
+        self.assertEqual(updated, 1)
+        self.assertEqual(len(self.repo.get_queued_digest_notifications()), 0)
+        self.assertEqual(self.repo.get_daily_sent_message_count(dispatch_time), 1)
+        self.assertEqual(self.repo.get_last_digest_sent_at(), dispatch_time)
+
+    def test_ai_usage_ledger_and_batch_cache_parity(self):
+        """Both SQLite and Turso track monthly AI token/cost usage and cache batch responses."""
+        self.repo.record_ai_usage(
+            usage_id="USAGE-001",
+            run_mode="SHADOW_EVAL",
+            model_name="gemini-3.5-flash-lite",
+            batch_hash="hash_batch_abc",
+            candidate_count=8,
+            input_tokens=2400,
+            output_tokens=720,
+            estimated_cost_usd=0.000528,
+            response_json='{"picks": []}',
+            created_at=self.now,
+        )
+        cached = self.repo.get_cached_ai_batch_response("hash_batch_abc", "gemini-3.5-flash-lite")
+        self.assertEqual(cached, '{"picks": []}')
+
+        usage = self.repo.get_monthly_ai_usage("2026-10")
+        self.assertEqual(usage["call_count"], 1)
+        self.assertEqual(usage["input_tokens"], 2400)
+        self.assertEqual(usage["output_tokens"], 720)
+        self.assertAlmostEqual(float(usage["total_cost_usd"]), 0.000528, places=6)
 
 
 class TestSqliteRepositoryParity(unittest.TestCase, RepositoryContractTestMixin):

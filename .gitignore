@@ -22,6 +22,12 @@ data/*.tmp
 data/*.json
 data/state.json
 
+# Personal editorial review and calibration files
+data/*.csv
+data/*.xlsx
+data/*.xls
+data/*Kalibrasyon*.md
+
 # OS and logs
 *.log
 .DS_Store

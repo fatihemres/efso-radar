@@ -14,7 +14,14 @@ from typing import Optional
 
 from pydantic import ValidationError
 
-from efso_radar.ai.cost import estimate_call_cost, estimate_tokens_from_text
+from efso_radar.ai.cost import (
+    check_monthly_budget_guard,
+    compute_candidate_batch_hash,
+    compute_enforceable_batch_output_tokens,
+    estimate_call_cost,
+    estimate_tokens_from_text,
+    extract_provider_token_usage,
+)
 from efso_radar.ai.prompts import build_editorial_prompt
 from efso_radar.ai.schemas import EditorialDecisionBatch, EditorialPickSchema
 from efso_radar.config import Settings
@@ -28,6 +35,7 @@ from efso_radar.domain import (
     VerificationStatus,
     normalize_text,
 )
+from efso_radar.repositories.base import StateRepository
 
 logger = logging.getLogger("efso-radar.ai.client")
 
@@ -125,12 +133,16 @@ def is_headline_too_similar(headline: str, existing_headline: str, threshold: fl
 class GeminiEditorialEngine(AIEditorialEngine):
     """Google Gemini AI client with Structured Outputs and application-level verification."""
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, repository: Optional[StateRepository] = None):
         self.settings = settings
+        self.repository = repository
         self.client = None
         if self.settings.gemini_api_key:
             from google import genai
-            self.client = genai.Client(api_key=self.settings.gemini_api_key)
+            from google.genai import types
+
+            http_opts = types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=1))
+            self.client = genai.Client(api_key=self.settings.gemini_api_key, http_options=http_opts)
 
     def evaluate(
         self,
@@ -141,9 +153,19 @@ class GeminiEditorialEngine(AIEditorialEngine):
         if not candidates:
             return []
 
+        batch_hash = compute_candidate_batch_hash([c.id for c in candidates], self.settings.gemini_model)
+
+        # 0. Check persistent batch cache first for idempotent resume / zero-cost replay
+        if self.repository is not None:
+            cached_raw = self.repository.get_cached_ai_batch_response(batch_hash, self.settings.gemini_model)
+            if cached_raw:
+                logger.info("Reusing cached Gemini response for batch_hash=%s (0 API tokens billed)", batch_hash)
+                batch = EditorialDecisionBatch.model_validate_json(cached_raw)
+                return self._validate_and_transform_picks(batch.picks, candidates, recent_stories)
+
         prompt_text = build_editorial_prompt(candidates, recent_stories, now)
 
-        # Budget & Token Pre-check
+        # 1. Per-Run & Monthly Budget Circuit-Breaker Pre-check
         est_input_tokens = estimate_tokens_from_text(prompt_text)
         est_cost = estimate_call_cost(
             self.settings.gemini_model,
@@ -157,7 +179,20 @@ class GeminiEditorialEngine(AIEditorialEngine):
             est_cost,
         )
 
-        if est_cost > self.settings.max_estimated_run_cost_usd:
+        if self.repository is not None:
+            monthly_usage = self.repository.get_monthly_ai_usage(now=now)
+            allowed, reason = check_monthly_budget_guard(
+                est_run_cost_usd=est_cost,
+                current_monthly_cost_usd=float(monthly_usage["total_cost_usd"]),
+                current_monthly_calls=int(monthly_usage["call_count"]),
+                max_run_cost_usd=self.settings.max_estimated_run_cost_usd,
+                max_monthly_cost_usd=self.settings.max_monthly_ai_cost_usd,
+                max_monthly_calls=self.settings.max_monthly_ai_calls,
+            )
+            if not allowed:
+                logger.error("AI Budget Circuit-Breaker triggered: %s", reason)
+                raise AIEvaluationError(reason)
+        elif est_cost > self.settings.max_estimated_run_cost_usd:
             msg = f"Estimated AI cost (${est_cost:.4f}) exceeds configured per-run budget (${self.settings.max_estimated_run_cost_usd:.4f})."
             logger.error(msg)
             raise AIEvaluationError(msg)
@@ -166,16 +201,64 @@ class GeminiEditorialEngine(AIEditorialEngine):
             logger.warning("No GEMINI_API_KEY configured. Returning empty editorial picks.")
             return []
 
-        # Call Gemini with Structured Outputs
+        import uuid
+        usage_id = f"AI-{now.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        batch_max_out = compute_enforceable_batch_output_tokens(
+            len(candidates),
+            self.settings.max_output_tokens,
+        )
+        expected_out_tokens = max(1, batch_max_out // 2)
+
+        # Pre-call budget reservation: persist RESERVED_IN_FLIGHT entry before network dispatch
+        # so concurrent invocations and ambiguous/failed requests are accounted for in the ledger.
+        if self.repository is not None:
+            self.repository.record_ai_usage(
+                usage_id=usage_id,
+                run_mode="RESERVED_IN_FLIGHT",
+                model_name=self.settings.gemini_model,
+                batch_hash=batch_hash,
+                candidate_count=len(candidates),
+                input_tokens=est_input_tokens,
+                output_tokens=batch_max_out,
+                estimated_cost_usd=est_cost,
+                response_json=None,
+                created_at=now,
+            )
+
+        # Call Gemini with Structured Outputs and enforceable batch output token ceiling
         from google.genai import types
 
-        config = types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=EditorialDecisionBatch,
-            temperature=0.15,
-            max_output_tokens=self.settings.max_output_tokens,
-        )
+        thinking_cfg = None
+        if hasattr(types, "ThinkingConfig"):
+            try:
+                thinking_cfg = types.ThinkingConfig(thinking_level="minimal")
+            except Exception:
+                thinking_cfg = None
 
+        http_opts = None
+        if hasattr(types, "HttpOptions") and hasattr(types, "HttpRetryOptions"):
+            http_opts = types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=1))
+
+        afc_cfg = None
+        if hasattr(types, "AutomaticFunctionCallingConfig"):
+            afc_cfg = types.AutomaticFunctionCallingConfig(disable=True, maximum_remote_calls=0)
+
+        config_kwargs: dict[str, Any] = {
+            "response_mime_type": "application/json",
+            "response_schema": EditorialDecisionBatch,
+            "temperature": 0.15,
+            "max_output_tokens": batch_max_out,
+        }
+        if thinking_cfg is not None:
+            config_kwargs["thinking_config"] = thinking_cfg
+        if http_opts is not None:
+            config_kwargs["http_options"] = http_opts
+        if afc_cfg is not None:
+            config_kwargs["automatic_function_calling"] = afc_cfg
+
+        config = types.GenerateContentConfig(**config_kwargs)
+
+        response = None
         try:
             response = self.client.models.generate_content(
                 model=self.settings.gemini_model,
@@ -183,21 +266,125 @@ class GeminiEditorialEngine(AIEditorialEngine):
                 config=config,
             )
         except Exception as exc:
+            if self.repository is not None:
+                self.repository.record_ai_usage(
+                    usage_id=usage_id,
+                    run_mode="FAILED_AMBIGUOUS",
+                    model_name=self.settings.gemini_model,
+                    batch_hash=batch_hash,
+                    candidate_count=len(candidates),
+                    input_tokens=est_input_tokens,
+                    output_tokens=expected_out_tokens,
+                    estimated_cost_usd=est_cost,
+                    response_json=None,
+                    created_at=now,
+                )
             msg = f"Gemini API call failed: {exc}"
             logger.error(msg)
             raise AIEvaluationError(msg) from exc
 
+        if getattr(response, "candidates", None) and len(response.candidates) > 0:
+            cand = response.candidates[0]
+            finish_reason = getattr(cand, "finish_reason", None)
+            if finish_reason and "MAX_TOKENS" in str(finish_reason).upper():
+                if self.repository is not None:
+                    actual_in, actual_out, _ = extract_provider_token_usage(response, est_input_tokens, batch_max_out)
+                    trunc_cost = estimate_call_cost(
+                        self.settings.gemini_model,
+                        input_tokens=actual_in,
+                        output_tokens=actual_out,
+                        used_search_grounding=self.settings.enable_search_grounding,
+                        output_already_includes_thinking=True,
+                    )
+                    self.repository.record_ai_usage(
+                        usage_id=usage_id,
+                        run_mode="FAILED_AMBIGUOUS",
+                        model_name=self.settings.gemini_model,
+                        batch_hash=batch_hash,
+                        candidate_count=len(candidates),
+                        input_tokens=actual_in,
+                        output_tokens=actual_out,
+                        estimated_cost_usd=trunc_cost,
+                        response_json=None,
+                        created_at=now,
+                    )
+                msg = f"Gemini response truncated at max token limit (finish_reason=MAX_TOKENS). Ceiling={batch_max_out}."
+                logger.error(msg)
+                raise AIEvaluationError(msg)
+
         if not response or not response.text:
+            if self.repository is not None:
+                actual_in, actual_out, _ = extract_provider_token_usage(response, est_input_tokens, 0)
+                empty_cost = estimate_call_cost(
+                    self.settings.gemini_model,
+                    input_tokens=actual_in,
+                    output_tokens=actual_out,
+                    used_search_grounding=self.settings.enable_search_grounding,
+                    output_already_includes_thinking=True,
+                )
+                self.repository.record_ai_usage(
+                    usage_id=usage_id,
+                    run_mode="FAILED_EMPTY",
+                    model_name=self.settings.gemini_model,
+                    batch_hash=batch_hash,
+                    candidate_count=len(candidates),
+                    input_tokens=actual_in,
+                    output_tokens=actual_out,
+                    estimated_cost_usd=empty_cost,
+                    response_json=None,
+                    created_at=now,
+                )
             logger.warning("Gemini returned empty response.")
             return []
+
+        actual_in, actual_out, _ = extract_provider_token_usage(
+            response,
+            fallback_input_tokens=est_input_tokens,
+            fallback_output_tokens=estimate_tokens_from_text(response.text),
+        )
+        actual_cost = estimate_call_cost(
+            self.settings.gemini_model,
+            input_tokens=actual_in,
+            output_tokens=actual_out,
+            used_search_grounding=self.settings.enable_search_grounding,
+            output_already_includes_thinking=True,
+        )
 
         # Validate with Pydantic
         try:
             batch = EditorialDecisionBatch.model_validate_json(response.text)
         except (ValidationError, json.JSONDecodeError) as err:
+            if self.repository is not None:
+                self.repository.record_ai_usage(
+                    usage_id=usage_id,
+                    run_mode="FAILED_VALIDATION",
+                    model_name=self.settings.gemini_model,
+                    batch_hash=batch_hash,
+                    candidate_count=len(candidates),
+                    input_tokens=actual_in,
+                    output_tokens=actual_out,
+                    estimated_cost_usd=actual_cost,
+                    response_json=None,
+                    created_at=now,
+                )
             msg = f"Structured output parsing error: {err}. Raw response: {response.text[:200]}"
             logger.error(msg)
             raise AIEvaluationError(msg) from err
+
+        # Reconcile actual/estimated token usage and cached JSON in repository ledger
+        if self.repository is not None:
+            self.repository.record_ai_usage(
+                usage_id=usage_id,
+                run_mode="PRODUCTION",
+                model_name=self.settings.gemini_model,
+                batch_hash=batch_hash,
+                candidate_count=len(candidates),
+                input_tokens=actual_in,
+                output_tokens=actual_out,
+                estimated_cost_usd=actual_cost,
+                response_json=response.text,
+                created_at=now,
+            )
 
         # Validate with Application-Level Business Rules
         return self._validate_and_transform_picks(batch.picks, candidates, recent_stories)

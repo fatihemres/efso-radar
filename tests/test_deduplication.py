@@ -72,6 +72,64 @@ class TestDeduplication(unittest.TestCase):
         cluster_ids = billie_rep.raw_metadata.get("cluster_article_ids", [])
         self.assertEqual(len(cluster_ids), 2)
 
+    def test_unrelated_mortality_events_never_merge_calib03_calib44_vs_metin_arolat(self):
+        """Regression test for CALIB-03/CALIB-44 audit:
+        - CALIB-03 and CALIB-44 (both about Atilla Taş's daughter Sezen Taş) DO merge.
+        - An unrelated mortality story about a different person (e.g. Metin Arolat) MUST NEVER merge with them,
+          even if both share generic mortality keywords ('hayatını kaybetti', 'cenaze', 'vefat').
+        """
+        calib_03 = Article.create(
+            "14. Kattan Düşerek Hayatını Kaybetmişti: Atilla Taş'ın Kızı Sezen Taş'ın Eski Eşinin Paylaşımı Tepki Çekti!",
+            "https://onedio.com/calib-03",
+            "Onedio Magazin",
+            self.now,
+            snippet="Mersin'de 14. kattan düşerek hayatını kaybeden Sezen Taş toprağa verildi. Eski eşi Uğur Haliloğlu'nun cenaze sonrası paylaşımı tepki topladı.",
+        )
+        calib_44 = Article.create(
+            "Atilla Taş'ın acı günü... Kızı 14'üncü kattan düşerek hayatını kaybetti: Eski eşin paylaşımı 'pes' dedirtti!",
+            "https://hurriyet.com.tr/calib-44",
+            "Hürriyet Kelebek",
+            self.now,
+            snippet="Şarkıcı Atilla Taş'ın kızı Sezen Taş 14. kattan düşerek yaşamını yitirdi. Eski eşi Uğur Haliloğlu'nun paylaşımı tepki çekti.",
+        )
+        metin_arolat = Article.create(
+            "Sahnedeyken fenalaşarak hayatını kaybetmişti: Metin Arolat son yolculuğuna uğurlandı, cenaze töreninde gözyaşları sel oldu!",
+            "https://milliyet.com.tr/metin-arolat",
+            "Milliyet Cadde",
+            self.now,
+            snippet="Ünlü şarkıcı ve yönetmen Metin Arolat hayatını kaybetti. Cenaze töreninde sanat dünyası bir araya geldi.",
+        )
+
+        candidates = self.engine.filter_fresh_candidates([calib_03, calib_44, metin_arolat])
+        # Must produce exactly 2 clusters: [Sezen Taş (CALIB-03 + CALIB-44)] and [Metin Arolat]
+        self.assertEqual(len(candidates), 2)
+
+        sezen_rep = next(c for c in candidates if "Sezen" in c.title or "Atilla Taş" in c.title)
+        metin_rep = next(c for c in candidates if "Metin Arolat" in c.title)
+
+        self.assertEqual(set(sezen_rep.raw_metadata["cluster_article_ids"]), {calib_03.id, calib_44.id})
+        self.assertEqual(metin_rep.raw_metadata["cluster_article_ids"], [metin_arolat.id])
+
+    def test_unrelated_events_for_same_celebrity_do_not_merge(self):
+        """Two completely different events about the same celebrity must remain separate candidates."""
+        event_a = Article.create(
+            "Hadise Harbiye Açıkhava konserinde sahne şovuyla büyüledi",
+            "https://magazin.com/hadise-konser",
+            "Magazin A",
+            self.now,
+            snippet="Ünlü şarkıcı Hadise Harbiye konserinde binlerce hayranıyla buluştu.",
+        )
+        event_b = Article.create(
+            "Hadise yeni reklam anlaşmasıyla rekor ücret aldı",
+            "https://magazin.com/hadise-reklam",
+            "Magazin B",
+            self.now,
+            snippet="Hadise bir kozmetik markasının yüzü olarak anlaşma imzaladı.",
+        )
+
+        candidates = self.engine.filter_fresh_candidates([event_a, event_b])
+        self.assertEqual(len(candidates), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

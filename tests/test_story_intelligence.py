@@ -250,6 +250,7 @@ class TestStoryIntelligence(unittest.TestCase):
         """
         settings = Settings(
             min_score=85,
+            ai_evaluation_enabled=True,
             enable_quiet_hours=False,
             sqlite_db_path=self.db_path,
         )

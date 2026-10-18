@@ -34,3 +34,34 @@ def format_telegram_alert(assessment: EditorialAssessment) -> str:
         f"<b>Kaynaklar</b>\n{sources_html}\n\n"
         "<i>Ön eleme: haberin tam metni ve iddialar yayın öncesi doğrulanmalıdır.</i>"
     )
+
+
+def format_telegram_digest(
+    assessments: list[EditorialAssessment],
+    window_label: str = "6 Saatlik Editoryal Özet",
+) -> str:
+    """Format a group of editorially approved stories into a single periodic Telegram digest."""
+    e = html.escape
+    tr_upper = window_label.replace("i", "İ").replace("ı", "I").upper()
+    header = (
+        f"<b>📋 EFSO RADAR | {e(tr_upper)} ({len(assessments)} Haber)</b>\n"
+        "<i>Acil kırılım gerektirmeyen ancak içerik kütüphanesi için öne çıkan editoryal adaylar:</i>\n"
+    )
+    blocks: list[str] = [header]
+    for idx, item in enumerate(assessments, 1):
+        kind_tag = "🔄 GÜNCELLEME" if item.kind == EditorialKind.UPDATE else "✨ ADAY"
+        caution_line = ""
+        if item.uncertainties_tr:
+            caution_line = f"\n   ⚠️ <i>Teyit notu: {e(item.uncertainties_tr)}</i>"
+        first_source = ""
+        if item.supporting_articles:
+            art = item.supporting_articles[0]
+            first_source = f' — <a href="{e(art.url, quote=True)}">{e(art.source)}</a>'
+        blocks.append(
+            f"<b>{idx}. [{kind_tag} | {item.score}/100 | {e(item.suggested_format.value)}] {e(item.headline_tr)}</b>\n"
+            f"   💡 {e(item.why_efso_tr)}{first_source}\n"
+            f"   🎯 Kapak: {e(item.cover_title_tr)}{caution_line}"
+        )
+    blocks.append("\n<i>Not: Yayın öncesi birincil kaynak ve iddia doğrulaması yapılmalıdır.</i>")
+    return "\n\n".join(blocks)
+

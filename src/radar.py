@@ -44,7 +44,7 @@ MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "16"))
 MAX_CANDIDATES = int(os.getenv("MAX_CANDIDATES", "55"))
 MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "3"))
 MIN_SCORE = int(os.getenv("MIN_SCORE", "82"))
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 # Broad searches (not limited to a fixed celebrity watchlist); Google News is not
 # a comprehensive index of social-only Instagram/TikTok posts.

@@ -1,6 +1,7 @@
 """Tests for AI components: pricing, schemas, prompts, and business rule validation."""
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import MagicMock
 
 from pydantic import ValidationError
 
@@ -37,6 +38,76 @@ class TestAIComponents(unittest.TestCase):
         # gemini-2.0-flash-lite was shut down on June 1, 2026; must reject with explicit ValueError
         with self.assertRaises(ValueError):
             estimate_call_cost("gemini-2.0-flash-lite", 1_000_000, 1_000_000)
+
+        # gemini-3.1-flash-lite-preview was shut down on May 25, 2026; must NOT be treated as a valid fallback
+        with self.assertRaises(ValueError) as ctx:
+            estimate_call_cost("gemini-3.1-flash-lite-preview", 1_000_000, 1_000_000)
+        self.assertIn("May 25, 2026", str(ctx.exception))
+
+    def test_stable_gemini_3_1_flash_lite_distinguished_from_shutdown_preview(self):
+        from efso_radar.ai.cost import OFFICIAL_PRICING
+        # Stable gemini-3.1-flash-lite ($0.25 input / $1.50 output, scheduled shutdown May 7, 2027)
+        cost = estimate_call_cost("gemini-3.1-flash-lite", 1_000_000, 1_000_000)
+        self.assertAlmostEqual(cost, 1.75, places=4)
+        meta = OFFICIAL_PRICING["gemini-3.1-flash-lite"]
+        self.assertEqual(meta.shutdown_date, "May 7, 2027")
+        self.assertEqual(meta.recommended_replacement, "gemini-3.5-flash-lite")
+
+    def test_extract_provider_token_usage_handles_separate_thoughts_tokens(self):
+        from types import SimpleNamespace
+        from efso_radar.ai.cost import extract_provider_token_usage
+
+        resp = SimpleNamespace(
+            usage_metadata=SimpleNamespace(
+                prompt_token_count=4200,
+                candidates_token_count=480,
+                thoughts_token_count=120,
+                total_token_count=4800,
+            )
+        )
+        in_tok, out_tok_total, from_meta = extract_provider_token_usage(
+            resp, fallback_input_tokens=100, fallback_output_tokens=50
+        )
+        self.assertEqual(in_tok, 4200)
+        # 480 candidate tokens + 120 thinking tokens = 600 total billed output tokens
+        self.assertEqual(out_tok_total, 600)
+        self.assertTrue(from_meta)
+
+    def test_ledger_pre_reservation_and_failed_call_cost_accounting(self):
+        """Failed or ambiguous API calls still record estimated cost in ai_usage_ledger without polluting cache."""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import MagicMock
+        from efso_radar.ai.client import AIEvaluationError
+        from efso_radar.repositories.sqlite import SqliteStateRepository
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = SqliteStateRepository(Path(tmp) / "ledger_test.db")
+            settings = Settings(
+                gemini_api_key="mock-test-key",
+                gemini_model="gemini-3.5-flash-lite",
+                max_estimated_run_cost_usd=0.05,
+                max_monthly_ai_cost_usd=1.20,
+                max_monthly_ai_calls=10,
+            )
+            engine = GeminiEditorialEngine(settings, repository=repo)
+            engine.client = MagicMock()
+            engine.client.models.generate_content.side_effect = RuntimeError("504 Gateway Timeout")
+            art = Article.create("Test Haberi", "https://example.com/1", "Kaynak", self.now)
+
+            with self.assertRaises(AIEvaluationError):
+                engine.evaluate([art], [], self.now)
+
+            # Verify cost was accounted in monthly usage summary
+            usage = repo.get_monthly_ai_usage(now=self.now)
+            self.assertEqual(int(usage["call_count"]), 1)
+            self.assertGreater(float(usage["total_cost_usd"]), 0.0)
+
+            # Verify failed call did NOT pollute batch cache (cached response must be None)
+            with repo._connection() as conn:
+                row = conn.execute("SELECT run_mode, response_json FROM ai_usage_ledger").fetchone()
+                self.assertEqual(row["run_mode"], "FAILED_AMBIGUOUS")
+                self.assertIsNone(row["response_json"])
 
     def test_search_grounding_cost(self):
         cost_with_search = estimate_call_cost("gemini-3.5-flash-lite", 10_000, 1_000, used_search_grounding=True)
@@ -162,6 +233,93 @@ class TestAIComponents(unittest.TestCase):
         self.assertEqual(len(approved), 1)
         self.assertEqual(approved[0].kind, EditorialKind.UPDATE)
         self.assertEqual(approved[0].parent_story_id, "STORY-1")
+
+    def test_compute_enforceable_batch_output_tokens(self):
+        from efso_radar.ai.cost import compute_enforceable_batch_output_tokens
+
+        # Batch of 8 stories with global config 3200 or 4096:
+        # 100 base + 8 * 180 = 1540 tokens (never 3200 or 4096!)
+        self.assertEqual(compute_enforceable_batch_output_tokens(8, 3200), 1540)
+        self.assertEqual(compute_enforceable_batch_output_tokens(8, 4096), 1540)
+
+        # Batch of 2 stories: 100 + 2 * 180 = 460 -> clamped to 500 minimum
+        self.assertEqual(compute_enforceable_batch_output_tokens(2, 3200), 500)
+
+        # 7 batches (6 of 8 stories + 1 of 2 stories) = 6 * 1540 + 500 = 9740 tokens (< 10,000!)
+        total_7_batches = 6 * compute_enforceable_batch_output_tokens(8, 4096) + compute_enforceable_batch_output_tokens(2, 4096)
+        self.assertEqual(total_7_batches, 9740)
+        self.assertLessEqual(total_7_batches, 10000)
+
+    def test_engine_passes_enforceable_batch_output_tokens_to_generate_content_config(self):
+        """GeminiEditorialEngine.evaluate configures types.GenerateContentConfig with enforceable batch tokens."""
+        from unittest.mock import MagicMock
+        art1 = Article.create("Haber 1", "https://url.com/1", "Kaynak", self.now)
+        art2 = Article.create("Haber 2", "https://url.com/2", "Kaynak", self.now)
+        art3 = Article.create("Haber 3", "https://url.com/3", "Kaynak", self.now)
+
+        settings = Settings(gemini_api_key="mock-key", max_output_tokens=4096)
+        engine = GeminiEditorialEngine(settings)
+        engine.client = MagicMock()
+
+        # Mock successful empty pick batch
+        mock_resp = MagicMock()
+        mock_resp.text = '{"picks": []}'
+        engine.client.models.generate_content.return_value = mock_resp
+
+        engine.evaluate([art1, art2, art3], [], self.now)
+
+        # Inspect the config passed to client.models.generate_content
+        call_kwargs = engine.client.models.generate_content.call_args.kwargs
+        config_passed = call_kwargs["config"]
+        # For 3 articles: 100 + 3 * 180 = 640 tokens (strictly enforced, NOT 4096!)
+        self.assertEqual(config_passed.max_output_tokens, 640)
+        self.assertNotEqual(config_passed.max_output_tokens, 4096)
+        if hasattr(config_passed, "thinking_config") and config_passed.thinking_config is not None:
+            self.assertEqual(str(config_passed.thinking_config.thinking_level).upper(), "THINKINGLEVEL.MINIMAL")
+
+    def test_sdk_level_request_controls_and_thinking_config(self):
+        """Verifies explicit SDK request controls: attempts=1, automatic_function_calling disabled, and thinking_level='minimal'."""
+        from efso_radar.ai.phase3c2b_eval import BlindShadowEvaluationRunner
+
+        art1 = Article.create("Canary 1", "https://url.com/c1", "Kaynak", self.now)
+        runner = BlindShadowEvaluationRunner(
+            settings=Settings(gemini_model="gemini-3.5-flash-lite", max_shadow_eval_budget_usd=0.05),
+            repository=None,
+            batch_size=8,
+        )
+        mock_client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.text = '{"picks": []}'
+        mock_resp.candidates = [MagicMock(finish_reason="STOP")]
+        mock_client.models.generate_content.return_value = mock_resp
+
+        preds, metrics, report = runner.run_live_gemini_evaluation(
+            items=[art1],
+            mock_client=mock_client,
+            max_batches=1,
+            automatic_continuation=False,
+        )
+
+        call_kwargs = mock_client.models.generate_content.call_args.kwargs
+        config = call_kwargs["config"]
+
+        # 1. SDK-level HTTP retry disabled (attempts=1)
+        self.assertIsNotNone(config.http_options)
+        self.assertEqual(config.http_options.retry_options.attempts, 1)
+
+        # 2. Automatic function calling disabled
+        self.assertIsNotNone(config.automatic_function_calling)
+        self.assertTrue(config.automatic_function_calling.disable)
+
+        # 3. Documented supported thinking_level="minimal"
+        self.assertIsNotNone(config.thinking_config)
+        self.assertEqual(str(config.thinking_config.thinking_level).upper(), "THINKINGLEVEL.MINIMAL")
+
+        # 4. Evidence report captures SDK controls
+        self.assertIn("evidence", report)
+        self.assertEqual(report["evidence"]["sdk_controls"]["http_retry_attempts"], 1)
+        self.assertFalse(report["evidence"]["sdk_controls"]["automatic_continuation"])
+        self.assertEqual(report["evidence"]["sdk_controls"]["thinking_level"], "minimal")
 
 
 if __name__ == "__main__":

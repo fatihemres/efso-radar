@@ -40,14 +40,43 @@ class Settings(BaseModel):
     quiet_hours_start_utc: str = Field(default="21:00")  # 21:00 UTC = 00:00 Turkey (UTC+3)
     quiet_hours_end_utc: str = Field(default="05:30")    # 05:30 UTC = 08:30 Turkey (UTC+3)
     quiet_hours_behavior: Literal["HOLD", "DISCARD", "ALLOW_BREAKING_95"] = Field(default="HOLD")
-    max_quiet_hours_hold_age_hours: int = Field(default=8, ge=1, le=48)
+    max_quiet_hours_hold_age_hours: int = Field(default=12, ge=1, le=48)
 
+    # Hybrid Telegram Notification Strategy (Configurable frequency & urgency tiering)
+    notification_strategy: Literal["IMMEDIATE", "HYBRID", "DIGEST_ONLY"] = Field(default="HYBRID")
+    scan_interval_minutes: int = Field(default=180, ge=5, le=720)
+    breaking_alert_min_score: int = Field(default=92, ge=0, le=100)
+    digest_min_score: int = Field(default=78, ge=0, le=100)
+    digest_interval_minutes: int = Field(default=360, ge=30, le=1440)
+    target_daily_telegram_messages: int = Field(default=6, ge=1, le=30)
+    max_items_per_digest: int = Field(default=5, ge=1, le=15)
+    cap_overflow_behavior: Literal["DEFER_TO_NEXT_DIGEST", "HOLD_IN_QUEUE"] = Field(
+        default="DEFER_TO_NEXT_DIGEST"
+    )
 
-    # API Budgets and Safety
+    # Low-Cost Architecture, API Budgets & Safety Circuit-Breakers
+    # Live AI processing is disabled by default until separately authorized by the Product Owner
+    ai_evaluation_enabled: bool = Field(default=False)
+    min_discovery_priority_for_ai: float = Field(default=5.5, ge=0.0, le=20.0)
+    ai_batch_size: int = Field(default=10, ge=1, le=60)
     max_output_tokens: int = Field(default=3200, ge=500, le=8192)
     max_estimated_run_cost_usd: float = Field(default=0.05, ge=0.001)
+    max_monthly_ai_cost_usd: float = Field(default=1.20, ge=0.01)
+    max_monthly_ai_calls: int = Field(default=300, ge=1)
+    max_shadow_eval_budget_usd: float = Field(default=0.05, ge=0.001, le=0.50)
+    usd_to_try_rate: float = Field(default=36.0, ge=1.0)
     enable_search_grounding: bool = Field(default=False)  # Disabled to prevent extra costs
     http_timeout_seconds: float = Field(default=18.0, ge=2.0, le=120.0)
+
+    def effective_max_age_hours(self) -> int:
+        """Ensure longer scan intervals or a missed run never invalidate story freshness."""
+        interval_floor = int((self.scan_interval_minutes / 60.0) * 4) + 4
+        return max(self.max_age_hours, interval_floor)
+
+    def effective_backlog_retention_hours(self) -> int:
+        """Ensure deferred backlog and digest items survive across multi-hour scan/digest cycles."""
+        digest_floor = int((self.digest_interval_minutes / 60.0) * 3) + 6
+        return max(self.effective_max_age_hours(), digest_floor)
 
     @field_validator("quiet_hours_start_utc", "quiet_hours_end_utc")
     @classmethod
@@ -97,7 +126,6 @@ class Settings(BaseModel):
             gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
-
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
             min_score=int(os.getenv("MIN_SCORE", "82")),
             max_per_run=int(os.getenv("MAX_PER_RUN", "3")),
@@ -111,8 +139,24 @@ class Settings(BaseModel):
             quiet_hours_start_utc=os.getenv("QUIET_HOURS_START_UTC", "21:00"),
             quiet_hours_end_utc=os.getenv("QUIET_HOURS_END_UTC", "05:30"),
             quiet_hours_behavior=os.getenv("QUIET_HOURS_BEHAVIOR", "HOLD"),  # type: ignore
-            max_quiet_hours_hold_age_hours=int(os.getenv("MAX_QUIET_HOURS_HOLD_AGE_HOURS", "8")),
+            max_quiet_hours_hold_age_hours=int(os.getenv("MAX_QUIET_HOURS_HOLD_AGE_HOURS", "12")),
+            notification_strategy=os.getenv("NOTIFICATION_STRATEGY", "HYBRID"),  # type: ignore
+            scan_interval_minutes=int(os.getenv("SCAN_INTERVAL_MINUTES", "180")),
+            breaking_alert_min_score=int(os.getenv("BREAKING_ALERT_MIN_SCORE", "92")),
+            digest_min_score=int(os.getenv("DIGEST_MIN_SCORE", "78")),
+            digest_interval_minutes=int(os.getenv("DIGEST_INTERVAL_MINUTES", "360")),
+            target_daily_telegram_messages=int(os.getenv("TARGET_DAILY_TELEGRAM_MESSAGES", "6")),
+            max_items_per_digest=int(os.getenv("MAX_ITEMS_PER_DIGEST", "5")),
+            cap_overflow_behavior=os.getenv("CAP_OVERFLOW_BEHAVIOR", "DEFER_TO_NEXT_DIGEST"),  # type: ignore
+            ai_evaluation_enabled=os.getenv("AI_EVALUATION_ENABLED", "false").lower() in ("true", "1", "yes"),
+            min_discovery_priority_for_ai=float(os.getenv("MIN_DISCOVERY_PRIORITY_FOR_AI", "5.5")),
+            ai_batch_size=int(os.getenv("AI_BATCH_SIZE", "10")),
             max_output_tokens=int(os.getenv("MAX_OUTPUT_TOKENS", "3200")),
+            max_estimated_run_cost_usd=float(os.getenv("MAX_ESTIMATED_RUN_COST_USD", "0.05")),
+            max_monthly_ai_cost_usd=float(os.getenv("MAX_MONTHLY_AI_COST_USD", "1.20")),
+            max_monthly_ai_calls=int(os.getenv("MAX_MONTHLY_AI_CALLS", "300")),
+            max_shadow_eval_budget_usd=float(os.getenv("MAX_SHADOW_EVAL_BUDGET_USD", "0.05")),
+            usd_to_try_rate=float(os.getenv("USD_TO_TRY_RATE", "36.0")),
             enable_search_grounding=os.getenv("ENABLE_SEARCH_GROUNDING", "false").lower() in ("true", "1"),
             http_timeout_seconds=float(os.getenv("HTTP_TIMEOUT_SECONDS", "18.0")),
         )

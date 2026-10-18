@@ -82,6 +82,16 @@ class DeliveryStatus(str, Enum):
     FAILED = "FAILED"
     SKIPPED_BELOW_THRESHOLD = "SKIPPED_BELOW_THRESHOLD"
     EXPIRED_STALE = "EXPIRED_STALE"
+    QUEUED_FOR_DIGEST = "QUEUED_FOR_DIGEST"
+    HELD_FOR_VERIFICATION = "HELD_FOR_VERIFICATION"
+
+
+class NotificationUrgencyTier(str, Enum):
+    """Distinguishes editorial interest from notification delivery urgency and verification safety."""
+    BREAKING_IMMEDIATE = "BREAKING_IMMEDIATE"      # Exceptionally important, verified breaking news -> immediate alert
+    PERIODIC_DIGEST = "PERIODIC_DIGEST"            # Editorially approved story -> grouped into ~2h periodic digest
+    HOLD_FOR_VERIFICATION = "HOLD_FOR_VERIFICATION"  # Editorially interesting but unverified/sensitive -> requires human verification
+    SUPPRESSED = "SUPPRESSED"                      # Rejected, too weak, or duplicate -> no notification
 
 
 

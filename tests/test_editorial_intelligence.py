@@ -87,6 +87,7 @@ class TestEditorialIntelligence(unittest.TestCase):
         self.db_path = Path(self.temp_dir.name) / "test_editorial.db"
         self.settings = Settings(
             sqlite_db_path=self.db_path,
+            ai_evaluation_enabled=True,
             min_score=82,
             max_per_run=3,
             max_estimated_run_cost_usd=0.05,
@@ -406,6 +407,7 @@ class TestEditorialIntelligence(unittest.TestCase):
         # Configure max_candidates=5 (valid setting >= 5) to force 6th article into backlog
         orch_settings = Settings(
             sqlite_db_path=self.db_path,
+            ai_evaluation_enabled=True,
             max_candidates=5,
             min_score=82,
         )
@@ -418,13 +420,13 @@ class TestEditorialIntelligence(unittest.TestCase):
             ai_engine=GeminiEditorialEngine(orch_settings),
             notifier=MockSilentNotifier(),
         )
-        res1 = orch1.run()
+        res1 = orch1.run(now=self.now)
         self.assertTrue(res1.success)
         self.assertEqual(res1.candidates_evaluated, 5)
 
         # Confirm the deprioritized article was NOT marked processed, but IS persisted in pending backlog
         self.assertFalse(self.repo.is_article_processed(art_deprioritized.id))
-        pending = self.repo.get_pending_candidates()
+        pending = self.repo.get_pending_candidates(now=self.now)
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0].id, art_deprioritized.id)
 
@@ -436,7 +438,7 @@ class TestEditorialIntelligence(unittest.TestCase):
             ai_engine=GeminiEditorialEngine(orch_settings),
             notifier=MockSilentNotifier(),
         )
-        res2 = orch2.run()
+        res2 = orch2.run(now=self.now)
         self.assertTrue(res2.success)
         # art_deprioritized was recovered from candidate_backlog and evaluated in run 2!
         self.assertEqual(res2.candidates_evaluated, 1)

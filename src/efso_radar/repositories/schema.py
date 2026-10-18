@@ -10,7 +10,7 @@ from typing import NamedTuple
 
 logger = logging.getLogger("efso-radar.repository.schema")
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 
 class MigrationStep(NamedTuple):
@@ -177,6 +177,34 @@ MIGRATIONS: list[MigrationStep] = [
             """,
         ],
     ),
+    MigrationStep(
+        version=5,
+        description="Persistent AI token usage ledger and batch cache for cost protection",
+        statements=[
+            """
+            CREATE TABLE IF NOT EXISTS ai_usage_ledger (
+                usage_id TEXT PRIMARY KEY,
+                run_mode TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                batch_hash TEXT NOT NULL,
+                candidate_count INTEGER NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                estimated_cost_usd REAL NOT NULL,
+                response_json TEXT,
+                created_at TEXT NOT NULL
+            );
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_ai_usage_ledger_created_at
+                ON ai_usage_ledger (created_at);
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_ai_usage_ledger_batch_hash
+                ON ai_usage_ledger (batch_hash, model_name);
+            """,
+        ],
+    ),
 ]
 
 
@@ -334,6 +362,28 @@ def get_all_init_statements() -> list[str]:
         """
         CREATE INDEX IF NOT EXISTS idx_candidate_backlog_status
             ON candidate_backlog (status, discovered_at);
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS ai_usage_ledger (
+            usage_id TEXT PRIMARY KEY,
+            run_mode TEXT NOT NULL,
+            model_name TEXT NOT NULL,
+            batch_hash TEXT NOT NULL,
+            candidate_count INTEGER NOT NULL,
+            input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            estimated_cost_usd REAL NOT NULL,
+            response_json TEXT,
+            created_at TEXT NOT NULL
+        );
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_ai_usage_ledger_created_at
+            ON ai_usage_ledger (created_at);
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_ai_usage_ledger_batch_hash
+            ON ai_usage_ledger (batch_hash, model_name);
         """,
     ]
     return stmts
