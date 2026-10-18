@@ -90,12 +90,15 @@ def build_editorial_digest_preview(
     limit: int = 5,
     preview_timestamp: Optional[datetime] = None,
     repo_root: Path = REPO_ROOT,
+    decisions: Optional[list[DiagnosticArticleDecision]] = None,
+    articles: Optional[list[Article]] = None,
 ) -> dict:
     """Build the complete editorial digest preview and triage audit breakdown."""
     ts = preview_timestamp or datetime.now(timezone.utc)
     ts_str = ts.strftime("%d %B %Y - %H:%M UTC").replace("October", "Ekim").replace("November", "Kasım")
 
-    decisions, articles = load_genuine_project_decisions(repo_root)
+    if decisions is None or articles is None:
+        decisions, articles = load_genuine_project_decisions(repo_root)
 
     # 1. Project all decisions including holds and sensitive reviews for full triage visibility
     all_projected = project_diagnostic_decisions_to_assessments(

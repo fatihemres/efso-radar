@@ -437,6 +437,10 @@ class TestPhase3C2DContract(unittest.TestCase):
         self.assertIn("Doğrulama bekletmesinde", hold_asm.uncertainties_tr)
         self.assertFalse(hold_asm.is_publishable)
 
+    @unittest.skipUnless(
+        Path(DEFAULT_FILLED_CALIBRATION_CSV).exists() and Path("data/canary2_gemini_eval_report.json").exists(),
+        "Requires authentic calibration CSV and second canary evaluation report in data/",
+    )
     def test_offline_production_projection_using_real_saved_second_canary_decisions(self):
         """
         Exercise offline production projection strictly from saved genuine second-canary model decisions.
@@ -758,10 +762,7 @@ class TestPhase3C2DContract(unittest.TestCase):
 
     def test_data_provenance_validation_detects_corrupted_or_mismatched_canary_records(self):
         """Audit test: data-provenance validation must detect and fail on corrupted, missing, or mismatched records."""
-        from efso_radar.ai.calibration import load_and_verify_calibration_csv, DEFAULT_FILLED_CALIBRATION_CSV
-
-        calib_items = load_and_verify_calibration_csv(DEFAULT_FILLED_CALIBRATION_CSV)[:8]
-        blind_articles = BlindShadowEvaluationRunner.to_blind_articles(calib_items)
+        blind_articles = self.articles
         art_ids = [a.id for a in blind_articles]
 
         # Case 1: Corrupted or mismatched article_id in canary decisions
@@ -865,6 +866,10 @@ class TestPhase3C2DContract(unittest.TestCase):
             self.assertEqual(len(sensitive_outbox), 1)
             self.assertEqual(sensitive_outbox[0].status, DeliveryStatus.HELD_FOR_SENSITIVE_REVIEW)
 
+    @unittest.skipUnless(
+        Path(DEFAULT_FILLED_CALIBRATION_CSV).exists(),
+        "Requires authentic calibration CSV dataset in data/",
+    )
     def test_sensitive_review_calib_11_regression_case(self):
         """CALIB-11 regression test: Cindy Crawford / Presley Gerber death story must route to SENSITIVE_REVIEW."""
         calib_items = load_and_verify_calibration_csv(DEFAULT_FILLED_CALIBRATION_CSV)
@@ -921,6 +926,35 @@ class TestPhase3C2DContract(unittest.TestCase):
         self.assertEqual(metrics.digest_count, 0)
         self.assertEqual(metrics.ignore_count, 0)
         self.assertEqual(metrics.positive_predicted_relevant, 0, "SENSITIVE_REVIEW must not be counted as automatically published")
+
+    def test_sensitive_review_bereavement_regression_case_portable(self):
+        """Portable regression test: death/bereavement story must route to SENSITIVE_REVIEW and fail closed."""
+        art = Article.create(
+            "Acılı anne babanın ilk görüntüsü",
+            "https://www.haberturk.com/magazin/cindy-crawford-presley-gerber-vefat",
+            "Habertürk Magazin",
+            self.now,
+            snippet="Cindy Crawford ve Rande Gerber'in oğlu Presley Gerber'in eski sevgilisinin vefatı sonrası ilk görüntüleri ortaya çıktı.",
+        )
+
+        batch_res = _offline_blind_diagnostic_predictor([art], [], self.now)
+        self.assertEqual(len(batch_res.decisions), 1)
+        dec = batch_res.decisions[0]
+        self.assertEqual(dec.article_id, art.id)
+        self.assertEqual(dec.disposition, "SENSITIVE_REVIEW", "Bereavement case must be classified as SENSITIVE_REVIEW")
+
+        asms = project_diagnostic_decisions_to_assessments([dec], [art])
+        self.assertEqual(len(asms), 1)
+        asm = asms[0]
+        self.assertFalse(asm.is_publishable, "Bereavement case must NOT be publishable without owner review")
+        self.assertEqual(asm.disposition, EditorialDisposition.SENSITIVE_REVIEW)
+        self.assertIn("[NOT_PUBLISHABLE - SENSITIVE EDITORIAL REVIEW REQUIRED]", asm.uncertainties_tr)
+
+        planner = HybridNotificationPlanner(self.settings)
+        plan = planner.plan_dispatch([asm], messages_sent_today=0, is_digest_due=True)
+        self.assertEqual(len(plan.immediate_breaking_alerts), 0)
+        self.assertEqual(len(plan.digest_batch), 0)
+        self.assertEqual(len(plan.held_for_sensitive_review), 1)
 
     def test_independent_sensitivity_veto_overrides_model_digest(self):
         """Independent sensitivity veto intercepts death/funeral news even if Gemini assigned DIGEST and BREAKING."""
