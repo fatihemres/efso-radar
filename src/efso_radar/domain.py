@@ -50,6 +50,15 @@ class EditorialKind(str, Enum):
     IGNORE = "IGNORE"
 
 
+class EditorialDisposition(str, Enum):
+    """Explicit per-article publication priority and triage decision."""
+    DIGEST = "DIGEST"    # Approved for publication in periodic digest (or immediate alert if breaking)
+    RESERVE = "RESERVE"  # Worthy optional / filler content suitable for backlog buffer if content needed
+    IGNORE = "IGNORE"    # Rejected, routine, irrelevant, distressing/negative, or unworthy
+    HOLD = "HOLD"        # Editorially interesting but unverified rumor / sensitive claim needing review
+    SENSITIVE_REVIEW = "SENSITIVE_REVIEW"  # Significant, credible sensitive tragedy/bereavement news needing private review
+
+
 class VerificationStatus(str, Enum):
     """Factual confidence and source attribution category for an event."""
     OFFICIAL_CONFIRMATION = "OFFICIAL_CONFIRMATION"  # Resmî onay / ajans / menajer beyanı
@@ -84,6 +93,8 @@ class DeliveryStatus(str, Enum):
     EXPIRED_STALE = "EXPIRED_STALE"
     QUEUED_FOR_DIGEST = "QUEUED_FOR_DIGEST"
     HELD_FOR_VERIFICATION = "HELD_FOR_VERIFICATION"
+    HELD_FOR_SENSITIVE_REVIEW = "HELD_FOR_SENSITIVE_REVIEW"
+    DELIVERY_UNCERTAIN = "DELIVERY_UNCERTAIN"
 
 
 class NotificationUrgencyTier(str, Enum):
@@ -91,7 +102,16 @@ class NotificationUrgencyTier(str, Enum):
     BREAKING_IMMEDIATE = "BREAKING_IMMEDIATE"      # Exceptionally important, verified breaking news -> immediate alert
     PERIODIC_DIGEST = "PERIODIC_DIGEST"            # Editorially approved story -> grouped into ~2h periodic digest
     HOLD_FOR_VERIFICATION = "HOLD_FOR_VERIFICATION"  # Editorially interesting but unverified/sensitive -> requires human verification
+    SENSITIVE_REVIEW = "SENSITIVE_REVIEW"          # Significant sensitive tragedy/death news -> requires private editorial review
     SUPPRESSED = "SUPPRESSED"                      # Rejected, too weak, or duplicate -> no notification
+
+
+class TelegramNotificationCategory(str, Enum):
+    """Logically separated message categories within the single private owner chat."""
+    EDITORIAL_DIGEST = "EDITORIAL_DIGEST"
+    VERIFIED_BREAKING = "VERIFIED_BREAKING"
+    SENSITIVE_EDITORIAL_REVIEW = "SENSITIVE_EDITORIAL_REVIEW"
+    HOLD_FOR_VERIFICATION = "HOLD_FOR_VERIFICATION"
 
 
 
@@ -206,6 +226,8 @@ class EditorialAssessment(BaseModel):
     verification_status: VerificationStatus = VerificationStatus.REPUTABLE_REPORTING
     source_urls: list[str] = Field(default_factory=list)
     supporting_articles: list[Article] = Field(default_factory=list)
+    is_publishable: bool = True
+    disposition: Optional[EditorialDisposition] = None
 
 
 class OwnerFeedbackRating(str, Enum):
@@ -241,3 +263,4 @@ class NotificationRecord(BaseModel):
     headline_tr: str
     score: int
     error_message: Optional[str] = None
+    category: Optional[TelegramNotificationCategory] = None

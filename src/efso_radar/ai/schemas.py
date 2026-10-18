@@ -91,3 +91,60 @@ class EditorialDecisionBatch(BaseModel):
         description="Brief 1-2 sentence executive summary of news scan in Turkish."
     )
 
+
+class DiagnosticArticleDecision(BaseModel):
+    """Compact structured evaluation decision for a single candidate article."""
+    article_id: str = Field(
+        description="Exact 24-character candidate article ID from the input candidates list."
+    )
+    score: int = Field(
+        ge=0,
+        le=100,
+        description="Editorial interest score from 0 to 100 reflecting audience relevance, visual appeal, fan engagement, and viral potential.",
+    )
+    disposition: Literal["DIGEST", "RESERVE", "IGNORE", "HOLD", "SENSITIVE_REVIEW"] = Field(
+        description="'DIGEST' for editorially approved stories, 'RESERVE' for optional/filler backlog buffer, 'IGNORE' for unsuitable/routine/negative items, 'HOLD' for verification-needed claims, 'SENSITIVE_REVIEW' for significant sensitive tragedy/death news needing private review.",
+    )
+    kind: Literal["NEW", "UPDATE", "DUPLICATE"] = Field(
+        default="NEW",
+        description="'NEW' for first-time stories, 'UPDATE' for significant developments, 'DUPLICATE' for repeat reporting.",
+    )
+    urgency: Literal["NORMAL", "BREAKING"] = Field(
+        default="NORMAL",
+        description="'NORMAL' for standard digest delivery, 'BREAKING' for rare, major breaking alerts.",
+    )
+    rationale_tr: str = Field(
+        min_length=5,
+        max_length=300,
+        description="Brief, grounded editorial rationale in Turkish explaining the score and disposition.",
+    )
+    headline_tr: str = Field(
+        default="",
+        max_length=200,
+        description="Short, impactful Turkish headline for editorially selected stories (DIGEST/RESERVE/BREAKING), empty string for IGNORE.",
+    )
+    verification_status: Literal[
+        "OFFICIAL_CONFIRMATION",
+        "FIRST_PARTY_STATEMENT",
+        "REPUTABLE_REPORTING",
+        "ATTRIBUTED_CLAIM",
+        "UNVERIFIED_RUMOR",
+        "SPECULATION",
+    ] = Field(
+        default="REPUTABLE_REPORTING",
+        description="Factual verification confidence status.",
+    )
+
+
+class DiagnosticEvaluationBatch(BaseModel):
+    """Explicit per-article diagnostic evaluation batch requiring exactly one decision per candidate."""
+    decisions: list[DiagnosticArticleDecision] = Field(
+        default_factory=list,
+        description="List of explicit decisions containing exactly one decision per input candidate article ID.",
+    )
+    run_editorial_summary_tr: str = Field(
+        default="",
+        max_length=500,
+        description="Brief 1-2 sentence executive summary of news scan in Turkish.",
+    )
+

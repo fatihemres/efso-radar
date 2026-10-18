@@ -130,8 +130,13 @@ class StateRepository(ABC):
         pass
 
     @abstractmethod
-    def record_notification_failure(self, notification_id: str, error_message: str) -> None:
-        """Mark a notification delivery as failed with an error message."""
+    def record_notification_failure(
+        self,
+        notification_id: str,
+        error_message: str,
+        status: DeliveryStatus = DeliveryStatus.FAILED,
+    ) -> None:
+        """Mark a notification delivery as failed or uncertain with an error message."""
         pass
 
     @abstractmethod
@@ -201,6 +206,13 @@ class StateRepository(ABC):
         self, max_age_hours: Optional[int] = None, now: Optional[datetime] = None
     ) -> list[NotificationRecord]:
         """Fetch notifications held due to unverified rumor or single-source uncertainty."""
+        pass
+
+    @abstractmethod
+    def get_sensitive_review_notifications(
+        self, max_age_hours: Optional[int] = None, now: Optional[datetime] = None
+    ) -> list[NotificationRecord]:
+        """Fetch notifications held in private review queue for sensitive tragedy/death news."""
         pass
 
     @abstractmethod

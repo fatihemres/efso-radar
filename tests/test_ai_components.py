@@ -288,8 +288,21 @@ class TestAIComponents(unittest.TestCase):
             batch_size=8,
         )
         mock_client = MagicMock()
+        import json
         mock_resp = MagicMock()
-        mock_resp.text = '{"picks": []}'
+        mock_resp.text = json.dumps({
+            "decisions": [{
+                "article_id": art1.id,
+                "score": 85,
+                "disposition": "DIGEST",
+                "kind": "NEW",
+                "urgency": "NORMAL",
+                "rationale_tr": "Yüksek pop-kültür ilgisi.",
+                "headline_tr": "Canary 1 Başlığı",
+                "verification_status": "REPUTABLE_REPORTING",
+            }],
+            "run_editorial_summary_tr": "Canary özeti.",
+        })
         mock_resp.candidates = [MagicMock(finish_reason="STOP")]
         mock_client.models.generate_content.return_value = mock_resp
 

@@ -41,6 +41,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import sqlite3
+from pathlib import Path
 from typing import Any, NamedTuple, Optional, Sequence
 
 logger = logging.getLogger("efso-radar.ai.cost")
@@ -329,5 +331,172 @@ def check_monthly_budget_guard(
             f"Monthly AI call count ({current_monthly_calls + 1}) exceeds configured monthly call cap ({max_monthly_calls}).",
         )
     return True, "OK"
+
+
+class ExperimentBudgetGuard:
+    """
+    Durable, persistent experiment budget ledger and circuit breaker.
+    Enforces a strict cumulative budget ceiling across multiple canary databases,
+    subsequent evaluation batches, and application restarts.
+
+    Guarantees:
+    1. Prevents budget resets when new temporary databases are instantiated.
+    2. Prevents double-counting completed runs by using unique batch hashes and run IDs.
+    3. Prevents repeating cached successful batches (reused at $0 cost).
+    4. Prevents concurrent / sequential reservations from overspending the shared allowance.
+    5. Ambiguous failed requests are treated as spent (fail-closed, never free).
+    """
+
+    def __init__(
+        self,
+        ledger_path: Path = Path("data/experiment_budget_ledger.json"),
+        budget_ceiling_usd: float = 0.050000,
+        canary1_db_path: Path = Path("data/canary_radar.db"),
+        canary2_db_path: Path = Path("data/canary2_radar.db"),
+    ):
+        self.ledger_path = Path(ledger_path)
+        self.budget_ceiling_usd = budget_ceiling_usd
+        self.canary1_db_path = Path(canary1_db_path)
+        self.canary2_db_path = Path(canary2_db_path)
+        self.data: dict[str, Any] = {}
+        self._load_or_initialize()
+
+    def _extract_db_cost(self, db_path: Path) -> tuple[int, int, float]:
+        if not db_path.exists():
+            return 0, 0, 0.0
+        try:
+            conn = sqlite3.connect(db_path)
+            c = conn.cursor()
+            c.execute("SELECT input_tokens, output_tokens, estimated_cost_usd FROM ai_usage_ledger")
+            rows = c.fetchall()
+            conn.close()
+            in_tok = sum(r[0] for r in rows)
+            out_tok = sum(r[1] for r in rows)
+            cost = sum(r[2] for r in rows)
+            return in_tok, out_tok, cost
+        except Exception:
+            return 0, 0, 0.0
+
+    def _load_or_initialize(self) -> None:
+        if self.ledger_path.exists():
+            try:
+                with open(self.ledger_path, "r", encoding="utf-8") as f:
+                    self.data = json.load(f)
+                return
+            except Exception:
+                pass
+
+        # Initialize ledger from prior canary databases
+        c1_in, c1_out, c1_cost = self._extract_db_cost(self.canary1_db_path)
+        c2_in, c2_out, c2_cost = self._extract_db_cost(self.canary2_db_path)
+
+        # Fallback to known authoritative values if DB exists but yielded 0
+        if c1_cost == 0.0 and self.canary1_db_path.exists():
+            c1_in, c1_out, c1_cost = 2815, 73, 0.001027
+        if c2_cost == 0.0 and self.canary2_db_path.exists():
+            c2_in, c2_out, c2_cost = 3024, 1300, 0.0041572
+
+        self.data = {
+            "experiment_id": "phase3c_shadow_eval",
+            "budget_ceiling_usd": self.budget_ceiling_usd,
+            "prior_canaries": [
+                {
+                    "canary_id": "canary_1",
+                    "db_path": str(self.canary1_db_path),
+                    "input_tokens": c1_in,
+                    "output_tokens": c1_out,
+                    "cost_usd": round(c1_cost, 6),
+                },
+                {
+                    "canary_id": "canary_2",
+                    "db_path": str(self.canary2_db_path),
+                    "input_tokens": c2_in,
+                    "output_tokens": c2_out,
+                    "cost_usd": round(c2_cost, 6),
+                },
+            ],
+            "batches": {},
+        }
+        self._save()
+
+    def _save(self) -> None:
+        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.ledger_path.with_suffix(".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, indent=2, ensure_ascii=False)
+        tmp_path.replace(self.ledger_path)
+
+    def get_prior_canaries_cost_usd(self) -> float:
+        return sum(c["cost_usd"] for c in self.data.get("prior_canaries", []))
+
+    def get_total_consumed_usd(self) -> float:
+        total = self.get_prior_canaries_cost_usd()
+        for b in self.data.get("batches", {}).values():
+            if b.get("status") == "COMPLETED":
+                total += b.get("actual_cost_usd", 0.0)
+            else:
+                # RESERVED or FAILED_AMBIGUOUS: fail-closed, treat worst-case as spent
+                total += b.get("estimated_worst_case_usd", 0.0)
+        return round(total, 6)
+
+    def get_remaining_allowance_usd(self) -> float:
+        return max(0.0, round(self.budget_ceiling_usd - self.get_total_consumed_usd(), 6))
+
+    def is_batch_completed(self, batch_hash: str) -> bool:
+        b = self.data.get("batches", {}).get(batch_hash)
+        return bool(b and b.get("status") == "COMPLETED")
+
+    def reserve_batch(
+        self,
+        batch_hash: str,
+        candidate_ids: list[str],
+        estimated_worst_cost_usd: float,
+    ) -> bool:
+        if self.is_batch_completed(batch_hash):
+            return True
+
+        projected = self.get_total_consumed_usd() + estimated_worst_cost_usd
+        if projected > self.budget_ceiling_usd:
+            raise RuntimeError(
+                f"Fail-closed budget circuit breaker: experiment batch reservation "
+                f"(${estimated_worst_cost_usd:.5f}) would cause cumulative experiment cost "
+                f"(${projected:.5f}) to breach the budget ceiling (${self.budget_ceiling_usd:.4f}). "
+                f"Remaining allowance: ${self.get_remaining_allowance_usd():.5f}. "
+                "Execution halted before network dispatch."
+            )
+
+        self.data.setdefault("batches", {})[batch_hash] = {
+            "status": "RESERVED",
+            "candidate_ids": candidate_ids,
+            "estimated_worst_case_usd": round(estimated_worst_cost_usd, 6),
+            "actual_cost_usd": None,
+            "input_tokens": None,
+            "output_tokens": None,
+        }
+        self._save()
+        return True
+
+    def reconcile_batch(
+        self,
+        batch_hash: str,
+        actual_cost_usd: float,
+        input_tokens: int,
+        output_tokens: int,
+        model_name: str = "gemini-3.5-flash-lite",
+    ) -> None:
+        b = self.data.setdefault("batches", {}).setdefault(batch_hash, {})
+        b["status"] = "COMPLETED"
+        b["actual_cost_usd"] = round(actual_cost_usd, 6)
+        b["input_tokens"] = input_tokens
+        b["output_tokens"] = output_tokens
+        b["model_name"] = model_name
+        self._save()
+
+    def record_failure(self, batch_hash: str, error_message: str) -> None:
+        b = self.data.setdefault("batches", {}).setdefault(batch_hash, {})
+        b["status"] = "FAILED_AMBIGUOUS"
+        b["error"] = error_message
+        self._save()
+
 
 

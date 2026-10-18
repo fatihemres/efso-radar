@@ -408,6 +408,47 @@ class RepositoryContractTestMixin:
         self.assertEqual(self.repo.get_daily_sent_message_count(dispatch_time), 1)
         self.assertEqual(self.repo.get_last_digest_sent_at(), dispatch_time)
 
+    def test_sensitive_review_isolation_parity(self):
+        """Both SQLite and Turso isolate HELD_FOR_SENSITIVE_REVIEW from queued digest and verification holds."""
+        sens_notif = NotificationRecord(
+            notification_id="HOLD-SENS-1",
+            story_id="STORY-SENS-1",
+            kind=EditorialKind.NEW,
+            channel="TELEGRAM_SENSITIVE_REVIEW",
+            sent_at=self.now,
+            status=DeliveryStatus.HELD_FOR_SENSITIVE_REVIEW,
+            message_text="Cindy Crawford ve Rande Gerber taziye haberi",
+            headline_tr="Acılı anne babanın ilk görüntüsü",
+            score=90,
+            error_message="Held for sensitive review: requires explicit Product Owner approval",
+        )
+        self.repo.record_notification(sens_notif)
+
+        # 1. Recognized as already tracked/alerted so duplicate notifications are blocked
+        self.assertTrue(self.repo.has_story_been_alerted("STORY-SENS-1", kind=EditorialKind.NEW))
+
+        # 2. Complete isolation: MUST NOT appear in queued digest notifications
+        queued = self.repo.get_queued_digest_notifications()
+        self.assertEqual(len(queued), 0, "Sensitive review records must never leak into queued digest outbox")
+
+        # 3. Complete isolation: MUST NOT appear in verification-only hold notifications
+        held_verif = self.repo.get_verification_held_notifications()
+        self.assertEqual(len(held_verif), 0, "Sensitive review records must not mix into standard verification holds")
+
+        # 4. Correctly retrievable via get_sensitive_review_notifications
+        sens_records = self.repo.get_sensitive_review_notifications()
+        self.assertEqual(len(sens_records), 1)
+        self.assertEqual(sens_records[0].notification_id, "HOLD-SENS-1")
+        self.assertEqual(sens_records[0].status, DeliveryStatus.HELD_FOR_SENSITIVE_REVIEW)
+        self.assertEqual(sens_records[0].channel, "TELEGRAM_SENSITIVE_REVIEW")
+
+        # 5. Age filtering parity
+        recent_records = self.repo.get_sensitive_review_notifications(max_age_hours=24, now=self.now + timedelta(hours=2))
+        self.assertEqual(len(recent_records), 1)
+
+        old_records = self.repo.get_sensitive_review_notifications(max_age_hours=1, now=self.now + timedelta(hours=5))
+        self.assertEqual(len(old_records), 0)
+
     def test_ai_usage_ledger_and_batch_cache_parity(self):
         """Both SQLite and Turso track monthly AI token/cost usage and cache batch responses."""
         self.repo.record_ai_usage(

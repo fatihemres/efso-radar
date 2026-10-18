@@ -19,18 +19,29 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
-from efso_radar.ai.client import AIEvaluationError, GeminiEditorialEngine, is_headline_too_similar
+from efso_radar.ai.client import (
+    AIEvaluationError,
+    GeminiEditorialEngine,
+    is_headline_too_similar,
+    project_diagnostic_decisions_to_assessments,
+)
 from efso_radar.ai.cost import (
     check_monthly_budget_guard,
     compute_candidate_batch_hash,
     compute_enforceable_batch_output_tokens,
     estimate_call_cost,
     estimate_tokens_from_text,
+    ExperimentBudgetGuard,
     extract_provider_token_usage,
     resolve_model_pricing,
 )
-from efso_radar.ai.prompts import build_editorial_prompt
-from efso_radar.ai.schemas import EditorialDecisionBatch, EditorialPickSchema
+from efso_radar.ai.prompts import build_diagnostic_editorial_prompt, build_editorial_prompt
+from efso_radar.ai.schemas import (
+    DiagnosticArticleDecision,
+    DiagnosticEvaluationBatch,
+    EditorialDecisionBatch,
+    EditorialPickSchema,
+)
 from efso_radar.config import Settings
 from efso_radar.deduplication.engine import (
     DeduplicationEngine,
@@ -45,6 +56,7 @@ from efso_radar.domain import (
     Article,
     DeliveryStatus,
     EditorialAssessment,
+    EditorialDisposition,
     EditorialKind,
     Market,
     NotificationUrgencyTier,
@@ -728,6 +740,8 @@ class ShadowPredictionRecord:
     uncertainties_tr: str
     grounded_article_ids: list[str]
     from_cache: bool = False
+    disposition: Optional[str] = None
+    is_directly_observed: bool = True
 
 
 @dataclass
@@ -766,6 +780,13 @@ class BlindShadowComparisonMetrics:
     precision: float = 0.0
     recall: float = 0.0
     f1_score: float = 0.0
+    disposition_counts: dict[str, int] = field(default_factory=dict)
+    unobserved_item_count: int = 0
+    reserve_count: int = 0
+    hold_count: int = 0
+    digest_count: int = 0
+    ignore_count: int = 0
+    sensitive_review_count: int = 0
 
 
 class BlindShadowEvaluationRunner:
@@ -787,10 +808,12 @@ class BlindShadowEvaluationRunner:
         settings: Optional[Settings] = None,
         repository: Optional[StateRepository] = None,
         batch_size: int = 8,
+        budget_guard: Optional[ExperimentBudgetGuard] = None,
     ):
         self.settings = settings or Settings()
         self.repository = repository
         self.batch_size = max(5, min(10, batch_size))
+        self.budget_guard = budget_guard
 
     @staticmethod
     def to_blind_articles(items: Sequence[Any]) -> list[Article]:
@@ -1152,8 +1175,12 @@ class BlindShadowEvaluationRunner:
 
         pos_hit = [
             i for i in pos_items
-            if predictions_by_article_id[_get_aid(i)].editorial_relevant
-            or predictions_by_article_id[_get_aid(i)].kind == EditorialKind.DUPLICATE
+            if (
+                predictions_by_article_id[_get_aid(i)].editorial_relevant
+                or predictions_by_article_id[_get_aid(i)].kind == EditorialKind.DUPLICATE
+                or predictions_by_article_id[_get_aid(i)].urgency_tier == NotificationUrgencyTier.HOLD_FOR_VERIFICATION
+            )
+            and predictions_by_article_id[_get_aid(i)].disposition != "SENSITIVE_REVIEW"
         ]
         pos_missed = [i for i in pos_items if i not in pos_hit]
         neg_fp = [
@@ -1202,6 +1229,8 @@ class BlindShadowEvaluationRunner:
 
         kind_counts = Counter(p.kind.value for p in predictions_by_article_id.values())
         urg_counts = Counter(p.urgency_tier.value for p in predictions_by_article_id.values())
+        disp_counts = Counter(p.disposition for p in predictions_by_article_id.values() if p.disposition is not None)
+        unobserved = sum(1 for p in predictions_by_article_id.values() if not getattr(p, "is_directly_observed", True))
 
         return BlindShadowComparisonMetrics(
             total_evaluated=len(items),
@@ -1237,6 +1266,13 @@ class BlindShadowEvaluationRunner:
             precision=precision,
             recall=recall,
             f1_score=f1,
+            disposition_counts=dict(disp_counts),
+            unobserved_item_count=unobserved,
+            reserve_count=disp_counts.get("RESERVE", 0),
+            hold_count=disp_counts.get("HOLD", 0),
+            digest_count=disp_counts.get("DIGEST", 0),
+            ignore_count=disp_counts.get("IGNORE", 0),
+            sensitive_review_count=disp_counts.get("SENSITIVE_REVIEW", 0),
         )
 
     def run_live_gemini_evaluation(
@@ -1249,6 +1285,8 @@ class BlindShadowEvaluationRunner:
         max_batches: Optional[int] = None,
         automatic_continuation: bool = False,
         output_artifact_path: Optional[Path] = None,
+        schema_mode: str = "DIAGNOSTIC",
+        budget_guard: Optional[ExperimentBudgetGuard] = None,
     ) -> tuple[list[ShadowPredictionRecord], BlindShadowComparisonMetrics, dict[str, Any]]:
         """
         Execute a functional live Gemini shadow evaluation (or verified offline preflight dry run).
@@ -1295,6 +1333,19 @@ class BlindShadowEvaluationRunner:
             Settings(min_score=self.settings.digest_min_score, max_per_run=10)
         )
 
+        guard = budget_guard or self.budget_guard
+        if guard is None and not dry_run:
+            if mock_client is not None:
+                import tempfile
+                guard = ExperimentBudgetGuard(
+                    ledger_path=Path(tempfile.gettempdir()) / f"mock_ledger_{uuid.uuid4().hex[:8]}.json",
+                    budget_ceiling_usd=self.settings.max_shadow_eval_budget_usd,
+                )
+            else:
+                guard = ExperimentBudgetGuard(
+                    budget_ceiling_usd=self.settings.max_shadow_eval_budget_usd
+                )
+
         predictions_by_article_id: dict[str, ShadowPredictionRecord] = {}
         raw_decision_batches: list[dict[str, Any]] = []
         cumulative_in_tokens = 0
@@ -1311,7 +1362,11 @@ class BlindShadowEvaluationRunner:
             if max_batches is not None and b_idx > max_batches:
                 break
 
-            prompt = build_editorial_prompt(batch, seen_recent_stories, ref_now)
+            prompt = (
+                build_diagnostic_editorial_prompt(batch, seen_recent_stories, ref_now)
+                if schema_mode == "DIAGNOSTIC"
+                else build_editorial_prompt(batch, seen_recent_stories, ref_now)
+            )
             if not self.verify_prompt_is_blind(prompt, items):
                 all_blind_ok = False
                 raise ValueError(f"Blind hygiene check failed on batch {b_idx}!")
@@ -1330,13 +1385,25 @@ class BlindShadowEvaluationRunner:
                 else None
             )
             if cached_json:
-                decision_batch = EditorialDecisionBatch.model_validate_json(cached_json)
+                if schema_mode == "DIAGNOSTIC":
+                    decision_batch = DiagnosticEvaluationBatch.model_validate_json(cached_json)
+                else:
+                    decision_batch = EditorialDecisionBatch.model_validate_json(cached_json)
                 raw_json = cached_json
                 from_cache = True
                 batches_cached += 1
             else:
                 worst_case_reservation = worst_batch_cost
-                if (cumulative_cost_usd + worst_case_reservation) > self.settings.max_shadow_eval_budget_usd:
+                if guard is not None:
+                    try:
+                        guard.reserve_batch(
+                            batch_hash=b_hash,
+                            candidate_ids=[a.id for a in batch],
+                            estimated_worst_cost_usd=worst_case_reservation,
+                        )
+                    except RuntimeError as budget_err:
+                        raise AIEvaluationError(str(budget_err)) from budget_err
+                elif (cumulative_cost_usd + worst_case_reservation) > self.settings.max_shadow_eval_budget_usd:
                     raise AIEvaluationError(
                         f"Fail-closed budget circuit breaker: batch {b_idx} worst-case cost "
                         f"(${worst_case_reservation:.5f}) would cause cumulative cost "
@@ -1361,7 +1428,10 @@ class BlindShadowEvaluationRunner:
                     )
 
                 if dry_run:
-                    decision_batch = _offline_blind_heuristic_predictor(batch, seen_recent_stories, ref_now)
+                    if schema_mode == "DIAGNOSTIC":
+                        decision_batch = _offline_blind_diagnostic_predictor(batch, seen_recent_stories, ref_now)
+                    else:
+                        decision_batch = _offline_blind_heuristic_predictor(batch, seen_recent_stories, ref_now)
                     raw_json = decision_batch.model_dump_json()
                     actual_in = in_tok
                     actual_out = estimate_tokens_from_text(raw_json)
@@ -1384,9 +1454,14 @@ class BlindShadowEvaluationRunner:
                     if hasattr(types, "AutomaticFunctionCallingConfig"):
                         afc_cfg = types.AutomaticFunctionCallingConfig(disable=True, maximum_remote_calls=0)
 
+                    resp_schema = (
+                        DiagnosticEvaluationBatch
+                        if schema_mode == "DIAGNOSTIC"
+                        else EditorialDecisionBatch
+                    )
                     config_kwargs = {
                         "response_mime_type": "application/json",
-                        "response_schema": EditorialDecisionBatch,
+                        "response_schema": resp_schema,
                         "temperature": 0.15,
                         "max_output_tokens": b_max_out,
                     }
@@ -1419,6 +1494,8 @@ class BlindShadowEvaluationRunner:
                             time.sleep(0.5 * (2 ** (attempts - 1)))
 
                     if not response or not getattr(response, "text", None):
+                        if guard is not None:
+                            guard.record_failure(b_hash, str(last_exc or "Empty response"))
                         if self.repository is not None:
                             self.repository.record_ai_usage(
                                 usage_id=usage_id,
@@ -1443,6 +1520,8 @@ class BlindShadowEvaluationRunner:
                         cand = response.candidates[0]
                         finish_reason = getattr(cand, "finish_reason", None)
                         if finish_reason and "MAX_TOKENS" in str(finish_reason).upper():
+                            if guard is not None:
+                                guard.record_failure(b_hash, f"Candidate truncated (MAX_TOKENS ceiling {b_max_out})")
                             if self.repository is not None:
                                 actual_in, actual_out, _ = extract_provider_token_usage(
                                     response, fallback_input_tokens=in_tok, fallback_output_tokens=b_max_out
@@ -1468,8 +1547,13 @@ class BlindShadowEvaluationRunner:
 
                     raw_json = response.text
                     try:
-                        decision_batch = EditorialDecisionBatch.model_validate_json(raw_json)
+                        if schema_mode == "DIAGNOSTIC":
+                            decision_batch = DiagnosticEvaluationBatch.model_validate_json(raw_json)
+                        else:
+                            decision_batch = EditorialDecisionBatch.model_validate_json(raw_json)
                     except Exception as schema_err:
+                        if guard is not None:
+                            guard.record_failure(b_hash, f"Failed schema validation: {schema_err}")
                         if self.repository is not None:
                             actual_in, actual_out, _ = extract_provider_token_usage(
                                 response, fallback_input_tokens=in_tok, fallback_output_tokens=estimate_tokens_from_text(raw_json)
@@ -1511,6 +1595,15 @@ class BlindShadowEvaluationRunner:
                 batches_executed += 1
                 from_cache = False
 
+                if guard is not None and not dry_run:
+                    guard.reconcile_batch(
+                        batch_hash=b_hash,
+                        actual_cost_usd=batch_cost,
+                        input_tokens=actual_in,
+                        output_tokens=actual_out,
+                        model_name=clean_model,
+                    )
+
                 if self.repository is not None:
                     self.repository.record_ai_usage(
                         usage_id=usage_id,
@@ -1527,69 +1620,174 @@ class BlindShadowEvaluationRunner:
 
             raw_decision_batches.append(json.loads(raw_json))
             batch_ids = {a.id for a in batch}
-            for raw_pick in decision_batch.picks:
-                for aid in raw_pick.article_ids:
-                    if aid not in batch_ids:
-                        hallucinated_ids += 1
 
-            validated_assessments = validator_engine._validate_and_transform_picks(
-                decision_batch.picks, batch, seen_recent_stories
-            )
-            validated_by_aid: dict[str, EditorialAssessment] = {}
-            for asm in validated_assessments:
-                for aid in asm.article_ids:
-                    validated_by_aid[aid] = asm
-                if asm.kind == EditorialKind.NEW:
-                    seen_recent_stories.append(
-                        Story(
-                            story_id=f"SHADOW-STORY-{asm.article_ids[0][:8]}",
-                            headline_tr=asm.headline_tr,
-                            category=asm.category,
-                            first_seen_at=ref_now,
-                            last_updated_at=ref_now,
-                            article_ids=asm.article_ids,
-                        )
+            if schema_mode == "DIAGNOSTIC":
+                decision_ids = [d.article_id for d in decision_batch.decisions]
+                if len(decision_ids) != len(set(decision_ids)):
+                    raise AIEvaluationError(
+                        f"Diagnostic evaluation failed on batch {b_idx}: duplicate article_ids returned in decisions."
+                    )
+                missing_ids = batch_ids - set(decision_ids)
+                if missing_ids:
+                    raise AIEvaluationError(
+                        f"Diagnostic evaluation failed on batch {b_idx}: missing {len(missing_ids)} candidate decision(s) for IDs {missing_ids}. "
+                        "Silent defaulting is prohibited."
+                    )
+                extra_ids = set(decision_ids) - batch_ids
+                if extra_ids:
+                    hallucinated_ids += len(extra_ids)
+                    raise AIEvaluationError(
+                        f"Diagnostic evaluation failed on batch {b_idx}: model hallucinated {len(extra_ids)} non-candidate ID(s) {extra_ids}."
                     )
 
-            raw_by_aid = {aid: p for p in decision_batch.picks for aid in p.article_ids if aid in batch_ids}
-            for art in batch:
-                if art.id in validated_by_aid:
-                    asm = validated_by_aid[art.id]
-                    tier = planner.classify_urgency_tier(asm)
+                for d in decision_batch.decisions:
+                    art = next(a for a in batch if a.id == d.article_id)
+                    is_unverified = d.verification_status in ("UNVERIFIED_RUMOR", "SPECULATION")
+
+                    if d.disposition == "IGNORE" or d.kind == "DUPLICATE":
+                        is_rel = False
+                        urg_tier = NotificationUrgencyTier.SUPPRESSED
+                    elif d.disposition == "RESERVE":
+                        is_rel = False
+                        urg_tier = NotificationUrgencyTier.SUPPRESSED
+                    elif d.disposition == "SENSITIVE_REVIEW":
+                        is_rel = False
+                        urg_tier = NotificationUrgencyTier.SENSITIVE_REVIEW
+                    elif d.disposition == "HOLD" or is_unverified:
+                        is_rel = False
+                        urg_tier = NotificationUrgencyTier.HOLD_FOR_VERIFICATION
+                    elif d.disposition == "DIGEST":
+                        if d.score >= self.settings.min_score:
+                            is_rel = True
+                            if d.urgency == "BREAKING" and d.score >= self.settings.breaking_alert_min_score:
+                                urg_tier = NotificationUrgencyTier.BREAKING_IMMEDIATE
+                            else:
+                                urg_tier = NotificationUrgencyTier.PERIODIC_DIGEST
+                        else:
+                            is_rel = False
+                            urg_tier = NotificationUrgencyTier.SUPPRESSED
+                    else:
+                        is_rel = False
+                        urg_tier = NotificationUrgencyTier.SUPPRESSED
+
                     predictions_by_article_id[art.id] = ShadowPredictionRecord(
                         article_id=art.id,
                         batch_index=b_idx,
                         batch_hash=b_hash,
-                        editorial_relevant=True,
-                        kind=asm.kind,
-                        score=asm.score,
-                        verification_status=asm.verification_status,
-                        urgency_tier=tier,
-                        headline_tr=asm.headline_tr,
-                        rationale_tr=asm.why_efso_tr,
-                        uncertainties_tr=asm.uncertainties_tr or "",
-                        grounded_article_ids=asm.article_ids,
-                        from_cache=from_cache,
-                    )
-                else:
-                    raw_p = raw_by_aid.get(art.id)
-                    kind_val = EditorialKind(raw_p.kind) if raw_p and raw_p.kind in ("IGNORE", "DUPLICATE") else EditorialKind.IGNORE
-                    score_val = raw_p.score if raw_p else 45
-                    predictions_by_article_id[art.id] = ShadowPredictionRecord(
-                        article_id=art.id,
-                        batch_index=b_idx,
-                        batch_hash=b_hash,
-                        editorial_relevant=False,
-                        kind=kind_val,
-                        score=score_val,
-                        verification_status=VerificationStatus.REPUTABLE_REPORTING,
-                        urgency_tier=NotificationUrgencyTier.SUPPRESSED,
-                        headline_tr=raw_p.headline_tr if raw_p else art.title[:95],
-                        rationale_tr=raw_p.why_efso_tr if raw_p else "Editoryal eşik altı / kapsam dışı.",
+                        editorial_relevant=is_rel,
+                        kind=EditorialKind(d.kind),
+                        score=d.score,
+                        verification_status=VerificationStatus(d.verification_status),
+                        urgency_tier=urg_tier,
+                        headline_tr=d.headline_tr or art.title[:95],
+                        rationale_tr=d.rationale_tr,
                         uncertainties_tr="",
                         grounded_article_ids=[art.id],
                         from_cache=from_cache,
+                        disposition=d.disposition,
+                        is_directly_observed=True,
                     )
+
+                projected_assessments = project_diagnostic_decisions_to_assessments(
+                    decision_batch.decisions, batch, seen_recent_stories, min_score=self.settings.min_score
+                )
+                for asm in projected_assessments:
+                    if asm.kind == EditorialKind.NEW:
+                        seen_recent_stories.append(
+                            Story(
+                                story_id=f"SHADOW-STORY-{asm.article_ids[0][:8]}",
+                                headline_tr=asm.headline_tr,
+                                category=asm.category,
+                                first_seen_at=ref_now,
+                                last_updated_at=ref_now,
+                                article_ids=asm.article_ids,
+                            )
+                        )
+            else:
+                for raw_pick in decision_batch.picks:
+                    for aid in raw_pick.article_ids:
+                        if aid not in batch_ids:
+                            hallucinated_ids += 1
+
+                validated_assessments = validator_engine._validate_and_transform_picks(
+                    decision_batch.picks, batch, seen_recent_stories
+                )
+                validated_by_aid: dict[str, EditorialAssessment] = {}
+                for asm in validated_assessments:
+                    for aid in asm.article_ids:
+                        validated_by_aid[aid] = asm
+                    if asm.kind == EditorialKind.NEW:
+                        seen_recent_stories.append(
+                            Story(
+                                story_id=f"SHADOW-STORY-{asm.article_ids[0][:8]}",
+                                headline_tr=asm.headline_tr,
+                                category=asm.category,
+                                first_seen_at=ref_now,
+                                last_updated_at=ref_now,
+                                article_ids=asm.article_ids,
+                            )
+                        )
+
+                raw_by_aid = {aid: p for p in decision_batch.picks for aid in p.article_ids if aid in batch_ids}
+                for art in batch:
+                    if art.id in validated_by_aid:
+                        asm = validated_by_aid[art.id]
+                        tier = planner.classify_urgency_tier(asm)
+                        predictions_by_article_id[art.id] = ShadowPredictionRecord(
+                            article_id=art.id,
+                            batch_index=b_idx,
+                            batch_hash=b_hash,
+                            editorial_relevant=True,
+                            kind=asm.kind,
+                            score=asm.score,
+                            verification_status=asm.verification_status,
+                            urgency_tier=tier,
+                            headline_tr=asm.headline_tr,
+                            rationale_tr=asm.why_efso_tr,
+                            uncertainties_tr=asm.uncertainties_tr or "",
+                            grounded_article_ids=asm.article_ids,
+                            from_cache=from_cache,
+                            disposition="DIGEST",
+                            is_directly_observed=True,
+                        )
+                    else:
+                        raw_p = raw_by_aid.get(art.id)
+                        if raw_p:
+                            predictions_by_article_id[art.id] = ShadowPredictionRecord(
+                                article_id=art.id,
+                                batch_index=b_idx,
+                                batch_hash=b_hash,
+                                editorial_relevant=False,
+                                kind=EditorialKind(raw_p.kind) if raw_p.kind in ("IGNORE", "DUPLICATE") else EditorialKind.IGNORE,
+                                score=raw_p.score,
+                                verification_status=VerificationStatus.REPUTABLE_REPORTING,
+                                urgency_tier=NotificationUrgencyTier.SUPPRESSED,
+                                headline_tr=raw_p.headline_tr,
+                                rationale_tr=raw_p.why_efso_tr,
+                                uncertainties_tr="",
+                                grounded_article_ids=[art.id],
+                                from_cache=from_cache,
+                                disposition=raw_p.kind,
+                                is_directly_observed=True,
+                            )
+                        else:
+                            predictions_by_article_id[art.id] = ShadowPredictionRecord(
+                                article_id=art.id,
+                                batch_index=b_idx,
+                                batch_hash=b_hash,
+                                editorial_relevant=False,
+                                kind=EditorialKind.IGNORE,
+                                score=0,
+                                verification_status=VerificationStatus.REPUTABLE_REPORTING,
+                                urgency_tier=NotificationUrgencyTier.SUPPRESSED,
+                                headline_tr=art.title[:95],
+                                rationale_tr="UNOBSERVED: Model returned empty picks array without individual article evaluations.",
+                                uncertainties_tr="",
+                                grounded_article_ids=[art.id],
+                                from_cache=from_cache,
+                                disposition=None,
+                                is_directly_observed=False,
+                            )
 
             if not automatic_continuation and (max_batches is not None and b_idx >= max_batches):
                 logger.info("Automatic continuation is disabled. Stopping after batch %d as requested.", b_idx)
@@ -1624,6 +1822,7 @@ class BlindShadowEvaluationRunner:
             i for i in pos_items
             if predictions_by_article_id[_get_item_aid(i)].editorial_relevant
             or predictions_by_article_id[_get_item_aid(i)].kind == EditorialKind.DUPLICATE
+            or predictions_by_article_id[_get_item_aid(i)].urgency_tier == NotificationUrgencyTier.HOLD_FOR_VERIFICATION
         ]
         pos_missed = [i for i in pos_items if i not in pos_hit]
         neg_fp = [i for i in neg_items if predictions_by_article_id[_get_item_aid(i)].editorial_relevant]
@@ -1724,7 +1923,10 @@ class BlindShadowEvaluationRunner:
                 "cumulative_out_tokens": cumulative_out_tokens,
                 "cumulative_cost_usd": round(cumulative_cost_usd, 6),
                 "cumulative_cost_try": round(cumulative_cost_usd * self.settings.usd_to_try_rate, 3),
-                "within_budget_ceiling": cumulative_cost_usd <= self.settings.max_shadow_eval_budget_usd,
+                "prior_canaries_cost_usd": guard.get_prior_canaries_cost_usd() if guard else 0.0,
+                "cumulative_overall_experiment_cost_usd": guard.get_total_consumed_usd() if guard else round(cumulative_cost_usd, 6),
+                "remaining_experiment_allowance_usd": guard.get_remaining_allowance_usd() if guard else round(self.settings.max_shadow_eval_budget_usd - cumulative_cost_usd, 6),
+                "within_budget_ceiling": (guard.get_total_consumed_usd() <= guard.budget_ceiling_usd) if guard else (cumulative_cost_usd <= self.settings.max_shadow_eval_budget_usd),
                 "budget_ceiling_usd": self.settings.max_shadow_eval_budget_usd,
             },
         }
@@ -1946,6 +2148,175 @@ def _offline_blind_heuristic_predictor(
         )
 
     return EditorialDecisionBatch(picks=picks)
+
+
+def _offline_blind_diagnostic_predictor(
+    batch: list[Article],
+    recent_stories: list[Story],
+    now: datetime,
+) -> DiagnosticEvaluationBatch:
+    """
+    Deterministic offline diagnostic simulation predictor providing explicit per-article decisions.
+
+    Used strictly for offline testing and preflight dry-runs without live API costs.
+    Its outputs must NOT be reported as measured Gemini model accuracy.
+    """
+    from efso_radar.deduplication.engine import (
+        extract_proper_name_bigrams,
+        extract_url_slug_text,
+        find_matched_affinity_entities,
+    )
+
+    decisions: list[DiagnosticArticleDecision] = []
+    seen_event_tokens: list[tuple[Article, set[str], set[str]]] = []
+
+    for art in batch:
+        p_score, reasons = compute_candidate_priority(art, cluster_size=1, publisher_seen_count=1, reference_time=now)
+        ev_tokens = extract_article_event_tokens(art)
+        full_ctx = f"{art.title} {art.snippet or ''} {extract_url_slug_text(art.canonical_url or art.url or '')}"
+        ev_bigrams = extract_proper_name_bigrams(f"{art.title} {art.snippet or ''}") | set(find_matched_affinity_entities(full_ctx))
+        combined_lower = f"{art.title} {art.snippet or ''}".lower()
+
+        # Check duplicate
+        is_dup = False
+        for prev_art, prev_tokens, prev_bigrams in seen_event_tokens:
+            shared_ents = ev_bigrams & prev_bigrams
+            disjoint_ents = bool(ev_bigrams) and bool(prev_bigrams) and not shared_ents
+            if disjoint_ents:
+                continue
+            ov = calculate_token_overlap(ev_tokens, prev_tokens)
+            if ov >= 0.34 or (bool(shared_ents) and ov >= 0.25):
+                is_dup = True
+                break
+        if not is_dup:
+            for st in recent_stories:
+                st_art = Article.create(st.headline_tr, "https://local/story", "History", now)
+                st_tokens = extract_article_event_tokens(st_art)
+                st_bigrams = extract_proper_name_bigrams(st.headline_tr) | set(find_matched_affinity_entities(st.headline_tr))
+                shared_ents = ev_bigrams & st_bigrams
+                disjoint_ents = bool(ev_bigrams) and bool(st_bigrams) and not shared_ents
+                if disjoint_ents:
+                    continue
+                ov = calculate_token_overlap(ev_tokens, st_tokens)
+                if ov >= 0.34 or (bool(shared_ents) and ov >= 0.25) or is_headline_too_similar(art.title, st.headline_tr, threshold=0.65):
+                    is_dup = True
+                    break
+
+        seen_event_tokens.append((art, ev_tokens, ev_bigrams))
+
+        if "subjectless_clickbait_penalty" in reasons and art.snippet and len(art.snippet) > len(art.title):
+            headline_clean = art.snippet[:85]
+        else:
+            headline_clean = art.title[:85]
+
+        if is_dup:
+            decisions.append(
+                DiagnosticArticleDecision(
+                    article_id=art.id,
+                    score=50,
+                    disposition="IGNORE",
+                    kind="DUPLICATE",
+                    urgency="NORMAL",
+                    rationale_tr="Çapraz yayıncı tekrarı; yeni bir olgusal gelişme bulunmuyor.",
+                    headline_tr="",
+                    verification_status="REPUTABLE_REPORTING",
+                )
+            )
+            continue
+
+        is_rumor = any(
+            m in combined_lower
+            for m in ("claims insider", "insider", "rumor", "allegedly", "black magic", "kara büyü", "iddia", "söylenti")
+        )
+        v_status = "ATTRIBUTED_CLAIM" if "insider" in combined_lower else ("UNVERIFIED_RUMOR" if is_rumor else "REPUTABLE_REPORTING")
+
+        if is_rumor:
+            if "iddia" not in headline_clean.lower():
+                h_text = f"İddia: {headline_clean}"[:95]
+            else:
+                h_text = headline_clean[:95]
+            decisions.append(
+                DiagnosticArticleDecision(
+                    article_id=art.id,
+                    score=75,
+                    disposition="HOLD",
+                    kind="NEW",
+                    urgency="NORMAL",
+                    rationale_tr="Teyit gerektiren iddia ve kulis haberi; editoryal doğrulama bekletmesinde.",
+                    headline_tr=h_text,
+                    verification_status=v_status,
+                )
+            )
+            continue
+
+        if any(r.startswith("out_of_scope_or_grim_news_dampened") for r in reasons) or p_score < 6.8:
+            decisions.append(
+                DiagnosticArticleDecision(
+                    article_id=art.id,
+                    score=max(20, min(65, int(p_score * 8))),
+                    disposition="IGNORE",
+                    kind="NEW",
+                    urgency="NORMAL",
+                    rationale_tr="Efso Magazin eğlence ve pop-kültür kapsamı dışında kalan içerik.",
+                    headline_tr="",
+                    verification_status="REPUTABLE_REPORTING",
+                )
+            )
+            continue
+
+        # Check significant sensitive tragedy/bereavement news (PO policy: private review queue)
+        is_sensitive = any(
+            w in combined_lower
+            for w in ("vefat", "hayatını kaybetti", "cenaze", "taziye", "acılı anne baba", "oğlunun ölümü")
+        )
+        if is_sensitive:
+            decisions.append(
+                DiagnosticArticleDecision(
+                    article_id=art.id,
+                    score=min(88, max(75, int(58 + p_score * 3.0))),
+                    disposition="SENSITIVE_REVIEW",
+                    kind="NEW",
+                    urgency="NORMAL",
+                    rationale_tr="Kamuoyunda yankı uyandıran hassas vefat/taziye haberi; özel editoryal inceleme bekletmesinde.",
+                    headline_tr=headline_clean[:95],
+                    verification_status="REPUTABLE_REPORTING",
+                )
+            )
+            continue
+
+        if p_score < 8.1:
+            decisions.append(
+                DiagnosticArticleDecision(
+                    article_id=art.id,
+                    score=min(79, max(68, int(54 + p_score * 2.8))),
+                    disposition="RESERVE",
+                    kind="NEW",
+                    urgency="NORMAL",
+                    rationale_tr="Yayın akışında boşluk oluştuğunda değerlendirilebilecek yedek magazin haberi.",
+                    headline_tr=headline_clean,
+                    verification_status="REPUTABLE_REPORTING",
+                )
+            )
+            continue
+
+        ed_score = min(95, max(82, int(62 + p_score * 2.5)))
+        decisions.append(
+            DiagnosticArticleDecision(
+                article_id=art.id,
+                score=ed_score,
+                disposition="DIGEST",
+                kind="NEW",
+                urgency="BREAKING" if p_score >= 12.0 else "NORMAL",
+                rationale_tr="Yüksek pop-kültür ve sosyal medya etkileşim potansiyeli taşıyan güncel magazin haberi.",
+                headline_tr=headline_clean,
+                verification_status="REPUTABLE_REPORTING",
+            )
+        )
+
+    return DiagnosticEvaluationBatch(
+        decisions=decisions,
+        run_editorial_summary_tr=f"Editoryal tarama tamamlandı: {len(batch)} aday değerlendirildi.",
+    )
 
 
 # ---------------------------------------------------------------------------

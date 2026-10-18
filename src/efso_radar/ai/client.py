@@ -10,6 +10,7 @@ import logging
 from abc import ABC, abstractmethod
 from datetime import datetime
 from difflib import SequenceMatcher
+import re
 from typing import Optional
 
 from pydantic import ValidationError
@@ -22,13 +23,20 @@ from efso_radar.ai.cost import (
     estimate_tokens_from_text,
     extract_provider_token_usage,
 )
-from efso_radar.ai.prompts import build_editorial_prompt
-from efso_radar.ai.schemas import EditorialDecisionBatch, EditorialPickSchema
+from efso_radar.ai.prompts import build_diagnostic_editorial_prompt, build_editorial_prompt
+from efso_radar.ai.schemas import (
+    DiagnosticArticleDecision,
+    DiagnosticEvaluationBatch,
+    EditorialDecisionBatch,
+    EditorialPickSchema,
+)
 from efso_radar.config import Settings
 from efso_radar.domain import (
     Article,
     EditorialAssessment,
+    EditorialDisposition,
     EditorialKind,
+    Market,
     Story,
     StoryCategory,
     SuggestedFormat,
@@ -542,3 +550,251 @@ class GeminiEditorialEngine(AIEditorialEngine):
             used_article_ids.update(valid_ids)
 
         return approved
+
+
+def sanitize_sensitive_headline(headline: str) -> str:
+    """Suppress intrusive, exploitative, or sensationalized clickbait phrases from sensitive headlines."""
+    cleaned = headline.strip()
+    patterns_to_strip = [
+        r"(?i)^\s*(bomba\s*iddia|şok\s*iddia|kahreden\s*detay|şok\s*gelişme|flaş\s*gelişme|şok\s*vefat|şok\s*ölüm|şok\s*haber)[!:\s-]*",
+        r"(?i)\s*bomba\s*iddia[!:]*",
+        r"(?i)\s*şok\s*(gelişme|iddia|ölüm|detay|vefat|haber)[!:]*",
+        r"(?i)\s*kahreden\s*(detay|iddia|vefat|ölüm|haber)[!:]*",
+        r"(?i)\s*görenler\s*tanıyamadı[!:]*",
+        r"(?i)\s*feci\s*(kaza|ölüm|şekilde)[!:]*",
+    ]
+    changed = True
+    while changed:
+        prev = cleaned
+        for pat in patterns_to_strip:
+            cleaned = re.sub(pat, "", cleaned).strip()
+        changed = (cleaned != prev)
+    return cleaned or headline.strip()
+
+
+TR_SENSITIVE_PATTERNS = [
+    r"\bvefat[a-zıiüöçşğ]*\b",
+    r"\bölüm[üi]?(?:ne|nün|nü|nde)?\b",
+    r"\böl(?:dü|düğü|müş|en|dürüldü)[a-zıiüöçşğ]*\b",
+    r"\b(?:hayatını|yaşamını)\s+(?:kayb[eü][td]|yitir)[a-zıiüöçşğ]*\b",
+    r"\bcan\s+verdi\b",
+    r"\bson\s+yolculuğuna\b",
+    r"\bcenaze[a-zıiüöçşğ]*\b",
+    r"\btoprağa\s+verild[a-zıiüöçşğ]*\b",
+    r"\bdefnedil[a-zıiüöçşğ]*\b",
+    r"\bnaaşı\b",
+    r"\bhelallik\b",
+    r"\btaziye[a-zıiüöçşğ]*\b",
+    r"\bbaşsağlığı\b",
+    r"\bacılı\s+(?:anne|baba|aile|eş|çocuk)\b",
+    r"\byasa\s+boğ[a-zıiüöçşğ]*\b",
+    r"\bmatem[a-zıiüöçşğ]*\b",
+    r"\bintihar[a-zıiüöçşğ]*\b",
+    r"\bfeci\s+kaza[a-zıiüöçşğ]*\b",
+    r"\btrajik\s+(?:vefat|ölüm|kaza|kayıp|olay)[a-zıiüöçşğ]*\b",
+    r"\bcinayet[a-zıiüöçşğ]*\b",
+]
+
+EN_SENSITIVE_PATTERNS = [
+    r"\bdied\b",
+    r"\bpasses?\s+away\b",
+    r"\bpassed\s+away\b",
+    r"\bpassing\s+away\b",
+    r"\b(?:fatal|fatally)\b",
+    r"\b(?:killed\s+in|mauled\s+(?:to\s+death|by))\b",
+    r"\b(?:funeral|memorial\s+service|obituary|suicide)\b",
+    r"\b(?:cause\s+of\s+death|tragic\s+death|found\s+dead|pronounced\s+dead|mourns?\s+(?:the\s+)?death|death\s+of)\b",
+    r"\b(?:grieving|mourning|bereavement|bereaved)\b",
+]
+
+COMPILED_SENSITIVE_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in (TR_SENSITIVE_PATTERNS + EN_SENSITIVE_PATTERNS)
+]
+
+
+def detect_sensitive_tragedy_content(*texts: Optional[str]) -> bool:
+    """Independent defense-in-depth safety detector identifying significant death, funeral,
+    suicide, fatal accident, bereavement, or tragedy-related entertainment news."""
+    combined = " ".join(t.strip() for t in texts if t and t.strip())
+    if not combined:
+        return False
+    return any(pat.search(combined) is not None for pat in COMPILED_SENSITIVE_PATTERNS)
+
+
+def project_diagnostic_decisions_to_assessments(
+    decisions: list[DiagnosticArticleDecision],
+    candidates: list[Article],
+    recent_stories: Optional[list[Story]] = None,
+    min_score: int = 75,
+    include_manual_holds: bool = True,
+    include_sensitive_reviews: bool = True,
+) -> list[EditorialAssessment]:
+    """
+    Production projection converting per-article diagnostic decisions into selective
+    EditorialAssessment objects suitable for Telegram delivery planning.
+
+    Strict Precedence & Invariants:
+    1. Urgency NEVER overrides verification, duplication, or editorial disposition.
+    2. IGNORE: Never enters publication queue under any circumstances (even if BREAKING).
+    3. DUPLICATE: Never becomes a new publishable story under any circumstances.
+    4. RESERVE: Retained for backlog buffer, never projected into immediate delivery (even if BREAKING).
+    5. INDEPENDENT SENSITIVITY VETO (Death, funeral, suicide, fatal accidents, bereavement):
+       Independent defense-in-depth safety mechanism intercepts sensitive stories even if the AI
+       model assigned DIGEST or BREAKING urgency.
+       - State B (Verified sensitive story): is_publishable=False, disposition=SENSITIVE_REVIEW,
+         uncertainties_tr='[NOT_PUBLISHABLE - SENSITIVE EDITORIAL REVIEW REQUIRED] ...'.
+       - State C (Sensitive + unverified story): is_publishable=False, disposition=SENSITIVE_REVIEW,
+         uncertainties_tr='[NOT_PUBLISHABLE - DUAL LOCK: SENSITIVE EDITORIAL REVIEW + FACTUAL VERIFICATION REQUIRED] ...'.
+         Factual verification alone does NOT authorize publication; both locks are required.
+       Intrusive, exploitative, graphic, speculative, or sensationalized details are suppressed.
+    6. UNVERIFIED NON-SENSITIVE CLAIMS (UNVERIFIED_RUMOR, SPECULATION):
+       - State A (Unverified non-sensitive claim): is_publishable=False, disposition=HOLD,
+         uncertainties_tr='[NOT_PUBLISHABLE - MANUAL VERIFICATION REQUIRED] ...'.
+    7. HOLD: Never enters the publishable digest or breaking-notification queue.
+    8. BREAKING: Applies ONLY to a verified, eligible, editorially approved (DIGEST) non-sensitive story.
+    9. UPDATE: Legitimate UPDATE events with meaningful developments remain eligible when approved.
+    """
+    candidate_map = {a.id: a for a in candidates}
+    assessments: list[EditorialAssessment] = []
+
+    for d in decisions:
+        if d.article_id not in candidate_map:
+            continue
+        art = candidate_map[d.article_id]
+
+        # 1. Absolute rejection gates (Urgency can NEVER override these)
+        if d.disposition == "IGNORE" or d.kind == "DUPLICATE":
+            continue
+
+        # 2. Backlog buffer gate (Urgency can NEVER override RESERVE)
+        if d.disposition == "RESERVE":
+            continue
+
+        cat = StoryCategory.YERLI if art.market == Market.TR else StoryCategory.GLOBAL
+        is_unverified = d.verification_status in ("UNVERIFIED_RUMOR", "SPECULATION")
+        is_hold = (d.disposition == "HOLD" or is_unverified)
+
+        # 3. Independent Defense-in-Depth Sensitivity Veto:
+        # Detect death, funeral, suicide, fatal accidents, bereavement, or grief news
+        # independently of model's disposition, urgency, or score.
+        is_sensitive = (
+            d.disposition == "SENSITIVE_REVIEW"
+            or detect_sensitive_tragedy_content(
+                art.title,
+                art.snippet,
+                d.headline_tr,
+                d.rationale_tr,
+            )
+        )
+
+        if is_sensitive:
+            if not include_sensitive_reviews:
+                continue
+            raw_headline = d.headline_tr.strip() if d.headline_tr and d.headline_tr.strip() else art.title
+            cleaned_headline = sanitize_sensitive_headline(raw_headline)
+
+            if is_unverified:
+                # State C: Sensitive AND unverified story (Dual Lock: Sensitive Review + Factual Verification)
+                uncertainties_msg = (
+                    "[NOT_PUBLISHABLE - DUAL LOCK: SENSITIVE EDITORIAL REVIEW + FACTUAL VERIFICATION REQUIRED] "
+                    "Çift kilit güvenlik bekletmesinde: Hem teyitsiz spekülasyon doğrulaması hem de Product Owner "
+                    "hassas içerik editoryal onayı zorunludur. Doğrulama tek başına yayına izin vermez."
+                )
+            else:
+                # State B: Verified sensitive story (Sensitive Editorial Review)
+                uncertainties_msg = (
+                    "[NOT_PUBLISHABLE - SENSITIVE EDITORIAL REVIEW REQUIRED] "
+                    "Hassas içerik özel editoryal inceleme bekletmesinde: "
+                    "Vefat/cenaze/taziye haberi Product Owner onayı olmadan yayınlanamaz."
+                )
+
+            assessment = EditorialAssessment(
+                article_ids=[art.id],
+                score=d.score,
+                kind=EditorialKind(d.kind),
+                parent_story_id=None,
+                development_tr=None,
+                headline_tr=cleaned_headline[:200],
+                cover_title_tr=cleaned_headline[:80],
+                caption_idea_tr=d.rationale_tr[:800],
+                relevance_reason_tr=d.rationale_tr[:500],
+                why_efso_tr=d.rationale_tr[:500],
+                uncertainties_tr=uncertainties_msg,
+                suggested_format=SuggestedFormat.POST,
+                category=cat,
+                verification_status=VerificationStatus(d.verification_status),
+                source_urls=[art.url],
+                supporting_articles=[art],
+                is_publishable=False,
+                disposition=EditorialDisposition.SENSITIVE_REVIEW,
+            )
+            assessments.append(assessment)
+            continue
+
+        # 4. State A: Unverified non-sensitive claim / manual verification hold
+        if is_hold:
+            if not include_manual_holds:
+                continue
+            headline = d.headline_tr.strip() if d.headline_tr and d.headline_tr.strip() else art.title
+            assessment = EditorialAssessment(
+                article_ids=[art.id],
+                score=d.score,
+                kind=EditorialKind(d.kind),
+                parent_story_id=None,
+                development_tr=None,
+                headline_tr=headline[:200],
+                cover_title_tr=headline[:80],
+                caption_idea_tr=d.rationale_tr[:800],
+                relevance_reason_tr=d.rationale_tr[:500],
+                why_efso_tr=d.rationale_tr[:500],
+                uncertainties_tr="[NOT_PUBLISHABLE - MANUAL VERIFICATION REQUIRED] Doğrulama bekletmesinde: Teyit gerektiren iddia/söylenti.",
+                suggested_format=SuggestedFormat.POST,
+                category=cat,
+                verification_status=VerificationStatus(d.verification_status),
+                source_urls=[art.url],
+                supporting_articles=[art],
+                is_publishable=False,
+                disposition=EditorialDisposition.HOLD,
+            )
+            assessments.append(assessment)
+            continue
+
+        # 5. Standard publishable evaluation (Only verified non-sensitive DIGEST stories)
+        if d.disposition != "DIGEST":
+            continue
+
+        # Unified product rule: DIGEST determines eligibility for the periodic editorial digest.
+        # Score ranks eligible items by editorial priority; no independent numeric threshold
+        # silently drops a verified DIGEST decision.
+
+        # Validate UPDATE development content if applicable
+        dev_tr = None
+        if d.kind == "UPDATE":
+            dev_tr = d.rationale_tr.strip() if d.rationale_tr else None
+
+        headline = d.headline_tr.strip() if d.headline_tr and d.headline_tr.strip() else art.title
+        cat = StoryCategory.YERLI if art.market == Market.TR else StoryCategory.GLOBAL
+
+        assessment = EditorialAssessment(
+            article_ids=[art.id],
+            score=d.score,
+            kind=EditorialKind(d.kind),
+            parent_story_id=None,
+            development_tr=dev_tr,
+            headline_tr=headline[:200],
+            cover_title_tr=headline[:80],
+            caption_idea_tr=d.rationale_tr[:800],
+            relevance_reason_tr=d.rationale_tr[:500],
+            why_efso_tr=d.rationale_tr[:500],
+            uncertainties_tr=None,
+            suggested_format=SuggestedFormat.POST,
+            category=cat,
+            verification_status=VerificationStatus(d.verification_status),
+            source_urls=[art.url],
+            supporting_articles=[art],
+            is_publishable=True,
+            disposition=EditorialDisposition.DIGEST,
+        )
+        assessments.append(assessment)
+
+    return assessments

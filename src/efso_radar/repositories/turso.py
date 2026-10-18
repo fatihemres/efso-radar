@@ -443,7 +443,7 @@ class TursoStateRepository(StateRepository):
                 """
                 SELECT 1 FROM notifications
                 WHERE story_id = ? AND kind = 'NEW'
-                  AND status IN ('SENT', 'HELD_QUIET_HOURS', 'DISPATCHING', 'QUEUED_FOR_DIGEST', 'HELD_FOR_VERIFICATION')
+                  AND status IN ('SENT', 'HELD_QUIET_HOURS', 'DISPATCHING', 'QUEUED_FOR_DIGEST', 'HELD_FOR_VERIFICATION', 'HELD_FOR_SENSITIVE_REVIEW', 'DELIVERY_UNCERTAIN')
                 LIMIT 1
                 """,
                 [story_id],
@@ -563,14 +563,19 @@ class TursoStateRepository(StateRepository):
             [DeliveryStatus.SENT.value, delivered_at.isoformat(), notification_id],
         )
 
-    def record_notification_failure(self, notification_id: str, error_message: str) -> None:
+    def record_notification_failure(
+        self,
+        notification_id: str,
+        error_message: str,
+        status: DeliveryStatus = DeliveryStatus.FAILED,
+    ) -> None:
         self.client.execute(
             """
             UPDATE notifications
             SET status = ?, lease_worker_id = NULL, lease_expires_at = NULL, error_message = ?
             WHERE notification_id = ?
             """,
-            [DeliveryStatus.FAILED.value, error_message, notification_id],
+            [status.value, error_message, notification_id],
         )
 
     def get_held_notifications(
@@ -808,6 +813,49 @@ class TursoStateRepository(StateRepository):
                        status, message_text, headline_tr, score, error_message
                 FROM notifications
                 WHERE status = 'HELD_FOR_VERIFICATION'
+                ORDER BY sent_at ASC, notification_id ASC
+                """
+            )
+        return [
+            NotificationRecord(
+                notification_id=r["notification_id"],
+                story_id=r["story_id"],
+                update_id=r.get("update_id"),
+                kind=EditorialKind(r["kind"]),
+                channel=r["channel"],
+                sent_at=datetime.fromisoformat(r["sent_at"]),
+                status=DeliveryStatus(r["status"]),
+                message_text=r["message_text"],
+                headline_tr=r["headline_tr"],
+                score=int(r["score"]),
+                error_message=r.get("error_message"),
+            )
+            for r in res.fetchall()
+        ]
+
+    def get_sensitive_review_notifications(
+        self, max_age_hours: Optional[int] = None, now: Optional[datetime] = None
+    ) -> list[NotificationRecord]:
+        if max_age_hours is not None:
+            ref_now = now or utc_now()
+            cutoff = (ref_now - timedelta(hours=max_age_hours)).isoformat()
+            res = self.client.execute(
+                """
+                SELECT notification_id, story_id, update_id, kind, channel, sent_at,
+                       status, message_text, headline_tr, score, error_message
+                FROM notifications
+                WHERE status = 'HELD_FOR_SENSITIVE_REVIEW' AND sent_at >= ?
+                ORDER BY sent_at ASC, notification_id ASC
+                """,
+                [cutoff],
+            )
+        else:
+            res = self.client.execute(
+                """
+                SELECT notification_id, story_id, update_id, kind, channel, sent_at,
+                       status, message_text, headline_tr, score, error_message
+                FROM notifications
+                WHERE status = 'HELD_FOR_SENSITIVE_REVIEW'
                 ORDER BY sent_at ASC, notification_id ASC
                 """
             )

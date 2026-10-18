@@ -12,24 +12,37 @@ import uuid
 from datetime import datetime
 from typing import NamedTuple, Optional
 
-from efso_radar.ai.client import AIEvaluationError, AIEditorialEngine, GeminiEditorialEngine
+from efso_radar.ai.client import (
+    AIEvaluationError,
+    AIEditorialEngine,
+    GeminiEditorialEngine,
+    detect_sensitive_tragedy_content,
+)
 from efso_radar.config import Settings
 from efso_radar.deduplication.engine import DeduplicationEngine
 from efso_radar.domain import (
     Article,
     DeliveryStatus,
     EditorialAssessment,
+    EditorialDisposition,
     EditorialKind,
     NotificationRecord,
     Story,
     StoryUpdate,
     SuggestedFormat,
     StoryCategory,
+    TelegramNotificationCategory,
     VerificationStatus,
     utc_now,
 )
 from efso_radar.notifications.base import NotificationChannel
-from efso_radar.notifications.formatters import format_telegram_alert, format_telegram_digest
+from efso_radar.notifications.formatters import (
+    format_telegram_alert,
+    format_telegram_breaking,
+    format_telegram_digest,
+    format_telegram_sensitive_review,
+    format_telegram_verification_hold,
+)
 from efso_radar.notifications.telegram import TelegramNotificationChannel
 from efso_radar.repositories.base import StateRepository
 from efso_radar.repositories.sqlite import SqliteStateRepository
@@ -137,15 +150,38 @@ class RadarOrchestrator:
         )
 
         if not dry_run:
-            if self.settings.telegram_bot_token and self.settings.telegram_chat_id and hasattr(self.notifier, "_dispatch_telegram"):
-                res = self.notifier._dispatch_telegram(
-                    f"DIGEST-{ref_now.strftime('%Y%m%d%H%M%S')}",
-                    batch[0].story_id,
-                    None,
-                    None,
-                    digest_text,
-                    ref_now,
+            if hasattr(self.notifier, "send_digest_batch"):
+                res = self.notifier.send_digest_batch(
+                    synthetic_assessments,
+                    notification_id=f"DIGEST-{ref_now.strftime('%Y%m%d%H%M%S')}",
+                    window_label=f"{hours_label} Saatlik Editoryal Özet",
+                    dry_run=dry_run,
+                    now=ref_now,
                 )
+                if res.status != DeliveryStatus.SENT:
+                    return 0
+            elif self.settings.telegram_bot_token and self.settings.telegram_chat_id and hasattr(self.notifier, "_dispatch_telegram"):
+                try:
+                    res = self.notifier._dispatch_telegram(
+                        f"DIGEST-{ref_now.strftime('%Y%m%d%H%M%S')}",
+                        batch[0].story_id,
+                        None,
+                        None,
+                        digest_text,
+                        ref_now,
+                        self.settings.telegram_chat_id,
+                        TelegramNotificationCategory.EDITORIAL_DIGEST,
+                        "TELEGRAM_DIGEST",
+                    )
+                except TypeError:
+                    res = self.notifier._dispatch_telegram(
+                        f"DIGEST-{ref_now.strftime('%Y%m%d%H%M%S')}",
+                        batch[0].story_id,
+                        None,
+                        None,
+                        digest_text,
+                        ref_now,
+                    )
                 if res.status != DeliveryStatus.SENT:
                     return 0
             self.repository.mark_digest_notifications_dispatched(
@@ -441,7 +477,17 @@ class RadarOrchestrator:
                         logger.info("Story %s has already been alerted; skipping duplicate notification", story_id)
                         continue
 
-                # 7. Verification Hold & Hybrid Digest Routing vs Immediate Notification Delivery
+                # 7. Sensitive Review, Verification Hold & Hybrid Digest Routing vs Immediate Notification Delivery
+                is_sensitive_review = (
+                    getattr(pick, "disposition", None) == EditorialDisposition.SENSITIVE_REVIEW
+                    or (pick.uncertainties_tr and "SENSITIVE EDITORIAL REVIEW" in pick.uncertainties_tr)
+                    or detect_sensitive_tragedy_content(
+                        pick.headline_tr,
+                        pick.caption_idea_tr,
+                        pick.relevance_reason_tr,
+                        pick.why_efso_tr,
+                    )
+                )
                 is_unverified = pick.verification_status in (
                     VerificationStatus.UNVERIFIED_RUMOR,
                     VerificationStatus.SPECULATION,
@@ -450,13 +496,30 @@ class RadarOrchestrator:
                 should_queue_digest = (
                     (use_hybrid_digest or self.settings.notification_strategy == "DIGEST_ONLY")
                     and not is_unverified
+                    and not is_sensitive_review
                     and (
                         self.settings.notification_strategy == "DIGEST_ONLY"
                         or pick.score < self.settings.breaking_alert_min_score
                     )
                 )
 
-                if is_unverified:
+                if is_sensitive_review:
+                    notif_suffix = update_id if update_id else story_id
+                    record = NotificationRecord(
+                        notification_id=f"HOLD-SENSITIVE-{now.strftime('%Y%m%d%H%M%S')}-{notif_suffix}",
+                        story_id=story_id,
+                        update_id=update_id,
+                        kind=pick.kind,
+                        channel="TELEGRAM_SENSITIVE_REVIEW",
+                        sent_at=now,
+                        status=DeliveryStatus.HELD_FOR_SENSITIVE_REVIEW,
+                        message_text=format_telegram_sensitive_review(pick),
+                        headline_tr=pick.headline_tr,
+                        score=pick.score,
+                        error_message="Held for sensitive review: requires explicit Product Owner approval",
+                        category=TelegramNotificationCategory.SENSITIVE_EDITORIAL_REVIEW,
+                    )
+                elif is_unverified:
                     notif_suffix = update_id if update_id else story_id
                     record = NotificationRecord(
                         notification_id=f"HOLD-VERIF-{now.strftime('%Y%m%d%H%M%S')}-{notif_suffix}",
@@ -466,10 +529,11 @@ class RadarOrchestrator:
                         channel="TELEGRAM",
                         sent_at=now,
                         status=DeliveryStatus.HELD_FOR_VERIFICATION,
-                        message_text=format_telegram_alert(pick),
+                        message_text=format_telegram_verification_hold(pick),
                         headline_tr=pick.headline_tr,
                         score=pick.score,
                         error_message="Held for verification: unverified rumor or attributed claim",
+                        category=TelegramNotificationCategory.HOLD_FOR_VERIFICATION,
                     )
                 elif should_queue_digest:
                     notif_suffix = update_id if update_id else story_id
@@ -484,12 +548,23 @@ class RadarOrchestrator:
                         message_text=format_telegram_alert(pick),
                         headline_tr=pick.headline_tr,
                         score=pick.score,
+                        category=TelegramNotificationCategory.EDITORIAL_DIGEST,
                     )
                 else:
                     try:
-                        record = self.notifier.send(pick, story_id, update_id=update_id, dry_run=dry_run, now=now)
+                        record = self.notifier.send(
+                            pick,
+                            story_id,
+                            update_id=update_id,
+                            category=TelegramNotificationCategory.VERIFIED_BREAKING,
+                            dry_run=dry_run,
+                            now=now,
+                        )
                     except TypeError:
-                        record = self.notifier.send(pick, story_id, dry_run=dry_run, now=now)
+                        try:
+                            record = self.notifier.send(pick, story_id, update_id=update_id, dry_run=dry_run, now=now)
+                        except TypeError:
+                            record = self.notifier.send(pick, story_id, dry_run=dry_run, now=now)
                     if record.status in (DeliveryStatus.SENT, DeliveryStatus.HELD_QUIET_HOURS):
                         notifications_dispatched += 1
 

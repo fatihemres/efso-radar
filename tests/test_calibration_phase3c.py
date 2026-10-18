@@ -574,12 +574,15 @@ class TestCalibrationPhase3C(unittest.TestCase):
 
     def test_phase3c2c_live_shadow_evaluation_requires_api_key_when_not_dry_run(self):
         """Calling run_live_gemini_evaluation without API key or authorization raises AIEvaluationError."""
+        import os
+        import unittest.mock
         target_csv = DEFAULT_FILLED_CALIBRATION_CSV if DEFAULT_FILLED_CALIBRATION_CSV.exists() else self.csv_path
         items = load_and_verify_calibration_csv(target_csv)
         runner = BlindShadowEvaluationRunner(settings=Settings(gemini_api_key=""))
-        with self.assertRaises(AIEvaluationError) as ctx:
-            runner.run_live_gemini_evaluation(items, api_key="", dry_run=False)
-        self.assertIn("GEMINI_API_KEY is required", str(ctx.exception))
+        with unittest.mock.patch.dict(os.environ, {"GEMINI_API_KEY": ""}):
+            with self.assertRaises(AIEvaluationError) as ctx:
+                runner.run_live_gemini_evaluation(items, api_key="", dry_run=False)
+            self.assertIn("GEMINI_API_KEY is required", str(ctx.exception))
 
     def test_phase3c2c_live_shadow_evaluation_mock_client_and_resume_and_confusion_matrix(self):
         """run_live_gemini_evaluation with mock_client enforces per-batch output tokens, records ledger, and resumes."""
@@ -616,6 +619,7 @@ class TestCalibrationPhase3C(unittest.TestCase):
             mock_client=mock_client,
             dry_run=False,
             output_artifact_path=artifact_json,
+            schema_mode="SELECTIVE_PICKS",
         )
 
         self.assertEqual(len(preds1), 50)
@@ -649,6 +653,7 @@ class TestCalibrationPhase3C(unittest.TestCase):
             items=items,
             mock_client=mock_client,
             dry_run=False,
+            schema_mode="SELECTIVE_PICKS",
         )
         self.assertEqual(len(preds2), 50)
         self.assertEqual(metrics2.batches_executed, 0)

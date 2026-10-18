@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from efso_radar.ai.client import is_headline_too_similar
+from efso_radar.ai.client import detect_sensitive_tragedy_content, is_headline_too_similar
 from efso_radar.ai.cost import estimate_call_cost, estimate_tokens_from_text
 from efso_radar.ai.prompts import build_editorial_prompt
 from efso_radar.config import Settings
@@ -24,6 +24,7 @@ from efso_radar.domain import (
     Article,
     DeliveryStatus,
     EditorialAssessment,
+    EditorialDisposition,
     EditorialKind,
     Market,
     NotificationUrgencyTier,
@@ -230,6 +231,7 @@ class HybridDispatchPlan:
     digest_batch: list[EditorialAssessment] = field(default_factory=list)
     deferred_for_next_digest: list[EditorialAssessment] = field(default_factory=list)
     held_for_verification: list[EditorialAssessment] = field(default_factory=list)
+    held_for_sensitive_review: list[EditorialAssessment] = field(default_factory=list)
     held_quiet_hours: list[EditorialAssessment] = field(default_factory=list)
     suppressed: list[EditorialAssessment] = field(default_factory=list)
     formatted_breaking_messages: list[str] = field(default_factory=list)
@@ -601,10 +603,36 @@ class HybridNotificationPlanner:
 
     def classify_urgency_tier(self, assessment: EditorialAssessment) -> NotificationUrgencyTier:
         """Determine the notification urgency tier for an AI editorial assessment."""
+        disp = getattr(assessment, "disposition", None)
+        if disp == EditorialDisposition.SENSITIVE_REVIEW or disp == "SENSITIVE_REVIEW":
+            return NotificationUrgencyTier.SENSITIVE_REVIEW
+
+        # Independent Defense-in-Depth Sensitivity Veto:
+        # Significant death, funeral, bereavement, or tragedy content must NEVER automatically
+        # enter publication queues, regardless of AI disposition or score.
+        if (
+            assessment.uncertainties_tr and "SENSITIVE EDITORIAL REVIEW" in assessment.uncertainties_tr
+        ) or detect_sensitive_tragedy_content(
+            assessment.headline_tr,
+            assessment.caption_idea_tr,
+            assessment.relevance_reason_tr,
+            assessment.why_efso_tr,
+        ):
+            return NotificationUrgencyTier.SENSITIVE_REVIEW
+
+        if not getattr(assessment, "is_publishable", True):
+            return NotificationUrgencyTier.HOLD_FOR_VERIFICATION
+
         if assessment.kind in (EditorialKind.IGNORE, EditorialKind.DUPLICATE):
             return NotificationUrgencyTier.SUPPRESSED
 
-        if assessment.score < self.settings.min_score:
+        # Unified product rule:
+        # DIGEST determines eligibility for the periodic editorial digest.
+        # Score ranks eligible items by editorial priority; numeric min_score
+        # does NOT silently discard a verified, valid DIGEST decision.
+        if disp == EditorialDisposition.DIGEST or disp == "DIGEST":
+            pass  # Explicitly eligible
+        elif assessment.score < self.settings.min_score:
             return NotificationUrgencyTier.SUPPRESSED
 
         # Factual-safety & verification gate: unverified rumors or sensitive claims never trigger immediate breaking alerts
@@ -657,6 +685,10 @@ class HybridNotificationPlanner:
             tier = self.classify_urgency_tier(item)
             if tier == NotificationUrgencyTier.SUPPRESSED:
                 plan.suppressed.append(item)
+                continue
+
+            if tier == NotificationUrgencyTier.SENSITIVE_REVIEW:
+                plan.held_for_sensitive_review.append(item)
                 continue
 
             if tier == NotificationUrgencyTier.HOLD_FOR_VERIFICATION:

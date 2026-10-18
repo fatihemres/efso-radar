@@ -18,8 +18,13 @@ class Settings(BaseModel):
     gemini_api_key: str = Field(default="")
     gemini_model: str = Field(default="gemini-3.5-flash-lite")
     telegram_bot_token: str = Field(default="")
-
-    telegram_chat_id: str = Field(default="")
+    telegram_chat_id: str = Field(default="")  # ADMIN / Technical Owner Chat ID
+    telegram_primary_editor_chat_id: str = Field(default="")  # PRIMARY_EDITOR Chat ID (Product Owner's girlfriend)
+    telegram_allowed_chat_ids: list[str] = Field(default_factory=list)
+    telegram_delivery_enabled: bool = Field(default=False)
+    telegram_max_retries: int = Field(default=3, ge=1, le=10)
+    telegram_retry_backoff_base: float = Field(default=0.5, ge=0.0, le=10.0)
+    instagram_publishing_enabled: bool = Field(default=False)  # Automated Instagram posting is strictly disabled
 
     # Editorial thresholds
     min_score: int = Field(default=82, ge=0, le=100)
@@ -107,6 +112,102 @@ class Settings(BaseModel):
         # Crosses midnight (e.g. 21:00 to 05:30)
         return curr_t >= start_t or curr_t <= end_t
 
+    def is_chat_id_allowed(self, chat_id: str | int) -> bool:
+        """Check if a given Telegram chat ID is explicitly allowlisted for editorial updates.
+
+        Strictly rejects group and channel IDs starting with '-'.
+        """
+        target = str(chat_id).strip()
+        if not target or target.startswith("-"):
+            return False
+        allowed = {str(cid).strip() for cid in self.telegram_allowed_chat_ids if str(cid).strip()}
+        if allowed:
+            return target in allowed
+        if self.telegram_chat_id:
+            return target == str(self.telegram_chat_id).strip()
+        return False
+
+    def get_masked_telegram_token(self) -> str:
+        """Return safely masked Telegram token for logging/auditing without leaking secrets."""
+        if not self.telegram_bot_token:
+            return "<NOT_SET>"
+        tok = self.telegram_bot_token.strip()
+        if len(tok) < 10:
+            return "***REDACTED***"
+        return f"{tok[:6]}...{tok[-4:]}"
+
+    def get_masked_chat_id(self, chat_id: Optional[str | int] = None) -> str:
+        """Return safely masked chat ID for logging/auditing without leaking private IDs."""
+        cid = str(chat_id or self.telegram_chat_id).strip()
+        if not cid:
+            return "<NOT_SET>"
+        if len(cid) <= 4:
+            return "***"
+        return f"{cid[:2]}...{cid[-2:]}"
+
+    def get_masked_admin_chat_id(self) -> str:
+        """Return safely masked ADMIN chat ID."""
+        return self.get_masked_chat_id(self.telegram_chat_id)
+
+    def get_masked_primary_editor_chat_id(self) -> str:
+        """Return safely masked PRIMARY_EDITOR chat ID."""
+        return self.get_masked_chat_id(self.telegram_primary_editor_chat_id)
+
+    def get_recipient_role(self, chat_id: str | int) -> Optional[str]:
+        """Return the authorized role ('PRIMARY_EDITOR' or 'ADMIN') for a given chat ID."""
+        target = str(chat_id).strip()
+        if not target or not self.is_chat_id_allowed(target):
+            return None
+        if self.telegram_primary_editor_chat_id and target == str(self.telegram_primary_editor_chat_id).strip():
+            return "PRIMARY_EDITOR"
+        if self.telegram_chat_id and target == str(self.telegram_chat_id).strip():
+            return "ADMIN"
+        return "AUTHORIZED_RECIPIENT"
+
+    def get_authorized_recipients(self) -> list[dict[str, str]]:
+        """Return all validated, allowlisted private recipients with their roles.
+
+        Both PRIMARY_EDITOR (Product Owner's girlfriend) and ADMIN (Product Owner)
+        receive the complete editorial experience across all categories:
+        - EDITORIAL_DIGEST
+        - VERIFIED_BREAKING
+        - SENSITIVE_EDITORIAL_REVIEW
+        - HOLD_FOR_VERIFICATION
+        """
+        recipients: list[dict[str, str]] = []
+
+        # 1. PRIMARY_EDITOR (Product Owner's girlfriend — primary intended editorial user)
+        editor_id = str(self.telegram_primary_editor_chat_id).strip() if self.telegram_primary_editor_chat_id else ""
+        if editor_id and self.is_chat_id_allowed(editor_id):
+            recipients.append({
+                "chat_id": editor_id,
+                "role": "PRIMARY_EDITOR",
+                "label": "Baş Editör / Primary Editor",
+                "masked_chat_id": self.get_masked_chat_id(editor_id),
+            })
+
+        # 2. ADMIN (Product Owner — technical owner and administrator)
+        admin_id = str(self.telegram_chat_id).strip() if self.telegram_chat_id else ""
+        if admin_id and self.is_chat_id_allowed(admin_id):
+            # Avoid duplicate if same chat ID was configured for both
+            if not any(r["chat_id"] == admin_id for r in recipients):
+                recipients.append({
+                    "chat_id": admin_id,
+                    "role": "ADMIN",
+                    "label": "Yönetici / Admin",
+                    "masked_chat_id": self.get_masked_chat_id(admin_id),
+                })
+
+        return recipients
+
+    def get_recipients_for_category(self, category: Optional[Any] = None) -> list[dict[str, str]]:
+        """Return authorized recipient records permitted to receive this notification category.
+
+        Per Product Owner directive, both PRIMARY_EDITOR and ADMIN receive the complete
+        editorial notification experience without restriction.
+        """
+        return self.get_authorized_recipients()
+
     @classmethod
     def from_env(cls) -> Settings:
         """Load settings from environment variables."""
@@ -122,11 +223,28 @@ class Settings(BaseModel):
                     if k not in os.environ:
                         os.environ[k] = v
 
+        raw_allowed = os.getenv("TELEGRAM_ALLOWED_CHAT_IDS", "")
+        allowed_list = [cid.strip() for cid in raw_allowed.split(",") if cid.strip()]
+
+        primary_editor_id = (
+            os.getenv("TELEGRAM_PRIMARY_EDITOR_CHAT_ID", "")
+            or os.getenv("TELEGRAM_SECONDARY_CHAT_ID", "")
+        ).strip()
+
+        if primary_editor_id and not primary_editor_id.startswith("-") and primary_editor_id not in allowed_list:
+            allowed_list.append(primary_editor_id)
+
         return cls(
             gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
+            telegram_primary_editor_chat_id=primary_editor_id,
+            telegram_allowed_chat_ids=allowed_list,
+            telegram_delivery_enabled=os.getenv("TELEGRAM_DELIVERY_ENABLED", "false").lower() in ("true", "1", "yes"),
+            telegram_max_retries=int(os.getenv("TELEGRAM_MAX_RETRIES", "3")),
+            telegram_retry_backoff_base=float(os.getenv("TELEGRAM_RETRY_BACKOFF_BASE", "0.5")),
+            instagram_publishing_enabled=os.getenv("INSTAGRAM_PUBLISHING_ENABLED", "false").lower() in ("true", "1", "yes"),
             min_score=int(os.getenv("MIN_SCORE", "82")),
             max_per_run=int(os.getenv("MAX_PER_RUN", "3")),
             max_age_hours=int(os.getenv("MAX_AGE_HOURS", "16")),
