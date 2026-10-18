@@ -203,6 +203,10 @@ class TestPhase4BDigestPreview(unittest.TestCase):
         self.assertNotIn("Çağatay Ulusoy köklerine döndü", rendered)
         self.assertIn("Instagram'da otomatik paylaşım yapılmaz.", rendered)
 
+    @unittest.skipUnless(
+        (REPO_ROOT / "data" / "Efso_Radar_Kalibrasyon_Doldurulmus.csv").exists(),
+        "Requires authentic calibration CSV and genuine project data in data/",
+    )
     def test_build_editorial_digest_preview_with_genuine_project_data(self) -> None:
         """Integration test: build_editorial_digest_preview correctly loads genuine saved records."""
         preview = build_editorial_digest_preview(limit=5, preview_timestamp=self.now)
@@ -301,6 +305,10 @@ class TestPhase4BDigestPreview(unittest.TestCase):
         self.assertEqual(len(dropped), 1)
         self.assertEqual(dropped[0][0].headline_tr, self.assess_cagatay_low.headline_tr)
 
+    @unittest.skipUnless(
+        (REPO_ROOT / "data" / "experiment_budget_ledger.json").exists(),
+        "Requires authentic experiment budget ledger in data/",
+    )
     def test_budget_ledger_reporting_matches_ledger_file(self) -> None:
         """Budget reporting in preview dynamically reads actual ledger evidence."""
         preview = build_editorial_digest_preview(limit=5)
@@ -315,16 +323,97 @@ class TestPhase4BDigestPreview(unittest.TestCase):
 
     def test_url_checks_separate_structural_and_remote(self) -> None:
         """URL validation reports separate structural verification from remote network verification."""
-        preview = build_editorial_digest_preview(limit=5)
+        if (REPO_ROOT / "data" / "Efso_Radar_Kalibrasyon_Doldurulmus.csv").exists():
+            preview = build_editorial_digest_preview(limit=5)
+            min_checks = 5
+        else:
+            syn_decisions = [
+                DiagnosticArticleDecision(
+                    article_id=self.art_eda.id,
+                    score=85,
+                    disposition="DIGEST",
+                    kind="NEW",
+                    urgency="NORMAL",
+                    rationale_tr="Eda Ece açıklaması",
+                    headline_tr=self.art_eda.title,
+                    verification_status="FIRST_PARTY_STATEMENT",
+                ),
+                DiagnosticArticleDecision(
+                    article_id=self.art_sila.id,
+                    score=82,
+                    disposition="DIGEST",
+                    kind="NEW",
+                    urgency="NORMAL",
+                    rationale_tr="Sıla paylaşımı",
+                    headline_tr=self.art_sila.title,
+                    verification_status="FIRST_PARTY_STATEMENT",
+                ),
+            ]
+            preview = build_editorial_digest_preview(
+                limit=2,
+                decisions=syn_decisions,
+                articles=[self.art_eda, self.art_sila],
+            )
+            min_checks = 2
+
         url_checks = preview.get("url_checks", [])
 
-        self.assertGreaterEqual(len(url_checks), 5)
+        self.assertGreaterEqual(len(url_checks), min_checks)
         for check in url_checks:
             # Structural validation passes 100%
             self.assertTrue(check["structural_valid"])
             self.assertTrue(check["url"].startswith("http://") or check["url"].startswith("https://"))
             # Remote check is strictly False (offline isolation)
             self.assertFalse(check["remote_checked"])
+
+    def test_build_editorial_digest_preview_hermetic(self) -> None:
+        """Hermetic portable test: build_editorial_digest_preview with synthetic decisions."""
+        syn_decisions = [
+            DiagnosticArticleDecision(
+                article_id=self.art_cagatay_1.id,
+                score=75,
+                disposition="DIGEST",
+                kind="NEW",
+                urgency="NORMAL",
+                rationale_tr="Çağatay köy ziyareti 1",
+                headline_tr=self.art_cagatay_1.title,
+                verification_status="REPUTABLE_REPORTING",
+            ),
+            DiagnosticArticleDecision(
+                article_id=self.art_cagatay_2.id,
+                score=78,
+                disposition="DIGEST",
+                kind="NEW",
+                urgency="NORMAL",
+                rationale_tr="Çağatay köy ziyareti 2",
+                headline_tr=self.art_cagatay_2.title,
+                verification_status="REPUTABLE_REPORTING",
+            ),
+            DiagnosticArticleDecision(
+                article_id=self.art_eda.id,
+                score=85,
+                disposition="DIGEST",
+                kind="NEW",
+                urgency="NORMAL",
+                rationale_tr="Eda Ece set kuralları",
+                headline_tr=self.art_eda.title,
+                verification_status="FIRST_PARTY_STATEMENT",
+            ),
+        ]
+        articles = [self.art_cagatay_1, self.art_cagatay_2, self.art_eda]
+        preview = build_editorial_digest_preview(
+            limit=2,
+            preview_timestamp=self.now,
+            decisions=syn_decisions,
+            articles=articles,
+        )
+
+        self.assertEqual(len(preview["selected_top"]), 2)
+        self.assertEqual(preview["selected_top"][0].score, 85)
+        self.assertEqual(preview["selected_top"][1].score, 78)
+        self.assertEqual(len(preview["duplicate_drops"]), 1)
+        self.assertIn("EDİTORYAL BÜLTEN", preview["telegram_html"])
+        self.assertIn("2 haber önerisi", preview["telegram_html"])
 
 
 if __name__ == "__main__":
