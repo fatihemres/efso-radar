@@ -107,11 +107,12 @@ class NotificationUrgencyTier(str, Enum):
 
 
 class TelegramNotificationCategory(str, Enum):
-    """Logically separated message categories within the single private owner chat."""
+    """Logically separated message categories within the private chat notifications."""
     EDITORIAL_DIGEST = "EDITORIAL_DIGEST"
     VERIFIED_BREAKING = "VERIFIED_BREAKING"
     SENSITIVE_EDITORIAL_REVIEW = "SENSITIVE_EDITORIAL_REVIEW"
     HOLD_FOR_VERIFICATION = "HOLD_FOR_VERIFICATION"
+    OPERATIONAL_HEALTH_REPORT = "OPERATIONAL_HEALTH_REPORT"
 
 
 
