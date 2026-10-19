@@ -50,14 +50,78 @@ from efso_radar.repositories.schema import (
 
 logger = logging.getLogger("efso-radar.repository.sqlite")
 
+# Module-private token for explicit synthetic test fixture ownership
+_FIXTURE_OWNERSHIP_TOKEN = object()
+
 
 class SqliteStateRepository(StateRepository):
     """SQLite-based persistent state storage."""
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, *, _internal_fixture_token: Optional[object] = None):
         self.db_path = Path(db_path)
+        self._is_owned_synthetic_fixture = (_internal_fixture_token is _FIXTURE_OWNERSHIP_TOKEN)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
+
+    @classmethod
+    def create_owned_synthetic_fixture(cls, db_path: Path) -> SqliteStateRepository:
+        """Create an explicitly owned synthetic SQLite test fixture in isolated temporary storage.
+
+        Public reconciliation fails closed by default on all standard repository instances.
+        Synthetic reconciliation testing is restricted exclusively to instances created via this factory.
+
+        Guarantees:
+        - Rejects any database path outside designated OS temporary storage.
+        - Rejects operational paths, repository data directories, and paths adjacent to operational ledgers.
+        - Rejects symlinks.
+        - Rejects pre-existing non-empty database files (cannot adopt arbitrary existing databases).
+        - Stamps the repository with the module-private ownership token.
+        """
+        path = Path(db_path)
+        if path.is_symlink():
+            raise DeliveryStateError(f"Synthetic test fixture cannot be a symlink: '{path}'.")
+
+        resolved = path.resolve()
+
+        # Reject operational data directories
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        op_data_dir = (repo_root / "data").resolve()
+        if resolved == op_data_dir or resolved.is_relative_to(op_data_dir):
+            raise DeliveryStateError(
+                f"Synthetic test fixture cannot reside within operational repository data directory: '{resolved}'."
+            )
+
+        # Reject directories containing operational ledgers
+        if (resolved.parent / "telegram_digest_delivery_ledger.json").exists() or (resolved.parent / "experiment_budget_ledger.json").exists():
+            raise DeliveryStateError(
+                f"Synthetic test fixture cannot reside adjacent to operational ledgers: '{resolved}'."
+            )
+
+        if resolved.name == "radar.db" and resolved.parent.name == "data":
+            raise DeliveryStateError(
+                f"Synthetic test fixture cannot target operational database: '{resolved}'."
+            )
+
+        # Enforce that fixture path resides strictly within system temporary directory
+        try:
+            system_temp = Path(tempfile.gettempdir()).resolve()
+            if not resolved.is_relative_to(system_temp):
+                raise DeliveryStateError(
+                    f"Synthetic test fixture path '{resolved}' must reside strictly within temporary directory '{system_temp}'."
+                )
+        except Exception as exc:
+            if isinstance(exc, DeliveryStateError):
+                raise
+            raise DeliveryStateError(f"Invalid synthetic fixture path '{path}': {exc}") from exc
+
+        # Never allow an arbitrary pre-existing SQLite database to be adopted as a synthetic fixture
+        if resolved.exists() and resolved.stat().st_size > 0:
+            raise DeliveryStateError(
+                f"Cannot adopt pre-existing non-empty database '{resolved}' (size {resolved.stat().st_size} bytes) "
+                "as synthetic fixture. Synthetic fixtures must be created fresh."
+            )
+
+        return cls(resolved, _internal_fixture_token=_FIXTURE_OWNERSHIP_TOKEN)
 
     @contextmanager
     def _connection(self) -> Generator[sqlite3.Connection, None, None]:
@@ -1219,12 +1283,15 @@ class SqliteStateRepository(StateRepository):
         """Verify that the repository database path is an isolated offline test fixture.
 
         Rejects:
+        - Any repository instance not explicitly stamped with internal fixture ownership.
         - Any live operational database path (e.g. data/radar.db, repo data directories).
         - Any database located adjacent to operational delivery or budget ledgers.
         - Any path outside designated system temporary storage.
         - Symlinks.
         """
         try:
+            if not getattr(self, "_is_owned_synthetic_fixture", False):
+                return False
             if self.db_path.is_symlink():
                 return False
             resolved = self.db_path.resolve()
@@ -1259,8 +1326,9 @@ class SqliteStateRepository(StateRepository):
           NOT independently verified authoritative evidence.
         - Unattended or automated flows must NEVER invoke this method.
         - In live operation (live_mode=True), reconciliation is permanently disabled in this milestone.
+        - Public reconciliation fails closed by default on all operational and standard repository instances.
         - Offline reconciliation testing is isolated strictly to explicitly owned synthetic SQLite fixtures
-          in designated temporary storage. Arbitrary operational database paths cannot be reconciled.
+          created via SqliteStateRepository.create_owned_synthetic_fixture() in designated temporary storage.
         - Operator authorization (operator_authorized=True or proof['operator_authorized']=True) is strictly
           required. Empty or fabricated metadata strings alone do not authorize delivery-state transitions.
         """
@@ -1270,10 +1338,11 @@ class SqliteStateRepository(StateRepository):
                 "Independent proof verification is not implemented."
             )
 
-        if not self._is_safe_synthetic_fixture():
+        if not getattr(self, "_is_owned_synthetic_fixture", False) or not self._is_safe_synthetic_fixture():
             raise DeliveryStateError(
-                f"Reconciliation of DELIVERY_UNCERTAIN records is disabled on operational database path '{self.db_path}'. "
-                "Offline reconciliation testing is restricted to explicitly owned synthetic SQLite test fixtures "
+                f"Reconciliation of DELIVERY_UNCERTAIN records is disabled on unowned or operational database path '{self.db_path}'. "
+                "Public reconciliation fails closed by default. Offline reconciliation testing is restricted to explicitly "
+                "created, internally owned synthetic SQLite test fixtures (via SqliteStateRepository.create_owned_synthetic_fixture) "
                 "in isolated temporary storage."
             )
 

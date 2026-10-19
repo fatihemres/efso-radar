@@ -77,7 +77,7 @@ class TestPhase5B3BCloudSafetyContracts(unittest.TestCase):
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.tmp_path = Path(self.tmp_dir.name)
         self.db_path = self.tmp_path / "test_safety.db"
-        self.repo = SqliteStateRepository(self.db_path)
+        self.repo = SqliteStateRepository.create_owned_synthetic_fixture(self.db_path)
 
     def tearDown(self):
         import gc
@@ -489,7 +489,26 @@ class TestPhase5B3BCloudSafetyContracts(unittest.TestCase):
         op_db_repo = SqliteStateRepository(Path("data/radar.db"))
         with self.assertRaises(DeliveryStateError) as op_ctx:
             op_db_repo.reconcile_uncertain_delivery("del_unc_001", valid_proof, operator_authorized=True)
-        self.assertIn("operational database path", str(op_ctx.exception))
+        self.assertIn("unowned or operational", str(op_ctx.exception))
+
+        # 14. Unregistered temporary database fails public reconciliation closed by default
+        unreg_temp_path = self.tmp_path / "unregistered_temp.db"
+        unreg_repo = SqliteStateRepository(unreg_temp_path)
+        with self.assertRaises(DeliveryStateError) as unreg_ctx:
+            unreg_repo.reconcile_uncertain_delivery("del_unc_001", valid_proof, operator_authorized=True)
+        self.assertIn("unowned or operational", str(unreg_ctx.exception))
+
+        # 15. Attempting to adopt pre-existing non-empty database as synthetic fixture is rejected
+        pre_existing_path = self.tmp_path / "pre_existing_adopted.db"
+        pre_existing_path.write_bytes(b"SQLite format 3\x00arbitrary pre-existing database content")
+        with self.assertRaises(DeliveryStateError) as adopt_ctx:
+            SqliteStateRepository.create_owned_synthetic_fixture(pre_existing_path)
+        self.assertIn("Cannot adopt pre-existing non-empty database", str(adopt_ctx.exception))
+
+        # 16. Operational paths cannot be adopted as synthetic fixtures
+        with self.assertRaises(DeliveryStateError) as op_adopt_ctx:
+            SqliteStateRepository.create_owned_synthetic_fixture(Path("data/radar.db"))
+        self.assertIn("operational", str(op_adopt_ctx.exception).lower())
 
     # --- 4. At-Most-Once Daily Admin Reports & Window Validation ---
     def test_14_admin_report_at_most_once_per_date(self):
@@ -1286,19 +1305,12 @@ class TestPhase5B3BCloudSafetyContracts(unittest.TestCase):
             "verified_by": "lead_operator",
             "proof_reference": "ref_123",
         }
-        # Turso reconciliation is unconditionally disabled in Phase 5B.3B regardless of flags
-        with self.assertRaises(DeliveryStateError) as t_ctx:
-            turso_repo.reconcile_uncertain_delivery("del_unc_t", proof, operator_authorized=True, live_mode=False)
-        self.assertIn("NOT IMPLEMENTED", str(t_ctx.exception))
-        self.assertIn("unconditionally disabled", str(t_ctx.exception))
-
-        # Unauthorized call raises DeliveryStateError
-        with self.assertRaises(DeliveryStateError):
-            turso_repo.reconcile_uncertain_delivery("del_unc_t", proof, operator_authorized=False)
-
-        # Live mode raises DeliveryStateError
-        with self.assertRaises(DeliveryStateError):
-            turso_repo.reconcile_uncertain_delivery("del_unc_t", proof, operator_authorized=True, live_mode=True)
+        # Turso reconciliation is unconditionally disabled in Phase 5B.3B across all 4 caller flag combinations
+        for lm, oa in [(False, False), (False, True), (True, False), (True, True)]:
+            with self.assertRaises(DeliveryStateError) as t_ctx:
+                turso_repo.reconcile_uncertain_delivery("del_unc_t", proof, operator_authorized=oa, live_mode=lm)
+            self.assertIn("NOT IMPLEMENTED", str(t_ctx.exception))
+            self.assertIn("unconditionally disabled", str(t_ctx.exception))
 
         # Assert no UPDATE SQL statement was ever executed on Turso client
         for call_args in mock_client.execute.call_args_list:
