@@ -111,11 +111,14 @@ To prevent duplicate deliveries:
 
 ## 5. Non-Destructive Staging & Transactional Cutover Mechanics
 
-### 5.1 Safe Staging Path Invariants
+### 5.1 Safe Staging Path Invariants & Partial-Extraction Cleanup
 - Default staging uses dedicated system temporary directories (`tempfile.mkdtemp(prefix="efso_restore_staging_")`).
 - Arbitrary caller paths are checked: roots (`/`, `C:\`), user home directories, repository roots, and operational `data/` directories are rejected with `UnsafeStagingPathError`.
 - Pre-existing non-empty caller directories are strictly refused to prevent deleting user data.
+- **Pre-existing File Protection:** `safe_extract_tar()` validates `dest_path.exists()` prior to file creation, strictly refusing to overwrite pre-existing files or duplicate archive members.
 - Envelope decryption occurs **prior** to filesystem staging; wrong keys or corrupt archives never modify any filesystem directory.
+- **Guaranteed Partial-Extraction Cleanup:** Every file created during extraction is tracked in real time. If extraction aborts midway (disallowed member, decompression bomb, or truncated stream), all partially written and previously extracted files are unlinked immediately before the exception propagates.
+- **Precise Caller-Staging Cleanup:** When caller-owned staging directories are used, cleanup only removes files created by the operation (`RestoreVerificationResult.created_files`), preserving unrelated files and leaving caller directories intact. Cleanup errors are logged safely with file basenames only, preventing sensitive data exposure.
 
 ### 5.2 Transactional Crash-Recovery Cutover & Simulation Isolation
 Sequential file copying is not an atomic operation. Disaster recovery mechanics implement:

@@ -922,7 +922,108 @@ class TestPhase5B2EncryptedBackup(unittest.TestCase):
             self.assertTrue(cm_res.staging_dir.exists())
         self.assertFalse(cm_res.staging_dir.exists())
 
+    def test_18_partial_extraction_cleanup_and_pre_existing_protection(self):
+        """Guarantees cleanup of every file created during partial extraction (disallowed or truncated) and protects pre-existing files."""
+        # --- 1. Valid radar.db member followed by disallowed member ---
+        tar_buf = io.BytesIO()
+        with tarfile.open(fileobj=tar_buf, mode="w:gz") as tar:
+            # Member 1: Valid radar.db
+            db_b = self.db_path.read_bytes()
+            ti_db = tarfile.TarInfo("radar.db")
+            ti_db.size = len(db_b)
+            tar.addfile(ti_db, io.BytesIO(db_b))
+
+            # Member 2: Disallowed archive member
+            disallowed_content = b"#!/bin/bash\necho hack\n"
+            ti_disallowed = tarfile.TarInfo("unauthorized_script.sh")
+            ti_disallowed.size = len(disallowed_content)
+            tar.addfile(ti_disallowed, io.BytesIO(disallowed_content))
+
+        raw_tar_disallowed = tar_buf.getvalue()
+        manifest_disallowed = {
+            "key_id": "efso-2026-v1",
+            "created_at_utc": "2026-10-19T14:00:00Z",
+            "schema_version": 5,
+            "source_engine": "sqlite",
+            "plaintext_sha256": hashlib.sha256(raw_tar_disallowed).hexdigest(),
+        }
+        envelope_disallowed = encrypt_envelope(raw_tar_disallowed, self.key, manifest=manifest_disallowed)
+
+        # Safe, empty caller-owned staging directory
+        caller_staging_1 = self.tmp_path / "caller_staging_disallowed_test"
+        caller_staging_1.mkdir(parents=True, exist_ok=True)
+
+        # Unrelated file in adjacent directory to confirm unrelated files are never modified
+        unrelated_canary = self.tmp_path / "unrelated_canary.txt"
+        unrelated_canary.write_text("canary_safe_data", encoding="utf-8")
+
+        with self.assertRaises(RestoreVerificationError):
+            verify_restore_archive(envelope_disallowed, self.key, staging_dir=caller_staging_1)
+
+        # Assert: verification failed, no partially extracted plaintext files remain, caller directory intact, unrelated file untouched
+        self.assertTrue(caller_staging_1.exists())
+        self.assertFalse((caller_staging_1 / "radar.db").exists())
+        self.assertFalse((caller_staging_1 / "unauthorized_script.sh").exists())
+        self.assertEqual(list(caller_staging_1.iterdir()), [])
+        self.assertTrue(unrelated_canary.exists())
+        self.assertEqual(unrelated_canary.read_text(encoding="utf-8"), "canary_safe_data")
+
+        # --- 2. Truncated extraction after a partially written member ---
+        buf_trunc = io.BytesIO()
+        t_trunc = tarfile.open(fileobj=buf_trunc, mode="w")
+        ti_db2 = tarfile.TarInfo("radar.db")
+        ti_db2.size = len(db_b)
+        t_trunc.addfile(ti_db2, io.BytesIO(db_b))
+
+        # Member 2 declares 50,000 bytes, but stream is truncated after 1,024 bytes
+        ti_del_trunc = tarfile.TarInfo("telegram_digest_delivery_ledger.json")
+        ti_del_trunc.size = 50000
+        raw_trunc_tar = buf_trunc.getvalue() + ti_del_trunc.tobuf() + (b"partial_delivery_data_" * 40)
+
+        manifest_trunc = {
+            "key_id": "efso-2026-v1",
+            "created_at_utc": "2026-10-19T14:15:00Z",
+            "schema_version": 5,
+            "source_engine": "sqlite",
+            "plaintext_sha256": hashlib.sha256(raw_trunc_tar).hexdigest(),
+        }
+        envelope_trunc = encrypt_envelope(raw_trunc_tar, self.key, manifest=manifest_trunc)
+
+        caller_staging_2 = self.tmp_path / "caller_staging_trunc_test"
+        caller_staging_2.mkdir(parents=True, exist_ok=True)
+
+        with self.assertRaises(RestoreVerificationError):
+            verify_restore_archive(envelope_trunc, self.key, staging_dir=caller_staging_2)
+
+        # Assert: partial radar.db and partial delivery ledger were removed, caller directory intact
+        self.assertTrue(caller_staging_2.exists())
+        self.assertFalse((caller_staging_2 / "radar.db").exists())
+        self.assertFalse((caller_staging_2 / "telegram_digest_delivery_ledger.json").exists())
+        self.assertEqual(list(caller_staging_2.iterdir()), [])
+
+        # --- 3. Protection against overwriting pre-existing files ---
+        caller_staging_3 = self.tmp_path / "caller_staging_preexisting"
+        caller_staging_3.mkdir(parents=True, exist_ok=True)
+        preexisting_db = caller_staging_3 / "radar.db"
+        preexisting_db.write_text("ORIGINAL_USER_DATA", encoding="utf-8")
+
+        # verify_restore_archive fails closed via validate_staging_path_safety on non-empty directory
+        from efso_radar.backup.restore import UnsafeStagingPathError
+        with self.assertRaises(UnsafeStagingPathError):
+            verify_restore_archive(envelope_disallowed, self.key, staging_dir=caller_staging_3)
+        self.assertTrue(preexisting_db.exists())
+        self.assertEqual(preexisting_db.read_text(encoding="utf-8"), "ORIGINAL_USER_DATA")
+
+        # safe_extract_tar standalone also refuses to overwrite pre-existing file
+        valid_single_tar = io.BytesIO()
+        with tarfile.open(fileobj=valid_single_tar, mode="w") as t_single:
+            t_single.addfile(ti_db, io.BytesIO(db_b))
+        with self.assertRaises(RestoreVerificationError):
+            safe_extract_tar(valid_single_tar.getvalue(), caller_staging_3)
+        self.assertEqual(preexisting_db.read_text(encoding="utf-8"), "ORIGINAL_USER_DATA")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

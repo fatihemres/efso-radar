@@ -90,6 +90,7 @@ class RestoreVerificationResult:
     verification_report_markdown: str
     errors: list[str]
     is_operation_owned: bool = False
+    created_files: tuple[Path, ...] = ()
 
     def cleanup(self) -> None:
         """Safely clean up decrypted staging data.
@@ -99,15 +100,23 @@ class RestoreVerificationResult:
         only the extracted files (radar.db, ledgers) without deleting the caller directory.
         """
         if self.is_operation_owned:
-            if self.staging_dir and self.staging_dir.exists():
-                shutil.rmtree(self.staging_dir, ignore_errors=True)
+            try:
+                if self.staging_dir and self.staging_dir.exists():
+                    shutil.rmtree(self.staging_dir)
+            except OSError as exc:
+                logger.warning("Failed to clean up temporary staging directory: %s", exc)
         else:
-            for p in (self.db_path, self.delivery_ledger_path, self.budget_ledger_path):
+            files_to_clean = self.created_files or (
+                self.db_path,
+                self.delivery_ledger_path,
+                self.budget_ledger_path,
+            )
+            for p in files_to_clean:
                 try:
                     if p and p.exists() and p.is_file():
                         p.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                except OSError as exc:
+                    logger.warning("Failed to clean up staging file %s: %s", p.name if p else "unknown", exc)
 
     def __enter__(self) -> "RestoreVerificationResult":
         return self
@@ -370,12 +379,17 @@ def validate_staging_path_safety(staging_dir: Path) -> Path:
     return resolved
 
 
-def safe_extract_tar(tar_bytes: bytes, target_dir: Path) -> dict[str, Path]:
-    """Extract tar archive with strict path traversal and decompression bomb defenses.
+def safe_extract_tar(
+    tar_bytes: bytes,
+    target_dir: Path,
+    created_files_tracker: list[Path] | None = None,
+) -> dict[str, Path]:
+    """Extract tar archive with strict path traversal, pre-existing file, and decompression bomb defenses.
 
     Args:
         tar_bytes: Uncompressed or gzipped tarball bytes.
         target_dir: Target isolated staging directory.
+        created_files_tracker: Optional list to track files created on disk for caller cleanup.
 
     Returns:
         Mapping of canonical member name to extracted file Path.
@@ -383,58 +397,92 @@ def safe_extract_tar(tar_bytes: bytes, target_dir: Path) -> dict[str, Path]:
     Raises:
         PathTraversalSecurityError: If any archive member path contains directory traversal.
         DecompressionBombSecurityError: If total extracted size exceeds safety limit.
-        RestoreVerificationError: If unknown or disallowed files are in archive.
+        RestoreVerificationError: If unknown, disallowed, duplicate, or truncated files are in archive.
     """
     target_dir.mkdir(parents=True, exist_ok=True)
     target_root = target_dir.resolve()
 
     extracted_files: dict[str, Path] = {}
+    locally_created: list[Path] = []
     cumulative_bytes = 0
 
-    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:*") as tar:
-        for member in tar.getmembers():
-            # Security Check 1: Whitelisted member names only
-            norm_name = os.path.normpath(member.name).replace("\\", "/")
-            if norm_name not in ALLOWED_ARCHIVE_MEMBERS:
-                raise RestoreVerificationError(f"Disallowed file found in backup archive: {member.name}")
+    try:
+        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:*") as tar:
+            for member in tar:
+                # Security Check 1: Whitelisted member names only
+                norm_name = os.path.normpath(member.name).replace("\\", "/")
+                if norm_name not in ALLOWED_ARCHIVE_MEMBERS:
+                    raise RestoreVerificationError(f"Disallowed file found in backup archive: {member.name}")
 
-            # Security Check 2: Reject links, pipes, devices
-            if not member.isreg():
-                raise RestoreVerificationError(f"Non-regular file in backup archive: {member.name}")
+                # Security Check 2: Reject links, pipes, devices
+                if not member.isreg():
+                    raise RestoreVerificationError(f"Non-regular file in backup archive: {member.name}")
 
-            # Security Check 3: Path Traversal defense (no .., no absolute paths)
-            dest_path = (target_dir / norm_name).resolve()
-            if not str(dest_path).startswith(str(target_root)):
-                raise PathTraversalSecurityError(f"Path traversal detected in archive member: {member.name}")
+                # Security Check 3: Path Traversal defense (no .., no absolute paths)
+                dest_path = (target_dir / norm_name).resolve()
+                if not dest_path.is_relative_to(target_root):
+                    raise PathTraversalSecurityError(f"Path traversal detected in archive member: {member.name}")
 
-            # Security Check 4: Decompression bomb defense on declared size
-            cumulative_bytes += member.size
-            if cumulative_bytes > MAX_EXTRACTED_BYTES:
-                raise DecompressionBombSecurityError(
-                    f"Archive exceeds maximum allowed size ({MAX_EXTRACTED_BYTES} bytes)"
-                )
+                # Security Check 4: Refuse to overwrite pre-existing files or duplicate members
+                if norm_name in extracted_files or dest_path.exists():
+                    raise RestoreVerificationError(
+                        f"Refusing to overwrite pre-existing file or duplicate archive member: {norm_name}"
+                    )
 
-            # Safe extraction with streaming limit check
-            file_obj = tar.extractfile(member)
-            if file_obj is None:
-                raise RestoreVerificationError(f"Failed to extract archive member: {member.name}")
+                # Security Check 5: Decompression bomb defense on declared size
+                cumulative_bytes += member.size
+                if cumulative_bytes > MAX_EXTRACTED_BYTES:
+                    raise DecompressionBombSecurityError(
+                        f"Archive exceeds maximum allowed size ({MAX_EXTRACTED_BYTES} bytes)"
+                    )
 
-            with open(dest_path, "wb") as f_out:
-                extracted_member_bytes = 0
-                while True:
-                    chunk = file_obj.read(65536)
-                    if not chunk:
-                        break
-                    extracted_member_bytes += len(chunk)
-                    if extracted_member_bytes > MAX_EXTRACTED_BYTES:
-                        raise DecompressionBombSecurityError(
-                            f"Archive member extracted size exceeds maximum allowed limit ({MAX_EXTRACTED_BYTES} bytes)"
-                        )
-                    f_out.write(chunk)
+                # Safe extraction with streaming limit check
+                file_obj = tar.extractfile(member)
+                if file_obj is None:
+                    raise RestoreVerificationError(f"Failed to extract archive member: {member.name}")
 
-            extracted_files[norm_name] = dest_path
+                # Track created file path before opening to ensure cleanup if write fails
+                locally_created.append(dest_path)
+                if created_files_tracker is not None:
+                    created_files_tracker.append(dest_path)
 
-    return extracted_files
+                with open(dest_path, "wb") as f_out:
+                    extracted_member_bytes = 0
+                    while True:
+                        chunk = file_obj.read(65536)
+                        if not chunk:
+                            break
+                        extracted_member_bytes += len(chunk)
+                        if extracted_member_bytes > MAX_EXTRACTED_BYTES:
+                            raise DecompressionBombSecurityError(
+                                f"Archive member extracted size exceeds maximum allowed limit ({MAX_EXTRACTED_BYTES} bytes)"
+                            )
+                        f_out.write(chunk)
+
+                if extracted_member_bytes != member.size:
+                    raise RestoreVerificationError(
+                        f"Truncated archive member '{member.name}': expected {member.size} bytes, got {extracted_member_bytes}"
+                    )
+
+                extracted_files[norm_name] = dest_path
+
+        return extracted_files
+    except (PathTraversalSecurityError, DecompressionBombSecurityError, RestoreVerificationError):
+        for f in locally_created:
+            try:
+                if f.exists() and f.is_file():
+                    f.unlink(missing_ok=True)
+            except OSError as cleanup_err:
+                logger.warning("Failed to clean up partially extracted file %s: %s", f.name, cleanup_err)
+        raise
+    except Exception as exc:
+        for f in locally_created:
+            try:
+                if f.exists() and f.is_file():
+                    f.unlink(missing_ok=True)
+            except OSError as cleanup_err:
+                logger.warning("Failed to clean up partially extracted file %s: %s", f.name, cleanup_err)
+        raise RestoreVerificationError(f"Archive extraction failed: {exc}") from exc
 
 
 def verify_staging_database(
@@ -561,6 +609,7 @@ def verify_restore_archive(
 
     target_staging: Path | None = None
     is_operation_owned = False
+    created_files: list[Path] = []
     extracted: dict[str, Path] = {}
 
     try:
@@ -573,8 +622,8 @@ def verify_restore_archive(
             target_staging = Path(tempfile.mkdtemp(prefix="efso_restore_staging_"))
             is_operation_owned = True
 
-        # 5. Safe extraction into staging
-        extracted = safe_extract_tar(plaintext_tar, target_staging)
+        # 5. Safe extraction into staging with explicit created file tracking
+        extracted = safe_extract_tar(plaintext_tar, target_staging, created_files_tracker=created_files)
 
         db_path = extracted.get("radar.db")
         del_path = extracted.get("telegram_digest_delivery_ledger.json")
@@ -657,18 +706,22 @@ def verify_restore_archive(
             verification_report_markdown=report,
             errors=errors,
             is_operation_owned=is_operation_owned,
+            created_files=tuple(created_files),
         )
     except Exception:
         if target_staging and target_staging.exists():
             if is_operation_owned:
-                shutil.rmtree(target_staging, ignore_errors=True)
+                try:
+                    shutil.rmtree(target_staging)
+                except OSError as cleanup_err:
+                    logger.warning("Failed to remove operation-owned staging directory: %s", cleanup_err)
             else:
-                for f_path in extracted.values():
+                for f_path in created_files:
                     try:
                         if f_path.exists() and f_path.is_file():
                             f_path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+                    except OSError as cleanup_err:
+                        logger.warning("Failed to clean up staging file %s: %s", f_path.name, cleanup_err)
         raise
 
 
