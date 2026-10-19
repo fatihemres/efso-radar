@@ -20,6 +20,7 @@ Comprehensive safety verification covering:
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -29,6 +30,7 @@ import tarfile
 import tempfile
 import time
 import unittest
+import unittest.mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -63,6 +65,7 @@ from efso_radar.backup.restore import (
     safe_extract_tar,
     simulate_offline_cutover_in_test_workspace,
     validate_simulation_workspace,
+    validate_staging_path_safety,
     verify_restore_archive,
 )
 from efso_radar.backup.retention import (
@@ -465,7 +468,7 @@ class TestPhase5B2EncryptedBackup(unittest.TestCase):
         self.assertIn("schema version mismatch", str(ctx.exception).lower())
 
     def test_11_staging_directory_safety_and_non_destructive_guarantees(self):
-        """Caller cannot supply root, home, repo, or pre-existing non-empty dirs; user files are never wiped."""
+        """Caller cannot supply root, home, repo, non-temp, or pre-existing non-empty dirs; user files are never wiped."""
         backup_res = create_backup(
             key=self.key,
             db_path=self.db_path,
@@ -492,8 +495,19 @@ class TestPhase5B2EncryptedBackup(unittest.TestCase):
             verify_restore_archive(backup_res.envelope_bytes, b"\x99" * 32, staging_dir=unused_dir)
         self.assertFalse(unused_dir.exists())
 
+        # 3. Path outside system temporary directory is strictly refused
+        with self.assertRaises(UnsafeStagingPathError):
+            validate_staging_path_safety(Path.cwd() / "data" / "fake_staging")
+        with self.assertRaises(UnsafeStagingPathError):
+            validate_staging_path_safety(Path.home() / "fake_user_staging")
+
+        # 4. Symlink staging path is strictly refused
+        with unittest.mock.patch.object(Path, "is_symlink", return_value=True):
+            with self.assertRaises(UnsafeStagingPathError):
+                validate_staging_path_safety(self.tmp_path / "symlink_staging")
+
     def test_12_atomic_cutover_mechanics_crash_journal_and_step_rollback(self):
-        """Production cutover unconditionally fails closed; simulated offline cutover requires authorization, validates workspace, provides step rollback and crash recovery."""
+        """Production cutover unconditionally fails closed; simulated offline cutover requires authorization, validates workspace without name substrings, provides step rollback and crash recovery."""
         backup_res = create_backup(
             key=self.key,
             db_path=self.db_path,
@@ -518,23 +532,54 @@ class TestPhase5B2EncryptedBackup(unittest.TestCase):
         (live_dir / "telegram_digest_delivery_ledger.json").write_text("{}", encoding="utf-8")
         (live_dir / "experiment_budget_ledger.json").write_text("{}", encoding="utf-8")
 
-        # 1. Live cutover without simulated=True fails closed
+        # 1. Public production cutover entry point rejects ALL invocations unconditionally
         with self.assertRaises(ProductionCutoverDisabledError):
             execute_production_cutover(restore_res, live_dir, authorized=True, simulated=False)
-
-        # 2. Production cutover entry point fails closed EVEN WITH simulated=True (simulation bypass closed!)
         with self.assertRaises(ProductionCutoverDisabledError):
             execute_production_cutover(restore_res, live_dir, authorized=True, simulated=True)
+        with self.assertRaises(ProductionCutoverDisabledError):
+            execute_production_cutover(restore_res, live_dir, authorized=False, simulated=True)
+        with self.assertRaises(ProductionCutoverDisabledError):
+            execute_production_cutover(restore_res, live_dir)
 
-        # 3. Dedicated offline simulation function refuses operational / non-test workspaces
+        # 2. Rejection of paths with misleading 'test'/'temp' substrings outside system temp
+        fake_test_repo = Path.cwd() / "test_fake_cutover"
         with self.assertRaises(UnsafeStagingPathError):
-            simulate_offline_cutover_in_test_workspace(restore_res, Path.cwd() / "data", authorized=True)
+            validate_simulation_workspace(fake_test_repo)
 
-        # 4. Simulated cutover without authorized=True fails closed
+        fake_temp_data = Path.cwd() / "data" / "temp_fake_cutover"
+        with self.assertRaises(UnsafeStagingPathError):
+            validate_simulation_workspace(fake_temp_data)
+
+        fake_test_home = Path.home() / "test_arbitrary_user_folder"
+        with self.assertRaises(UnsafeStagingPathError):
+            validate_simulation_workspace(fake_test_home)
+
+        # 3. Rejection of symlinks and symlink escapes
+        with unittest.mock.patch.object(Path, "is_symlink", return_value=True):
+            with self.assertRaises(UnsafeStagingPathError):
+                validate_simulation_workspace(self.tmp_path / "symlink_test")
+
+        # 4. Protection against overwriting non-fixture files
+        non_fixture_dir = self.tmp_path / "non_fixture_dir"
+        non_fixture_dir.mkdir(parents=True, exist_ok=True)
+        secret_file = non_fixture_dir / "passwords.txt"
+        secret_file.write_text("sensitive_data", encoding="utf-8")
+
+        with self.assertRaises(UnsafeStagingPathError):
+            validate_simulation_workspace(non_fixture_dir)
+        self.assertTrue(secret_file.exists())
+        self.assertEqual(secret_file.read_text(encoding="utf-8"), "sensitive_data")
+
+        # 5. Internal workspace ownership: simulate_offline_cutover_in_test_workspace with test_workspace_dir=None
+        internal_success = simulate_offline_cutover_in_test_workspace(restore_res, test_workspace_dir=None, authorized=True)
+        self.assertTrue(internal_success)
+
+        # 6. Simulated cutover without authorized=True fails closed
         with self.assertRaises(CutoverAuthorizationError):
             simulate_offline_cutover_in_test_workspace(restore_res, live_dir, authorized=False)
 
-        # 5. Injected failure at step 2 (delivery ledger) executes verified rollback
+        # 7. Injected failure at step 2 (delivery ledger) executes verified rollback
         with self.assertRaises(RestoreVerificationError):
             simulate_offline_cutover_in_test_workspace(
                 restore_res, live_dir, authorized=True, inject_failure_step=2
@@ -555,13 +600,13 @@ class TestPhase5B2EncryptedBackup(unittest.TestCase):
         journal_data = json.loads(journal_path.read_text(encoding="utf-8"))
         self.assertEqual(journal_data["phase"], "ROLLED_BACK")
 
-        # 6. Successful simulated cutover
+        # 8. Successful simulated cutover with supplied fixtures
         success = simulate_offline_cutover_in_test_workspace(restore_res, live_dir, authorized=True)
         self.assertTrue(success)
         journal_data = json.loads(journal_path.read_text(encoding="utf-8"))
         self.assertEqual(journal_data["phase"], "COMPLETED")
 
-        # 7. Interrupted cutover startup recovery
+        # 9. Interrupted cutover startup recovery
         journal_data["phase"] = "REPLACED_DB"  # simulate mid-cutover crash
         journal_path.write_text(json.dumps(journal_data), encoding="utf-8")
         recovered = detect_and_recover_incomplete_cutover(live_dir)
@@ -773,6 +818,111 @@ class TestPhase5B2EncryptedBackup(unittest.TestCase):
         self.assertIn("87...78", report)
         self.assertNotIn("AIza", report)
 
+    def test_17_decrypted_staging_cleanup_lifecycle_and_failure_resilience(self):
+        """Operation-owned staging is purged on verification failures (corrupt SQLite, bad JSON, wrong schema); caller directories preserved."""
+        # 1. Wrong schema version cleans up operation-owned staging directory
+        backup_res = create_backup(self.key, self.db_path, self.del_ledger_path, self.bud_ledger_path)
+        with self.assertRaises(RestoreVerificationError):
+            verify_restore_archive(backup_res.envelope_bytes, self.key, expected_schema_version=99)
+
+        # 2. Malformed SQLite database cleans up operation-owned staging directory
+        corrupt_db = self.tmp_path / "corrupt_table.db"
+        conn = sqlite3.connect(corrupt_db)
+        conn.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);")
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (5);")
+        conn.execute("CREATE TABLE stories (id TEXT PRIMARY KEY, title TEXT);")
+        conn.execute("CREATE TABLE notifications (id TEXT PRIMARY KEY);")
+        conn.execute("CREATE TABLE candidate_backlog (id TEXT PRIMARY KEY);")
+        conn.execute("CREATE TABLE processed_articles (id TEXT PRIMARY KEY);")
+        conn.commit()
+        conn.close()
+        # Corrupt raw bytes of the DB file
+        corrupt_bytes = bytearray(corrupt_db.read_bytes())
+        corrupt_bytes[100:150] = b"\xFF" * 50
+        corrupt_db.write_bytes(bytes(corrupt_bytes))
+
+        # Make an envelope that packages this corrupt db
+        corrupt_tar = io.BytesIO()
+        with tarfile.open(fileobj=corrupt_tar, mode="w:gz") as tar:
+            ti = tarfile.TarInfo("radar.db")
+            ti.size = len(corrupt_bytes)
+            tar.addfile(ti, io.BytesIO(bytes(corrupt_bytes)))
+            del_b = self.del_ledger_path.read_bytes()
+            ti_del = tarfile.TarInfo("telegram_digest_delivery_ledger.json")
+            ti_del.size = len(del_b)
+            tar.addfile(ti_del, io.BytesIO(del_b))
+            bud_b = self.bud_ledger_path.read_bytes()
+            ti_bud = tarfile.TarInfo("experiment_budget_ledger.json")
+            ti_bud.size = len(bud_b)
+            tar.addfile(ti_bud, io.BytesIO(bud_b))
+
+        raw_tar = corrupt_tar.getvalue()
+        manifest = {
+            "key_id": "efso-2026-v1",
+            "created_at_utc": "2026-10-19T12:00:00Z",
+            "schema_version": 5,
+            "source_engine": "sqlite",
+            "plaintext_sha256": hashlib.sha256(raw_tar).hexdigest(),
+        }
+        corrupt_envelope = encrypt_envelope(raw_tar, self.key, manifest=manifest)
+
+        with self.assertRaises(RestoreVerificationError):
+            verify_restore_archive(corrupt_envelope, self.key)
+
+        # 3. Malformed JSON delivery ledger cleans up operation-owned staging directory
+        bad_json_tar = io.BytesIO()
+        with tarfile.open(fileobj=bad_json_tar, mode="w:gz") as tar:
+            db_b = self.db_path.read_bytes()
+            ti_db = tarfile.TarInfo("radar.db")
+            ti_db.size = len(db_b)
+            tar.addfile(ti_db, io.BytesIO(db_b))
+
+            bad_json = b"{ NOT_VALID_JSON }"
+            ti_del = tarfile.TarInfo("telegram_digest_delivery_ledger.json")
+            ti_del.size = len(bad_json)
+            tar.addfile(ti_del, io.BytesIO(bad_json))
+
+            bud_b = self.bud_ledger_path.read_bytes()
+            ti_bud = tarfile.TarInfo("experiment_budget_ledger.json")
+            ti_bud.size = len(bud_b)
+            tar.addfile(ti_bud, io.BytesIO(bud_b))
+
+        raw_bad_tar = bad_json_tar.getvalue()
+        bad_manifest = {
+            "key_id": "efso-2026-v1",
+            "created_at_utc": "2026-10-19T12:00:00Z",
+            "schema_version": 5,
+            "source_engine": "sqlite",
+            "plaintext_sha256": hashlib.sha256(raw_bad_tar).hexdigest(),
+        }
+        bad_envelope = encrypt_envelope(raw_bad_tar, self.key, manifest=bad_manifest)
+
+        with self.assertRaises(RestoreVerificationError):
+            verify_restore_archive(bad_envelope, self.key)
+
+        # 4. Caller-provided staging directory is NOT deleted when verification fails
+        caller_staging = self.tmp_path / "caller_staging_fail_test"
+        caller_staging.mkdir(parents=True, exist_ok=True)
+        with self.assertRaises(RestoreVerificationError):
+            verify_restore_archive(bad_envelope, self.key, staging_dir=caller_staging)
+        self.assertTrue(caller_staging.exists())
+        # Extracted files inside it were cleaned up
+        self.assertFalse((caller_staging / "radar.db").exists())
+        self.assertFalse((caller_staging / "telegram_digest_delivery_ledger.json").exists())
+
+        # 5. Explicit cleanup method and context manager lifecycle on success
+        res = verify_restore_archive(backup_res.envelope_bytes, self.key)
+        self.assertTrue(res.is_operation_owned)
+        self.assertTrue(res.staging_dir.exists())
+        res.cleanup()
+        self.assertFalse(res.staging_dir.exists())
+
+        # Context manager lifecycle
+        with verify_restore_archive(backup_res.envelope_bytes, self.key) as cm_res:
+            self.assertTrue(cm_res.staging_dir.exists())
+        self.assertFalse(cm_res.staging_dir.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
+

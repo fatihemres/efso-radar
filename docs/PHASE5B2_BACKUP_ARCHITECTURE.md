@@ -33,7 +33,7 @@ Efso Radar maintains state across multiple stores:
 ### Coordinated Snapshot Protocol & Quiescence Verification (Approach B)
 Backing up stores independently without locking introduces split-brain skew:
 - If `radar.db` is captured at $T_1$ and `telegram_digest_delivery_ledger.json` at $T_2$, a digest sent between $T_1$ and $T_2$ would be marked delivered in the ledger but missing from the database, or vice versa.
-- **Approach B Quiescence Invariant:** In Phase 5B.2B, backups are treated strictly as an offline/quiescent operation. Prior to snapshotting, `create_backup()` explicitly executes `verify_quiescence(operational_data_dir)` and checks `TelegramDeliveryReconciliationGate.is_dispatch_blocked()`. If active worker run locks or unsettled delivery state exist, backup creation fails closed. Live unattended backups during active multi-process write traffic remain blocked until cross-process writer coordination is embedded into production cycles.
+- **Approach B Quiescence Invariant & Writer Limitation:** In Phase 5B.2B, backups are treated strictly as an offline/quiescent operation. Prior to snapshotting, `create_backup()` explicitly executes `verify_quiescence(operational_data_dir)` and checks `TelegramDeliveryReconciliationGate.is_dispatch_blocked()`. **Critical Limitation:** The absence of active `run_locks` in SQLite is a necessary condition, but it does NOT prove that all database and JSON writers are paused (e.g. ad-hoc background scripts, unmanaged workers, or direct ledger modifications). Live unattended backups remain strictly blocked until cross-process writer coordination or externally verified quiescence is integrated into production cycles.
 - To guarantee cross-store consistency, `create_backup()` executes inside an exclusive `SnapshotCoordinationBarrier`:
   - **Deadlock Avoidance & Timeout:** Uses an advisory cross-store lock with a strict 5.0s timeout. If writers cannot be paused, the backup aborts fail-closed with `BackupCoordinationTimeoutError`.
   - **Point-in-Time SQLite Snapshot:** Uses SQLite's online backup API (`sqlite3.Connection.backup()`), folds all active WAL frames into a temporary snapshot, switches `journal_mode = DELETE;` to eliminate `-wal`/`-shm` dependencies, and strips transient `run_locks`.
@@ -120,7 +120,7 @@ To prevent duplicate deliveries:
 ### 5.2 Transactional Crash-Recovery Cutover & Simulation Isolation
 Sequential file copying is not an atomic operation. Disaster recovery mechanics implement:
 1. **Unconditional Production Fail-Closed:** `execute_production_cutover()` unconditionally raises `ProductionCutoverDisabledError` (even if `simulated=True`). Live operational restoration is forbidden in Phase 5B.2B.
-2. **Dedicated Hermetic Offline Simulation:** Hermetic testing is routed through `simulate_offline_cutover_in_test_workspace()`. It strictly checks workspace isolation via `validate_simulation_workspace()`, rejecting filesystem roots, user homes, repository root, source tree, and `data/` directories.
+2. **Dedicated Hermetic Offline Simulation:** Hermetic testing is routed through `simulate_offline_cutover_in_test_workspace()`. If no workspace is supplied, it creates and manages an isolated `tempfile.TemporaryDirectory` internally. If a workspace is supplied, it strictly checks workspace isolation via `validate_simulation_workspace()`, rejecting symlinks, filesystem roots, user homes, repository root, source tree, `data/` directories, any path outside system temporary storage (without relying on name substrings), and any directory containing non-fixture files.
 3. **Quiescence Verification:** Ensures zero active worker run locks or active database connections before staging replacements.
 4. **Pre-Cutover Backup via SQLite Backup API:** Live `radar.db` is backed up via `sqlite3.Connection.backup()` to `radar.db.pre_cutover.bak`, and JSON ledgers are copied to `.pre_cutover.bak`.
 5. **Crash Journal (`.cutover_journal.json`):** Tracks each state transition (`INITIATED`, `PRE_BACKUP_COMPLETED`, `REPLACED_DB`, `REPLACED_DELIVERY_LEDGER`, `REPLACED_BUDGET_LEDGER`, `COMPLETED`, `ROLLED_BACK`).
@@ -138,6 +138,7 @@ Sequential file copying is not an atomic operation. Disaster recovery mechanics 
    - Confirms true schema migrations version matches `expected_schema_version` (version 5).
    - Validates structure and status enumerations of both Telegram delivery and experiment budget ledgers.
    - Any asset with corrupt internal database or schema mismatch is quarantined into `issues` and **excluded** from `verified_points`.
+   - Temporary staging directories are cleanly purged on both success and failure lifecycles.
 2. **Inventory Fingerprinting:** Evaluates an inventory fingerprint (SHA-256 of sorted asset IDs, names, sizes, and SHA-256 digests). Before deleting any asset, the fingerprint is revalidated; if storage changed concurrently, deletion aborts with `StaleInventoryError`.
 3. **Budget Conflict Resolution:** If total storage exceeds `max_storage_budget_bytes`, pruning is planned. However, if pruning would reduce verified recovery points below 2, **new uploads are halted (`upload_blocked=True`) rather than deleting backups**.
 4. **Never Delete the Last Verified Backup:** Under no circumstances will the newest verified backup be deleted.
@@ -162,20 +163,20 @@ To prevent accidental operational risk, Phase 5B.2B strictly compartmentalizes c
 - **Structural Ledger Integrity:** Strict schema validation and status enumeration checking for both `telegram_digest_delivery_ledger.json` and `experiment_budget_ledger.json`.
 - **Zip-Slip & Bomb Protection:** Extraction defenses against directory traversal and tar decompression bombs (> 500 MB).
 - **SQLite Engine Verification:** PRAGMA integrity check, foreign key check, migration version verification, and manifest row count comparison.
-- **Non-Destructive Staging:** Caller path safety validation refusing root, home, repo, and pre-existing non-empty directories.
+- **Non-Destructive Staging & Auto-Cleanup:** Caller path safety validation refusing root, home, repo, non-temp, and pre-existing non-empty directories. Operation-owned temporary staging is cleanly purged on both verification success and failure.
 - **Full Restore Viability in Retention Inventory:** `verify_inventory()` executes full restore verification inside ephemeral staging; corrupt SQLite databases or schema mismatches are quarantined and cannot satisfy `min_recovery_points = 2`.
 - **Fingerprinted Retention Lifecycle:** Enforces 14-day retention, atomic fingerprint checks against concurrent modifications, storage budget upload halting, and immutable protection for the latest verified backup.
 - **Durable Telegram Uncertainty Gate:** Persists `.recovery_pending_reconciliation.json` to survive process crashes, checks surviving delivery history continuity, and blocks automated dispatch under `DELIVERY_UNCERTAIN`.
 - **Zero Secrets & Chat ID Masking:** Complete redaction of credentials and recipient chat IDs (`87...78`).
 
 ### 8.2 Synthetic Test Simulations
-- **`simulate_offline_cutover_in_test_workspace()`:** Transactional cutover simulation confined strictly to isolated temporary fixtures (`tmp`, `temp`, `test`, `fixture`, `staging`). Verifies quiescence, pre-cutover backups, `.cutover_journal.json`, atomic `os.replace`, and verified step-by-step rollback.
+- **`simulate_offline_cutover_in_test_workspace()`:** Transactional cutover simulation confined strictly to internally owned temporary directories or strictly validated fixtures in system temporary storage (without relying on name substring matching). Rejects symlinks, repository locations, user folders, and non-fixture files. Verifies quiescence, pre-cutover backups, `.cutover_journal.json`, atomic `os.replace`, and verified step-by-step rollback.
 - **Startup Crash Recovery:** `detect_and_recover_incomplete_cutover()` simulating rollback of interrupted cutover states.
 - **`MockGitHubReleaseStorageAdapter`:** In-memory hermetic simulation of GitHub Release asset operations, upload limits, and inventory fingerprinting.
 
 ### 8.3 Not-Yet-Integrated / Blocked Production Mechanisms
 - **Production Cutover Entry Point:** `execute_production_cutover()` unconditionally raises `ProductionCutoverDisabledError`. Live production restoration is forbidden and blocked at runtime.
-- **Unattended Live Multi-Store Backups:** Approach B is enforced; `create_backup()` verifies quiescent state and checks dispatch blocks before snapshotting. Unattended backups during concurrent write traffic remain blocked until cross-process writer coordination is embedded into application run loops.
+- **Unattended Live Multi-Store Backups:** Approach B is enforced; `create_backup()` verifies quiescent state and checks dispatch blocks before snapshotting. **Writer Limitation:** The absence of active `run_locks` does not prove all database and JSON writers are paused. Unattended backups during concurrent write traffic remain strictly blocked until cross-process writer coordination or externally verified quiescence is embedded into application run loops.
 - **Telegram Dispatcher Recovery Wiring:** `TelegramDeliveryReconciliationGate.is_dispatch_blocked()` is provided, but runtime wiring into active Telegram notification channels is deferred to production deployment.
 
 ### 8.4 Future Production Prerequisites (Prior to Live Activation)

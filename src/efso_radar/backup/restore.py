@@ -89,6 +89,31 @@ class RestoreVerificationResult:
     budget_ledger_batch_count: int
     verification_report_markdown: str
     errors: list[str]
+    is_operation_owned: bool = False
+
+    def cleanup(self) -> None:
+        """Safely clean up decrypted staging data.
+
+        If the staging directory was operation-owned (created internally),
+        recursively removes the temporary directory. If caller-owned, safely removes
+        only the extracted files (radar.db, ledgers) without deleting the caller directory.
+        """
+        if self.is_operation_owned:
+            if self.staging_dir and self.staging_dir.exists():
+                shutil.rmtree(self.staging_dir, ignore_errors=True)
+        else:
+            for p in (self.db_path, self.delivery_ledger_path, self.budget_ledger_path):
+                try:
+                    if p and p.exists() and p.is_file():
+                        p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def __enter__(self) -> "RestoreVerificationResult":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.cleanup()
 
 
 @dataclass
@@ -301,10 +326,14 @@ def validate_staging_path_safety(staging_dir: Path) -> Path:
     """Validate that a caller-provided staging path is non-destructive and isolated.
 
     Raises:
-        UnsafeStagingPathError: If path points to root, user home, repo root, data dir, or non-empty dir.
+        UnsafeStagingPathError: If path is a symlink, points to root, user home, repo root, data dir, outside system temp, or non-empty dir.
     """
+    if staging_dir.is_symlink():
+        raise UnsafeStagingPathError(f"Staging path cannot be a symlink: {staging_dir}")
+
     resolved = staging_dir.resolve()
     repo_root = Path.cwd().resolve()
+    system_temp = Path(tempfile.gettempdir()).resolve()
 
     # 1. Refuse root directory
     if resolved == resolved.parent:
@@ -314,8 +343,8 @@ def validate_staging_path_safety(staging_dir: Path) -> Path:
     if resolved == Path.home().resolve():
         raise UnsafeStagingPathError(f"Staging path cannot be user home directory: {resolved}")
 
-    # 3. Refuse repository root and src directory
-    if resolved == repo_root or resolved == repo_root / "src":
+    # 3. Refuse repository root and repository subdirectories
+    if resolved == repo_root or resolved.is_relative_to(repo_root):
         raise UnsafeStagingPathError(f"Staging path cannot be repository root or code directory: {resolved}")
 
     # 4. Refuse operational data directory
@@ -323,7 +352,13 @@ def validate_staging_path_safety(staging_dir: Path) -> Path:
         if (resolved / "radar.db").exists() or (resolved / "telegram_digest_delivery_ledger.json").exists():
             raise UnsafeStagingPathError(f"Staging path cannot be live operational data directory: {resolved}")
 
-    # 5. Pre-existing non-empty directory check
+    # 5. Must be strictly contained within designated system temporary storage
+    if not resolved.is_relative_to(system_temp):
+        raise UnsafeStagingPathError(
+            f"Staging path must be within designated system temporary directory ({system_temp}), got: {resolved}"
+        )
+
+    # 6. Pre-existing non-empty directory check
     if resolved.exists():
         entries = list(resolved.iterdir())
         if entries:
@@ -524,101 +559,129 @@ def verify_restore_archive(
             f"expected {expected_schema_version}"
         )
 
-    # 4. Resolve safe staging directory (only after crypto succeeds)
-    if staging_dir is not None:
-        target_staging = validate_staging_path_safety(staging_dir)
-        target_staging.mkdir(parents=True, exist_ok=True)
-    else:
-        target_staging = Path(tempfile.mkdtemp(prefix="efso_restore_staging_"))
+    target_staging: Path | None = None
+    is_operation_owned = False
+    extracted: dict[str, Path] = {}
 
-    # 5. Safe extraction into staging
-    extracted = safe_extract_tar(plaintext_tar, target_staging)
+    try:
+        # 4. Resolve safe staging directory (only after crypto succeeds)
+        if staging_dir is not None:
+            target_staging = validate_staging_path_safety(staging_dir)
+            target_staging.mkdir(parents=True, exist_ok=True)
+            is_operation_owned = False
+        else:
+            target_staging = Path(tempfile.mkdtemp(prefix="efso_restore_staging_"))
+            is_operation_owned = True
 
-    db_path = extracted.get("radar.db")
-    del_path = extracted.get("telegram_digest_delivery_ledger.json")
-    bud_path = extracted.get("experiment_budget_ledger.json")
+        # 5. Safe extraction into staging
+        extracted = safe_extract_tar(plaintext_tar, target_staging)
 
-    if not db_path or not del_path or not bud_path:
-        raise RestoreVerificationError(
-            f"Backup archive is incomplete; missing required components: {list(extracted.keys())}"
+        db_path = extracted.get("radar.db")
+        del_path = extracted.get("telegram_digest_delivery_ledger.json")
+        bud_path = extracted.get("experiment_budget_ledger.json")
+
+        if not db_path or not del_path or not bud_path:
+            raise RestoreVerificationError(
+                f"Backup archive is incomplete; missing required components: {list(extracted.keys())}"
+            )
+
+        # 6. Verify SQLite Database & Compare Row Counts
+        manifest_row_counts = manifest.get("table_row_counts", {})
+        table_counts = verify_staging_database(
+            db_path,
+            expected_schema_version=expected_schema_version,
+            manifest_row_counts=manifest_row_counts,
         )
 
-    # 6. Verify SQLite Database & Compare Row Counts
-    manifest_row_counts = manifest.get("table_row_counts", {})
-    table_counts = verify_staging_database(
-        db_path,
-        expected_schema_version=expected_schema_version,
-        manifest_row_counts=manifest_row_counts,
-    )
+        # 7. Strictly Validate Telegram Delivery Ledger
+        try:
+            del_data = json.loads(del_path.read_text(encoding="utf-8"))
+            validate_delivery_ledger_structure(del_data, "restored_telegram_delivery_ledger")
+            deliveries = del_data.get("deliveries", {})
+            delivery_count = len(deliveries)
+        except MalformedLedgerError as exc:
+            raise RestoreVerificationError(f"Restored Telegram delivery ledger is malformed: {exc}") from exc
+        except Exception as exc:
+            raise RestoreVerificationError(f"Failed to parse restored Telegram delivery ledger: {exc}") from exc
 
-    # 7. Strictly Validate Telegram Delivery Ledger
-    try:
-        del_data = json.loads(del_path.read_text(encoding="utf-8"))
-        validate_delivery_ledger_structure(del_data, "restored_telegram_delivery_ledger")
-        deliveries = del_data.get("deliveries", {})
-        delivery_count = len(deliveries)
-    except MalformedLedgerError as exc:
-        raise RestoreVerificationError(f"Restored Telegram delivery ledger is malformed: {exc}") from exc
-    except Exception as exc:
-        raise RestoreVerificationError(f"Failed to parse restored Telegram delivery ledger: {exc}") from exc
+        # 8. Strictly Validate Experiment Budget Ledger
+        try:
+            bud_data = json.loads(bud_path.read_text(encoding="utf-8"))
+            validate_budget_ledger_structure(bud_data, "restored_experiment_budget_ledger")
+            budget_batches = bud_data.get("batches", {})
+            budget_count = len(budget_batches)
+        except MalformedLedgerError as exc:
+            raise RestoreVerificationError(f"Restored experiment budget ledger is malformed: {exc}") from exc
+        except Exception as exc:
+            raise RestoreVerificationError(f"Failed to parse restored experiment budget ledger: {exc}") from exc
 
-    # 8. Strictly Validate Experiment Budget Ledger
-    try:
-        bud_data = json.loads(bud_path.read_text(encoding="utf-8"))
-        validate_budget_ledger_structure(bud_data, "restored_experiment_budget_ledger")
-        budget_batches = bud_data.get("batches", {})
-        budget_count = len(budget_batches)
-    except MalformedLedgerError as exc:
-        raise RestoreVerificationError(f"Restored experiment budget ledger is malformed: {exc}") from exc
-    except Exception as exc:
-        raise RestoreVerificationError(f"Failed to parse restored experiment budget ledger: {exc}") from exc
+        # 9. Generate Structured Markdown Verification Report
+        masked_sample_recipients = []
+        for d in list(deliveries.values())[:3]:
+            cid = d.get("chat_id") or d.get("target_chat_id", "")
+            if cid:
+                masked_sample_recipients.append(mask_chat_id(cid))
 
-    # 9. Generate Structured Markdown Verification Report
-    masked_sample_recipients = []
-    for d in list(deliveries.values())[:3]:
-        cid = d.get("chat_id") or d.get("target_chat_id", "")
-        if cid:
-            masked_sample_recipients.append(mask_chat_id(cid))
+        report = (
+            "### Efso Radar Restore Verification Report\n\n"
+            f"- **Status:** VERIFIED (Isolated in `{target_staging}`)\n"
+            f"- **Created At (UTC):** {manifest.get('created_at_utc', 'N/A')}\n"
+            f"- **Key ID:** `{manifest.get('key_id', 'N/A')}`\n"
+            f"- **Engine Type:** {manifest.get('source_engine', 'sqlite')}\n"
+            f"- **Schema Version:** {manifest.get('schema_version', 'N/A')} (Verified = {expected_schema_version})\n"
+            f"- **Plaintext SHA-256:** `{computed_sha256[:16]}...` (Match: Valid)\n"
+            f"- **Stories Count:** {table_counts.get('stories', 0)}\n"
+            f"- **Story Updates Count:** {table_counts.get('story_updates', 0)}\n"
+            f"- **Candidate Backlog Count:** {table_counts.get('candidate_backlog', 0)}\n"
+            f"- **Notifications History:** {table_counts.get('notifications', 0)}\n"
+            f"- **Processed Articles:** {table_counts.get('processed_articles', 0)}\n"
+            f"- **Delivery Ledger Entries:** {delivery_count} verified outbox records\n"
+            f"- **Budget Batches Recorded:** {budget_count} batches\n"
+            f"- **Sample Masked Recipients:** {', '.join(masked_sample_recipients) or 'None'}\n\n"
+            "> [!IMPORTANT]\n"
+            "> Live operational databases were **NOT modified**. Cutover requires explicit authorization.\n"
+        )
 
-    report = (
-        "### Efso Radar Restore Verification Report\n\n"
-        f"- **Status:** VERIFIED (Isolated in `{target_staging}`)\n"
-        f"- **Created At (UTC):** {manifest.get('created_at_utc', 'N/A')}\n"
-        f"- **Key ID:** `{manifest.get('key_id', 'N/A')}`\n"
-        f"- **Engine Type:** {manifest.get('source_engine', 'sqlite')}\n"
-        f"- **Schema Version:** {manifest.get('schema_version', 'N/A')} (Verified = {expected_schema_version})\n"
-        f"- **Plaintext SHA-256:** `{computed_sha256[:16]}...` (Match: Valid)\n"
-        f"- **Stories Count:** {table_counts.get('stories', 0)}\n"
-        f"- **Story Updates Count:** {table_counts.get('story_updates', 0)}\n"
-        f"- **Candidate Backlog Count:** {table_counts.get('candidate_backlog', 0)}\n"
-        f"- **Notifications History:** {table_counts.get('notifications', 0)}\n"
-        f"- **Processed Articles:** {table_counts.get('processed_articles', 0)}\n"
-        f"- **Delivery Ledger Entries:** {delivery_count} verified outbox records\n"
-        f"- **Budget Batches Recorded:** {budget_count} batches\n"
-        f"- **Sample Masked Recipients:** {', '.join(masked_sample_recipients) or 'None'}\n\n"
-        "> [!IMPORTANT]\n"
-        "> Live operational databases were **NOT modified**. Cutover requires explicit authorization.\n"
-    )
+        logger.info("Restore verification completed successfully for backup created at %s", manifest.get("created_at_utc"))
 
-    logger.info("Restore verification completed successfully for backup created at %s", manifest.get("created_at_utc"))
-
-    return RestoreVerificationResult(
-        success=True,
-        staging_dir=target_staging,
-        db_path=db_path,
-        delivery_ledger_path=del_path,
-        budget_ledger_path=bud_path,
-        manifest=manifest,
-        table_row_counts=table_counts,
-        delivery_ledger_count=delivery_count,
-        budget_ledger_batch_count=budget_count,
-        verification_report_markdown=report,
-        errors=errors,
-    )
+        return RestoreVerificationResult(
+            success=True,
+            staging_dir=target_staging,
+            db_path=db_path,
+            delivery_ledger_path=del_path,
+            budget_ledger_path=bud_path,
+            manifest=manifest,
+            table_row_counts=table_counts,
+            delivery_ledger_count=delivery_count,
+            budget_ledger_batch_count=budget_count,
+            verification_report_markdown=report,
+            errors=errors,
+            is_operation_owned=is_operation_owned,
+        )
+    except Exception:
+        if target_staging and target_staging.exists():
+            if is_operation_owned:
+                shutil.rmtree(target_staging, ignore_errors=True)
+            else:
+                for f_path in extracted.values():
+                    try:
+                        if f_path.exists() and f_path.is_file():
+                            f_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+        raise
 
 
 def verify_quiescence(operational_data_dir: Path) -> None:
-    """Verify that all writers, dispatchers, and worker runs are paused and quiescent."""
+    """Verify that known database worker run locks are released before cutover or snapshotting.
+
+    LIMITATION & OPERATIONAL BOUNDARY:
+    The absence of active 'run_locks' in radar.db is a necessary check, but it does NOT
+    prove that all database and JSON writers (e.g. ad-hoc scripts, unmanaged workers, or
+    direct outbox modifications) are paused. In Phase 5B.2B, backups and cutovers are strictly
+    offline operations. Live unattended backups remain disabled until actual cross-process
+    writer coordination or externally verified quiescence is implemented.
+    """
     live_db = operational_data_dir / "radar.db"
     if not live_db.exists():
         return
@@ -685,36 +748,69 @@ def detect_and_recover_incomplete_cutover(operational_data_dir: Path) -> bool:
         return False
 
 
+ALLOWED_SIMULATION_FIXTURE_NAMES = {
+    "radar.db",
+    "radar.db-wal",
+    "radar.db-shm",
+    "radar.db.pre_cutover.bak",
+    "radar.db.tmp_cutover",
+    "telegram_digest_delivery_ledger.json",
+    "telegram_digest_delivery_ledger.json.pre_cutover.bak",
+    "telegram_digest_delivery_ledger.json.tmp_cutover",
+    "experiment_budget_ledger.json",
+    "experiment_budget_ledger.json.pre_cutover.bak",
+    "experiment_budget_ledger.json.tmp_cutover",
+    ".cutover_journal.json",
+    ".recovery_pending_reconciliation.json",
+}
+
+
 def validate_simulation_workspace(test_workspace_dir: Path) -> Path:
     """Validate that a cutover simulation workspace is an isolated temporary test fixture.
 
     Strictly refuses:
+    - Symlinks or paths that resolve through symlinks outside temporary storage
     - Filesystem root (/ or C:\\)
-    - User home directory
-    - Repository root and source tree
-    - Repository data/ directory or operational directories
-    - Any path not clearly marked as a temporary test fixture
+    - User home directory outside designated system temporary storage
+    - Repository root, source tree, data directory, or any in-repo path
+    - Any path not strictly contained within the OS designated temporary directory
+    - Any directory containing non-fixture files (never overwrites user files)
     """
+    if test_workspace_dir.is_symlink():
+        raise UnsafeStagingPathError(f"Simulation workspace cannot be a symlink: {test_workspace_dir}")
+
     resolved = test_workspace_dir.resolve()
     repo_root = Path.cwd().resolve()
+    system_temp = Path(tempfile.gettempdir()).resolve()
 
+    # 1. Refuse root directory
     if resolved == resolved.parent:
         raise UnsafeStagingPathError(f"Simulation workspace cannot be filesystem root: {resolved}")
 
-    if resolved == Path.home().resolve():
+    # 2. Refuse repository root and repository subdirectories
+    if resolved == repo_root or resolved.is_relative_to(repo_root):
+        raise UnsafeStagingPathError(f"Simulation workspace cannot be repository root or inside repository: {resolved}")
+
+    # 3. Refuse user home directory
+    user_home = Path.home().resolve()
+    if resolved == user_home:
         raise UnsafeStagingPathError(f"Simulation workspace cannot be user home directory: {resolved}")
 
-    if resolved == repo_root or str(resolved).startswith(str(repo_root / "src")):
-        raise UnsafeStagingPathError(f"Simulation workspace cannot be inside repo root or source tree: {resolved}")
-
-    if resolved == repo_root / "data" or str(resolved).startswith(str(repo_root / "data")):
-        raise UnsafeStagingPathError(f"Simulation workspace cannot be inside live repository data directory: {resolved}")
-
-    parent_str = str(resolved).lower()
-    if not any(marker in parent_str for marker in ("tmp", "temp", "test", "fixture", "staging")):
+    # 4. Must be strictly contained within designated system temporary storage.
+    # No substring matching (e.g. 'tmp'/'test'/'fixture' in string names) is relied upon.
+    if not resolved.is_relative_to(system_temp):
         raise UnsafeStagingPathError(
-            f"Simulation workspace {resolved} must be a dedicated temporary test directory (containing tmp/temp/test/fixture)."
+            f"Simulation workspace must be strictly contained within system temporary directory ({system_temp}), got: {resolved}"
         )
+
+    # 5. Never overwrite existing non-fixture files
+    if resolved.exists():
+        for entry in resolved.iterdir():
+            if entry.is_dir() or entry.name not in ALLOWED_SIMULATION_FIXTURE_NAMES:
+                raise UnsafeStagingPathError(
+                    f"Simulation workspace contains unrecognized non-fixture file: {entry.name}. "
+                    "Refusing to overwrite non-fixture files."
+                )
 
     return resolved
 
@@ -740,7 +836,7 @@ def execute_production_cutover(
 
 def simulate_offline_cutover_in_test_workspace(
     verification_result: RestoreVerificationResult,
-    test_workspace_dir: Path,
+    test_workspace_dir: Path | None = None,
     authorized: bool = False,
     inject_failure_step: int | None = None,
 ) -> bool:
@@ -750,23 +846,9 @@ def simulate_offline_cutover_in_test_workspace(
     via online backup API, transactional crash journal (.cutover_journal.json),
     atomic os.replace, and step-by-step rollback.
 
-    Args:
-        verification_result: Successful outcome from verify_restore_archive.
-        test_workspace_dir: Isolated temporary directory (must NOT be repo or live data).
-        authorized: Explicit authorization flag.
-        inject_failure_step: Optional step index (1, 2, 3, 4) to test rollback resilience.
-
-    Returns:
-        True if simulated cutover succeeded and passed smoke checks.
-
-    Raises:
-        UnsafeStagingPathError: If test_workspace_dir is unsafe or inside repo/data.
-        CutoverAuthorizationError: If authorized=False.
-        RestoreVerificationError: If verification_result failed, quiescence failed, or smoke test failed.
+    If test_workspace_dir is None, creates and manages an isolated TemporaryDirectory internally.
+    If test_workspace_dir is supplied, strictly validates that it is a safe test fixture in system temp.
     """
-    # 1. Unconditionally validate workspace isolation
-    safe_workspace = validate_simulation_workspace(test_workspace_dir)
-
     if not authorized:
         raise CutoverAuthorizationError(
             "Simulated cutover blocked: requires explicit authorization flag."
@@ -775,123 +857,142 @@ def simulate_offline_cutover_in_test_workspace(
     if not verification_result.success:
         raise RestoreVerificationError("Cannot cutover an unverified or failed restore result.")
 
-    safe_workspace.mkdir(parents=True, exist_ok=True)
-    live_db = safe_workspace / "radar.db"
-    live_del = safe_workspace / "telegram_digest_delivery_ledger.json"
-    live_bud = safe_workspace / "experiment_budget_ledger.json"
+    internal_temp: tempfile.TemporaryDirectory | None = None
+    if test_workspace_dir is None:
+        internal_temp = tempfile.TemporaryDirectory(prefix="efso_sim_cutover_")
+        safe_workspace = Path(internal_temp.name).resolve()
+        # Initialize synthetic live baseline in internally owned temp directory
+        conn = sqlite3.connect(safe_workspace / "radar.db")
+        conn.execute("CREATE TABLE stories (id TEXT);")
+        conn.execute("INSERT INTO stories VALUES ('internal_story');")
+        conn.commit()
+        conn.close()
+        (safe_workspace / "telegram_digest_delivery_ledger.json").write_text("{}", encoding="utf-8")
+        (safe_workspace / "experiment_budget_ledger.json").write_text("{}", encoding="utf-8")
+    else:
+        safe_workspace = validate_simulation_workspace(test_workspace_dir)
 
-    # Step 0: Quiescence check
-    verify_quiescence(safe_workspace)
+    try:
+        safe_workspace.mkdir(parents=True, exist_ok=True)
+        live_db = safe_workspace / "radar.db"
+        live_del = safe_workspace / "telegram_digest_delivery_ledger.json"
+        live_bud = safe_workspace / "experiment_budget_ledger.json"
 
-    cutover_id = f"sim_cutover_{int(time.time())}"
-    journal = CutoverJournal(
-        cutover_id=cutover_id,
-        phase="INITIATED",
-        target_dir=str(safe_workspace),
-        timestamp_utc=datetime.now(timezone.utc).isoformat(),
-        step_history=["Quiescence verified"],
-    )
-    journal.save(safe_workspace)
+        # Step 0: Quiescence check
+        verify_quiescence(safe_workspace)
 
-    # Step 1: Pre-cutover consistent SQLite snapshot using backup API
-    bak_db = safe_workspace / "radar.db.pre_cutover.bak"
-    bak_del = safe_workspace / "telegram_digest_delivery_ledger.json.pre_cutover.bak"
-    bak_bud = safe_workspace / "experiment_budget_ledger.json.pre_cutover.bak"
+        cutover_id = f"sim_cutover_{int(time.time())}"
+        journal = CutoverJournal(
+            cutover_id=cutover_id,
+            phase="INITIATED",
+            target_dir=str(safe_workspace),
+            timestamp_utc=datetime.now(timezone.utc).isoformat(),
+            step_history=["Quiescence verified"],
+        )
+        journal.save(safe_workspace)
 
-    if live_db.exists():
+        # Step 1: Pre-cutover consistent SQLite snapshot using backup API
+        bak_db = safe_workspace / "radar.db.pre_cutover.bak"
+        bak_del = safe_workspace / "telegram_digest_delivery_ledger.json.pre_cutover.bak"
+        bak_bud = safe_workspace / "experiment_budget_ledger.json.pre_cutover.bak"
+
+        if live_db.exists():
+            try:
+                live_conn = sqlite3.connect(f"file:{live_db}?mode=ro", uri=True, timeout=10.0)
+                bak_conn = sqlite3.connect(bak_db)
+                live_conn.backup(bak_conn)
+                live_conn.close()
+                bak_conn.close()
+                del live_conn
+                del bak_conn
+                import gc
+                gc.collect()
+                journal.db_backed_up = True
+            except Exception as exc:
+                journal.phase = "FAILED"
+                journal.step_history.append(f"Pre-cutover DB backup failed: {exc}")
+                journal.save(safe_workspace)
+                raise RestoreVerificationError(f"Failed to create pre-cutover DB backup: {exc}") from exc
+
+        if live_del.exists():
+            shutil.copy2(live_del, bak_del)
+            journal.delivery_backed_up = True
+
+        if live_bud.exists():
+            shutil.copy2(live_bud, bak_bud)
+            journal.budget_backed_up = True
+
+        journal.phase = "PRE_BACKUP_COMPLETED"
+        journal.step_history.append("Consistent pre-cutover backups created")
+        journal.save(safe_workspace)
+
+        # Step 2: Atomic multi-file replacement with step-by-step rollback
         try:
-            live_conn = sqlite3.connect(f"file:{live_db}?mode=ro", uri=True, timeout=10.0)
-            bak_conn = sqlite3.connect(bak_db)
-            live_conn.backup(bak_conn)
-            live_conn.close()
-            bak_conn.close()
-            del live_conn
-            del bak_conn
+            if inject_failure_step == 1:
+                raise RuntimeError("Injected fault at step 1: DB replacement")
+
+            # Atomic replacement for radar.db
+            tmp_db = safe_workspace / "radar.db.tmp_cutover"
+            shutil.copy2(verification_result.db_path, tmp_db)
             import gc
             gc.collect()
-            journal.db_backed_up = True
-        except Exception as exc:
-            journal.phase = "FAILED"
-            journal.step_history.append(f"Pre-cutover DB backup failed: {exc}")
+            os.replace(tmp_db, live_db)
+            journal.phase = "REPLACED_DB"
+            journal.step_history.append("radar.db replaced atomically")
             journal.save(safe_workspace)
-            raise RestoreVerificationError(f"Failed to create pre-cutover DB backup: {exc}") from exc
 
-    if live_del.exists():
-        shutil.copy2(live_del, bak_del)
-        journal.delivery_backed_up = True
+            if inject_failure_step == 2:
+                raise RuntimeError("Injected fault at step 2: Delivery ledger replacement")
 
-    if live_bud.exists():
-        shutil.copy2(live_bud, bak_bud)
-        journal.budget_backed_up = True
+            # Atomic replacement for delivery ledger
+            tmp_del = safe_workspace / "telegram_digest_delivery_ledger.json.tmp_cutover"
+            shutil.copy2(verification_result.delivery_ledger_path, tmp_del)
+            os.replace(tmp_del, live_del)
+            journal.phase = "REPLACED_DELIVERY_LEDGER"
+            journal.step_history.append("delivery ledger replaced atomically")
+            journal.save(safe_workspace)
 
-    journal.phase = "PRE_BACKUP_COMPLETED"
-    journal.step_history.append("Consistent pre-cutover backups created")
-    journal.save(safe_workspace)
+            if inject_failure_step == 3:
+                raise RuntimeError("Injected fault at step 3: Budget ledger replacement")
 
-    # Step 2: Atomic multi-file replacement with step-by-step rollback
-    try:
-        if inject_failure_step == 1:
-            raise RuntimeError("Injected fault at step 1: DB replacement")
+            # Atomic replacement for budget ledger
+            tmp_bud = safe_workspace / "experiment_budget_ledger.json.tmp_cutover"
+            shutil.copy2(verification_result.budget_ledger_path, tmp_bud)
+            os.replace(tmp_bud, live_bud)
+            journal.phase = "REPLACED_BUDGET_LEDGER"
+            journal.step_history.append("budget ledger replaced atomically")
+            journal.save(safe_workspace)
 
-        # Atomic replacement for radar.db
-        tmp_db = safe_workspace / "radar.db.tmp_cutover"
-        shutil.copy2(verification_result.db_path, tmp_db)
-        import gc
-        gc.collect()
-        os.replace(tmp_db, live_db)
-        journal.phase = "REPLACED_DB"
-        journal.step_history.append("radar.db replaced atomically")
-        journal.save(safe_workspace)
+            if inject_failure_step == 4:
+                raise RuntimeError("Injected fault at step 4: Smoke test failure")
 
-        if inject_failure_step == 2:
-            raise RuntimeError("Injected fault at step 2: Delivery ledger replacement")
+            # Step 3: Post-cutover smoke test
+            conn = sqlite3.connect(f"file:{live_db}?mode=ro", uri=True)
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM stories;")
+            cursor.fetchone()
+            conn.close()
 
-        # Atomic replacement for delivery ledger
-        tmp_del = safe_workspace / "telegram_digest_delivery_ledger.json.tmp_cutover"
-        shutil.copy2(verification_result.delivery_ledger_path, tmp_del)
-        os.replace(tmp_del, live_del)
-        journal.phase = "REPLACED_DELIVERY_LEDGER"
-        journal.step_history.append("delivery ledger replaced atomically")
-        journal.save(safe_workspace)
+            journal.phase = "COMPLETED"
+            journal.step_history.append("Smoke test passed successfully")
+            journal.save(safe_workspace)
 
-        if inject_failure_step == 3:
-            raise RuntimeError("Injected fault at step 3: Budget ledger replacement")
+            logger.info("Simulated cutover completed successfully in test workspace %s", safe_workspace)
+            return True
+        except Exception as exc:
+            logger.error("Cutover failed (%s); executing verified rollback...", exc)
+            # Immediate rollback
+            if bak_db.exists():
+                shutil.copy2(bak_db, live_db)
+            if bak_del.exists():
+                shutil.copy2(bak_del, live_del)
+            if bak_bud.exists():
+                shutil.copy2(bak_bud, live_bud)
 
-        # Atomic replacement for budget ledger
-        tmp_bud = safe_workspace / "experiment_budget_ledger.json.tmp_cutover"
-        shutil.copy2(verification_result.budget_ledger_path, tmp_bud)
-        os.replace(tmp_bud, live_bud)
-        journal.phase = "REPLACED_BUDGET_LEDGER"
-        journal.step_history.append("budget ledger replaced atomically")
-        journal.save(safe_workspace)
-
-        if inject_failure_step == 4:
-            raise RuntimeError("Injected fault at step 4: Smoke test failure")
-
-        # Step 3: Post-cutover smoke test
-        conn = sqlite3.connect(f"file:{live_db}?mode=ro", uri=True)
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM stories;")
-        cursor.fetchone()
-        conn.close()
-
-        journal.phase = "COMPLETED"
-        journal.step_history.append("Smoke test passed successfully")
-        journal.save(safe_workspace)
-
-        logger.info("Simulated cutover completed successfully in test workspace %s", safe_workspace)
-        return True
-    except Exception as exc:
-        logger.error("Cutover failed (%s); executing verified rollback...", exc)
-        # Immediate rollback
-        if bak_db.exists():
-            shutil.copy2(bak_db, live_db)
-        if bak_del.exists():
-            shutil.copy2(bak_del, live_del)
-        if bak_bud.exists():
-            shutil.copy2(bak_bud, live_bud)
-
-        journal.phase = "ROLLED_BACK"
-        journal.step_history.append(f"Rolled back due to error: {exc}")
-        journal.save(safe_workspace)
-        raise RestoreVerificationError(f"Cutover failed and was safely rolled back: {exc}") from exc
+            journal.phase = "ROLLED_BACK"
+            journal.step_history.append(f"Rolled back due to error: {exc}")
+            journal.save(safe_workspace)
+            raise RestoreVerificationError(f"Cutover failed and was safely rolled back: {exc}") from exc
+    finally:
+        if internal_temp is not None:
+            internal_temp.cleanup()

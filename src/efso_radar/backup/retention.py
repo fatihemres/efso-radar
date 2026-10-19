@@ -206,6 +206,7 @@ class RetentionPolicyManager:
 
         assets = storage.list_assets()
         for asset in assets:
+            restore_res = None
             try:
                 data = storage.download_asset(asset.asset_id)
                 restore_res = verify_restore_archive(
@@ -217,13 +218,6 @@ class RetentionPolicyManager:
                 if not restore_res.success:
                     issues.append(f"Asset '{asset.name}' ({asset.asset_id}) failed restore verification")
                     continue
-
-                # Clean up ephemeral verification staging directory immediately
-                try:
-                    if restore_res.staging_dir.exists():
-                        shutil.rmtree(restore_res.staging_dir, ignore_errors=True)
-                except Exception:
-                    pass
 
                 schema_ver = restore_res.manifest.get("schema_version", 0)
                 plaintext_sha = restore_res.manifest.get("plaintext_sha256", "")
@@ -238,6 +232,9 @@ class RetentionPolicyManager:
                 )
             except Exception as exc:
                 issues.append(f"Asset '{asset.name}' ({asset.asset_id}) failed verification: {exc}")
+            finally:
+                if restore_res is not None:
+                    restore_res.cleanup()
 
         return verified_points, issues
 

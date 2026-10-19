@@ -317,6 +317,14 @@ def create_backup(
         now: Optional reference timestamp (defaults to UTC now).
         coordination_dir: Directory for cross-store lock barrier (defaults to db parent).
 
+    LIMITATION & OPERATIONAL BOUNDARY:
+    The absence of active 'run_locks' in radar.db is a necessary check, but it does NOT
+    prove that all database and JSON writers are paused (e.g. ad-hoc background scripts,
+    unmanaged workers, or direct outbox ledger modifications). In Phase 5B.2B, backups
+    are strictly offline/quiescent operations. Live unattended backups remain disabled
+    until actual cross-process writer coordination or externally verified quiescence is
+    implemented.
+
     Returns:
         BackupResult containing envelope bytes, authenticated manifest, and hashes.
 
