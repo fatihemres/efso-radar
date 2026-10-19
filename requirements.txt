@@ -1,3 +1,5 @@
 google-genai>=1.30,<2
 pydantic>=2.9.0,<3
 certifi>=2024.0.0
+cryptography>=42.0.0
+
