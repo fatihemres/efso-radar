@@ -353,13 +353,23 @@ class StateRepository(ABC):
         completion_tokens: int,
         total_tokens: int,
         estimated_cost_usd: float,
-    ) -> None:
-        """Persist budget consumption entry."""
+        timestamp: Optional[datetime] = None,
+        record_id: Optional[str] = None,
+    ) -> bool:
+        """Persist immutable budget consumption entry.
+
+        Idempotent for identical replays; raises BudgetHistoryConflictError on conflicting values.
+        """
         pass
 
     @abstractmethod
     def get_monthly_budget_summary(self, period_month: str) -> dict[str, Any]:
         """Retrieve aggregated token usage and cost for month (YYYY-MM)."""
+        pass
+
+    @abstractmethod
+    def get_budget_record(self, record_id: str) -> Optional[dict[str, Any]]:
+        """Retrieve a specific budget usage record by record_id."""
         pass
 
     # --- Scheduled Cloud Execution Audit History ---

@@ -189,6 +189,16 @@ To prevent stale workers whose lease expired from disrupting a new lock owner:
   ```
   Only the active, non-expired owner can extend the lock lease.
 
+### 4.4 Downstream Write Fencing & Epoch Limitations
+In distributed system theory, a database lock guarantees mutual exclusion on the lock resource itself. However, if a worker experiences a stop-the-world process pause (e.g., long garbage collection, VM freeze, or asynchronous network partition) exceeding its lease timeout:
+1. Another worker will rightfully acquire the expired lock.
+2. If the paused worker resumes execution without re-checking its lease, it could theoretically attempt downstream side-effects (such as dispatching an HTTP POST to Telegram Bot API).
+3. **Efso Radar Architectural Mitigations:**
+   - **Outbox Database Deduplication:** `telegram_delivery_records` enforces `UNIQUE(recipient_chat_id, message_key)`. Even if two workers attempt to record or dispatch, the database layer physically rejects duplicates.
+   - **Pre-Dispatch Lease Heartbeat Verification:** Workers re-verify lock ownership immediately before external side-effects.
+   - **Short-Lived Leases with Active Renewal:** Runner batches maintain conservative lease periods with active heartbeats.
+   - **Fencing Epoch / Token Guidance:** For future multi-region orchestrators with external storage writes, monotonic fencing tokens (incrementing integer epochs passed to all downstream operations) are required if external systems support fencing tokens. For Telegram Bot API (which does not support custom fencing headers), outbox message key uniqueness serves as the ultimate idempotency barrier.
+
 ---
 
 ## 5. Durable Telegram Delivery Protocol & Safety Gates
@@ -204,6 +214,36 @@ If an HTTP request times out, disconnects, or drops while communicating with the
 - It is recorded with timestamp and error message.
 - Automatic retry loops strictly exclude `DELIVERY_UNCERTAIN` records from blind re-dispatch.
 - This prevents duplicate messages when the Telegram server received the message but the client did not receive the HTTP 200 OK acknowledgment.
+
+### 5.3 Legal Delivery Transition State Machine & Non-Regression Invariant
+To prevent state regressions where a previously sent or uncertain message is inadvertently downgraded to `PENDING` or `FAILED` via retries or upserts:
+- **State Transition Graph:**
+  - `PENDING -> {DISPATCHING, SENT, DELIVERY_UNCERTAIN, FAILED}`
+  - `DISPATCHING -> {SENT, DELIVERY_UNCERTAIN, FAILED, PENDING}`
+  - `FAILED -> {PENDING, DISPATCHING, SENT}`
+  - `DELIVERY_UNCERTAIN -> {SENT}` (Manual or verified reconciliation only; never back to `PENDING` or `FAILED`)
+  - `SENT -> {}` (Terminal immutable state; replays with identical payload are idempotent no-ops)
+- **Illegal Regressions Raised as `DeliveryStatusRegressionError`:**
+  - `SENT -> PENDING` / `SENT -> FAILED` / `SENT -> DISPATCHING`: Strictly forbidden.
+  - `DELIVERY_UNCERTAIN -> PENDING` / `DELIVERY_UNCERTAIN -> FAILED`: Strictly forbidden.
+- **Identity Immutability (`DeliveryIdentityConflictError`):**
+  - Attempting to overwrite an existing `(recipient_chat_id, message_key)` record with a differing `recipient_role` or `category` raises `DeliveryIdentityConflictError`.
+- **Database-Level Guarded UPSERT:**
+  ```sql
+  ON CONFLICT(recipient_chat_id, message_key) DO UPDATE SET ...
+  WHERE telegram_delivery_records.status NOT IN ('SENT', 'DELIVERY_UNCERTAIN')
+     OR (telegram_delivery_records.status = 'DELIVERY_UNCERTAIN' AND excluded.status = 'SENT');
+  ```
+  Both SQLite and Turso databases physically enforce this invariant, guaranteeing that no rogue process or query can regress delivery status even if application logic were bypassed.
+
+### 5.4 Immutable Budget History & Collision-Resistant Event IDs
+The AI consumption ledger (`experiment_budget_history`) tracks Gemini token usage and estimated USD expenditure:
+- **Full Run ID Preservation:** Event IDs use full collision-resistant keys `rec_id = f"bud_{period_month}_{clean_run}"` (replacing legacy 16-character truncation).
+- **Strict INSERT Policy (No `INSERT OR REPLACE`):**
+  Existing records are never overwritten silently.
+- **Idempotent Exact Replays:** If a record with `rec_id` already exists and all metrics (`calls_count`, `prompt_tokens`, `completion_tokens`, `total_tokens`, `estimated_cost_usd`) match exactly, execution returns `True` as a safe idempotent no-op.
+- **Conflict Fail-Closed (`BudgetHistoryConflictError`):** If a record with `rec_id` exists but contains differing metrics or cost, `BudgetHistoryConflictError` is raised immediately.
+- **Original Timestamp Immutability:** Historical event timestamps are preserved exactly; `utc_now()` is never substituted for existing records.
 
 ---
 
@@ -238,26 +278,42 @@ raise RestoreVerificationError(
 ```
 Live database replacement or cutover is strictly prohibited.
 
+### 7.3 Backwards-Compatible Verification Policy for Schema v5 & v6 Backups
+To prevent historical encrypted backups created during Phase 5B.2B (which carry schema version 5) from failing validation under the schema version 6 codebase, the verification subsystem enforces:
+- `SUPPORTED_BACKUP_SCHEMA_VERSIONS = {5, 6}`: `verify_restore_archive()`, `verify_staging_database()`, and `verify_inventory()` accept any backup whose authenticated manifest schema version is within the supported set.
+- **Strict Internal Version Parity:** The database contained inside the archive must match the manifest's declared schema version (`db_version == manifest_version`).
+- **Zero Ciphertext Rewrite:** Historical `.efbk` releases on GitHub remain immutable; no re-encryption or retroactive migration is performed on cold backup assets.
+
 ---
 
-## 8. Synthetic Fixture Migration Guide (JSON Ledgers to Database Tables)
+## 8. Lossless Synthetic Fixture Migration Guide
 
-The ledger migration module (`src/efso_radar/repositories/migration_ledger.py`) provides `migrate_ledgers_to_repository()`:
-1. **Source Files:** Reads `telegram_digest_delivery_ledger.json` and `experiment_budget_ledger.json`.
-2. **Idempotent Insertion:** Checks `repo.get_telegram_delivery(chat_id, message_key)` before inserting.
-3. **Conflict Detection:** If an entry already exists with a conflicting delivery status, logs a conflict in `MigrationLedgerResult.conflicts_detected`.
-4. **Zero State Mutation on Conflict:** Re-running migration produces 0 duplicates.
+The ledger migration module (`src/efso_radar/repositories/migration_ledger.py`) provides `migrate_ledgers_to_repository()` with the following guarantees:
+1. **Explicit File Existence Enforcement:** If `delivery_ledger_path` or `budget_ledger_path` is passed, missing files fail validation with explicit error messages (no silent skips).
+2. **Strict Timestamp Immutability:** Historical records must contain valid ISO timestamps. Timestamps are never invented or defaulted to `utc_now()`; records missing timestamps are rejected as invalid.
+3. **Accurate Historical Status Mapping:**
+   - `DELIVERY_SUCCESS`, `SENT`, `SUCCESS` -> `DeliveryStatus.SENT`
+   - `DELIVERY_UNCERTAIN` -> `DeliveryStatus.DELIVERY_UNCERTAIN`
+   - `FAILED`, `HELD_QUIET_HOURS` -> `DeliveryStatus.FAILED`
+   - `PENDING` -> `DeliveryStatus.PENDING`
+   - Unknown statuses fail validation immediately and are never silently treated as FAILED.
+4. **Preservation of Roles & Categories:** Recipient roles (`PRIMARY_EDITOR`, `ADMIN`, etc.) and notification categories are preserved from the source records rather than hardcoded.
+5. **In-File and Database-Level Deduplication:**
+   - Historical aliases resolving to the same `(recipient_chat_id, message_key)` with identical payloads are safely deduplicated (`deliveries_skipped += 1`).
+   - Conflicting payloads (differing status, role, or category) are detected and flagged in `conflicts_detected`.
+6. **Pre-Flight Dry-Run Validation (`dry_run=True`):**
+   Executes complete parsing, timestamp validation, alias deduplication, and database conflict checks without mutating the database, returning a structured `MigrationLedgerResult` report.
 
 ---
 
 ## 9. Verification Sign-Off & Test Matrix
 
-All 16 acceptance test scenarios implemented in `tests/test_phase5b3b_cloud_safety_contracts.py` pass cleanly:
+Acceptance test scenarios implemented in `tests/test_phase5b3b_cloud_safety_contracts.py`:
 
 | # | Test Scenario | Verified Safety Invariant | Result |
 |---|---|---|---|
 | 01 | `test_01_legacy_runner_live_execution_rejected` | Live `--legacy` fails closed with RuntimeError | PASSED |
-| 02 | `test_02_legacy_runner_dry_run_allowed` | `--legacy --dry-run` permitted | PASSED |
+| 02 | `test_02_legacy_runner_dry_run_zero_network_zero_ai` | `--legacy --dry-run` permitted with strictly 0 network and 0 Gemini calls | PASSED |
 | 03 | `test_03_modular_runner_removes_silent_fallback` | Modular orchestrator error never falls back to legacy | PASSED |
 | 04 | `test_04_cloud_mode_configuration_enforcement` | `EFSO_STORAGE_MODE=turso` fails closed without SQLite fallback | PASSED |
 | 05 | `test_05_atomic_concurrency_lock_mutual_exclusion` | 2-worker race: Worker 1 succeeds, Worker 2 fails (0 affected rows) | PASSED |
@@ -265,10 +321,15 @@ All 16 acceptance test scenarios implemented in `tests/test_phase5b3b_cloud_safe
 | 07 | `test_07_atomic_concurrency_reentrancy` | Same worker can re-acquire and extend active lock | PASSED |
 | 08 | `test_08_atomic_concurrency_stale_worker_release_fenced` | Stale worker release cannot delete new worker's lock | PASSED |
 | 09 | `test_09_atomic_concurrency_stale_worker_renew_fenced` | Stale worker renew cannot extend new worker's lock | PASSED |
-| 10 | `test_10_telegram_outbox_uniqueness_and_idempotency` | `UNIQUE(recipient_chat_id, message_key)` prevents outbox duplicates | PASSED |
-| 11 | `test_11_telegram_outbox_uncertain_state_safety` | `DELIVERY_UNCERTAIN` state persisted and excluded from blind retry | PASSED |
-| 12 | `test_12_admin_report_at_most_once_per_date` | Admin report dispatch permitted at most once per calendar date | PASSED |
-| 13 | `test_13_admin_report_window_and_no_catchup` | Europe/Istanbul window validation; out-of-window rejected | PASSED |
-| 14 | `test_14_durable_recovery_state_restart_resilience` | Checkpoint persists and recovers across runner restarts | PASSED |
-| 15 | `test_15_ledger_migration_utility_idempotency_and_conflict` | JSON ledger migration idempotent with conflict detection | PASSED |
-| 16 | `test_16_repository_parity_sqlite_and_turso` | Sqlite and Turso repositories satisfy identical atomic contracts | PASSED |
+| 10 | `test_10_multithreaded_sqlite_concurrency_barrier` | Multi-threaded race (10 threads via Barrier): exactly 1 winner | PASSED |
+| 11 | `test_11_telegram_outbox_uniqueness_and_idempotency` | `UNIQUE(recipient_chat_id, message_key)` prevents outbox duplicates | PASSED |
+| 12 | `test_12_telegram_outbox_uncertain_state_safety` | `DELIVERY_UNCERTAIN` state persisted and excluded from blind retry | PASSED |
+| 13 | `test_13_delivery_status_regression_protection` | `SENT` and `UNCERTAIN` cannot regress to `PENDING` or `FAILED` | PASSED |
+| 14 | `test_14_admin_report_at_most_once_per_date` | Admin report dispatch permitted at most once per calendar date | PASSED |
+| 15 | `test_15_admin_report_window_and_no_catchup` | Europe/Istanbul window validation; out-of-window rejected | PASSED |
+| 16 | `test_16_durable_recovery_state_restart_resilience` | Checkpoint persists and recovers across runner restarts | PASSED |
+| 17 | `test_17_lossless_ledger_migration_and_dryrun` | Lossless migration, strict timestamps, status mapping & dry-run | PASSED |
+| 18 | `test_18_budget_ledger_immutability_and_conflict` | Full event IDs, idempotent replay, conflict rejection | PASSED |
+| 19 | `test_19_backup_schema_v5_compatibility` | Historical v5 encrypted backups verify cleanly under v6 codebase | PASSED |
+| 20 | `test_20_repository_parity_sqlite_and_turso` | Sqlite and Turso repositories satisfy identical atomic contracts | PASSED |
+

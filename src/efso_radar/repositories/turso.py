@@ -14,7 +14,10 @@ import httpx
 from efso_radar.domain import (
     AdminOperationalReport,
     Article,
+    BudgetHistoryConflictError,
+    DeliveryIdentityConflictError,
     DeliveryStatus,
+    DeliveryStatusRegressionError,
     DurableRecoveryRecord,
     EditorialAssessment,
     EditorialKind,
@@ -32,6 +35,7 @@ from efso_radar.domain import (
     TelegramNotificationCategory,
     normalize_text,
     utc_now,
+    validate_delivery_status_transition,
 )
 from efso_radar.repositories.base import StateRepository
 from efso_radar.repositories.schema import (
@@ -1000,6 +1004,41 @@ class TursoStateRepository(StateRepository):
 
     # --- Telegram Delivery Outbox & Recipient Lifecycle ---
     def record_telegram_delivery(self, delivery: TelegramDeliveryRecord) -> None:
+        # 1. Fetch existing delivery record if any
+        res = self.client.execute(
+            """
+            SELECT delivery_id, message_key, recipient_role, recipient_chat_id,
+                   category, status, sent_at, payload_json
+            FROM telegram_delivery_records
+            WHERE recipient_chat_id = ? AND message_key = ?
+            """,
+            [delivery.recipient_chat_id, delivery.message_key],
+        )
+        existing = res.fetchone()
+        if existing:
+            # Reject conflicting identities
+            if existing["recipient_role"] != delivery.recipient_role:
+                raise DeliveryIdentityConflictError(
+                    f"Conflicting recipient role for {delivery.recipient_chat_id}:{delivery.message_key}: "
+                    f"existing '{existing['recipient_role']}' vs new '{delivery.recipient_role}'"
+                )
+            if existing["category"] != delivery.category.value:
+                raise DeliveryIdentityConflictError(
+                    f"Conflicting notification category for {delivery.recipient_chat_id}:{delivery.message_key}: "
+                    f"existing '{existing['category']}' vs new '{delivery.category.value}'"
+                )
+
+            # Legal status transition validation
+            existing_status = DeliveryStatus(existing["status"])
+            validate_delivery_status_transition(existing_status, delivery.status)
+
+            # Terminal SENT or DELIVERY_UNCERTAIN idempotent replay
+            if existing_status == DeliveryStatus.SENT and delivery.status == DeliveryStatus.SENT:
+                return
+            if existing_status == DeliveryStatus.DELIVERY_UNCERTAIN and delivery.status == DeliveryStatus.DELIVERY_UNCERTAIN:
+                return
+
+        # Execute guarded atomic upsert
         self.client.execute(
             """
             INSERT INTO telegram_delivery_records (
@@ -1009,11 +1048,13 @@ class TursoStateRepository(StateRepository):
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(recipient_chat_id, message_key) DO UPDATE SET
                 status = excluded.status,
-                attempt_count = excluded.attempt_count,
+                attempt_count = MAX(telegram_delivery_records.attempt_count, excluded.attempt_count),
                 error_message = excluded.error_message,
                 payload_json = excluded.payload_json,
                 updated_at = excluded.updated_at,
-                sent_at = COALESCE(excluded.sent_at, telegram_delivery_records.sent_at)
+                sent_at = COALESCE(telegram_delivery_records.sent_at, excluded.sent_at)
+            WHERE telegram_delivery_records.status NOT IN ('SENT', 'DELIVERY_UNCERTAIN')
+               OR (telegram_delivery_records.status = 'DELIVERY_UNCERTAIN' AND excluded.status = 'SENT')
             """,
             [
                 delivery.delivery_id,
@@ -1069,21 +1110,40 @@ class TursoStateRepository(StateRepository):
         error_message: Optional[str] = None,
         sent_at: Optional[datetime] = None,
     ) -> bool:
-        now_iso = utc_now().isoformat()
-        sent_iso = sent_at.isoformat() if sent_at else None
+        # Fetch existing status first
         res = self.client.execute(
+            "SELECT status, sent_at FROM telegram_delivery_records WHERE delivery_id = ?",
+            [delivery_id],
+        )
+        row = res.fetchone()
+        if not row:
+            return False
+        existing_status = DeliveryStatus(row["status"])
+        validate_delivery_status_transition(existing_status, status)
+        if existing_status == DeliveryStatus.SENT and status == DeliveryStatus.SENT:
+            return True
+        if existing_status == DeliveryStatus.DELIVERY_UNCERTAIN and status == DeliveryStatus.DELIVERY_UNCERTAIN:
+            return True
+
+        now_iso = utc_now().isoformat()
+        sent_iso = sent_at.isoformat() if sent_at else (now_iso if status == DeliveryStatus.SENT else None)
+        res_upd = self.client.execute(
             """
             UPDATE telegram_delivery_records
             SET status = ?,
                 error_message = ?,
                 updated_at = ?,
-                sent_at = COALESCE(?, sent_at),
+                sent_at = COALESCE(sent_at, ?),
                 attempt_count = attempt_count + 1
             WHERE delivery_id = ?
+              AND (
+                status NOT IN ('SENT', 'DELIVERY_UNCERTAIN')
+                OR (status = 'DELIVERY_UNCERTAIN' AND ? = 'SENT')
+              )
             """,
-            [status.value, error_message, now_iso, sent_iso, delivery_id],
+            [status.value, error_message, now_iso, sent_iso, delivery_id, status.value],
         )
-        return res.affected_row_count > 0
+        return res_upd.affected_row_count > 0
 
     def is_digest_delivered_to_recipient(self, recipient_chat_id: str, message_key: str) -> bool:
         res = self.client.execute(
@@ -1240,12 +1300,43 @@ class TursoStateRepository(StateRepository):
         completion_tokens: int,
         total_tokens: int,
         estimated_cost_usd: float,
-    ) -> None:
-        rec_id = f"bud_{period_month}_{run_id[:16]}"
-        now_iso = utc_now().isoformat()
+        timestamp: Optional[datetime] = None,
+        record_id: Optional[str] = None,
+    ) -> bool:
+        clean_run = run_id.strip()
+        rec_id = record_id or f"bud_{period_month}_{clean_run}"
+        ts_iso = (timestamp or utc_now()).isoformat()
+
+        res = self.client.execute(
+            """
+            SELECT record_id, period_month, run_id, worker_id, calls_count,
+                   prompt_tokens, completion_tokens, total_tokens, estimated_cost_usd
+            FROM experiment_budget_history
+            WHERE record_id = ?
+            """,
+            [rec_id],
+        )
+        existing = res.fetchone()
+        if existing:
+            is_identical = (
+                int(existing["calls_count"]) == int(calls_count)
+                and int(existing["prompt_tokens"]) == int(prompt_tokens)
+                and int(existing["completion_tokens"]) == int(completion_tokens)
+                and int(existing["total_tokens"]) == int(total_tokens)
+                and abs(float(existing["estimated_cost_usd"]) - float(estimated_cost_usd)) < 1e-9
+            )
+            if is_identical:
+                return True
+            raise BudgetHistoryConflictError(
+                f"Conflict in immutable budget event '{rec_id}': existing "
+                f"(calls={existing['calls_count']}, prompt={existing['prompt_tokens']}, "
+                f"cost={existing['estimated_cost_usd']}) vs new (calls={calls_count}, "
+                f"prompt={prompt_tokens}, cost={estimated_cost_usd})"
+            )
+
         self.client.execute(
             """
-            INSERT OR REPLACE INTO experiment_budget_history (
+            INSERT INTO experiment_budget_history (
                 record_id, period_month, run_id, worker_id, timestamp,
                 calls_count, prompt_tokens, completion_tokens, total_tokens,
                 estimated_cost_usd
@@ -1254,9 +1345,9 @@ class TursoStateRepository(StateRepository):
             [
                 rec_id,
                 period_month,
-                run_id,
+                clean_run,
                 worker_id,
-                now_iso,
+                ts_iso,
                 calls_count,
                 prompt_tokens,
                 completion_tokens,
@@ -1264,6 +1355,7 @@ class TursoStateRepository(StateRepository):
                 estimated_cost_usd,
             ],
         )
+        return True
 
     def get_monthly_budget_summary(self, period_month: str) -> dict[str, Any]:
         res = self.client.execute(
@@ -1288,6 +1380,33 @@ class TursoStateRepository(StateRepository):
             "total_completion_tokens": int(row.get("total_completion_tokens") or 0),
             "total_tokens": int(row.get("total_tokens") or 0),
             "total_cost_usd": round(float(row.get("total_cost_usd") or 0.0), 6),
+        }
+
+    def get_budget_record(self, record_id: str) -> Optional[dict[str, Any]]:
+        res = self.client.execute(
+            """
+            SELECT record_id, period_month, run_id, worker_id, timestamp,
+                   calls_count, prompt_tokens, completion_tokens, total_tokens,
+                   estimated_cost_usd
+            FROM experiment_budget_history
+            WHERE record_id = ?
+            """,
+            [record_id],
+        )
+        row = res.fetchone()
+        if not row:
+            return None
+        return {
+            "record_id": row["record_id"],
+            "period_month": row["period_month"],
+            "run_id": row["run_id"],
+            "worker_id": row["worker_id"],
+            "timestamp": row["timestamp"],
+            "calls_count": int(row["calls_count"]),
+            "prompt_tokens": int(row["prompt_tokens"]),
+            "completion_tokens": int(row["completion_tokens"]),
+            "total_tokens": int(row["total_tokens"]),
+            "estimated_cost_usd": float(row["estimated_cost_usd"]),
         }
 
     # --- Scheduled Cloud Execution Audit History ---

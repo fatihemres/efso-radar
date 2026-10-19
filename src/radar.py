@@ -378,14 +378,64 @@ def telegram_send(pick: dict[str, Any]) -> None:
         raise RuntimeError("Telegram rejected message")
 
 
+def get_legacy_offline_fixture_articles() -> list[dict[str, Any]]:
+    """Deterministic offline fixture for legacy dry-run mode (zero network, zero Gemini tokens)."""
+    return [
+        {
+            "id": "offline_fix_001",
+            "title": "[OFFLINE ÖNİZLEME] Küresel Müzik Ödülleri Adayları Açıklandı",
+            "link": "https://example.org/news/music-awards-offline-preview",
+            "source": "Offline Fixture News",
+            "published_utc": "2026-10-19T10:00:00Z",
+            "market": "EN",
+            "description": "Yılın müzik ödülleri için aday listeleri resmen kamuoyuyla paylaşıldı.",
+        },
+        {
+            "id": "offline_fix_002",
+            "title": "[OFFLINE ÖNİZLEME] Yeni Dizi Rekor İzlenme Oranına Ulaştı",
+            "link": "https://example.org/news/tv-series-record-offline-preview",
+            "source": "Offline Fixture Pop",
+            "published_utc": "2026-10-19T11:00:00Z",
+            "market": "TR",
+            "description": "Dijital platformda yayınlanan yeni yapım ilk hafta sonunda rekor kırdı.",
+        },
+    ]
+
+
 def run(
     dry_run: bool = False,
     use_legacy: bool = False,
     scan_only: bool = False,
     settings: Optional[Any] = None,
 ) -> None:
-    if use_legacy and not dry_run:
-        raise RuntimeError("--legacy mode cannot be run live; it is strictly restricted to --dry-run")
+    if use_legacy:
+        if not dry_run:
+            raise RuntimeError(
+                "--legacy mode cannot be run live; legacy live execution has been permanently discontinued. "
+                "Use the modular orchestrator for live runs or use --dry-run for legacy offline preview."
+            )
+        # Deterministic offline dry-run (strictly 0 network requests, 0 Gemini API tokens)
+        LOG.info("[LEGACY DRY-RUN] Executing legacy dry-run using deterministic offline fixtures. No external RSS or Gemini calls.")
+        articles = get_legacy_offline_fixture_articles()
+        preview_picks = [
+            {
+                "kind": "NEW",
+                "headline_tr": "[OFFLINE ÖNİZLEME] Küresel Müzik Ödülleri Adayları Açıklandı",
+                "cover_title_tr": "MÜZİK ÖDÜLLERİ ADAYLARI",
+                "score": 85,
+                "suggested_format": "POST",
+                "category": "GLOBAL",
+                "why_efso_tr": "Genç kitle ve popüler kültür için küresel gündem değeri yüksek bir gelişme.",
+                "caption_idea_tr": "Ödül sezonu resmen başladı! İşte bu yılın en çok konuşulan adayları.",
+                "article_ids": [articles[0]["id"]],
+                "articles": [articles[0]],
+                "parent_story_id": "",
+                "development": "",
+            }
+        ]
+        for p in preview_picks:
+            print("\n=== PREVIEW: NO MESSAGE SENT (LEGACY OFFLINE FIXTURE) ===\n" + telegram_text(p) + "\n")
+        return
 
     if scan_only:
         import tempfile
@@ -551,44 +601,8 @@ def run(
                 raise RuntimeError(f"Modular Radar run failed: {result.message}")
             return
 
-    # Strictly guard legacy runner: reject live execution
-    if not dry_run:
-        raise RuntimeError("--legacy mode cannot be run live; it is strictly restricted to --dry-run")
-
-    now = datetime.now(UTC)
-    state = load_state(STATE_PATH)
-    expire_state(state, now)
-    articles, success = fetch_articles(now)
-    if success == 0:
-        raise RuntimeError("All news feeds failed; stopping to avoid marking articles processed")
-    candidates = unique_new(articles, state["processed"])
-    LOG.info("Sources: %s/%s, recent: %s, new candidate(s): %s",
-             success, len(QUERIES), len(articles), len(candidates))
-    if not candidates:
-        if not dry_run:
-            save_state(STATE_PATH, state)
-        return
-    raw_picks = judge(candidates, state, now)
-    picks = validate_picks(raw_picks, candidates, state["sent"])
-    LOG.info("Editorially selected %s noteworthy story/stories", len(picks))
-    for p in picks:
-        if dry_run:
-            print("\n=== PREVIEW: NO MESSAGE SENT ===\n" + telegram_text(p) + "\n")
-        else:
-            telegram_send(p)
-            story_id = "EFSO-" + now.strftime("%Y%m%d") + "-" + p["article_ids"][0][:8]
-            state["sent"].append({
-                "story_id": story_id, "headline_tr": p["headline_tr"],
-                "sent_at": now.isoformat(), "kind": p["kind"],
-                "parent_story_id": p["parent_story_id"], "development": p["development"],
-            })
-            for a in p["articles"]:
-                state["processed"][a["id"]] = now.isoformat()
-            save_state(STATE_PATH, state)
-    if not dry_run:
-        for a in candidates:
-            state["processed"][a["id"]] = now.isoformat()
-        save_state(STATE_PATH, state)
+    # Defensive fail-closed guard
+    raise RuntimeError("Unexpected execution path reached in radar.run")
 
 
 def demo() -> None:

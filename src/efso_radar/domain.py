@@ -85,6 +85,7 @@ class StoryCategory(str, Enum):
 
 
 class DeliveryStatus(str, Enum):
+    PENDING = "PENDING"
     SENT = "SENT"
     HELD_QUIET_HOURS = "HELD_QUIET_HOURS"
     DISPATCHING = "DISPATCHING"
@@ -95,6 +96,108 @@ class DeliveryStatus(str, Enum):
     HELD_FOR_VERIFICATION = "HELD_FOR_VERIFICATION"
     HELD_FOR_SENSITIVE_REVIEW = "HELD_FOR_SENSITIVE_REVIEW"
     DELIVERY_UNCERTAIN = "DELIVERY_UNCERTAIN"
+
+
+class DeliveryStateError(Exception):
+    """Base exception for telegram delivery state violations."""
+
+
+class DeliveryStatusRegressionError(DeliveryStateError):
+    """Raised when an illegal delivery status transition or regression is attempted."""
+
+
+class DeliveryIdentityConflictError(DeliveryStateError):
+    """Raised when delivery record recipient or message identities conflict."""
+
+
+class BudgetHistoryConflictError(Exception):
+    """Raised when an existing immutable budget event is overwritten with conflicting data."""
+
+
+# Explicit legal transition model for telegram delivery lifecycle
+LEGAL_DELIVERY_TRANSITIONS: dict[DeliveryStatus, set[DeliveryStatus]] = {
+    DeliveryStatus.PENDING: {
+        DeliveryStatus.PENDING,
+        DeliveryStatus.DISPATCHING,
+        DeliveryStatus.SENT,
+        DeliveryStatus.FAILED,
+        DeliveryStatus.DELIVERY_UNCERTAIN,
+        DeliveryStatus.HELD_QUIET_HOURS,
+    },
+    DeliveryStatus.DISPATCHING: {
+        DeliveryStatus.DISPATCHING,
+        DeliveryStatus.PENDING,
+        DeliveryStatus.SENT,
+        DeliveryStatus.FAILED,
+        DeliveryStatus.DELIVERY_UNCERTAIN,
+        DeliveryStatus.HELD_QUIET_HOURS,
+    },
+    DeliveryStatus.HELD_QUIET_HOURS: {
+        DeliveryStatus.HELD_QUIET_HOURS,
+        DeliveryStatus.PENDING,
+        DeliveryStatus.DISPATCHING,
+        DeliveryStatus.SENT,
+        DeliveryStatus.FAILED,
+        DeliveryStatus.EXPIRED_STALE,
+    },
+    DeliveryStatus.FAILED: {
+        DeliveryStatus.FAILED,
+        DeliveryStatus.PENDING,
+        DeliveryStatus.DISPATCHING,
+        DeliveryStatus.SENT,
+        DeliveryStatus.DELIVERY_UNCERTAIN,
+    },
+    # Uncertainty-sensitive: blind retry to PENDING or DISPATCHING is strictly prohibited.
+    # May only remain UNCERTAIN or be reconciled with verified proof to SENT.
+    DeliveryStatus.DELIVERY_UNCERTAIN: {
+        DeliveryStatus.DELIVERY_UNCERTAIN,
+        DeliveryStatus.SENT,
+    },
+    # Terminal success: once SENT, cannot regress to any prior or failed state.
+    DeliveryStatus.SENT: {
+        DeliveryStatus.SENT,
+    },
+    DeliveryStatus.EXPIRED_STALE: {
+        DeliveryStatus.EXPIRED_STALE,
+    },
+    DeliveryStatus.SKIPPED_BELOW_THRESHOLD: {
+        DeliveryStatus.SKIPPED_BELOW_THRESHOLD,
+    },
+    DeliveryStatus.HELD_FOR_VERIFICATION: {
+        DeliveryStatus.HELD_FOR_VERIFICATION,
+        DeliveryStatus.PENDING,
+        DeliveryStatus.DISPATCHING,
+        DeliveryStatus.SENT,
+        DeliveryStatus.EXPIRED_STALE,
+    },
+    DeliveryStatus.HELD_FOR_SENSITIVE_REVIEW: {
+        DeliveryStatus.HELD_FOR_SENSITIVE_REVIEW,
+        DeliveryStatus.PENDING,
+        DeliveryStatus.DISPATCHING,
+        DeliveryStatus.SENT,
+        DeliveryStatus.EXPIRED_STALE,
+    },
+}
+
+
+def validate_delivery_status_transition(
+    current_status: DeliveryStatus | str,
+    new_status: DeliveryStatus | str,
+) -> None:
+    """Validate that transition from current_status to new_status is legal.
+
+    Raises:
+        DeliveryStatusRegressionError: If the transition represents an illegal status regression.
+    """
+    curr = DeliveryStatus(current_status) if isinstance(current_status, str) else current_status
+    nxt = DeliveryStatus(new_status) if isinstance(new_status, str) else new_status
+
+    allowed = LEGAL_DELIVERY_TRANSITIONS.get(curr, {curr})
+    if nxt not in allowed:
+        raise DeliveryStatusRegressionError(
+            f"Illegal delivery status transition: cannot transition from {curr.value} to {nxt.value}. "
+            f"Allowed next states: {[s.value for s in allowed]}."
+        )
 
 
 class NotificationUrgencyTier(str, Enum):
