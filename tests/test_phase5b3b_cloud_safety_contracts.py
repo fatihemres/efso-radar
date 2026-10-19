@@ -54,6 +54,7 @@ from efso_radar.config import (
 from efso_radar.domain import (
     BudgetHistoryConflictError,
     DeliveryIdentityConflictError,
+    DeliveryStateError,
     DeliveryStatus,
     DeliveryStatusRegressionError,
     TelegramDeliveryRecord,
@@ -421,12 +422,48 @@ class TestPhase5B3BCloudSafetyContracts(unittest.TestCase):
         with self.assertRaises(DeliveryStatusRegressionError):
             self.repo.update_telegram_delivery_status("del_unc_001", DeliveryStatus.FAILED)
 
-        # 7. UNCERTAIN -> SENT is permitted (manual/verified reconciliation)
-        self.repo.update_telegram_delivery_status("del_unc_001", DeliveryStatus.SENT)
-        fetched = self.repo.get_telegram_delivery("8712345678", "key_uncertain")
-        self.assertEqual(fetched.status, DeliveryStatus.SENT)
+        # 7. Generic update_telegram_delivery_status and record_telegram_delivery CANNOT transition UNCERTAIN to SENT
+        with self.assertRaises(DeliveryStatusRegressionError):
+            self.repo.update_telegram_delivery_status("del_unc_001", DeliveryStatus.SENT)
 
-        # 8. Idempotent replay of SENT is safe
+        rec_unc_sent_variant = TelegramDeliveryRecord(
+            delivery_id="del_unc_001_variant",
+            message_key="key_uncertain",
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id="8712345678",
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            status=DeliveryStatus.SENT,
+            attempt_count=2,
+        )
+        with self.assertRaises(DeliveryStatusRegressionError):
+            self.repo.record_telegram_delivery(rec_unc_sent_variant)
+
+        # 8. reconcile_uncertain_delivery requires complete proof and only works on UNCERTAIN records
+        with self.assertRaises(DeliveryStateError):
+            self.repo.reconcile_uncertain_delivery("del_sent_001", {"reconciliation_method": "check", "verified_by": "op", "proof_reference": "ref"})
+
+        with self.assertRaises(ValueError):
+            self.repo.reconcile_uncertain_delivery("del_unc_001", {"reconciliation_method": "check"})  # Missing verifier & ref!
+
+        # 9. Explicit reconciliation with valid proof transitions to SENT and preserves evidence
+        valid_proof = {
+            "reconciliation_method": "telegram_update_offset_inspection",
+            "verified_by": "lead_operator",
+            "proof_reference": "update_id_9928172",
+            "proof_notes": "Bot update verified delivery to editor chat.",
+        }
+        reconciled = self.repo.reconcile_uncertain_delivery("del_unc_001", valid_proof)
+        self.assertEqual(reconciled.status, DeliveryStatus.SENT)
+        self.assertIsNotNone(reconciled.sent_at)
+        self.assertEqual(reconciled.payload["reconciliation"]["verified_by"], "lead_operator")
+        self.assertIn("original_uncertainty_evidence", reconciled.payload)
+
+        fetched = self.repo.get_telegram_delivery("8712345678", "key_uncertain")
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched.status, DeliveryStatus.SENT)
+        self.assertEqual(fetched.payload["reconciliation"]["proof_reference"], "update_id_9928172")
+
+        # 10. Idempotent replay of SENT is safe
         self.repo.record_telegram_delivery(rec_sent)
 
     # --- 4. At-Most-Once Daily Admin Reports & Window Validation ---
@@ -515,7 +552,7 @@ class TestPhase5B3BCloudSafetyContracts(unittest.TestCase):
         self.assertFalse(res_missing.success)
         self.assertTrue(any("does not exist" in e for e in res_missing.errors))
 
-        # 2. Write valid ledgers with mixed roles and historical statuses
+        # 2. Write valid ledgers with mixed roles and historical statuses (including HELD_QUIET_HOURS)
         del_data = {
             "version": 1,
             "deliveries": {
@@ -543,6 +580,14 @@ class TestPhase5B3BCloudSafetyContracts(unittest.TestCase):
                     "recipient_role": "PRIMARY_EDITOR",
                     "category": "EDITORIAL_DIGEST",
                     "error_message": "Network timeout",
+                },
+                "8712345678:d_hash_held": {
+                    "status": "HELD_QUIET_HOURS",
+                    "delivered_at_utc": "2026-10-19T01:30:00Z",
+                    "chat_id": "8712345678",
+                    "digest_hash": "d_hash_held",
+                    "recipient_role": "PRIMARY_EDITOR",
+                    "category": "EDITORIAL_DIGEST",
                 },
                 # Identical alias for d_hash_001 should be deduplicated
                 "alias_001": {
@@ -575,7 +620,7 @@ class TestPhase5B3BCloudSafetyContracts(unittest.TestCase):
         res_dry = migrate_ledgers_to_repository(self.repo, del_path, bud_path, dry_run=True)
         self.assertTrue(res_dry.success)
         self.assertTrue(res_dry.dry_run)
-        self.assertEqual(res_dry.deliveries_imported, 3)
+        self.assertEqual(res_dry.deliveries_imported, 4)
         self.assertEqual(res_dry.deliveries_skipped, 1)  # alias_001 deduplicated
         self.assertEqual(res_dry.budget_records_imported, 1)
         self.assertIn("DRY-RUN", res_dry.summary())
@@ -586,11 +631,11 @@ class TestPhase5B3BCloudSafetyContracts(unittest.TestCase):
         # 4. Live migration
         res_live = migrate_ledgers_to_repository(self.repo, del_path, bud_path, dry_run=False)
         self.assertTrue(res_live.success)
-        self.assertEqual(res_live.deliveries_imported, 3)
+        self.assertEqual(res_live.deliveries_imported, 4)
         self.assertEqual(res_live.deliveries_skipped, 1)
         self.assertEqual(res_live.budget_records_imported, 1)
 
-        # Verify preserved roles & categories
+        # Verify preserved roles, categories, and HELD_QUIET_HOURS (not FAILED)
         rec_editor = self.repo.get_telegram_delivery("8712345678", "d_hash_001")
         self.assertIsNotNone(rec_editor)
         self.assertEqual(rec_editor.recipient_role, "PRIMARY_EDITOR")
@@ -605,11 +650,15 @@ class TestPhase5B3BCloudSafetyContracts(unittest.TestCase):
         self.assertIsNotNone(rec_unc)
         self.assertEqual(rec_unc.status, DeliveryStatus.DELIVERY_UNCERTAIN)
 
+        rec_held = self.repo.get_telegram_delivery("8712345678", "d_hash_held")
+        self.assertIsNotNone(rec_held)
+        self.assertEqual(rec_held.status, DeliveryStatus.HELD_QUIET_HOURS)
+
         # 5. Idempotent re-run: all existing records are skipped safely
         res_replay = migrate_ledgers_to_repository(self.repo, del_path, bud_path, dry_run=False)
         self.assertTrue(res_replay.success)
         self.assertEqual(res_replay.deliveries_imported, 0)
-        self.assertEqual(res_replay.deliveries_skipped, 4)  # 3 distinct + 1 alias
+        self.assertEqual(res_replay.deliveries_skipped, 5)  # 4 distinct + 1 alias
         self.assertEqual(res_replay.budget_records_imported, 0)
         self.assertEqual(res_replay.budget_records_skipped, 1)
 
@@ -620,6 +669,8 @@ class TestPhase5B3BCloudSafetyContracts(unittest.TestCase):
                     "status": "SENT",
                     "chat_id": "8712345678",
                     "digest_hash": "d_bad_ts",
+                    "recipient_role": "PRIMARY_EDITOR",
+                    "category": "EDITORIAL_DIGEST",
                     # No timestamp!
                 }
             }
@@ -630,6 +681,111 @@ class TestPhase5B3BCloudSafetyContracts(unittest.TestCase):
         res_bad_ts = migrate_ledgers_to_repository(self.repo, del_bad_path, dry_run=True)
         self.assertFalse(res_bad_ts.success)
         self.assertTrue(any("Missing delivery timestamp" in e for e in res_bad_ts.errors))
+
+        # 7. Reject missing recipient role without defaulting to PRIMARY_EDITOR
+        del_bad_role = {
+            "deliveries": {
+                "8712345678:d_bad_role": {
+                    "status": "SENT",
+                    "delivered_at_utc": "2026-10-19T12:00:00Z",
+                    "chat_id": "8712345678",
+                    "digest_hash": "d_bad_role",
+                    "category": "EDITORIAL_DIGEST",
+                    # No recipient_role!
+                }
+            }
+        }
+        del_bad_role_path = self.tmp_path / "del_bad_role.json"
+        del_bad_role_path.write_text(json.dumps(del_bad_role), encoding="utf-8")
+        res_bad_role = migrate_ledgers_to_repository(self.repo, del_bad_role_path, dry_run=True)
+        self.assertFalse(res_bad_role.success)
+        self.assertTrue(any("recipient role" in e for e in res_bad_role.errors))
+
+        # 8. Reject missing category without defaulting to EDITORIAL_DIGEST
+        del_bad_cat = {
+            "deliveries": {
+                "8712345678:d_bad_cat": {
+                    "status": "SENT",
+                    "delivered_at_utc": "2026-10-19T12:00:00Z",
+                    "chat_id": "8712345678",
+                    "digest_hash": "d_bad_cat",
+                    "recipient_role": "PRIMARY_EDITOR",
+                    # No category!
+                }
+            }
+        }
+        del_bad_cat_path = self.tmp_path / "del_bad_cat.json"
+        del_bad_cat_path.write_text(json.dumps(del_bad_cat), encoding="utf-8")
+        res_bad_cat = migrate_ledgers_to_repository(self.repo, del_bad_cat_path, dry_run=True)
+        self.assertFalse(res_bad_cat.success)
+        self.assertTrue(any("notification category" in e for e in res_bad_cat.errors))
+
+        # 9. Conflicting payload test (existing record has different payload)
+        del_conflict_payload = {
+            "deliveries": {
+                "8712345678:d_hash_001": {
+                    "status": "DELIVERY_SUCCESS",
+                    "delivered_at_utc": "2026-10-19T12:00:00Z",
+                    "chat_id": "8712345678",
+                    "digest_hash": "d_hash_001",
+                    "recipient_role": "PRIMARY_EDITOR",
+                    "category": "EDITORIAL_DIGEST",
+                    "extra_tampered_payload_field": "conflict_value",
+                }
+            }
+        }
+        del_conflict_payload_path = self.tmp_path / "del_conflict_payload.json"
+        del_conflict_payload_path.write_text(json.dumps(del_conflict_payload), encoding="utf-8")
+        res_conflict_p = migrate_ledgers_to_repository(self.repo, del_conflict_payload_path, dry_run=True)
+        self.assertFalse(res_conflict_p.success)
+        self.assertTrue(len(res_conflict_p.conflicts_detected) > 0)
+        self.assertTrue(any("Delivery conflict" in c for c in res_conflict_p.conflicts_detected))
+
+        # 10. Conflicting timestamp test (existing record has different timestamp)
+        del_conflict_ts = {
+            "deliveries": {
+                "8712345678:d_hash_001": {
+                    "status": "DELIVERY_SUCCESS",
+                    "delivered_at_utc": "2026-10-19T19:00:00Z",  # Different timestamp!
+                    "chat_id": "8712345678",
+                    "digest_hash": "d_hash_001",
+                    "recipient_role": "PRIMARY_EDITOR",
+                    "category": "EDITORIAL_DIGEST",
+                }
+            }
+        }
+        del_conflict_ts_path = self.tmp_path / "del_conflict_ts.json"
+        del_conflict_ts_path.write_text(json.dumps(del_conflict_ts), encoding="utf-8")
+        res_conflict_t = migrate_ledgers_to_repository(self.repo, del_conflict_ts_path, dry_run=True)
+        self.assertFalse(res_conflict_t.success)
+        self.assertTrue(len(res_conflict_t.conflicts_detected) > 0)
+
+        # 11. Atomic pre-flight & partial-write safety: malformed later entry results in ZERO writes
+        del_atomic = {
+            "deliveries": {
+                "8712345678:d_atomic_valid": {
+                    "status": "SENT",
+                    "delivered_at_utc": "2026-10-19T12:00:00Z",
+                    "chat_id": "8712345678",
+                    "digest_hash": "d_atomic_valid",
+                    "recipient_role": "PRIMARY_EDITOR",
+                    "category": "EDITORIAL_DIGEST",
+                },
+                "8712345678:d_atomic_malformed_later": {
+                    "status": "SENT",
+                    # Missing timestamp!
+                    "chat_id": "8712345678",
+                    "digest_hash": "d_atomic_malformed_later",
+                    "recipient_role": "PRIMARY_EDITOR",
+                    "category": "EDITORIAL_DIGEST",
+                },
+            }
+        }
+        del_atomic_path = self.tmp_path / "del_atomic.json"
+        del_atomic_path.write_text(json.dumps(del_atomic), encoding="utf-8")
+        res_atomic = migrate_ledgers_to_repository(self.repo, del_atomic_path, dry_run=False)
+        self.assertFalse(res_atomic.success)
+        self.assertIsNone(self.repo.get_telegram_delivery("8712345678", "d_atomic_valid"))
 
     def test_18_budget_ledger_immutability_and_conflict(self):
         """Full event IDs, idempotent replay, conflict rejection on budget ledger."""
@@ -683,6 +839,53 @@ class TestPhase5B3BCloudSafetyContracts(unittest.TestCase):
                 estimated_cost_usd=0.0035,
                 timestamp=ts,
             )
+
+        # 5. Conflicting replay with different worker_id raises BudgetHistoryConflictError
+        with self.assertRaises(BudgetHistoryConflictError):
+            self.repo.record_budget_usage(
+                period_month="2026-10",
+                run_id="exp_super_long_event_identifier_1234567890_abcdef",
+                worker_id="runner_2",  # Different worker!
+                calls_count=2,
+                prompt_tokens=2000,
+                completion_tokens=500,
+                total_tokens=2500,
+                estimated_cost_usd=0.0025,
+                timestamp=ts,
+            )
+
+        # 6. Conflicting replay with different timestamp raises BudgetHistoryConflictError
+        with self.assertRaises(BudgetHistoryConflictError):
+            self.repo.record_budget_usage(
+                period_month="2026-10",
+                run_id="exp_super_long_event_identifier_1234567890_abcdef",
+                worker_id="runner_1",
+                calls_count=2,
+                prompt_tokens=2000,
+                completion_tokens=500,
+                total_tokens=2500,
+                estimated_cost_usd=0.0025,
+                timestamp=datetime(2026, 10, 19, 18, 0, 0, tzinfo=timezone.utc),  # Different ts!
+            )
+
+        # 7. Reject missing timestamp in historical budget ledger (no month-start 01T00:00:00 invention)
+        bud_bad_ts = {
+            "experiment_id": "test_exp",
+            "batches": {
+                "b_bad_ts": {
+                    "actual_cost_usd": 0.001,
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "period_month": "2026-10",
+                    # No timestamp!
+                }
+            }
+        }
+        bud_bad_path = self.tmp_path / "bud_bad_ts.json"
+        bud_bad_path.write_text(json.dumps(bud_bad_ts), encoding="utf-8")
+        res_bad_bud = migrate_ledgers_to_repository(self.repo, budget_ledger_path=bud_bad_path, dry_run=True)
+        self.assertFalse(res_bad_bud.success)
+        self.assertTrue(any("Missing required timestamp" in e for e in res_bad_bud.errors))
 
     # --- 7. Encrypted Backup Compatibility Across Schema Versions ---
     def test_19_backup_schema_v5_compatibility(self):
@@ -808,14 +1011,51 @@ class TestPhase5B3BCloudSafetyContracts(unittest.TestCase):
         with self.assertRaises(DeliveryStatusRegressionError):
             turso_repo.record_telegram_delivery(rec_pending)
 
-        # 5. Budget conflict check on Turso
+        # 5. Delivery UNCERTAIN -> SENT locked down on Turso; reconcile_uncertain_delivery parity
         mock_client.execute.return_value = TursoQueryResult(
-            cols=["record_id", "period_month", "run_id", "worker_id", "calls_count", "prompt_tokens", "completion_tokens", "total_tokens", "estimated_cost_usd"],
+            cols=["delivery_id", "message_key", "recipient_role", "recipient_chat_id", "category", "status", "attempt_count", "max_attempts", "error_message", "payload_json", "created_at", "updated_at", "sent_at"],
+            rows=[{
+                "delivery_id": "del_unc_t",
+                "message_key": "key_unc_t",
+                "recipient_role": "PRIMARY_EDITOR",
+                "recipient_chat_id": "8712345678",
+                "category": "EDITORIAL_DIGEST",
+                "status": "DELIVERY_UNCERTAIN",
+                "attempt_count": 1,
+                "max_attempts": 3,
+                "error_message": "Network drop",
+                "payload_json": '{"digest": "test"}',
+                "created_at": "2026-10-19T10:00:00Z",
+                "updated_at": "2026-10-19T10:00:00Z",
+                "sent_at": None,
+            }],
+            affected_row_count=1,
+        )
+        with self.assertRaises(DeliveryStatusRegressionError):
+            turso_repo.update_telegram_delivery_status("del_unc_t", DeliveryStatus.SENT)
+
+        with self.assertRaises(ValueError):
+            turso_repo.reconcile_uncertain_delivery("del_unc_t", {"reconciliation_method": "check"})
+
+        proof = {
+            "reconciliation_method": "telegram_update_offset_check",
+            "verified_by": "lead_operator",
+            "proof_reference": "ref_123",
+        }
+        reconciled_t = turso_repo.reconcile_uncertain_delivery("del_unc_t", proof)
+        self.assertEqual(reconciled_t.status, DeliveryStatus.SENT)
+        self.assertEqual(reconciled_t.payload["reconciliation"]["verified_by"], "lead_operator")
+        self.assertIn("original_uncertainty_evidence", reconciled_t.payload)
+
+        # 6. Budget conflict check on Turso (prompt tokens conflict)
+        mock_client.execute.return_value = TursoQueryResult(
+            cols=["record_id", "period_month", "run_id", "worker_id", "timestamp", "calls_count", "prompt_tokens", "completion_tokens", "total_tokens", "estimated_cost_usd"],
             rows=[{
                 "record_id": "bud_2026-10_run_1",
                 "period_month": "2026-10",
                 "run_id": "run_1",
                 "worker_id": "w1",
+                "timestamp": "2026-10-19T10:00:00+00:00",
                 "calls_count": 1,
                 "prompt_tokens": 1000,
                 "completion_tokens": 200,
@@ -834,6 +1074,21 @@ class TestPhase5B3BCloudSafetyContracts(unittest.TestCase):
                 completion_tokens=200,
                 total_tokens=10199,
                 estimated_cost_usd=0.005,
+                timestamp=datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc),
+            )
+
+        # 7. Budget conflict check on Turso (worker_id conflict)
+        with self.assertRaises(BudgetHistoryConflictError):
+            turso_repo.record_budget_usage(
+                period_month="2026-10",
+                run_id="run_1",
+                worker_id="different_worker",  # Conflict!
+                calls_count=1,
+                prompt_tokens=1000,
+                completion_tokens=200,
+                total_tokens=1200,
+                estimated_cost_usd=0.001,
+                timestamp=datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc),
             )
 
 

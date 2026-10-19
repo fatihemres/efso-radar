@@ -148,10 +148,9 @@ LEGAL_DELIVERY_TRANSITIONS: dict[DeliveryStatus, set[DeliveryStatus]] = {
         DeliveryStatus.DELIVERY_UNCERTAIN,
     },
     # Uncertainty-sensitive: blind retry to PENDING or DISPATCHING is strictly prohibited.
-    # May only remain UNCERTAIN or be reconciled with verified proof to SENT.
+    # Generic transition to SENT is also blocked without authoritative reconciliation proof.
     DeliveryStatus.DELIVERY_UNCERTAIN: {
         DeliveryStatus.DELIVERY_UNCERTAIN,
-        DeliveryStatus.SENT,
     },
     # Terminal success: once SENT, cannot regress to any prior or failed state.
     DeliveryStatus.SENT: {
@@ -180,9 +179,31 @@ LEGAL_DELIVERY_TRANSITIONS: dict[DeliveryStatus, set[DeliveryStatus]] = {
 }
 
 
+def mask_chat_id(chat_id: str | int | None) -> str:
+    """Mask sensitive chat IDs in logs and public reports (e.g. 87...78)."""
+    if chat_id is None:
+        return "***"
+    clean = str(chat_id).strip()
+    if len(clean) >= 6:
+        return f"{clean[:2]}...{clean[-2:]}"
+    elif len(clean) > 0:
+        return f"{clean[0]}...{clean[-1]}"
+    return "***"
+
+
+class ReconciliationProof(BaseModel):
+    """Authoritative proof required to reconcile a DELIVERY_UNCERTAIN record to SENT."""
+    reconciliation_method: str = Field(min_length=3)
+    verified_by: str = Field(min_length=2)
+    proof_reference: str = Field(min_length=1)
+    proof_notes: Optional[str] = None
+    reconciled_at: datetime = Field(default_factory=utc_now)
+
+
 def validate_delivery_status_transition(
     current_status: DeliveryStatus | str,
     new_status: DeliveryStatus | str,
+    allow_reconciliation: bool = False,
 ) -> None:
     """Validate that transition from current_status to new_status is legal.
 
@@ -191,6 +212,14 @@ def validate_delivery_status_transition(
     """
     curr = DeliveryStatus(current_status) if isinstance(current_status, str) else current_status
     nxt = DeliveryStatus(new_status) if isinstance(new_status, str) else new_status
+
+    if curr == DeliveryStatus.DELIVERY_UNCERTAIN and nxt == DeliveryStatus.SENT:
+        if not allow_reconciliation:
+            raise DeliveryStatusRegressionError(
+                "Generic delivery status transition from DELIVERY_UNCERTAIN to SENT is blocked. "
+                "Authoritative reconciliation proof is required via reconcile_uncertain_delivery()."
+            )
+        return
 
     allowed = LEGAL_DELIVERY_TRANSITIONS.get(curr, {curr})
     if nxt not in allowed:

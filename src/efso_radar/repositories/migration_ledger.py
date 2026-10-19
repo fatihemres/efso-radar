@@ -2,8 +2,9 @@
 
 Losslessly and idempotently imports legacy/offline JSON ledgers (telegram_digest_delivery_ledger.json
 and experiment_budget_ledger.json) into repository tables (telegram_delivery_records
-and experiment_budget_history) with strict conflict detection, historical role/category preservation,
-timestamp immutability (zero synthetic utc_now() invention), alias deduplication, and pre-flight dry-run reporting.
+and experiment_budget_history) with strict two-phase validation, historical role/category preservation,
+timestamp immutability (zero synthetic utc_now() invention, zero day-1 timestamp invention),
+alias deduplication, complete conflict detection, raw chat ID masking, and transactional execution.
 """
 from __future__ import annotations
 
@@ -21,8 +22,10 @@ from efso_radar.domain import (
     DeliveryStatusRegressionError,
     TelegramDeliveryRecord,
     TelegramNotificationCategory,
+    mask_chat_id,
 )
 from efso_radar.repositories.base import StateRepository
+from efso_radar.repositories.sqlite import SqliteStateRepository
 
 logger = logging.getLogger("efso-radar.repository.migration_ledger")
 
@@ -68,20 +71,32 @@ def migrate_ledgers_to_repository(
     budget_ledger_path: Optional[Path] = None,
     dry_run: bool = False,
 ) -> MigrationLedgerResult:
-    """Losslessly migrate JSON ledgers into the repository database.
+    """Losslessly migrate JSON ledgers into the repository database using strict two-phase validation.
 
-    Enforces:
-    - Fail-closed if explicitly provided ledger file does not exist.
-    - Zero timestamp invention: records without valid historical ISO timestamps fail validation.
-    - Accurate historical status mapping (SENT, DELIVERY_UNCERTAIN, FAILED, HELD_QUIET_HOURS, PENDING);
-      unknown statuses fail with explicit errors.
-    - Full preservation of source recipient roles and notification categories.
-    - In-file and database-level duplicate/alias deduplication and conflict detection.
-    - Pre-flight dry-run reporting (dry_run=True) without database mutation.
+    Phase 1: Pure in-memory pre-flight validation.
+    - Validates file existence, JSON syntax, required fields, and historical statuses.
+    - Preserves HELD_QUIET_HOURS as HELD_QUIET_HOURS, not FAILED.
+    - Requires authoritative recipient_role and category (never assumes PRIMARY_EDITOR or EDITORIAL_DIGEST).
+    - Requires authoritative timestamps (never invents utc_now() or month-start 01T00:00:00).
+    - Performs full-field duplicate and conflict detection (status, role, category, timestamp, error, payload).
+    - Masks raw chat IDs in all logs and reports.
+    - If ANY error or conflict is detected, or if dry_run=True, aborts with 0 database writes.
+
+    Phase 2: Transactional application.
+    - Executes writes within an atomic transaction on SQLite.
     """
     result = MigrationLedgerResult(dry_run=dry_run)
 
-    # 1. Delivery Ledger Migration
+    deliveries_to_import: list[TelegramDeliveryRecord] = []
+    deliveries_to_skip_count = 0
+    budget_to_import: list[dict[str, Any]] = []
+    budget_to_skip_count = 0
+
+    # ---------------------------------------------------------
+    # PHASE 1: PRE-FLIGHT VALIDATION (STRICTLY IN-MEMORY & READ-ONLY)
+    # ---------------------------------------------------------
+
+    # 1. Delivery Ledger Pre-flight
     if delivery_ledger_path is not None:
         if not delivery_ledger_path.exists():
             result.errors.append(f"Delivery ledger path does not exist: {delivery_ledger_path}")
@@ -99,7 +114,7 @@ def migrate_ledgers_to_repository(
                         result.errors.append(f"Malformed delivery ledger entry is not a dict: {entry_key}")
                         continue
 
-                    # 1a. Identity extraction
+                    # Identity extraction
                     chat_id = str(entry_val.get("chat_id", "")).strip()
                     digest_hash = str(entry_val.get("digest_hash", "") or entry_val.get("message_key", "")).strip()
                     if not chat_id or not digest_hash:
@@ -108,11 +123,14 @@ def migrate_ledgers_to_repository(
                             chat_id = chat_id or parts[0].strip()
                             digest_hash = digest_hash or parts[1].strip()
 
+                    masked_chat = mask_chat_id(chat_id) if chat_id else "unknown_chat"
                     if not chat_id or not digest_hash:
-                        result.errors.append(f"Malformed delivery ledger entry missing chat_id or digest_hash: {entry_key}")
+                        result.errors.append(
+                            f"Malformed delivery ledger entry missing chat_id or digest_hash: {entry_key}"
+                        )
                         continue
 
-                    # 1b. Timestamp validation (strict - NO invented utc_now())
+                    # Timestamp validation (strict - NO invented utc_now())
                     delivered_at_str = (
                         entry_val.get("delivered_at_utc")
                         or entry_val.get("sent_at")
@@ -121,20 +139,22 @@ def migrate_ledgers_to_repository(
                     )
                     if not delivered_at_str:
                         result.errors.append(
-                            f"Missing delivery timestamp for entry '{entry_key}' ({chat_id}:{digest_hash}). "
+                            f"Missing delivery timestamp for entry '{entry_key}' ({masked_chat}:{digest_hash}). "
                             "Historical timestamps must not be invented with utc_now()."
                         )
                         continue
 
                     try:
                         delivered_at = datetime.fromisoformat(str(delivered_at_str).replace("Z", "+00:00"))
+                        if delivered_at.tzinfo is None:
+                            delivered_at = delivered_at.replace(tzinfo=timezone.utc)
                     except Exception as ts_exc:
                         result.errors.append(
-                            f"Invalid ISO timestamp '{delivered_at_str}' for entry '{entry_key}': {ts_exc}"
+                            f"Invalid ISO timestamp '{delivered_at_str}' for entry '{entry_key}' ({masked_chat}): {ts_exc}"
                         )
                         continue
 
-                    # 1c. Historical status mapping
+                    # Historical status mapping
                     raw_status = str(entry_val.get("status", "")).strip().upper()
                     if raw_status in ("DELIVERY_SUCCESS", "SENT", "SUCCESS"):
                         status = DeliveryStatus.SENT
@@ -143,37 +163,50 @@ def migrate_ledgers_to_repository(
                     elif raw_status == "FAILED":
                         status = DeliveryStatus.FAILED
                     elif raw_status == "HELD_QUIET_HOURS":
-                        status = DeliveryStatus.FAILED
+                        status = DeliveryStatus.HELD_QUIET_HOURS
                     elif raw_status == "PENDING":
                         status = DeliveryStatus.PENDING
                     else:
                         result.errors.append(
-                            f"Unknown historical delivery status '{raw_status}' for entry '{entry_key}'. "
-                            "Unknown statuses cannot be silently converted to FAILED."
+                            f"Unknown historical delivery status '{raw_status}' for entry '{entry_key}' ({masked_chat}). "
+                            "Unknown statuses cannot be silently converted."
                         )
                         continue
 
-                    # 1d. Role and Category preservation
-                    role = str(entry_val.get("recipient_role") or entry_val.get("role") or "PRIMARY_EDITOR").strip()
+                    # Role and Category preservation (Never assume PRIMARY_EDITOR or EDITORIAL_DIGEST)
+                    raw_role = entry_val.get("recipient_role") or entry_val.get("role")
+                    if not raw_role or not str(raw_role).strip():
+                        result.errors.append(
+                            f"Missing required recipient role for entry '{entry_key}' ({masked_chat}:{digest_hash}). "
+                            "Recipient roles must not be assumed as PRIMARY_EDITOR without evidence."
+                        )
+                        continue
+                    role = str(raw_role).strip()
 
                     category_val = entry_val.get("category") or entry_val.get("notification_category")
-                    if category_val:
-                        cat_str = str(category_val).strip().upper()
-                        if cat_str in ("ADMIN_HEALTH_REPORT", "ADMIN_REPORT", "OPERATIONAL_HEALTH_REPORT"):
-                            category = TelegramNotificationCategory.OPERATIONAL_HEALTH_REPORT
-                        else:
-                            try:
-                                category = TelegramNotificationCategory(str(category_val))
-                            except ValueError:
-                                try:
-                                    category = TelegramNotificationCategory[cat_str]
-                                except KeyError:
-                                    result.errors.append(
-                                        f"Unknown notification category '{category_val}' for entry '{entry_key}'"
-                                    )
-                                    continue
-                    else:
+                    if not category_val or not str(category_val).strip():
+                        result.errors.append(
+                            f"Missing required notification category for entry '{entry_key}' ({masked_chat}:{digest_hash}). "
+                            "Categories must not be assumed as EDITORIAL_DIGEST without evidence."
+                        )
+                        continue
+
+                    cat_str = str(category_val).strip().upper()
+                    if cat_str in ("ADMIN_HEALTH_REPORT", "ADMIN_REPORT", "OPERATIONAL_HEALTH_REPORT"):
+                        category = TelegramNotificationCategory.OPERATIONAL_HEALTH_REPORT
+                    elif cat_str in ("EDITORIAL_DIGEST", "DIGEST"):
                         category = TelegramNotificationCategory.EDITORIAL_DIGEST
+                    else:
+                        try:
+                            category = TelegramNotificationCategory(str(category_val))
+                        except ValueError:
+                            try:
+                                category = TelegramNotificationCategory[cat_str]
+                            except KeyError:
+                                result.errors.append(
+                                    f"Unknown notification category '{category_val}' for entry '{entry_key}' ({masked_chat})"
+                                )
+                                continue
 
                     err_msg = entry_val.get("error_message")
                     if raw_status == "HELD_QUIET_HOURS" and not err_msg:
@@ -196,7 +229,7 @@ def migrate_ledgers_to_repository(
                         sent_at=delivered_at if status == DeliveryStatus.SENT else None,
                     )
 
-                    # 1e. In-file duplicate & alias deduplication
+                    # In-file duplicate & alias deduplication (comparing status, role, category, timestamp, error, payload)
                     del_ident = (chat_id, digest_hash)
                     if del_ident in seen_deliveries:
                         prev_rec = seen_deliveries[del_ident]
@@ -204,56 +237,54 @@ def migrate_ledgers_to_repository(
                             prev_rec.status == record.status
                             and prev_rec.recipient_role == record.recipient_role
                             and prev_rec.category == record.category
+                            and prev_rec.created_at.isoformat() == record.created_at.isoformat()
                             and prev_rec.error_message == record.error_message
+                            and prev_rec.payload == record.payload
                         ):
                             # Identical duplicate / alias in file -> skip safely
-                            result.deliveries_skipped += 1
+                            deliveries_to_skip_count += 1
                             continue
                         else:
                             result.conflicts_detected.append(
-                                f"Conflicting in-file duplicate entry for {chat_id}:{digest_hash} "
-                                f"(status={prev_rec.status}, role={prev_rec.recipient_role} vs "
-                                f"status={record.status}, role={record.recipient_role})"
+                                f"Conflicting in-file duplicate entry for {masked_chat}:{digest_hash} "
+                                f"(status={prev_rec.status.value}, role={prev_rec.recipient_role}, cat={prev_rec.category.value}, "
+                                f"ts={prev_rec.created_at.isoformat()} vs status={record.status.value}, "
+                                f"role={record.recipient_role}, cat={record.category.value}, ts={record.created_at.isoformat()})"
                             )
                             continue
                     seen_deliveries[del_ident] = record
 
-                    # 1f. Database check and conflict detection
+                    # Database check and conflict detection (read-only)
                     existing = repo.get_telegram_delivery(chat_id, digest_hash)
                     if existing:
-                        if (
+                        existing_ts = existing.created_at
+                        if existing_ts.tzinfo is None:
+                            existing_ts = existing_ts.replace(tzinfo=timezone.utc)
+                        is_identical = (
                             existing.status == record.status
                             and existing.recipient_role == record.recipient_role
                             and existing.category == record.category
-                        ):
-                            result.deliveries_skipped += 1
+                            and existing_ts.isoformat() == record.created_at.isoformat()
+                            and existing.error_message == record.error_message
+                            and existing.payload == record.payload
+                        )
+                        if is_identical:
+                            deliveries_to_skip_count += 1
                         else:
                             result.conflicts_detected.append(
-                                f"Delivery conflict for {chat_id}:{digest_hash} (existing in db "
-                                f"status={existing.status}, role={existing.recipient_role}, cat={existing.category} "
-                                f"vs imported status={record.status}, role={record.recipient_role}, cat={record.category})"
+                                f"Delivery conflict for {masked_chat}:{digest_hash} (existing in db "
+                                f"status={existing.status.value}, role={existing.recipient_role}, cat={existing.category.value}, "
+                                f"ts={existing_ts.isoformat()} vs imported status={record.status.value}, "
+                                f"role={record.recipient_role}, cat={record.category.value}, ts={record.created_at.isoformat()})"
                             )
                     else:
-                        if dry_run:
-                            result.deliveries_imported += 1
-                        else:
-                            try:
-                                repo.record_telegram_delivery(record)
-                                result.deliveries_imported += 1
-                            except (DeliveryStatusRegressionError, DeliveryIdentityConflictError) as reg_err:
-                                result.conflicts_detected.append(
-                                    f"Delivery conflict for {chat_id}:{digest_hash}: {reg_err}"
-                                )
-                            except Exception as rec_exc:
-                                result.errors.append(
-                                    f"Failed to record delivery for {chat_id}:{digest_hash}: {rec_exc}"
-                                )
+                        deliveries_to_import.append(record)
 
             except Exception as exc:
-                logger.exception("Failed to migrate delivery ledger: %s", exc)
+                logger.exception("Failed to validate delivery ledger: %s", exc)
                 result.errors.append(f"Delivery ledger migration error: {exc}")
 
-    # 2. Budget Ledger Migration
+    # 2. Budget Ledger Pre-flight
     if budget_ledger_path is not None:
         if not budget_ledger_path.exists():
             result.errors.append(f"Budget ledger path does not exist: {budget_ledger_path}")
@@ -264,7 +295,7 @@ def migrate_ledgers_to_repository(
                 batches = data.get("batches", {}) if isinstance(data, dict) else {}
                 exp_id = str(data.get("experiment_id", "default_exp"))
 
-                seen_budget_keys: set[str] = set()
+                seen_budget_records: dict[str, dict[str, Any]] = {}
 
                 for batch_id, batch_val in batches.items():
                     if not isinstance(batch_val, dict):
@@ -284,87 +315,193 @@ def migrate_ledgers_to_repository(
                         or batch_val.get("created_at")
                     )
 
-                    if ts_str:
-                        try:
-                            ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
-                            if not period:
-                                period = ts.strftime("%Y-%m")
-                        except Exception as ts_exc:
-                            result.errors.append(
-                                f"Invalid timestamp '{ts_str}' for budget batch {batch_id}: {ts_exc}"
-                            )
-                            continue
-                    elif period:
-                        try:
-                            ts = datetime.fromisoformat(f"{period}-01T00:00:00+00:00")
-                        except Exception as p_exc:
-                            result.errors.append(
-                                f"Invalid period_month '{period}' for budget batch {batch_id}: {p_exc}"
-                            )
-                            continue
-                    else:
+                    if not ts_str:
                         result.errors.append(
-                            f"Missing timestamp and period_month for budget batch {batch_id}. "
-                            "Timestamps must not be invented with utc_now()."
+                            f"Missing required timestamp for budget batch '{batch_id}'. "
+                            "Timestamps must not be derived or invented from period_month."
+                        )
+                        continue
+
+                    try:
+                        ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=timezone.utc)
+                        if not period:
+                            period = ts.strftime("%Y-%m")
+                    except Exception as ts_exc:
+                        result.errors.append(
+                            f"Invalid timestamp '{ts_str}' for budget batch '{batch_id}': {ts_exc}"
                         )
                         continue
 
                     clean_run = f"{exp_id}_{batch_id}".strip()
                     rec_id = f"bud_{period}_{clean_run}"
 
-                    # In-file duplicate check
-                    if rec_id in seen_budget_keys:
-                        result.budget_records_skipped += 1
-                        continue
-                    seen_budget_keys.add(rec_id)
+                    bud_data = {
+                        "record_id": rec_id,
+                        "period_month": period,
+                        "clean_run": clean_run,
+                        "worker_id": "migration_utility",
+                        "calls_count": calls,
+                        "prompt_tokens": in_tok,
+                        "completion_tokens": out_tok,
+                        "total_tokens": total_tok,
+                        "estimated_cost_usd": cost,
+                        "timestamp": ts,
+                    }
 
-                    # Check DB
+                    # In-file duplicate check
+                    if rec_id in seen_budget_records:
+                        prev_bud = seen_budget_records[rec_id]
+                        is_identical = (
+                            prev_bud["period_month"] == period
+                            and prev_bud["clean_run"] == clean_run
+                            and prev_bud["timestamp"].isoformat() == ts.isoformat()
+                            and prev_bud["calls_count"] == calls
+                            and prev_bud["prompt_tokens"] == in_tok
+                            and prev_bud["completion_tokens"] == out_tok
+                            and prev_bud["total_tokens"] == total_tok
+                            and abs(prev_bud["estimated_cost_usd"] - cost) < 1e-9
+                        )
+                        if is_identical:
+                            budget_to_skip_count += 1
+                            continue
+                        else:
+                            result.conflicts_detected.append(
+                                f"Conflicting in-file duplicate budget batch for '{rec_id}'"
+                            )
+                            continue
+                    seen_budget_records[rec_id] = bud_data
+
+                    # Database check (read-only)
                     existing = repo.get_budget_record(rec_id)
                     if existing:
                         is_identical = (
-                            int(existing["calls_count"]) == calls
+                            existing["period_month"] == period
+                            and existing["run_id"] == clean_run
+                            and existing["worker_id"] == "migration_utility"
+                            and existing["timestamp"] == ts.isoformat()
+                            and int(existing["calls_count"]) == calls
                             and int(existing["prompt_tokens"]) == in_tok
                             and int(existing["completion_tokens"]) == out_tok
                             and int(existing["total_tokens"]) == total_tok
                             and abs(float(existing["estimated_cost_usd"]) - cost) < 1e-9
                         )
                         if is_identical:
-                            result.budget_records_skipped += 1
+                            budget_to_skip_count += 1
                         else:
                             result.conflicts_detected.append(
-                                f"Budget conflict for batch {rec_id}: existing in db "
-                                f"(calls={existing['calls_count']}, prompt={existing['prompt_tokens']}, cost={existing['estimated_cost_usd']}) "
-                                f"vs imported (calls={calls}, prompt={in_tok}, cost={cost})"
+                                f"Budget conflict for batch '{rec_id}': existing in db "
+                                f"(period={existing['period_month']}, run={existing['run_id']}, worker={existing['worker_id']}, "
+                                f"ts={existing['timestamp']}, calls={existing['calls_count']}, prompt={existing['prompt_tokens']}, "
+                                f"cost={existing['estimated_cost_usd']}) vs imported "
+                                f"(period={period}, run={clean_run}, worker=migration_utility, ts={ts.isoformat()}, "
+                                f"calls={calls}, prompt={in_tok}, cost={cost})"
                             )
                     else:
-                        if dry_run:
-                            result.budget_records_imported += 1
-                        else:
-                            try:
-                                repo.record_budget_usage(
-                                    period_month=period,
-                                    run_id=clean_run,
-                                    worker_id="migration_utility",
-                                    calls_count=calls,
-                                    prompt_tokens=in_tok,
-                                    completion_tokens=out_tok,
-                                    total_tokens=total_tok,
-                                    estimated_cost_usd=cost,
-                                    timestamp=ts,
-                                    record_id=rec_id,
-                                )
-                                result.budget_records_imported += 1
-                            except BudgetHistoryConflictError as conf_err:
-                                result.conflicts_detected.append(
-                                    f"Budget conflict for batch {rec_id}: {conf_err}"
-                                )
-                            except Exception as exc:
-                                result.errors.append(
-                                    f"Failed to record budget usage for {rec_id}: {exc}"
-                                )
+                        budget_to_import.append(bud_data)
 
             except Exception as exc:
-                logger.exception("Failed to migrate budget ledger: %s", exc)
+                logger.exception("Failed to validate budget ledger: %s", exc)
                 result.errors.append(f"Budget ledger migration error: {exc}")
+
+    # If any error or conflict occurred, or if running in dry-run mode:
+    # FAIL CLOSED or RETURN PRE-FLIGHT REPORT WITH ZERO DATABASE WRITES
+    if not result.success or dry_run:
+        result.deliveries_imported = len(deliveries_to_import) if (result.success and dry_run) else 0
+        result.deliveries_skipped = deliveries_to_skip_count
+        result.budget_records_imported = len(budget_to_import) if (result.success and dry_run) else 0
+        result.budget_records_skipped = budget_to_skip_count
+        return result
+
+    # ---------------------------------------------------------
+    # PHASE 2: TRANSACTIONAL APPLICATION (ALL PRE-FLIGHT GATES PASSED)
+    # ---------------------------------------------------------
+    try:
+        if isinstance(repo, SqliteStateRepository):
+            with repo._connection() as conn:
+                for rec in deliveries_to_import:
+                    conn.execute(
+                        """
+                        INSERT INTO telegram_delivery_records (
+                            delivery_id, message_key, recipient_role, recipient_chat_id,
+                            category, status, attempt_count, max_attempts, error_message,
+                            payload_json, created_at, updated_at, sent_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(recipient_chat_id, message_key) DO UPDATE SET
+                            status = excluded.status,
+                            attempt_count = MAX(telegram_delivery_records.attempt_count, excluded.attempt_count),
+                            error_message = excluded.error_message,
+                            payload_json = excluded.payload_json,
+                            updated_at = excluded.updated_at,
+                            sent_at = COALESCE(telegram_delivery_records.sent_at, excluded.sent_at)
+                        WHERE telegram_delivery_records.status NOT IN ('SENT', 'DELIVERY_UNCERTAIN')
+                        """,
+                        (
+                            rec.delivery_id,
+                            rec.message_key,
+                            rec.recipient_role,
+                            rec.recipient_chat_id,
+                            rec.category.value,
+                            rec.status.value,
+                            rec.attempt_count,
+                            rec.max_attempts,
+                            rec.error_message,
+                            json.dumps(rec.payload, ensure_ascii=False),
+                            rec.created_at.isoformat(),
+                            rec.updated_at.isoformat(),
+                            rec.sent_at.isoformat() if rec.sent_at else None,
+                        ),
+                    )
+                for bud in budget_to_import:
+                    conn.execute(
+                        """
+                        INSERT INTO experiment_budget_history (
+                            record_id, period_month, run_id, worker_id, timestamp,
+                            calls_count, prompt_tokens, completion_tokens, total_tokens,
+                            estimated_cost_usd
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            bud["record_id"],
+                            bud["period_month"],
+                            bud["clean_run"],
+                            bud["worker_id"],
+                            bud["timestamp"].isoformat(),
+                            bud["calls_count"],
+                            bud["prompt_tokens"],
+                            bud["completion_tokens"],
+                            bud["total_tokens"],
+                            bud["estimated_cost_usd"],
+                        ),
+                    )
+        else:
+            # Generic StateRepository fallback (e.g. Turso or mocks)
+            for rec in deliveries_to_import:
+                repo.record_telegram_delivery(rec)
+            for bud in budget_to_import:
+                repo.record_budget_usage(
+                    period_month=bud["period_month"],
+                    run_id=bud["clean_run"],
+                    worker_id=bud["worker_id"],
+                    calls_count=bud["calls_count"],
+                    prompt_tokens=bud["prompt_tokens"],
+                    completion_tokens=bud["completion_tokens"],
+                    total_tokens=bud["total_tokens"],
+                    estimated_cost_usd=bud["estimated_cost_usd"],
+                    timestamp=bud["timestamp"],
+                    record_id=bud["record_id"],
+                )
+
+        result.deliveries_imported = len(deliveries_to_import)
+        result.deliveries_skipped = deliveries_to_skip_count
+        result.budget_records_imported = len(budget_to_import)
+        result.budget_records_skipped = budget_to_skip_count
+
+    except Exception as exc:
+        logger.exception("Failed during transactional application of ledgers: %s", exc)
+        result.errors.append(f"Transactional migration application failed: {exc}")
+        result.deliveries_imported = 0
+        result.budget_records_imported = 0
 
     return result

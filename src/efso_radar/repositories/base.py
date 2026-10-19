@@ -288,6 +288,16 @@ class StateRepository(ABC):
         pass
 
     @abstractmethod
+    def reconcile_uncertain_delivery(
+        self,
+        delivery_id: str,
+        reconciliation_proof: dict[str, Any],
+        reconciled_at: Optional[datetime] = None,
+    ) -> TelegramDeliveryRecord:
+        """Authoritatively reconcile a DELIVERY_UNCERTAIN record to SENT with verified proof."""
+        pass
+
+    @abstractmethod
     def is_digest_delivered_to_recipient(self, recipient_chat_id: str, message_key: str) -> bool:
         """Check if a specific digest has already been delivered to this recipient."""
         pass

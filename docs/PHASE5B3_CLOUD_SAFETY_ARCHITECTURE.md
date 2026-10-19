@@ -221,20 +221,24 @@ To prevent state regressions where a previously sent or uncertain message is ina
   - `PENDING -> {DISPATCHING, SENT, DELIVERY_UNCERTAIN, FAILED}`
   - `DISPATCHING -> {SENT, DELIVERY_UNCERTAIN, FAILED, PENDING}`
   - `FAILED -> {PENDING, DISPATCHING, SENT}`
-  - `DELIVERY_UNCERTAIN -> {SENT}` (Manual or verified reconciliation only; never back to `PENDING` or `FAILED`)
+  - `DELIVERY_UNCERTAIN -> {}` (Generic updates/upserts cannot transition to SENT; only explicit `reconcile_uncertain_delivery()` with verified proof is permitted)
   - `SENT -> {}` (Terminal immutable state; replays with identical payload are idempotent no-ops)
 - **Illegal Regressions Raised as `DeliveryStatusRegressionError`:**
   - `SENT -> PENDING` / `SENT -> FAILED` / `SENT -> DISPATCHING`: Strictly forbidden.
   - `DELIVERY_UNCERTAIN -> PENDING` / `DELIVERY_UNCERTAIN -> FAILED`: Strictly forbidden.
+  - Generic `DELIVERY_UNCERTAIN -> SENT`: Forbidden in `update_telegram_delivery_status` and `record_telegram_delivery`.
+- **Explicit Authoritative Reconciliation Pathway (`reconcile_uncertain_delivery`):**
+  - Transitioning a record from `DELIVERY_UNCERTAIN` to `SENT` requires calling `reconcile_uncertain_delivery(delivery_id, reconciliation_proof, reconciled_at)`.
+  - `reconciliation_proof` must contain non-empty `reconciliation_method`, `verified_by`, and `proof_reference`.
+  - Preserves `original_uncertainty_evidence` (`error_message`, `marked_uncertain_at`) inside `payload_json`.
 - **Identity Immutability (`DeliveryIdentityConflictError`):**
   - Attempting to overwrite an existing `(recipient_chat_id, message_key)` record with a differing `recipient_role` or `category` raises `DeliveryIdentityConflictError`.
 - **Database-Level Guarded UPSERT:**
   ```sql
   ON CONFLICT(recipient_chat_id, message_key) DO UPDATE SET ...
-  WHERE telegram_delivery_records.status NOT IN ('SENT', 'DELIVERY_UNCERTAIN')
-     OR (telegram_delivery_records.status = 'DELIVERY_UNCERTAIN' AND excluded.status = 'SENT');
+  WHERE telegram_delivery_records.status NOT IN ('SENT', 'DELIVERY_UNCERTAIN');
   ```
-  Both SQLite and Turso databases physically enforce this invariant, guaranteeing that no rogue process or query can regress delivery status even if application logic were bypassed.
+  Both SQLite and Turso databases physically enforce this invariant, guaranteeing that generic operations can never alter or overwrite either `SENT` or `DELIVERY_UNCERTAIN` records.
 
 ### 5.4 Immutable Budget History & Collision-Resistant Event IDs
 The AI consumption ledger (`experiment_budget_history`) tracks Gemini token usage and estimated USD expenditure:
@@ -289,19 +293,28 @@ To prevent historical encrypted backups created during Phase 5B.2B (which carry 
 ## 8. Lossless Synthetic Fixture Migration Guide
 
 The ledger migration module (`src/efso_radar/repositories/migration_ledger.py`) provides `migrate_ledgers_to_repository()` with the following guarantees:
-1. **Explicit File Existence Enforcement:** If `delivery_ledger_path` or `budget_ledger_path` is passed, missing files fail validation with explicit error messages (no silent skips).
-2. **Strict Timestamp Immutability:** Historical records must contain valid ISO timestamps. Timestamps are never invented or defaulted to `utc_now()`; records missing timestamps are rejected as invalid.
+1. **Strict Two-Phase Architecture:**
+   - **Phase 1 (Pre-Flight Validation):** Validates all files, records, timestamps, roles, categories, and conflict checks entirely in memory. If any record fails or conflict occurs, or in `dry_run=True`, execution halts with 0 database writes.
+   - **Phase 2 (Transactional Execution):** Writes are applied within an atomic transaction block on SQLite, ensuring zero partial writes if an unexpected error occurs.
+2. **Strict Timestamp Immutability:** Historical records must contain valid ISO timestamps. Timestamps are never invented or defaulted to `utc_now()`, and budget records never invent day-1 timestamps (`f"{period}-01T00:00:00+00:00"`). Records missing timestamps fail closed.
 3. **Accurate Historical Status Mapping:**
    - `DELIVERY_SUCCESS`, `SENT`, `SUCCESS` -> `DeliveryStatus.SENT`
    - `DELIVERY_UNCERTAIN` -> `DeliveryStatus.DELIVERY_UNCERTAIN`
-   - `FAILED`, `HELD_QUIET_HOURS` -> `DeliveryStatus.FAILED`
+   - `FAILED` -> `DeliveryStatus.FAILED`
+   - `HELD_QUIET_HOURS` -> `DeliveryStatus.HELD_QUIET_HOURS` (preserved accurately, never collapsed into FAILED)
    - `PENDING` -> `DeliveryStatus.PENDING`
-   - Unknown statuses fail validation immediately and are never silently treated as FAILED.
-4. **Preservation of Roles & Categories:** Recipient roles (`PRIMARY_EDITOR`, `ADMIN`, etc.) and notification categories are preserved from the source records rather than hardcoded.
-5. **In-File and Database-Level Deduplication:**
-   - Historical aliases resolving to the same `(recipient_chat_id, message_key)` with identical payloads are safely deduplicated (`deliveries_skipped += 1`).
-   - Conflicting payloads (differing status, role, or category) are detected and flagged in `conflicts_detected`.
-6. **Pre-Flight Dry-Run Validation (`dry_run=True`):**
+   - Unknown statuses fail validation immediately and are never silently converted.
+4. **Authoritative Evidence for Roles & Categories:**
+   - Recipient roles and notification categories must be authoritatively present in the source record.
+   - Missing roles are never defaulted to `PRIMARY_EDITOR`.
+   - Missing categories are never defaulted to `EDITORIAL_DIGEST`.
+   - Missing required fields immediately fail validation closed.
+5. **Complete Conflict & Duplicate Detection:**
+   - Compares identity, status, role, category, timestamp, error message, and payload evidence.
+   - Identical status alone is insufficient to skip; any mismatch in timestamp, payload, role, or category is flagged as a conflict.
+6. **Recipient Chat ID Privacy:**
+   - All raw Telegram chat IDs in error messages, conflict reports, and migration logs are masked (`87...78`, `19...35`) via `mask_chat_id()`.
+7. **Pre-Flight Dry-Run Validation (`dry_run=True`):**
    Executes complete parsing, timestamp validation, alias deduplication, and database conflict checks without mutating the database, returning a structured `MigrationLedgerResult` report.
 
 ---

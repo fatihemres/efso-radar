@@ -18,6 +18,7 @@ from efso_radar.domain import (
     Article,
     BudgetHistoryConflictError,
     DeliveryIdentityConflictError,
+    DeliveryStateError,
     DeliveryStatus,
     DeliveryStatusRegressionError,
     DurableRecoveryRecord,
@@ -1125,7 +1126,6 @@ class SqliteStateRepository(StateRepository):
                     updated_at = excluded.updated_at,
                     sent_at = COALESCE(telegram_delivery_records.sent_at, excluded.sent_at)
                 WHERE telegram_delivery_records.status NOT IN ('SENT', 'DELIVERY_UNCERTAIN')
-                   OR (telegram_delivery_records.status = 'DELIVERY_UNCERTAIN' AND excluded.status = 'SENT')
                 """,
                 (
                     delivery.delivery_id,
@@ -1208,14 +1208,94 @@ class SqliteStateRepository(StateRepository):
                     sent_at = COALESCE(sent_at, ?),
                     attempt_count = attempt_count + 1
                 WHERE delivery_id = ?
-                  AND (
-                    status NOT IN ('SENT', 'DELIVERY_UNCERTAIN')
-                    OR (status = 'DELIVERY_UNCERTAIN' AND ? = 'SENT')
-                  )
+                  AND status NOT IN ('SENT', 'DELIVERY_UNCERTAIN')
                 """,
-                (status.value, error_message, now_iso, sent_iso, delivery_id, status.value),
+                (status.value, error_message, now_iso, sent_iso, delivery_id),
             )
             return cursor.rowcount > 0
+
+    def reconcile_uncertain_delivery(
+        self,
+        delivery_id: str,
+        reconciliation_proof: dict[str, Any],
+        reconciled_at: Optional[datetime] = None,
+    ) -> TelegramDeliveryRecord:
+        if not isinstance(reconciliation_proof, dict):
+            raise ValueError("Reconciliation proof must be a dictionary.")
+        method = str(reconciliation_proof.get("reconciliation_method", "")).strip()
+        verifier = str(reconciliation_proof.get("verified_by", "")).strip()
+        ref = str(reconciliation_proof.get("proof_reference", "")).strip()
+        if not method or not verifier or not ref:
+            raise ValueError(
+                "Reconciliation proof requires non-empty 'reconciliation_method', "
+                "'verified_by', and 'proof_reference'."
+            )
+
+        rec_dt = reconciled_at or utc_now()
+        rec_iso = rec_dt.isoformat()
+
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT delivery_id, message_key, recipient_role, recipient_chat_id,
+                       category, status, attempt_count, max_attempts, error_message,
+                       payload_json, created_at, updated_at, sent_at
+                FROM telegram_delivery_records
+                WHERE delivery_id = ?
+                """,
+                (delivery_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise DeliveryStateError(f"Delivery record '{delivery_id}' not found.")
+
+            existing_status = DeliveryStatus(row["status"])
+            if existing_status != DeliveryStatus.DELIVERY_UNCERTAIN:
+                raise DeliveryStateError(
+                    f"Cannot reconcile delivery '{delivery_id}' with status '{existing_status.value}'; "
+                    "only DELIVERY_UNCERTAIN records can be reconciled."
+                )
+
+            payload = json.loads(row["payload_json"] or "{}")
+            payload["original_uncertainty_evidence"] = {
+                "error_message": row["error_message"],
+                "marked_uncertain_at": row["updated_at"],
+            }
+            payload["reconciliation"] = {
+                "reconciliation_method": method,
+                "verified_by": verifier,
+                "proof_reference": ref,
+                "proof_notes": reconciliation_proof.get("proof_notes"),
+                "reconciled_at": rec_iso,
+            }
+
+            conn.execute(
+                """
+                UPDATE telegram_delivery_records
+                SET status = 'SENT',
+                    updated_at = ?,
+                    sent_at = ?,
+                    payload_json = ?
+                WHERE delivery_id = ? AND status = 'DELIVERY_UNCERTAIN'
+                """,
+                (rec_iso, rec_iso, json.dumps(payload, ensure_ascii=False), delivery_id),
+            )
+
+            return TelegramDeliveryRecord(
+                delivery_id=row["delivery_id"],
+                message_key=row["message_key"],
+                recipient_role=row["recipient_role"],
+                recipient_chat_id=row["recipient_chat_id"],
+                category=TelegramNotificationCategory(row["category"]),
+                status=DeliveryStatus.SENT,
+                attempt_count=int(row["attempt_count"]),
+                max_attempts=int(row["max_attempts"]),
+                error_message=row["error_message"],
+                payload=payload,
+                created_at=datetime.fromisoformat(row["created_at"]),
+                updated_at=rec_dt,
+                sent_at=rec_dt,
+            )
 
     def is_digest_delivered_to_recipient(self, recipient_chat_id: str, message_key: str) -> bool:
         with self._connection() as conn:
@@ -1389,7 +1469,7 @@ class SqliteStateRepository(StateRepository):
         with self._connection() as conn:
             cursor = conn.execute(
                 """
-                SELECT record_id, period_month, run_id, worker_id, calls_count,
+                SELECT record_id, period_month, run_id, worker_id, timestamp, calls_count,
                        prompt_tokens, completion_tokens, total_tokens, estimated_cost_usd
                 FROM experiment_budget_history
                 WHERE record_id = ?
@@ -1399,7 +1479,11 @@ class SqliteStateRepository(StateRepository):
             existing = cursor.fetchone()
             if existing:
                 is_identical = (
-                    int(existing["calls_count"]) == int(calls_count)
+                    existing["period_month"] == period_month
+                    and existing["run_id"] == clean_run
+                    and existing["worker_id"] == worker_id
+                    and existing["timestamp"] == ts_iso
+                    and int(existing["calls_count"]) == int(calls_count)
                     and int(existing["prompt_tokens"]) == int(prompt_tokens)
                     and int(existing["completion_tokens"]) == int(completion_tokens)
                     and int(existing["total_tokens"]) == int(total_tokens)
@@ -1409,9 +1493,11 @@ class SqliteStateRepository(StateRepository):
                     return True
                 raise BudgetHistoryConflictError(
                     f"Conflict in immutable budget event '{rec_id}': existing "
-                    f"(calls={existing['calls_count']}, prompt={existing['prompt_tokens']}, "
-                    f"cost={existing['estimated_cost_usd']}) vs new (calls={calls_count}, "
-                    f"prompt={prompt_tokens}, cost={estimated_cost_usd})"
+                    f"(period={existing['period_month']}, run={existing['run_id']}, worker={existing['worker_id']}, "
+                    f"ts={existing['timestamp']}, calls={existing['calls_count']}, prompt={existing['prompt_tokens']}, "
+                    f"cost={existing['estimated_cost_usd']}) vs new "
+                    f"(period={period_month}, run={clean_run}, worker={worker_id}, ts={ts_iso}, "
+                    f"calls={calls_count}, prompt={prompt_tokens}, cost={estimated_cost_usd})"
                 )
 
             conn.execute(
