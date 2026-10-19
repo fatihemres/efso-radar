@@ -485,18 +485,29 @@ class TestPhase5B3BCloudSafetyContracts(unittest.TestCase):
         # 12. Idempotent replay of SENT is safe
         self.repo.record_telegram_delivery(rec_sent)
 
-        # 13. Operational SQLite database path fails closed (arbitrary operational paths cannot be reconciled)
-        op_db_repo = SqliteStateRepository(Path("data/radar.db"))
+        # 13. Operational SQLite database path fails closed without filesystem side-effects
+        # Construct an uninitialized repository instance via __new__ to guarantee ZERO filesystem access / _init_db()
+        op_db_repo = SqliteStateRepository.__new__(SqliteStateRepository)
+        op_db_repo.db_path = Path("data/radar.db")
+        op_db_repo._is_owned_synthetic_fixture = False
+
+        # Assert that public reconciliation fails closed BEFORE opening any database connection
+        mock_op_conn = MagicMock(side_effect=AssertionError("Database connection must NEVER be opened on operational paths"))
+        op_db_repo._connection = mock_op_conn
         with self.assertRaises(DeliveryStateError) as op_ctx:
             op_db_repo.reconcile_uncertain_delivery("del_unc_001", valid_proof, operator_authorized=True)
         self.assertIn("unowned or operational", str(op_ctx.exception))
+        mock_op_conn.assert_not_called()
 
-        # 14. Unregistered temporary database fails public reconciliation closed by default
+        # 14. Unregistered temporary database fails public reconciliation closed by default before connection
         unreg_temp_path = self.tmp_path / "unregistered_temp.db"
         unreg_repo = SqliteStateRepository(unreg_temp_path)
+        mock_unreg_conn = MagicMock(side_effect=AssertionError("Database connection must NEVER be opened on unowned repository"))
+        unreg_repo._connection = mock_unreg_conn
         with self.assertRaises(DeliveryStateError) as unreg_ctx:
             unreg_repo.reconcile_uncertain_delivery("del_unc_001", valid_proof, operator_authorized=True)
         self.assertIn("unowned or operational", str(unreg_ctx.exception))
+        mock_unreg_conn.assert_not_called()
 
         # 15. Attempting to adopt pre-existing non-empty database as synthetic fixture is rejected
         pre_existing_path = self.tmp_path / "pre_existing_adopted.db"
