@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 from efso_radar.backup.creator import (
+    BackupCoordinationTimeoutError,
     BackupCreationError,
     BackupResult,
+    MalformedLedgerError,
+    SnapshotCoordinationBarrier,
     create_backup,
     create_consistent_sqlite_snapshot,
 )
@@ -17,10 +20,16 @@ from efso_radar.backup.envelope import (
 )
 from efso_radar.backup.restore import (
     CutoverAuthorizationError,
+    CutoverJournal,
     DecompressionBombSecurityError,
+    DeliveryBlockedUncertainRecoveryError,
     PathTraversalSecurityError,
+    ProductionCutoverDisabledError,
     RestoreVerificationError,
     RestoreVerificationResult,
+    TelegramDeliveryReconciliationGate,
+    UnsafeStagingPathError,
+    detect_and_recover_incomplete_cutover,
     execute_production_cutover,
     verify_restore_archive,
 )
@@ -30,12 +39,17 @@ from efso_radar.backup.retention import (
     RetentionPlan,
     RetentionPolicyManager,
     RetentionPolicyViolationError,
+    StaleInventoryError,
     StorageAdapter,
+    VerifiedRecoveryPoint,
 )
 
 __all__ = [
+    "BackupCoordinationTimeoutError",
     "BackupCreationError",
     "BackupResult",
+    "MalformedLedgerError",
+    "SnapshotCoordinationBarrier",
     "create_backup",
     "create_consistent_sqlite_snapshot",
     "CryptographicIntegrityError",
@@ -45,10 +59,16 @@ __all__ = [
     "decrypt_envelope",
     "encrypt_envelope",
     "CutoverAuthorizationError",
+    "CutoverJournal",
     "DecompressionBombSecurityError",
+    "DeliveryBlockedUncertainRecoveryError",
     "PathTraversalSecurityError",
+    "ProductionCutoverDisabledError",
     "RestoreVerificationError",
     "RestoreVerificationResult",
+    "TelegramDeliveryReconciliationGate",
+    "UnsafeStagingPathError",
+    "detect_and_recover_incomplete_cutover",
     "execute_production_cutover",
     "verify_restore_archive",
     "BackupAsset",
@@ -56,5 +76,7 @@ __all__ = [
     "RetentionPlan",
     "RetentionPolicyManager",
     "RetentionPolicyViolationError",
+    "StaleInventoryError",
     "StorageAdapter",
+    "VerifiedRecoveryPoint",
 ]

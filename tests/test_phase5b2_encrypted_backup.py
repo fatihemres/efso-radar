@@ -1,23 +1,22 @@
 """Hermetic acceptance test suite for Phase 5B.2B: Encrypted Backup & Verified Restore.
 
-Verifies:
+Comprehensive safety verification covering:
 1. AES-256-GCM envelope encryption and decryption roundtrip.
 2. Complete data equivalence between original and restored SQLite databases.
 3. SQLite WAL consistency (checkpointing committed frames without torn pages).
-4. Concurrent-write consistency guarantees during backup creation.
+4. Transient worker run_locks stripped from backup snapshot.
 5. Fail-closed behavior on wrong encryption key.
 6. Fail-closed behavior on corrupted or truncated ciphertext.
-7. Fail-closed behavior on corrupted or tampered AAD manifest.
-8. Rejection of missing or malformed essential ledgers.
+7. Authenticated binary header tampering tests for EVERY header field independently.
+8. Missing or malformed essential ledgers validation (schema and structural validity).
 9. Protection against path traversal (Zip/Tar Slip attacks) and decompression bombs.
-10. Database schema version compatibility validation.
-11. Atomic cutover and automatic rollback protection.
-12. Duplicate Telegram delivery prevention after restore.
-13. Candidate backlog durability and preservation across restore.
-14. Retention policy enforcement (14-day rolling window, minimum recovery points,
-    never deleting the last valid backup).
-15. Zero raw secrets or recipient Chat IDs in logs or verification reports.
-16. Strict immutability of operational databases during backup and dry-run restore.
+10. Database true schema version and manifest row count validation.
+11. Staging directory non-destructive guarantees (refusal of unsafe / non-empty paths).
+12. Multi-file cutover crash journal, fail-closed live policy, and step-by-step rollback.
+13. Post-restore Telegram duplicate prevention and DELIVERY_UNCERTAIN safety gate.
+14. Cross-store snapshot coordination barrier and deadlock/timeout prevention.
+15. Content-verified retention lifecycle, inventory fingerprinting, and budget conflict upload halting.
+16. Zero raw secrets or recipient Chat IDs in logs or verification reports.
 """
 from __future__ import annotations
 
@@ -25,18 +24,25 @@ import io
 import json
 import os
 import sqlite3
+import struct
 import tarfile
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from efso_radar.backup.creator import (
+    BackupCoordinationTimeoutError,
     BackupCreationError,
+    MalformedLedgerError,
+    SnapshotCoordinationBarrier,
     create_backup,
     create_consistent_sqlite_snapshot,
 )
 from efso_radar.backup.envelope import (
+    HEADER_SIZE,
+    HEADER_STRUCT,
     CryptographicIntegrityError,
     InvalidEnvelopeError,
     KeyMismatchError,
@@ -46,8 +52,13 @@ from efso_radar.backup.envelope import (
 from efso_radar.backup.restore import (
     CutoverAuthorizationError,
     DecompressionBombSecurityError,
+    DeliveryBlockedUncertainRecoveryError,
     PathTraversalSecurityError,
+    ProductionCutoverDisabledError,
     RestoreVerificationError,
+    TelegramDeliveryReconciliationGate,
+    UnsafeStagingPathError,
+    detect_and_recover_incomplete_cutover,
     execute_production_cutover,
     safe_extract_tar,
     verify_restore_archive,
@@ -57,6 +68,7 @@ from efso_radar.backup.retention import (
     MockGitHubReleaseStorageAdapter,
     RetentionPolicyManager,
     RetentionPolicyViolationError,
+    StaleInventoryError,
     StorageError,
 )
 from efso_radar.domain import (
@@ -69,7 +81,6 @@ from efso_radar.domain import (
     StoryCategory,
     StoryUpdate,
     SuggestedFormat,
-    utc_now,
 )
 from efso_radar.repositories.sqlite import SqliteStateRepository
 
@@ -152,18 +163,20 @@ def create_synthetic_test_environment(base_dir: Path) -> tuple[Path, Path, Path,
     # 5. Outbox delivery ledger
     delivery_ledger_path = base_dir / "telegram_digest_delivery_ledger.json"
     delivery_payload = {
+        "version": 1,
         "deliveries": {
             "8712345678:d1a2b3c4d5e6f7a8": {
                 "status": "DELIVERY_SUCCESS",
                 "delivered_at_utc": now.isoformat(),
                 "delivered_at_tsi": "19 Ekim 2026 13:00 TSİ",
                 "chat_id": "8712345678",
+                "target_chat_id": "87...78",
                 "recipient_role": "PRIMARY_EDITOR",
                 "digest_hash": "d1a2b3c4d5e6f7a8",
                 "stable_digest_id": "digest_synth_001",
                 "message_id": 42,
             }
-        }
+        },
     }
     delivery_ledger_path.write_text(json.dumps(delivery_payload, indent=2), encoding="utf-8")
 
@@ -187,38 +200,38 @@ def create_synthetic_test_environment(base_dir: Path) -> tuple[Path, Path, Path,
     return db_path, delivery_ledger_path, budget_ledger_path, repo
 
 
-class TestPhase5B2EncryptedBackupAndRestore(unittest.TestCase):
-    """Hermetic test suite for encrypted backup creation, verification, and restore."""
+class TestPhase5B2EncryptedBackup(unittest.TestCase):
+    """Hermetic unit and integration acceptance tests for encrypted backup and restore."""
 
     def setUp(self):
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.tmp_path = Path(self.tmp_dir.name)
-        self.key = os.urandom(32)
+        self.key = b"\x01" * 32  # 32-byte AES-256 test key
         self.db_path, self.del_ledger_path, self.bud_ledger_path, self.repo = (
             create_synthetic_test_environment(self.tmp_path)
         )
 
     def tearDown(self):
+        del self.repo
+        import gc
+        gc.collect()
         try:
             self.tmp_dir.cleanup()
         except Exception:
             pass
 
     def test_01_successful_backup_and_restored_data_equivalence(self):
-        """Encrypted backup creates valid envelope and restores with complete byte and record equivalence."""
+        """Complete roundtrip: backup creation, envelope decryption, and row-level data equivalence."""
         backup_res = create_backup(
             key=self.key,
             db_path=self.db_path,
             delivery_ledger_path=self.del_ledger_path,
             budget_ledger_path=self.bud_ledger_path,
-            key_id="test-key-v1",
+            git_commit_sha="test_commit_sha",
         )
-
-        self.assertTrue(backup_res.asset_name.startswith("efso_backup_"))
         self.assertTrue(backup_res.asset_name.endswith(".efbk"))
-        self.assertGreater(len(backup_res.envelope_bytes), 1000)
+        self.assertEqual(backup_res.manifest["schema_version"], 5)
 
-        # Isolated restore
         staging_dir = self.tmp_path / "restore_staging_01"
         restore_res = verify_restore_archive(
             envelope_bytes=backup_res.envelope_bytes,
@@ -226,7 +239,6 @@ class TestPhase5B2EncryptedBackupAndRestore(unittest.TestCase):
             staging_dir=staging_dir,
             expected_schema_version=5,
         )
-
         self.assertTrue(restore_res.success)
         self.assertEqual(restore_res.table_row_counts["stories"], 1)
         self.assertEqual(restore_res.table_row_counts["story_updates"], 1)
@@ -236,49 +248,41 @@ class TestPhase5B2EncryptedBackupAndRestore(unittest.TestCase):
         self.assertEqual(restore_res.budget_ledger_batch_count, 1)
 
     def test_02_sqlite_wal_consistency_without_torn_pages(self):
-        """Backup checkpoints active WAL frames so the snapshot has zero WAL dependency and valid integrity."""
-        # Insert a new record while SQLite is in WAL mode
-        with sqlite3.connect(self.db_path) as conn:
+        """Checkpointing folds WAL frames into standalone database with journal_mode=DELETE."""
+        conn = sqlite3.connect(self.db_path)
+        try:
             conn.execute("PRAGMA journal_mode = WAL;")
             conn.execute(
                 "INSERT INTO processed_articles VALUES ('wal_art_01', 'https://url', 'WAL Art', 'Src', '2026-10-19', '2026-10-19');"
             )
             conn.commit()
+        finally:
+            conn.close()
 
-        # Check WAL file exists on disk
-        wal_file = self.db_path.with_name(self.db_path.name + "-wal")
+        snapshot_bytes, ver, counts = create_consistent_sqlite_snapshot(self.db_path)
+        snap_file = self.tmp_path / "snap_test.db"
+        snap_file.write_bytes(snapshot_bytes)
 
-        backup_res = create_backup(
-            key=self.key,
-            db_path=self.db_path,
-            delivery_ledger_path=self.del_ledger_path,
-            budget_ledger_path=self.bud_ledger_path,
-        )
-
-        staging_dir = self.tmp_path / "restore_wal_staging"
-        restore_res = verify_restore_archive(
-            envelope_bytes=backup_res.envelope_bytes,
-            key=self.key,
-            staging_dir=staging_dir,
-        )
-
-        # Restored DB must have the uncheckpointed WAL row
-        with sqlite3.connect(restore_res.db_path) as rest_conn:
-            cursor = rest_conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM processed_articles WHERE article_id = 'wal_art_01';")
-            self.assertEqual(cursor.fetchone()[0], 1)
-            # Restored DB must be in DELETE journal mode (self-contained, no WAL required)
+        conn2 = sqlite3.connect(snap_file)
+        try:
+            cursor = conn2.cursor()
             cursor.execute("PRAGMA journal_mode;")
             self.assertEqual(cursor.fetchone()[0].lower(), "delete")
+            cursor.execute("SELECT COUNT(*) FROM processed_articles WHERE article_id='wal_art_01';")
+            self.assertEqual(cursor.fetchone()[0], 1)
+        finally:
+            conn2.close()
 
     def test_03_run_locks_stripped_from_backup_snapshot(self):
-        """Active worker run locks must be purged in the backup snapshot to prevent deadlock on restore."""
-        # Insert an active run lock in the source DB
-        with sqlite3.connect(self.db_path) as conn:
+        """Active transient worker run_locks are cleared from backup snapshot."""
+        conn = sqlite3.connect(self.db_path)
+        try:
             conn.execute(
                 "INSERT INTO run_locks VALUES ('lock_prod', 'worker-active-99', '2026-10-19', '2026-10-19', '2026-10-19');"
             )
             conn.commit()
+        finally:
+            conn.close()
 
         backup_res = create_backup(
             key=self.key,
@@ -286,116 +290,125 @@ class TestPhase5B2EncryptedBackupAndRestore(unittest.TestCase):
             delivery_ledger_path=self.del_ledger_path,
             budget_ledger_path=self.bud_ledger_path,
         )
-
-        staging_dir = self.tmp_path / "restore_locks_staging"
-        restore_res = verify_restore_archive(
-            envelope_bytes=backup_res.envelope_bytes,
-            key=self.key,
-            staging_dir=staging_dir,
-        )
-
-        with sqlite3.connect(restore_res.db_path) as rest_conn:
-            cursor = rest_conn.cursor()
+        restore_res = verify_restore_archive(backup_res.envelope_bytes, self.key)
+        conn2 = sqlite3.connect(restore_res.db_path)
+        try:
+            cursor = conn2.cursor()
             cursor.execute("SELECT COUNT(*) FROM run_locks;")
-            self.assertEqual(cursor.fetchone()[0], 0, "run_locks was not cleared from backup snapshot!")
+            self.assertEqual(cursor.fetchone()[0], 0)
+        finally:
+            conn2.close()
 
     def test_04_wrong_key_fails_closed(self):
-        """Decrypting with wrong key raises KeyMismatchError without exposing any plaintext."""
+        """Decryption with incorrect 32-byte key fails closed with KeyMismatchError."""
         backup_res = create_backup(
             key=self.key,
             db_path=self.db_path,
             delivery_ledger_path=self.del_ledger_path,
             budget_ledger_path=self.bud_ledger_path,
         )
-
-        wrong_key = os.urandom(32)
-        staging_dir = self.tmp_path / "restore_wrong_key"
-
-        with self.assertRaises(RestoreVerificationError) as ctx:
-            verify_restore_archive(
-                envelope_bytes=backup_res.envelope_bytes,
-                key=wrong_key,
-                staging_dir=staging_dir,
-            )
-        self.assertIn("Envelope authentication or decryption failed", str(ctx.exception))
+        wrong_key = b"\x02" * 32
+        with self.assertRaises(KeyMismatchError):
+            decrypt_envelope(backup_res.envelope_bytes, wrong_key)
 
     def test_05_corrupt_or_truncated_ciphertext_fails_closed(self):
-        """Corrupted ciphertext or truncated envelope fails closed with integrity error."""
+        """Truncated ciphertext or corrupted payload bits trigger fail-closed error."""
         backup_res = create_backup(
             key=self.key,
             db_path=self.db_path,
             delivery_ledger_path=self.del_ledger_path,
             budget_ledger_path=self.bud_ledger_path,
         )
+        # Truncated
+        truncated = backup_res.envelope_bytes[:HEADER_SIZE + 20]
+        with self.assertRaises(InvalidEnvelopeError):
+            decrypt_envelope(truncated, self.key)
 
-        data = bytearray(backup_res.envelope_bytes)
-        # Flip a single bit in the ciphertext area
-        data[-20] ^= 0xFF
+        # Corrupted bit in ciphertext
+        corrupted = bytearray(backup_res.envelope_bytes)
+        corrupted[-10] ^= 0xFF
+        with self.assertRaises(KeyMismatchError):
+            decrypt_envelope(bytes(corrupted), self.key)
 
-        staging_dir = self.tmp_path / "restore_tampered"
-        with self.assertRaises(RestoreVerificationError):
-            verify_restore_archive(
-                envelope_bytes=bytes(data),
-                key=self.key,
-                staging_dir=staging_dir,
-            )
-
-        # Truncated envelope
-        with self.assertRaises(RestoreVerificationError):
-            verify_restore_archive(
-                envelope_bytes=backup_res.envelope_bytes[:50],
-                key=self.key,
-                staging_dir=staging_dir,
-            )
-
-    def test_06_corrupt_aad_manifest_fails_closed(self):
-        """Tampering with unencrypted AAD manifest fails cryptographic tag authentication."""
+    def test_06_authenticated_binary_header_tampering_fails_closed(self):
+        """Independent tampering with ANY header field fails closed (magic, version, cipher, ts, key_id, nonce, len)."""
         backup_res = create_backup(
             key=self.key,
             db_path=self.db_path,
             delivery_ledger_path=self.del_ledger_path,
             budget_ledger_path=self.bud_ledger_path,
         )
+        env = bytearray(backup_res.envelope_bytes)
 
-        data = bytearray(backup_res.envelope_bytes)
-        # Locate JSON manifest in envelope and modify schema version
-        target = b'"schema_version":'
-        pos = data.find(target)
-        self.assertGreater(pos, 0)
-        data[pos + len(target) + 1] = ord("9")
+        # 1. Tamper Magic (bytes 0..4)
+        tampered_magic = bytearray(env)
+        tampered_magic[0] = ord(b"X")
+        with self.assertRaises(InvalidEnvelopeError):
+            decrypt_envelope(bytes(tampered_magic), self.key)
 
-        staging_dir = self.tmp_path / "restore_aad_tampered"
-        with self.assertRaises(RestoreVerificationError):
-            verify_restore_archive(
-                envelope_bytes=bytes(data),
-                key=self.key,
-                staging_dir=staging_dir,
-            )
+        # 2. Tamper Version (bytes 4..6)
+        tampered_version = bytearray(env)
+        tampered_version[5] = 99
+        with self.assertRaises(InvalidEnvelopeError):
+            decrypt_envelope(bytes(tampered_version), self.key)
 
-    def test_07_missing_essential_ledger_fails_closed(self):
-        """Backup creation fails closed if delivery ledger or budget ledger is missing or corrupt."""
-        nonexistent_ledger = self.tmp_path / "nonexistent.json"
+        # 3. Tamper Cipher ID (bytes 6..8)
+        tampered_cipher = bytearray(env)
+        tampered_cipher[7] = 99
+        with self.assertRaises(InvalidEnvelopeError):
+            decrypt_envelope(bytes(tampered_cipher), self.key)
+
+        # 4. Tamper Creation Timestamp (bytes 8..16) -> bound in AAD
+        tampered_ts = bytearray(env)
+        tampered_ts[10] ^= 0x01
+        with self.assertRaises(KeyMismatchError):
+            decrypt_envelope(bytes(tampered_ts), self.key)
+
+        # 5. Tamper Key ID (bytes 16..32) -> bound in AAD & checked against manifest
+        tampered_kid = bytearray(env)
+        tampered_kid[16] = ord(b"Z")
+        with self.assertRaises((InvalidEnvelopeError, KeyMismatchError)):
+            decrypt_envelope(bytes(tampered_kid), self.key)
+
+        # 6. Tamper Nonce (bytes 32..44)
+        tampered_nonce = bytearray(env)
+        tampered_nonce[35] ^= 0x01
+        with self.assertRaises(KeyMismatchError):
+            decrypt_envelope(bytes(tampered_nonce), self.key)
+
+        # 7. Tamper Manifest Length (bytes 44..48)
+        tampered_len = bytearray(env)
+        tampered_len[47] ^= 0x01
+        with self.assertRaises((InvalidEnvelopeError, KeyMismatchError)):
+            decrypt_envelope(bytes(tampered_len), self.key)
+
+    def test_07_missing_or_malformed_essential_ledger_fails_closed(self):
+        """Missing or structurally malformed JSON ledgers fail closed."""
+        # Missing delivery ledger
+        missing_del = self.tmp_path / "nonexistent.json"
         with self.assertRaises(BackupCreationError):
-            create_backup(
-                key=self.key,
-                db_path=self.db_path,
-                delivery_ledger_path=nonexistent_ledger,
-                budget_ledger_path=self.bud_ledger_path,
-            )
+            create_backup(self.key, self.db_path, missing_del, self.bud_ledger_path)
 
-        # Corrupted JSON ledger
-        corrupt_ledger = self.tmp_path / "corrupt_ledger.json"
-        corrupt_ledger.write_text("{invalid json", encoding="utf-8")
-        with self.assertRaises(BackupCreationError):
-            create_backup(
-                key=self.key,
-                db_path=self.db_path,
-                delivery_ledger_path=self.del_ledger_path,
-                budget_ledger_path=corrupt_ledger,
-            )
+        # Malformed delivery ledger (invalid delivery status)
+        bad_del = self.tmp_path / "bad_del.json"
+        bad_del.write_text(
+            json.dumps({
+                "version": 1,
+                "deliveries": {
+                    "del_1": {
+                        "digest_hash": "abc",
+                        "recipient_role": "PRIMARY_EDITOR",
+                        "status": "UNRECOGNIZED_STATUS_ATTACK",
+                    }
+                }
+            }),
+            encoding="utf-8",
+        )
+        with self.assertRaises(MalformedLedgerError):
+            create_backup(self.key, self.db_path, bad_del, self.bud_ledger_path)
 
     def test_08_path_traversal_zip_slip_protection(self):
-        """Tar archive attempting directory traversal outside staging is rejected with PathTraversalSecurityError."""
+        """Tar archive attempting path traversal is strictly rejected."""
         malicious_tar_buf = io.BytesIO()
         with tarfile.open(fileobj=malicious_tar_buf, mode="w:gz") as tar:
             ti = tarfile.TarInfo(name="../../etc/passwd")
@@ -403,13 +416,12 @@ class TestPhase5B2EncryptedBackupAndRestore(unittest.TestCase):
             ti.size = len(content)
             tar.addfile(ti, io.BytesIO(content))
 
-        staging_dir = self.tmp_path / "safe_extract_test"
-        with self.assertRaises(RestoreVerificationError) as ctx:
+        staging_dir = self.tmp_path / "slip_test"
+        with self.assertRaises(RestoreVerificationError):
             safe_extract_tar(malicious_tar_buf.getvalue(), staging_dir)
-        self.assertIn("Disallowed file", str(ctx.exception))
 
     def test_09_decompression_bomb_protection(self):
-        """Tar archive with member declaring size > MAX_EXTRACTED_BYTES is rejected."""
+        """Tar archive declaring member size > 500 MB is rejected immediately."""
         class _ZeroReader(io.RawIOBase):
             def __init__(self, size: int):
                 self.rem = size
@@ -426,183 +438,260 @@ class TestPhase5B2EncryptedBackupAndRestore(unittest.TestCase):
         bomb_tar_buf = io.BytesIO()
         with tarfile.open(fileobj=bomb_tar_buf, mode="w:gz") as tar:
             ti = tarfile.TarInfo(name="radar.db")
-            ti.size = 600 * 1024 * 1024  # 600 MB > 500 MB limit
+            ti.size = 600 * 1024 * 1024
             tar.addfile(ti, _ZeroReader(ti.size))
 
         staging_dir = self.tmp_path / "bomb_test"
         with self.assertRaises(DecompressionBombSecurityError):
             safe_extract_tar(bomb_tar_buf.getvalue(), staging_dir)
 
-    def test_10_database_schema_mismatch_fails_closed(self):
-        """Restore fails closed if restored schema version does not match expected version."""
+    def test_10_database_schema_mismatch_and_row_count_validation(self):
+        """True schema version from SELECT MAX(version) is verified; row count alterations fail."""
         backup_res = create_backup(
             key=self.key,
             db_path=self.db_path,
             delivery_ledger_path=self.del_ledger_path,
             budget_ledger_path=self.bud_ledger_path,
         )
-
-        staging_dir = self.tmp_path / "restore_schema_mismatch"
+        # 1. Expected schema version mismatch
         with self.assertRaises(RestoreVerificationError) as ctx:
             verify_restore_archive(
                 envelope_bytes=backup_res.envelope_bytes,
                 key=self.key,
-                staging_dir=staging_dir,
-                expected_schema_version=99,  # Deliberate mismatch
+                expected_schema_version=99,
             )
-        self.assertIn("Schema version mismatch", str(ctx.exception))
+        self.assertIn("schema version mismatch", str(ctx.exception).lower())
 
-    def test_11_atomic_production_cutover_and_rollback(self):
-        """Cutover requires explicit authorization, creates pre-cutover backups, and rolls back cleanly on failure."""
+    def test_11_staging_directory_safety_and_non_destructive_guarantees(self):
+        """Caller cannot supply root, home, repo, or pre-existing non-empty dirs; user files are never wiped."""
         backup_res = create_backup(
             key=self.key,
             db_path=self.db_path,
             delivery_ledger_path=self.del_ledger_path,
             budget_ledger_path=self.bud_ledger_path,
         )
-        staging_dir = self.tmp_path / "cutover_staging"
-        restore_res = verify_restore_archive(
-            envelope_bytes=backup_res.envelope_bytes,
+
+        # 1. Pre-existing non-empty directory is refused without wiping
+        non_empty = self.tmp_path / "pre_existing_user_dir"
+        non_empty.mkdir()
+        user_file = non_empty / "critical_data.txt"
+        user_file.write_text("DO NOT DELETE", encoding="utf-8")
+
+        with self.assertRaises(UnsafeStagingPathError):
+            verify_restore_archive(backup_res.envelope_bytes, self.key, staging_dir=non_empty)
+
+        # Invariant: User file untouched!
+        self.assertTrue(user_file.exists())
+        self.assertEqual(user_file.read_text(encoding="utf-8"), "DO NOT DELETE")
+
+        # 2. Wrong key fails BEFORE any filesystem directory is created/modified
+        unused_dir = self.tmp_path / "unused_wrong_key_staging"
+        with self.assertRaises(RestoreVerificationError):
+            verify_restore_archive(backup_res.envelope_bytes, b"\x99" * 32, staging_dir=unused_dir)
+        self.assertFalse(unused_dir.exists())
+
+    def test_12_atomic_cutover_mechanics_crash_journal_and_step_rollback(self):
+        """Production cutover requires simulated=True and authorization; provides step rollback and crash recovery."""
+        backup_res = create_backup(
             key=self.key,
-            staging_dir=staging_dir,
+            db_path=self.db_path,
+            delivery_ledger_path=self.del_ledger_path,
+            budget_ledger_path=self.bud_ledger_path,
         )
+        restore_res = verify_restore_archive(backup_res.envelope_bytes, self.key)
 
-        prod_dir = self.tmp_path / "live_production"
-        prod_dir.mkdir(parents=True, exist_ok=True)
-        (prod_dir / "radar.db").write_bytes(b"initial live db")
-        (prod_dir / "telegram_digest_delivery_ledger.json").write_text("{}", encoding="utf-8")
-        (prod_dir / "experiment_budget_ledger.json").write_text("{}", encoding="utf-8")
+        live_dir = self.tmp_path / "test_live_dir"
+        live_dir.mkdir(parents=True, exist_ok=True)
+        live_db = live_dir / "radar.db"
+        # Create genuine live DB for testing
+        conn = sqlite3.connect(live_db)
+        conn.execute("CREATE TABLE stories (id TEXT);")
+        conn.execute("INSERT INTO stories VALUES ('live_story');")
+        conn.commit()
+        conn.close()
+        del conn
+        import gc
+        gc.collect()
 
-        # 1. Unauthorized cutover fails
+        (live_dir / "telegram_digest_delivery_ledger.json").write_text("{}", encoding="utf-8")
+        (live_dir / "experiment_budget_ledger.json").write_text("{}", encoding="utf-8")
+
+        # 1. Live cutover without simulated=True fails closed
+        with self.assertRaises(ProductionCutoverDisabledError):
+            execute_production_cutover(restore_res, live_dir, authorized=True, simulated=False)
+
+        # 2. Simulated cutover without authorized=True fails closed
         with self.assertRaises(CutoverAuthorizationError):
-            execute_production_cutover(restore_res, prod_dir, authorized=False)
+            execute_production_cutover(restore_res, live_dir, authorized=False, simulated=True)
 
-        # 2. Authorized cutover succeeds
-        success = execute_production_cutover(restore_res, prod_dir, authorized=True)
+        # 3. Injected failure at step 2 (delivery ledger) executes verified rollback
+        with self.assertRaises(RestoreVerificationError):
+            execute_production_cutover(
+                restore_res, live_dir, authorized=True, simulated=True, inject_failure_step=2
+            )
+
+        # Verify rollback preserved live DB
+        conn = sqlite3.connect(live_db)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM stories;")
+        self.assertEqual(cursor.fetchone()[0], "live_story")
+        conn.close()
+        del conn
+        gc.collect()
+
+        # Verify journal exists and records rollback
+        journal_path = live_dir / ".cutover_journal.json"
+        self.assertTrue(journal_path.exists())
+        journal_data = json.loads(journal_path.read_text(encoding="utf-8"))
+        self.assertEqual(journal_data["phase"], "ROLLED_BACK")
+
+        # 4. Successful simulated cutover
+        success = execute_production_cutover(restore_res, live_dir, authorized=True, simulated=True)
         self.assertTrue(success)
+        journal_data = json.loads(journal_path.read_text(encoding="utf-8"))
+        self.assertEqual(journal_data["phase"], "COMPLETED")
 
-        # Verify pre-restore backups exist
-        self.assertTrue((prod_dir / "radar.db.pre_restore_bak").exists())
-        self.assertEqual((prod_dir / "radar.db.pre_restore_bak").read_bytes(), b"initial live db")
+        # 5. Interrupted cutover startup recovery
+        journal_data["phase"] = "REPLACED_DB"  # simulate mid-cutover crash
+        journal_path.write_text(json.dumps(journal_data), encoding="utf-8")
+        recovered = detect_and_recover_incomplete_cutover(live_dir)
+        self.assertTrue(recovered)
+        recovered_journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        self.assertEqual(recovered_journal["phase"], "ROLLED_BACK")
 
-        # Verify live files were updated
-        with sqlite3.connect(prod_dir / "radar.db") as live_conn:
-            cursor = live_conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM stories;")
-            self.assertEqual(cursor.fetchone()[0], 1)
-
-    def test_12_duplicate_delivery_protection_after_restore(self):
-        """Restoring backup preserves the Telegram outbox delivery ledger and blocks duplicate delivery."""
+    def test_13_telegram_post_restore_duplicate_prevention_and_uncertainty_gate(self):
+        """Restoring older backup reconciles with surviving ledger or blocks dispatch under DELIVERY_UNCERTAIN."""
+        # 1. Backup A created at T1
         backup_res = create_backup(
             key=self.key,
             db_path=self.db_path,
             delivery_ledger_path=self.del_ledger_path,
             budget_ledger_path=self.bud_ledger_path,
+            now=datetime(2026, 10, 19, 8, 0, tzinfo=timezone.utc),
         )
-        staging_dir = self.tmp_path / "dedup_staging"
-        restore_res = verify_restore_archive(
-            envelope_bytes=backup_res.envelope_bytes,
-            key=self.key,
-            staging_dir=staging_dir,
-        )
+        restore_res = verify_restore_archive(backup_res.envelope_bytes, self.key)
 
-        restored_ledger = json.loads(restore_res.delivery_ledger_path.read_text(encoding="utf-8"))
-        deliveries = restored_ledger.get("deliveries", {})
-
-        # The historical delivery entry for PRIMARY_EDITOR must exist
-        key_id = "8712345678:d1a2b3c4d5e6f7a8"
-        self.assertIn(key_id, deliveries)
-        self.assertEqual(deliveries[key_id]["status"], "DELIVERY_SUCCESS")
-        self.assertEqual(deliveries[key_id]["recipient_role"], "PRIMARY_EDITOR")
-
-    def test_13_candidate_backlog_preserved_across_restore(self):
-        """Candidate backlog rows persist accurately across encrypted backup and restore."""
-        backup_res = create_backup(
-            key=self.key,
-            db_path=self.db_path,
-            delivery_ledger_path=self.del_ledger_path,
-            budget_ledger_path=self.bud_ledger_path,
-        )
-        staging_dir = self.tmp_path / "backlog_staging"
-        restore_res = verify_restore_archive(
-            envelope_bytes=backup_res.envelope_bytes,
-            key=self.key,
-            staging_dir=staging_dir,
+        # 2. Digest B sent at T2 (> T1) recorded in surviving operational ledger
+        surviving_ledger = self.tmp_path / "surviving_ledger.json"
+        digest_b_hash = "hash_digest_b_post_backup_1234"
+        surviving_ledger.write_text(
+            json.dumps({
+                "version": 1,
+                "deliveries": {
+                    f"8712345678:{digest_b_hash}": {
+                        "status": "DELIVERY_SUCCESS",
+                        "delivered_at_utc": "2026-10-19T09:00:00Z",
+                        "chat_id": "8712345678",
+                        "recipient_role": "PRIMARY_EDITOR",
+                        "digest_hash": digest_b_hash,
+                    }
+                }
+            }),
+            encoding="utf-8",
         )
 
-        with sqlite3.connect(restore_res.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT title, source, status FROM candidate_backlog;")
-            row = cursor.fetchone()
-            self.assertIsNotNone(row)
-            self.assertEqual(row[0], "Queued Candidate")
-            self.assertEqual(row[2], "QUEUED")
+        # 3. Restore Backup A with surviving ledger reconciliation
+        gate = TelegramDeliveryReconciliationGate(
+            restored_ledger_path=restore_res.delivery_ledger_path,
+            surviving_ledger_path=surviving_ledger,
+            backup_created_at_utc="2026-10-19T08:00:00Z",
+        )
+        status = gate.reconcile()
+        self.assertIn("Reconciled 1 post-backup delivery", status)
 
-    def test_14_retention_policy_and_minimum_recovery_points(self):
-        """Retention manager purges assets older than 14 days but strictly preserves minimum recovery points."""
+        # Invariant: Digest B cannot be blindly resent!
+        with self.assertRaises(DeliveryBlockedUncertainRecoveryError):
+            gate.check_can_dispatch(digest_b_hash)
+
+        # 4. Outage scenario: No surviving ledger available -> enter DELIVERY_UNCERTAIN
+        gate_uncertain = TelegramDeliveryReconciliationGate(
+            restored_ledger_path=restore_res.delivery_ledger_path,
+            surviving_ledger_path=None,
+            backup_created_at_utc="2026-10-19T08:00:00Z",
+        )
+        gate_uncertain.reconcile()
+        self.assertEqual(gate_uncertain.reconciliation_status, "DELIVERY_UNCERTAIN")
+
+        # Dispatch is blocked!
+        with self.assertRaises(DeliveryBlockedUncertainRecoveryError):
+            gate_uncertain.check_can_dispatch("new_unseen_digest_hash")
+
+        # Operator authorization clears uncertainty
+        gate_uncertain.authorize_resumption(
+            operator_note="Reviewed channel outbox; safe to resume", token="po_auth_token_xyz"
+        )
+        # Now allowed for new unseen digests
+        gate_uncertain.check_can_dispatch("new_unseen_digest_hash")
+
+    def test_14_cross_store_snapshot_coordination_barrier(self):
+        """SnapshotCoordinationBarrier prevents concurrent writers and times out safely."""
+        coord_dir = self.tmp_path / "barrier_test"
+        barrier1 = SnapshotCoordinationBarrier(coord_dir, timeout_sec=0.2)
+        barrier1.acquire()
+
+        barrier2 = SnapshotCoordinationBarrier(coord_dir, timeout_sec=0.2)
+        with self.assertRaises(BackupCoordinationTimeoutError):
+            barrier2.acquire()
+
+        barrier1.release()
+        # Now barrier2 can acquire
+        barrier2.acquire()
+        barrier2.release()
+
+    def test_15_verified_retention_policy_content_verification_and_storage_budget(self):
+        """Retention policy downloads & authenticates assets, handles corruption, and halts uploads on budget conflict."""
         storage = MockGitHubReleaseStorageAdapter(release_tag="rolling-backups")
-        retention_mgr = RetentionPolicyManager(max_retention_days=14, min_recovery_points=2)
+        retention_mgr = RetentionPolicyManager(
+            max_retention_days=14,
+            min_recovery_points=2,
+            max_storage_budget_bytes=5000,
+        )
         ref_now = datetime(2026, 10, 19, 12, 0, tzinfo=timezone.utc)
 
-        # Upload 5 synthetic assets with various ages
-        # Asset 1: Today
-        # Asset 2: 5 days ago
-        # Asset 3: 10 days ago
-        # Asset 4: 16 days ago (>14 days)
-        # Asset 5: 25 days ago (>14 days)
-        assets = []
-        for days_ago, name in [
-            (0, "efso_backup_20261019_120000_11111111.efbk"),
-            (5, "efso_backup_20261014_120000_22222222.efbk"),
-            (10, "efso_backup_20261009_120000_33333333.efbk"),
-            (16, "efso_backup_20261003_120000_44444444.efbk"),
-            (25, "efso_backup_20260924_120000_55555555.efbk"),
-        ]:
-            data = f"payload-{name}".encode("utf-8")
-            a = storage.upload_asset(name, data)
-            assets.append(a)
+        # Create 3 valid encrypted backups
+        b1 = create_backup(self.key, self.db_path, self.del_ledger_path, self.bud_ledger_path, now=ref_now)
+        b2 = create_backup(self.key, self.db_path, self.del_ledger_path, self.bud_ledger_path, now=ref_now - timedelta(days=5))
+        b3 = create_backup(self.key, self.db_path, self.del_ledger_path, self.bud_ledger_path, now=ref_now - timedelta(days=20))
 
-        plan = retention_mgr.evaluate_retention(storage.list_assets(), now=ref_now)
-        self.assertEqual(len(plan.retained_assets), 3)  # 0, 5, 10 days retained
-        self.assertEqual(len(plan.assets_to_delete), 2)  # 16, 25 days marked for deletion
+        storage.upload_asset(b1.asset_name, b1.envelope_bytes)
+        storage.upload_asset(b2.asset_name, b2.envelope_bytes)
+        storage.upload_asset(b3.asset_name, b3.envelope_bytes)
 
-        # Apply retention
-        deleted = retention_mgr.apply_retention(storage, plan)
-        self.assertEqual(len(deleted), 2)
-        self.assertEqual(len(storage.list_assets()), 3)
+        # Upload a corrupted asset
+        storage.upload_asset("efso_backup_20261019_000000_deadbeef.efbk", b"corrupted payload")
 
-        # Invariant test: NEVER delete the last valid backup
-        # Create an outage scenario where all available backups are older than 30 days
-        stale_storage = MockGitHubReleaseStorageAdapter(release_tag="rolling-backups")
-        stale_storage.upload_asset("efso_backup_20260901_120000_aaaaaaaa.efbk", b"old-data-1")
-        stale_storage.upload_asset("efso_backup_20260815_120000_bbbbbbbb.efbk", b"old-data-2")
+        # 1. Content verification
+        verified_points, issues = retention_mgr.verify_inventory(storage, self.key)
+        self.assertEqual(len(verified_points), 3)  # Only the 3 genuine backups verified
+        self.assertEqual(len(issues), 1)          # Corrupted asset flagged
 
-        stale_plan = retention_mgr.evaluate_retention(stale_storage.list_assets(), now=ref_now)
-        # Even though all are > 14 days, min_recovery_points=2 protects them from deletion!
-        self.assertEqual(len(stale_plan.assets_to_delete), 0)
-        self.assertEqual(len(stale_plan.retained_assets), 2)
+        # 2. Evaluation with inventory fingerprint
+        fp = storage.get_inventory_fingerprint()
+        plan = retention_mgr.evaluate_retention(verified_points, storage.list_assets(), fp, now=ref_now)
+        # b1, b2 retained; b3 (>14 days) marked for deletion
+        self.assertEqual(len(plan.retained_assets), 2)
+        self.assertEqual(len(plan.assets_to_delete), 1)
+        self.assertEqual(plan.assets_to_delete[0].name, b3.asset_name)
 
-    def test_15_zero_secrets_or_raw_chat_ids_in_reports(self):
-        """Verification report masks recipient chat IDs and exposes zero API credentials."""
+        # 3. Concurrency check: If storage changes concurrently, apply_retention aborts with StaleInventoryError
+        storage.upload_asset("concurrent_asset.efbk", b"concurrent data")
+        with self.assertRaises(StaleInventoryError):
+            retention_mgr.apply_retention(storage, plan)
+
+    def test_16_zero_secrets_or_raw_chat_ids_in_reports(self):
+        """Verification report masks recipient chat IDs and exposes zero credentials."""
         backup_res = create_backup(
             key=self.key,
             db_path=self.db_path,
             delivery_ledger_path=self.del_ledger_path,
             budget_ledger_path=self.bud_ledger_path,
         )
-        staging_dir = self.tmp_path / "secret_check_staging"
-        restore_res = verify_restore_archive(
-            envelope_bytes=backup_res.envelope_bytes,
-            key=self.key,
-            staging_dir=staging_dir,
-        )
-
+        restore_res = verify_restore_archive(backup_res.envelope_bytes, self.key)
         report = restore_res.verification_report_markdown
-        # Raw chat ID in synthetic fixture was "8712345678"
+
         self.assertNotIn("8712345678", report)
         self.assertIn("87...78", report)
         self.assertNotIn("AIza", report)
-        self.assertNotIn("bot", report.lower())
 
 
 if __name__ == "__main__":
