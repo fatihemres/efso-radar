@@ -32,6 +32,7 @@ import tarfile
 import tempfile
 import threading
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -61,6 +62,7 @@ from efso_radar.domain import (
     TelegramNotificationCategory,
     utc_now,
 )
+from efso_radar.repositories.base import StateRepository
 from efso_radar.repositories.migration_ledger import migrate_ledgers_to_repository
 from efso_radar.repositories.schema import CURRENT_SCHEMA_VERSION
 from efso_radar.repositories.sqlite import SqliteStateRepository
@@ -440,30 +442,47 @@ class TestPhase5B3BCloudSafetyContracts(unittest.TestCase):
 
         # 8. reconcile_uncertain_delivery requires complete proof and only works on UNCERTAIN records
         with self.assertRaises(DeliveryStateError):
-            self.repo.reconcile_uncertain_delivery("del_sent_001", {"reconciliation_method": "check", "verified_by": "op", "proof_reference": "ref"})
+            self.repo.reconcile_uncertain_delivery("del_sent_001", {"reconciliation_method": "check", "verified_by": "op", "proof_reference": "ref", "operator_authorized": True})
 
         with self.assertRaises(ValueError):
-            self.repo.reconcile_uncertain_delivery("del_unc_001", {"reconciliation_method": "check"})  # Missing verifier & ref!
+            self.repo.reconcile_uncertain_delivery("del_unc_001", {"reconciliation_method": "check"}, operator_authorized=True)  # Missing verifier & ref!
 
-        # 9. Explicit reconciliation with valid proof transitions to SENT and preserves evidence
+        # 9. Operator-supplied metadata strings alone do NOT automatically authorize reconciliation
+        with self.assertRaises(DeliveryStateError):
+            self.repo.reconcile_uncertain_delivery(
+                "del_unc_001",
+                {"reconciliation_method": "telegram_update_offset_inspection", "verified_by": "op", "proof_reference": "ref123"},
+                operator_authorized=False,
+            )
+
+        # 10. Live operation (live_mode=True) permanently disables automatic reconciliation
+        with self.assertRaises(DeliveryStateError):
+            self.repo.reconcile_uncertain_delivery(
+                "del_unc_001",
+                {"reconciliation_method": "telegram_update_offset_inspection", "verified_by": "op", "proof_reference": "ref123", "operator_authorized": True},
+                live_mode=True,
+            )
+
+        # 11. Explicit offline reconciliation with valid proof metadata and operator authorization succeeds
         valid_proof = {
             "reconciliation_method": "telegram_update_offset_inspection",
             "verified_by": "lead_operator",
             "proof_reference": "update_id_9928172",
             "proof_notes": "Bot update verified delivery to editor chat.",
+            "operator_authorized": True,
         }
-        reconciled = self.repo.reconcile_uncertain_delivery("del_unc_001", valid_proof)
+        reconciled = self.repo.reconcile_uncertain_delivery("del_unc_001", valid_proof, operator_authorized=True)
         self.assertEqual(reconciled.status, DeliveryStatus.SENT)
         self.assertIsNotNone(reconciled.sent_at)
-        self.assertEqual(reconciled.payload["reconciliation"]["verified_by"], "lead_operator")
+        self.assertEqual(reconciled.payload["operator_reconciliation_metadata"]["verified_by"], "lead_operator")
         self.assertIn("original_uncertainty_evidence", reconciled.payload)
 
         fetched = self.repo.get_telegram_delivery("8712345678", "key_uncertain")
         self.assertIsNotNone(fetched)
         self.assertEqual(fetched.status, DeliveryStatus.SENT)
-        self.assertEqual(fetched.payload["reconciliation"]["proof_reference"], "update_id_9928172")
+        self.assertEqual(fetched.payload["operator_reconciliation_metadata"]["proof_reference"], "update_id_9928172")
 
-        # 10. Idempotent replay of SENT is safe
+        # 12. Idempotent replay of SENT is safe
         self.repo.record_telegram_delivery(rec_sent)
 
     # --- 4. At-Most-Once Daily Admin Reports & Window Validation ---
@@ -787,6 +806,148 @@ class TestPhase5B3BCloudSafetyContracts(unittest.TestCase):
         self.assertFalse(res_atomic.success)
         self.assertIsNone(self.repo.get_telegram_delivery("8712345678", "d_atomic_valid"))
 
+        # 12. Non-SQLite write lockout: Turso/mock repository fails closed in write-mode
+        mock_turso_repo = MagicMock(spec=StateRepository)
+        mock_turso_repo.get_telegram_delivery.return_value = None
+        mock_turso_repo.get_budget_record.return_value = None
+        # Preflight dry-run on mock/cloud repo succeeds without calling any write methods
+        res_mock_dry = migrate_ledgers_to_repository(mock_turso_repo, del_path, bud_path, dry_run=True)
+        self.assertTrue(res_mock_dry.success)
+        self.assertTrue(res_mock_dry.dry_run)
+        self.assertEqual(mock_turso_repo.record_telegram_delivery.call_count, 0)
+        self.assertEqual(mock_turso_repo.record_budget_usage.call_count, 0)
+
+        # Write-mode (dry_run=False) on non-SQLite repo MUST fail closed with 0 writes
+        res_mock_live = migrate_ledgers_to_repository(mock_turso_repo, del_path, bud_path, dry_run=False)
+        self.assertFalse(res_mock_live.success)
+        self.assertEqual(res_mock_live.deliveries_imported, 0)
+        self.assertEqual(res_mock_live.budget_records_imported, 0)
+        self.assertTrue(any("production Turso migration is NOT IMPLEMENTED" in e for e in res_mock_live.errors))
+        self.assertEqual(mock_turso_repo.record_telegram_delivery.call_count, 0)
+        self.assertEqual(mock_turso_repo.record_budget_usage.call_count, 0)
+
+        # 13. Phase 2 collision rollback: collision occurring between preflight and application triggers full rollback (0 writes)
+        del_collision_batch = {
+            "deliveries": {
+                "8712345678:d_col_001": {
+                    "status": "SENT",
+                    "delivered_at_utc": "2026-10-19T15:00:00Z",
+                    "chat_id": "8712345678",
+                    "digest_hash": "d_col_001",
+                    "recipient_role": "PRIMARY_EDITOR",
+                    "category": "EDITORIAL_DIGEST",
+                },
+                "8712345678:d_col_002": {
+                    "status": "SENT",
+                    "delivered_at_utc": "2026-10-19T15:00:00Z",
+                    "chat_id": "8712345678",
+                    "digest_hash": "d_col_002",
+                    "recipient_role": "PRIMARY_EDITOR",
+                    "category": "EDITORIAL_DIGEST",
+                },
+            }
+        }
+        del_col_path = self.tmp_path / "del_col.json"
+        del_col_path.write_text(json.dumps(del_collision_batch), encoding="utf-8")
+
+        # Hook into repo._connection to inject collision specifically during Phase 2
+        original_conn = self.repo._connection
+        original_get = self.repo.get_telegram_delivery
+        phase_1_done = False
+
+        def tracked_get(chat_id, key):
+            res = original_get(chat_id, key)
+            if key == "d_col_002":
+                nonlocal phase_1_done
+                phase_1_done = True
+            return res
+
+        @contextmanager
+        def colliding_connection():
+            with original_conn() as conn:
+                if phase_1_done:
+                    # In Phase 2: inject colliding record right before Phase 2 executes its batch
+                    conn.execute(
+                        """
+                        INSERT INTO telegram_delivery_records (
+                            delivery_id, message_key, recipient_role, recipient_chat_id,
+                            category, status, attempt_count, max_attempts, payload_json,
+                            created_at, updated_at, sent_at
+                        ) VALUES ('del_injected', 'd_col_002', 'PRIMARY_EDITOR', '8712345678',
+                                  'EDITORIAL_DIGEST', 'SENT', 1, 3, '{}', '2026-10-19T10:00:00Z',
+                                  '2026-10-19T10:00:00Z', '2026-10-19T10:00:00Z')
+                        """
+                    )
+                yield conn
+
+        self.repo.get_telegram_delivery = tracked_get
+        self.repo._connection = colliding_connection
+        try:
+            res_collision = migrate_ledgers_to_repository(self.repo, del_col_path, dry_run=False)
+            self.assertFalse(res_collision.success)
+            self.assertEqual(res_collision.deliveries_imported, 0)
+            self.assertTrue(any("Transactional migration application failed" in e for e in res_collision.errors))
+        finally:
+            self.repo.get_telegram_delivery = original_get
+            self.repo._connection = original_conn
+
+        # Verify that d_col_001 was rolled back and is NOT in the database
+        self.assertIsNone(self.repo.get_telegram_delivery("8712345678", "d_col_001"))
+
+        # 14. Eliminate raw chat-ID leakage in migration error reports and conflict exceptions
+        raw_secret_chat = "9988776655"
+        masked_secret_chat = "99...55"
+        del_leak_data = {
+            "deliveries": {
+                f"{raw_secret_chat}:d_leak_malformed": {
+                    "status": "SENT",
+                    "delivered_at_utc": "2026-10-19T12:00:00Z",
+                    "chat_id": raw_secret_chat,
+                    "digest_hash": "d_leak_malformed",
+                    "recipient_role": "PRIMARY_EDITOR",
+                    # Missing category to trigger validation error with chat ID
+                }
+            }
+        }
+        del_leak_path = self.tmp_path / "del_leak.json"
+        del_leak_path.write_text(json.dumps(del_leak_data), encoding="utf-8")
+
+        res_leak = migrate_ledgers_to_repository(self.repo, del_leak_path, dry_run=True)
+        self.assertFalse(res_leak.success)
+        for err in res_leak.errors:
+            self.assertNotIn(raw_secret_chat, err)
+        for conf in res_leak.conflicts_detected:
+            self.assertNotIn(raw_secret_chat, conf)
+        self.assertNotIn(raw_secret_chat, res_leak.summary())
+        self.assertTrue(any(masked_secret_chat in err for err in res_leak.errors))
+
+        # Also assert that DeliveryIdentityConflictError never leaks raw chat ID
+        rec_leak_initial = TelegramDeliveryRecord(
+            delivery_id="del_leak_init",
+            message_key="key_leak_test",
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=raw_secret_chat,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            status=DeliveryStatus.SENT,
+            attempt_count=1,
+            sent_at=utc_now(),
+        )
+        self.repo.record_telegram_delivery(rec_leak_initial)
+
+        rec_leak_conflict = TelegramDeliveryRecord(
+            delivery_id="del_leak_conf",
+            message_key="key_leak_test",
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=raw_secret_chat,
+            category=TelegramNotificationCategory.OPERATIONAL_HEALTH_REPORT,  # Conflicting category
+            status=DeliveryStatus.SENT,
+            attempt_count=1,
+        )
+        with self.assertRaises(DeliveryIdentityConflictError) as leak_ctx:
+            self.repo.record_telegram_delivery(rec_leak_conflict)
+        self.assertNotIn(raw_secret_chat, str(leak_ctx.exception))
+        self.assertIn(masked_secret_chat, str(leak_ctx.exception))
+
     def test_18_budget_ledger_immutability_and_conflict(self):
         """Full event IDs, idempotent replay, conflict rejection on budget ledger."""
         ts = datetime(2026, 10, 19, 12, 0, 0, tzinfo=timezone.utc)
@@ -1035,17 +1196,41 @@ class TestPhase5B3BCloudSafetyContracts(unittest.TestCase):
             turso_repo.update_telegram_delivery_status("del_unc_t", DeliveryStatus.SENT)
 
         with self.assertRaises(ValueError):
-            turso_repo.reconcile_uncertain_delivery("del_unc_t", {"reconciliation_method": "check"})
+            turso_repo.reconcile_uncertain_delivery("del_unc_t", {"reconciliation_method": "check"}, operator_authorized=True)
 
         proof = {
             "reconciliation_method": "telegram_update_offset_check",
             "verified_by": "lead_operator",
             "proof_reference": "ref_123",
         }
-        reconciled_t = turso_repo.reconcile_uncertain_delivery("del_unc_t", proof)
+        # Unauthorized call raises DeliveryStateError
+        with self.assertRaises(DeliveryStateError):
+            turso_repo.reconcile_uncertain_delivery("del_unc_t", proof, operator_authorized=False)
+
+        # Live mode permanently raises DeliveryStateError
+        with self.assertRaises(DeliveryStateError):
+            turso_repo.reconcile_uncertain_delivery("del_unc_t", proof, operator_authorized=True, live_mode=True)
+
+        # Explicit operator authorization succeeds
+        reconciled_t = turso_repo.reconcile_uncertain_delivery("del_unc_t", proof, operator_authorized=True)
         self.assertEqual(reconciled_t.status, DeliveryStatus.SENT)
-        self.assertEqual(reconciled_t.payload["reconciliation"]["verified_by"], "lead_operator")
+        self.assertEqual(reconciled_t.payload["operator_reconciliation_metadata"]["verified_by"], "lead_operator")
         self.assertIn("original_uncertainty_evidence", reconciled_t.payload)
+
+        # Identity conflict on Turso masks raw recipient chat ID
+        rec_turso_conflict = TelegramDeliveryRecord(
+            delivery_id="del_t_conflict",
+            message_key="key_unc_t",
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id="8712345678",
+            category=TelegramNotificationCategory.OPERATIONAL_HEALTH_REPORT,
+            status=DeliveryStatus.SENT,
+            attempt_count=1,
+        )
+        with self.assertRaises(DeliveryIdentityConflictError) as turso_ctx:
+            turso_repo.record_telegram_delivery(rec_turso_conflict)
+        self.assertNotIn("8712345678", str(turso_ctx.exception))
+        self.assertIn("87...78", str(turso_ctx.exception))
 
         # 6. Budget conflict check on Turso (prompt tokens conflict)
         mock_client.execute.return_value = TursoQueryResult(

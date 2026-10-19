@@ -293,8 +293,11 @@ class StateRepository(ABC):
         delivery_id: str,
         reconciliation_proof: dict[str, Any],
         reconciled_at: Optional[datetime] = None,
+        *,
+        operator_authorized: bool = False,
+        live_mode: bool = False,
     ) -> TelegramDeliveryRecord:
-        """Authoritatively reconcile a DELIVERY_UNCERTAIN record to SENT with verified proof."""
+        """Reconcile a DELIVERY_UNCERTAIN record to SENT using operator-supplied evidence metadata."""
         pass
 
     @abstractmethod

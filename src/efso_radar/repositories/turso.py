@@ -1020,12 +1020,12 @@ class TursoStateRepository(StateRepository):
             # Reject conflicting identities
             if existing["recipient_role"] != delivery.recipient_role:
                 raise DeliveryIdentityConflictError(
-                    f"Conflicting recipient role for {delivery.recipient_chat_id}:{delivery.message_key}: "
+                    f"Conflicting recipient role for {delivery.masked_recipient_chat_id}:{delivery.message_key}: "
                     f"existing '{existing['recipient_role']}' vs new '{delivery.recipient_role}'"
                 )
             if existing["category"] != delivery.category.value:
                 raise DeliveryIdentityConflictError(
-                    f"Conflicting notification category for {delivery.recipient_chat_id}:{delivery.message_key}: "
+                    f"Conflicting notification category for {delivery.masked_recipient_chat_id}:{delivery.message_key}: "
                     f"existing '{existing['category']}' vs new '{delivery.category.value}'"
                 )
 
@@ -1147,7 +1147,26 @@ class TursoStateRepository(StateRepository):
         delivery_id: str,
         reconciliation_proof: dict[str, Any],
         reconciled_at: Optional[datetime] = None,
+        *,
+        operator_authorized: bool = False,
+        live_mode: bool = False,
     ) -> TelegramDeliveryRecord:
+        """Reconcile a DELIVERY_UNCERTAIN record to SENT using operator-supplied evidence metadata.
+
+        NOTE:
+        - The metadata strings in reconciliation_proof represent operator-supplied evidence metadata only,
+          NOT independently verified authoritative evidence.
+        - Unattended or automated flows must NEVER invoke this method.
+        - In live operation (live_mode=True), reconciliation is permanently disabled in this milestone.
+        - Operator authorization (operator_authorized=True or proof['operator_authorized']=True) is strictly
+          required. Empty or fabricated metadata strings alone do not authorize delivery-state transitions.
+        """
+        if live_mode:
+            raise DeliveryStateError(
+                "Live automatic reconciliation of DELIVERY_UNCERTAIN records is disabled in Phase 5B.3B. "
+                "Independent proof verification is not implemented."
+            )
+
         if not isinstance(reconciliation_proof, dict):
             raise ValueError("Reconciliation proof must be a dictionary.")
         method = str(reconciliation_proof.get("reconciliation_method", "")).strip()
@@ -1155,8 +1174,15 @@ class TursoStateRepository(StateRepository):
         ref = str(reconciliation_proof.get("proof_reference", "")).strip()
         if not method or not verifier or not ref:
             raise ValueError(
-                "Reconciliation proof requires non-empty 'reconciliation_method', "
-                "'verified_by', and 'proof_reference'."
+                "Reconciliation proof requires non-empty operator-supplied metadata "
+                "('reconciliation_method', 'verified_by', and 'proof_reference')."
+            )
+
+        is_authorized = operator_authorized or bool(reconciliation_proof.get("operator_authorized", False))
+        if not is_authorized:
+            raise DeliveryStateError(
+                "Reconciliation requires explicit operator authorization (operator_authorized=True); "
+                "operator-supplied metadata strings alone do not authorize delivery-state transitions."
             )
 
         rec_dt = reconciled_at or utc_now()
@@ -1188,13 +1214,16 @@ class TursoStateRepository(StateRepository):
             "error_message": row["error_message"],
             "marked_uncertain_at": row["updated_at"],
         }
-        payload["reconciliation"] = {
+        op_meta = {
             "reconciliation_method": method,
             "verified_by": verifier,
             "proof_reference": ref,
             "proof_notes": reconciliation_proof.get("proof_notes"),
+            "operator_authorized": True,
             "reconciled_at": rec_iso,
         }
+        payload["operator_reconciliation_metadata"] = op_meta
+        payload["reconciliation"] = op_meta
 
         self.client.execute(
             """

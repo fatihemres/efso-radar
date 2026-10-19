@@ -221,18 +221,21 @@ To prevent state regressions where a previously sent or uncertain message is ina
   - `PENDING -> {DISPATCHING, SENT, DELIVERY_UNCERTAIN, FAILED}`
   - `DISPATCHING -> {SENT, DELIVERY_UNCERTAIN, FAILED, PENDING}`
   - `FAILED -> {PENDING, DISPATCHING, SENT}`
-  - `DELIVERY_UNCERTAIN -> {}` (Generic updates/upserts cannot transition to SENT; only explicit `reconcile_uncertain_delivery()` with verified proof is permitted)
+  - `DELIVERY_UNCERTAIN -> {}` (Generic updates/upserts cannot transition to SENT; automated flows cannot transition uncertain deliveries)
   - `SENT -> {}` (Terminal immutable state; replays with identical payload are idempotent no-ops)
 - **Illegal Regressions Raised as `DeliveryStatusRegressionError`:**
   - `SENT -> PENDING` / `SENT -> FAILED` / `SENT -> DISPATCHING`: Strictly forbidden.
   - `DELIVERY_UNCERTAIN -> PENDING` / `DELIVERY_UNCERTAIN -> FAILED`: Strictly forbidden.
   - Generic `DELIVERY_UNCERTAIN -> SENT`: Forbidden in `update_telegram_delivery_status` and `record_telegram_delivery`.
-- **Explicit Authoritative Reconciliation Pathway (`reconcile_uncertain_delivery`):**
-  - Transitioning a record from `DELIVERY_UNCERTAIN` to `SENT` requires calling `reconcile_uncertain_delivery(delivery_id, reconciliation_proof, reconciled_at)`.
-  - `reconciliation_proof` must contain non-empty `reconciliation_method`, `verified_by`, and `proof_reference`.
-  - Preserves `original_uncertainty_evidence` (`error_message`, `marked_uncertain_at`) inside `payload_json`.
+- **Restricted Operator Reconciliation Protocol (`reconcile_uncertain_delivery`):**
+  - **Operator-Supplied Metadata Only:** Metadata strings (`reconciliation_method`, `verified_by`, `proof_reference`, `proof_notes`) represent operator-supplied assertions only, not independently verified cryptographic proof.
+  - **Automated Flow Lockout:** Unattended cron runs, retry loops, and dispatch workers are strictly barred from calling reconciliation.
+  - **Live Operation Lockout:** In live production (`live_mode=True`), automatic reconciliation remains permanently disabled during Phase 5B.3B because independent cryptographic verification is not implemented.
+  - **Explicit Authorization Barrier:** Calling `reconcile_uncertain_delivery` requires explicit operator authorization (`operator_authorized=True`). Empty or fabricated metadata strings alone do not authorize delivery-state transitions.
+  - **Audit Trail & Evidence Preservation:** When authorized, `original_uncertainty_evidence` (`error_message`, `marked_uncertain_at`) and `operator_reconciliation_metadata` are permanently recorded in `payload_json`.
+  - **Future Procedure Requirements:** Future milestones enabling live reconciliation must define a formal multi-party operator approval ceremony, independent API verification checks (e.g. Bot API update offset query logs), and immutable audit logs.
 - **Identity Immutability (`DeliveryIdentityConflictError`):**
-  - Attempting to overwrite an existing `(recipient_chat_id, message_key)` record with a differing `recipient_role` or `category` raises `DeliveryIdentityConflictError`.
+  - Attempting to overwrite an existing `(recipient_chat_id, message_key)` record with a differing `recipient_role` or `category` raises `DeliveryIdentityConflictError`. Raw recipient chat IDs are masked (`87...78`) in exception text.
 - **Database-Level Guarded UPSERT:**
   ```sql
   ON CONFLICT(recipient_chat_id, message_key) DO UPDATE SET ...
@@ -293,28 +296,33 @@ To prevent historical encrypted backups created during Phase 5B.2B (which carry 
 ## 8. Lossless Synthetic Fixture Migration Guide
 
 The ledger migration module (`src/efso_radar/repositories/migration_ledger.py`) provides `migrate_ledgers_to_repository()` with the following guarantees:
-1. **Strict Two-Phase Architecture:**
-   - **Phase 1 (Pre-Flight Validation):** Validates all files, records, timestamps, roles, categories, and conflict checks entirely in memory. If any record fails or conflict occurs, or in `dry_run=True`, execution halts with 0 database writes.
-   - **Phase 2 (Transactional Execution):** Writes are applied within an atomic transaction block on SQLite, ensuring zero partial writes if an unexpected error occurs.
-2. **Strict Timestamp Immutability:** Historical records must contain valid ISO timestamps. Timestamps are never invented or defaulted to `utc_now()`, and budget records never invent day-1 timestamps (`f"{period}-01T00:00:00+00:00"`). Records missing timestamps fail closed.
-3. **Accurate Historical Status Mapping:**
+1. **Strict Two-Phase Architecture & Non-SQLite Write Lockout:**
+   - **Phase 1 (Pre-Flight Validation):** Validates all files, records, timestamps, roles, categories, and conflict checks entirely in memory. Preflight read-only checks are safely supported across repository contracts (including simulated/cloud repos). If any record fails or conflict occurs, or in `dry_run=True`, execution halts with 0 database writes.
+   - **Phase 2 (Transactional Execution on SQLite Only):** Live migration for non-SQLite repositories (such as production Turso) is **NOT IMPLEMENTED** in Phase 5B.3B and fails closed with 0 writes, requiring separately approved transactional cloud integration. On SQLite, writes are applied inside a single atomic transaction block (`with repo._connection() as conn:`).
+2. **Strict INSERT-Only Application & Rollback on Collision:**
+   - Preflight-approved records are applied using strict `INSERT INTO` statements without `ON CONFLICT DO UPDATE`.
+   - Migration never overwrites an existing delivery identity or changes recipient roles, categories, payloads, or evidence.
+   - If a concurrent or unexpected identity collision occurs during application, SQLite raises an integrity error, the entire transaction is rolled back, and 0 partial writes persist.
+3. **Strict Timestamp Immutability:** Historical records must contain valid ISO timestamps. Timestamps are never invented or defaulted to `utc_now()`, and budget records never invent day-1 timestamps (`f"{period}-01T00:00:00+00:00"`). Records missing timestamps fail closed.
+4. **Accurate Historical Status Mapping:**
    - `DELIVERY_SUCCESS`, `SENT`, `SUCCESS` -> `DeliveryStatus.SENT`
    - `DELIVERY_UNCERTAIN` -> `DeliveryStatus.DELIVERY_UNCERTAIN`
    - `FAILED` -> `DeliveryStatus.FAILED`
    - `HELD_QUIET_HOURS` -> `DeliveryStatus.HELD_QUIET_HOURS` (preserved accurately, never collapsed into FAILED)
    - `PENDING` -> `DeliveryStatus.PENDING`
    - Unknown statuses fail validation immediately and are never silently converted.
-4. **Authoritative Evidence for Roles & Categories:**
+5. **Authoritative Evidence for Roles & Categories:**
    - Recipient roles and notification categories must be authoritatively present in the source record.
    - Missing roles are never defaulted to `PRIMARY_EDITOR`.
    - Missing categories are never defaulted to `EDITORIAL_DIGEST`.
    - Missing required fields immediately fail validation closed.
-5. **Complete Conflict & Duplicate Detection:**
+6. **Complete Conflict & Duplicate Detection:**
    - Compares identity, status, role, category, timestamp, error message, and payload evidence.
    - Identical status alone is insufficient to skip; any mismatch in timestamp, payload, role, or category is flagged as a conflict.
-6. **Recipient Chat ID Privacy:**
-   - All raw Telegram chat IDs in error messages, conflict reports, and migration logs are masked (`87...78`, `19...35`) via `mask_chat_id()`.
-7. **Pre-Flight Dry-Run Validation (`dry_run=True`):**
+7. **Comprehensive Recipient Chat ID Privacy:**
+   - All raw Telegram chat IDs in error messages, conflict reports, entry keys, and migration logs are sanitized and masked (`87...78`, `19...35`) via `mask_text_chat_ids()` and `mask_entry_reference()`.
+   - Raw source entry keys embedding chat IDs (e.g. `8712345678:d_hash_001`) are masked before output.
+8. **Pre-Flight Dry-Run Validation (`dry_run=True`):**
    Executes complete parsing, timestamp validation, alias deduplication, and database conflict checks without mutating the database, returning a structured `MigrationLedgerResult` report.
 
 ---

@@ -192,11 +192,16 @@ def mask_chat_id(chat_id: str | int | None) -> str:
 
 
 class ReconciliationProof(BaseModel):
-    """Authoritative proof required to reconcile a DELIVERY_UNCERTAIN record to SENT."""
+    """Operator-supplied evidence metadata required to request reconciliation of a DELIVERY_UNCERTAIN record.
+
+    NOTE: This model captures operator-supplied evidence metadata only, not independently verified
+    cryptographic proof. Automated or unattended flows must never automatically authorize reconciliation.
+    """
     reconciliation_method: str = Field(min_length=3)
     verified_by: str = Field(min_length=2)
     proof_reference: str = Field(min_length=1)
     proof_notes: Optional[str] = None
+    operator_authorized: bool = False
     reconciled_at: datetime = Field(default_factory=utc_now)
 
 
@@ -217,7 +222,7 @@ def validate_delivery_status_transition(
         if not allow_reconciliation:
             raise DeliveryStatusRegressionError(
                 "Generic delivery status transition from DELIVERY_UNCERTAIN to SENT is blocked. "
-                "Authoritative reconciliation proof is required via reconcile_uncertain_delivery()."
+                "Explicit operator-authorized reconciliation is required via reconcile_uncertain_delivery()."
             )
         return
 
