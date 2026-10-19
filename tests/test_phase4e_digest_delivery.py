@@ -50,9 +50,12 @@ class TestPhase4EDigestDelivery(unittest.TestCase):
             telegram_chat_id="1000000001",
             telegram_allowed_chat_ids=["1000000001"],
             telegram_delivery_enabled=False,
+            legacy_editorial_fallback=True,
             http_timeout_seconds=5.0,
         )
         self.assessments = build_final_three_assessments()
+        with open(self.ledger_path, "w", encoding="utf-8") as f:
+            json.dump({"deliveries": {}}, f)
 
     def tearDown(self) -> None:
         self.tmpdir.cleanup()
