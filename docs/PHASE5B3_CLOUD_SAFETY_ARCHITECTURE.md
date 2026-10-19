@@ -230,8 +230,9 @@ To prevent state regressions where a previously sent or uncertain message is ina
 - **Restricted Operator Reconciliation Protocol (`reconcile_uncertain_delivery`):**
   - **Operator-Supplied Metadata Only:** Metadata strings (`reconciliation_method`, `verified_by`, `proof_reference`, `proof_notes`) represent operator-supplied assertions only, not independently verified cryptographic proof.
   - **Automated Flow Lockout:** Unattended cron runs, retry loops, and dispatch workers are strictly barred from calling reconciliation.
-  - **Live Operation Lockout:** In live production (`live_mode=True`), automatic reconciliation remains permanently disabled during Phase 5B.3B because independent cryptographic verification is not implemented.
-  - **Explicit Authorization Barrier:** Calling `reconcile_uncertain_delivery` requires explicit operator authorization (`operator_authorized=True`). Empty or fabricated metadata strings alone do not authorize delivery-state transitions.
+  - **Unconditional Turso Lockout:** Turso-backed reconciliation is unconditionally disabled during Phase 5B.3B. Calling `reconcile_uncertain_delivery` on a Turso repository unconditionally raises `DeliveryStateError`; neither `live_mode=False` nor `operator_authorized=True` can override this prohibition. Production Turso reconciliation is NOT IMPLEMENTED.
+  - **Isolated Synthetic SQLite Fixture Restriction:** SQLite offline reconciliation testing is strictly restricted to explicitly owned synthetic fixtures in designated system temporary storage (`_is_safe_synthetic_fixture`). Arbitrary operational database paths (e.g. `data/radar.db` or paths outside system temp) fail closed with `DeliveryStateError`.
+  - **Explicit Authorization Barrier:** Calling `reconcile_uncertain_delivery` on a synthetic SQLite fixture requires explicit operator authorization (`operator_authorized=True`). Empty or fabricated metadata strings alone do not authorize delivery-state transitions.
   - **Audit Trail & Evidence Preservation:** When authorized, `original_uncertainty_evidence` (`error_message`, `marked_uncertain_at`) and `operator_reconciliation_metadata` are permanently recorded in `payload_json`.
   - **Future Procedure Requirements:** Future milestones enabling live reconciliation must define a formal multi-party operator approval ceremony, independent API verification checks (e.g. Bot API update offset query logs), and immutable audit logs.
 - **Identity Immutability (`DeliveryIdentityConflictError`):**
@@ -324,6 +325,13 @@ The ledger migration module (`src/efso_radar/repositories/migration_ledger.py`) 
    - Raw source entry keys embedding chat IDs (e.g. `8712345678:d_hash_001`) are masked before output.
 8. **Pre-Flight Dry-Run Validation (`dry_run=True`):**
    Executes complete parsing, timestamp validation, alias deduplication, and database conflict checks without mutating the database, returning a structured `MigrationLedgerResult` report.
+9. **Sanitized Exception Logging & Zero Traceback Privacy Leaks:**
+   - All migration exception logging paths use sanitized `logger.error("%s", err_msg)` with stable error codes (`[ERR_DELIVERY_JSON_SYNTAX]`, `[ERR_DELIVERY_SCHEMA]`, `[ERR_BUDGET_JSON_SYNTAX]`, `[ERR_BUDGET_SCHEMA]`, `[ERR_TRANSACTIONAL_APPLICATION]`).
+   - `logger.exception()` is eliminated from all migration paths to prevent raw stack frames or unmasked message keys containing Telegram chat IDs from entering log records.
+10. **Strict JSON Ledger Schema Validation:**
+   - Rejects non-dictionary top-level JSON structures (e.g. JSON arrays `[]` and JSON nulls fail closed).
+   - Validates that required containers (`deliveries`, `batches`) are present and are dictionary objects.
+   - Accurately distinguishes genuinely empty but valid ledgers (`{"version": 1, "deliveries": {}}`, `{"batches": {}}`) which succeed safely with 0 writes.
 
 ---
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1214,6 +1215,34 @@ class SqliteStateRepository(StateRepository):
             )
             return cursor.rowcount > 0
 
+    def _is_safe_synthetic_fixture(self) -> bool:
+        """Verify that the repository database path is an isolated offline test fixture.
+
+        Rejects:
+        - Any live operational database path (e.g. data/radar.db, repo data directories).
+        - Any database located adjacent to operational delivery or budget ledgers.
+        - Any path outside designated system temporary storage.
+        - Symlinks.
+        """
+        try:
+            if self.db_path.is_symlink():
+                return False
+            resolved = self.db_path.resolve()
+            repo_root = Path(__file__).resolve().parent.parent.parent
+            op_data_dir = (repo_root / "data").resolve()
+            # Refuse repository operational data directories
+            if resolved == op_data_dir or resolved.is_relative_to(op_data_dir):
+                return False
+            # Refuse any directory containing live operational ledgers
+            if (resolved.parent / "telegram_digest_delivery_ledger.json").exists() or (resolved.parent / "experiment_budget_ledger.json").exists():
+                return False
+            if resolved.name == "radar.db" and resolved.parent.name == "data":
+                return False
+            system_temp = Path(tempfile.gettempdir()).resolve()
+            return resolved.is_relative_to(system_temp)
+        except Exception:
+            return False
+
     def reconcile_uncertain_delivery(
         self,
         delivery_id: str,
@@ -1230,6 +1259,8 @@ class SqliteStateRepository(StateRepository):
           NOT independently verified authoritative evidence.
         - Unattended or automated flows must NEVER invoke this method.
         - In live operation (live_mode=True), reconciliation is permanently disabled in this milestone.
+        - Offline reconciliation testing is isolated strictly to explicitly owned synthetic SQLite fixtures
+          in designated temporary storage. Arbitrary operational database paths cannot be reconciled.
         - Operator authorization (operator_authorized=True or proof['operator_authorized']=True) is strictly
           required. Empty or fabricated metadata strings alone do not authorize delivery-state transitions.
         """
@@ -1237,6 +1268,13 @@ class SqliteStateRepository(StateRepository):
             raise DeliveryStateError(
                 "Live automatic reconciliation of DELIVERY_UNCERTAIN records is disabled in Phase 5B.3B. "
                 "Independent proof verification is not implemented."
+            )
+
+        if not self._is_safe_synthetic_fixture():
+            raise DeliveryStateError(
+                f"Reconciliation of DELIVERY_UNCERTAIN records is disabled on operational database path '{self.db_path}'. "
+                "Offline reconciliation testing is restricted to explicitly owned synthetic SQLite test fixtures "
+                "in isolated temporary storage."
             )
 
         if not isinstance(reconciliation_proof, dict):

@@ -36,6 +36,7 @@ from efso_radar.repositories.base import StateRepository
 from efso_radar.repositories.sqlite import SqliteStateRepository
 
 logger = logging.getLogger("efso-radar.repository.migration_ledger")
+_JSON_PARSE_ERROR = object()
 
 
 def mask_text_chat_ids(text: str) -> str:
@@ -136,8 +137,36 @@ def migrate_ledgers_to_repository(
         else:
             try:
                 raw_text = delivery_ledger_path.read_text(encoding="utf-8")
-                data = json.loads(raw_text)
-                deliveries = data.get("deliveries", {}) if isinstance(data, dict) else {}
+                try:
+                    data = json.loads(raw_text)
+                except Exception as json_exc:
+                    err_code = "[ERR_DELIVERY_JSON_SYNTAX]"
+                    err_msg = mask_text_chat_ids(
+                        f"Delivery ledger JSON syntax error {err_code}: {type(json_exc).__name__}: {json_exc}"
+                    )
+                    logger.error("%s", err_msg)
+                    result.add_error(err_msg)
+                    data = _JSON_PARSE_ERROR
+
+                if data is _JSON_PARSE_ERROR:
+                    deliveries = {}
+                elif not isinstance(data, dict):
+                    result.add_error(
+                        f"Malformed delivery ledger [ERR_DELIVERY_SCHEMA]: top-level JSON must be an object/dict, got {type(data).__name__}"
+                    )
+                    deliveries = {}
+                elif "deliveries" not in data:
+                    result.add_error(
+                        "Malformed delivery ledger [ERR_DELIVERY_SCHEMA]: missing required 'deliveries' container field"
+                    )
+                    deliveries = {}
+                elif not isinstance(data["deliveries"], dict):
+                    result.add_error(
+                        f"Malformed delivery ledger [ERR_DELIVERY_SCHEMA]: 'deliveries' field must be a dictionary/object, got {type(data['deliveries']).__name__}"
+                    )
+                    deliveries = {}
+                else:
+                    deliveries = data["deliveries"]
 
                 # Track entries seen within this file to deduplicate aliases and catch intra-file conflicts
                 seen_deliveries: dict[tuple[str, str], TelegramDeliveryRecord] = {}
@@ -317,8 +346,10 @@ def migrate_ledgers_to_repository(
                         deliveries_to_import.append(record)
 
             except Exception as exc:
-                logger.exception("Failed to validate delivery ledger: %s", exc)
-                result.add_error(f"Delivery ledger migration error: {exc}")
+                err_code = "[ERR_DELIVERY_VALIDATION]"
+                err_msg = mask_text_chat_ids(f"Delivery ledger migration error {err_code}: {type(exc).__name__}: {exc}")
+                logger.error("%s", err_msg)
+                result.add_error(err_msg)
 
     # 2. Budget Ledger Pre-flight
     if budget_ledger_path is not None:
@@ -327,10 +358,38 @@ def migrate_ledgers_to_repository(
         else:
             try:
                 raw_text = budget_ledger_path.read_text(encoding="utf-8")
-                data = json.loads(raw_text)
-                batches = data.get("batches", {}) if isinstance(data, dict) else {}
-                exp_id = str(data.get("experiment_id", "default_exp"))
+                try:
+                    data = json.loads(raw_text)
+                except Exception as json_exc:
+                    err_code = "[ERR_BUDGET_JSON_SYNTAX]"
+                    err_msg = mask_text_chat_ids(
+                        f"Budget ledger JSON syntax error {err_code}: {type(json_exc).__name__}: {json_exc}"
+                    )
+                    logger.error("%s", err_msg)
+                    result.add_error(err_msg)
+                    data = _JSON_PARSE_ERROR
 
+                if data is _JSON_PARSE_ERROR:
+                    batches = {}
+                elif not isinstance(data, dict):
+                    result.add_error(
+                        f"Malformed budget ledger [ERR_BUDGET_SCHEMA]: top-level JSON must be an object/dict, got {type(data).__name__}"
+                    )
+                    batches = {}
+                elif "batches" not in data:
+                    result.add_error(
+                        "Malformed budget ledger [ERR_BUDGET_SCHEMA]: missing required 'batches' container field"
+                    )
+                    batches = {}
+                elif not isinstance(data["batches"], dict):
+                    result.add_error(
+                        f"Malformed budget ledger [ERR_BUDGET_SCHEMA]: 'batches' field must be a dictionary/object, got {type(data['batches']).__name__}"
+                    )
+                    batches = {}
+                else:
+                    batches = data["batches"]
+
+                exp_id = str(data.get("experiment_id", "default_exp")) if isinstance(data, dict) else "default_exp"
                 seen_budget_records: dict[str, dict[str, Any]] = {}
 
                 for batch_id, batch_val in batches.items():
@@ -438,8 +497,10 @@ def migrate_ledgers_to_repository(
                         budget_to_import.append(bud_data)
 
             except Exception as exc:
-                logger.exception("Failed to validate budget ledger: %s", exc)
-                result.add_error(f"Budget ledger migration error: {exc}")
+                err_code = "[ERR_BUDGET_VALIDATION]"
+                err_msg = mask_text_chat_ids(f"Budget ledger migration error {err_code}: {type(exc).__name__}: {exc}")
+                logger.error("%s", err_msg)
+                result.add_error(err_msg)
 
     # If any error or conflict occurred, or if running in dry-run mode:
     # FAIL CLOSED or RETURN PRE-FLIGHT REPORT WITH ZERO DATABASE WRITES
@@ -520,8 +581,10 @@ def migrate_ledgers_to_repository(
         result.budget_records_skipped = budget_to_skip_count
 
     except Exception as exc:
-        logger.exception("Failed during transactional application of ledgers: %s", exc)
-        result.add_error(f"Transactional migration application failed: {exc}")
+        err_code = "[ERR_TRANSACTIONAL_APPLICATION]"
+        err_msg = mask_text_chat_ids(f"Transactional migration application failed {err_code}: {type(exc).__name__}: {exc}")
+        logger.error("%s", err_msg)
+        result.add_error(err_msg)
         result.deliveries_imported = 0
         result.budget_records_imported = 0
 

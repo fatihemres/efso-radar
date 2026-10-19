@@ -485,6 +485,12 @@ class TestPhase5B3BCloudSafetyContracts(unittest.TestCase):
         # 12. Idempotent replay of SENT is safe
         self.repo.record_telegram_delivery(rec_sent)
 
+        # 13. Operational SQLite database path fails closed (arbitrary operational paths cannot be reconciled)
+        op_db_repo = SqliteStateRepository(Path("data/radar.db"))
+        with self.assertRaises(DeliveryStateError) as op_ctx:
+            op_db_repo.reconcile_uncertain_delivery("del_unc_001", valid_proof, operator_authorized=True)
+        self.assertIn("operational database path", str(op_ctx.exception))
+
     # --- 4. At-Most-Once Daily Admin Reports & Window Validation ---
     def test_14_admin_report_at_most_once_per_date(self):
         """Admin health report can be dispatched at most once per Europe/Istanbul calendar date."""
@@ -948,6 +954,86 @@ class TestPhase5B3BCloudSafetyContracts(unittest.TestCase):
         self.assertNotIn(raw_secret_chat, str(leak_ctx.exception))
         self.assertIn(masked_secret_chat, str(leak_ctx.exception))
 
+        # 15. Exception-log privacy leak elimination: capture logger output and verify raw chat IDs never appear
+        import logging
+        del_leak_syntax = self.tmp_path / "del_leak_syntax.json"
+        del_leak_syntax.write_text(f'{{"{raw_secret_chat}:malformed": {{ invalid_json_syntax', encoding="utf-8")
+
+        migration_logger = logging.getLogger("efso-radar.repository.migration_ledger")
+        with self.assertLogs(migration_logger, level="ERROR") as log_ctx:
+            res_syntax_leak = migrate_ledgers_to_repository(self.repo, delivery_ledger_path=del_leak_syntax, dry_run=True)
+            self.assertFalse(res_syntax_leak.success)
+
+        # Assert raw chat ID never appeared in any captured log message
+        for log_record in log_ctx.output:
+            self.assertNotIn(raw_secret_chat, log_record)
+            self.assertIn("[ERR_DELIVERY_JSON_SYNTAX]", log_record)
+        # Also assert summary and errors are sanitized
+        for err in res_syntax_leak.errors:
+            self.assertNotIn(raw_secret_chat, err)
+        self.assertNotIn(raw_secret_chat, res_syntax_leak.summary())
+
+        # 16. Strict JSON ledger schema validation: reject arrays, nulls, missing containers, wrong container types
+        # a. JSON Array root rejected with 0 writes
+        p_array = self.tmp_path / "ledger_array.json"
+        p_array.write_text("[]", encoding="utf-8")
+        res_arr = migrate_ledgers_to_repository(self.repo, delivery_ledger_path=p_array, dry_run=False)
+        self.assertFalse(res_arr.success)
+        self.assertTrue(any("top-level JSON must be an object/dict" in e for e in res_arr.errors))
+        self.assertEqual(res_arr.deliveries_imported, 0)
+
+        # b. JSON Null root rejected with 0 writes
+        p_null = self.tmp_path / "ledger_null.json"
+        p_null.write_text("null", encoding="utf-8")
+        res_null = migrate_ledgers_to_repository(self.repo, delivery_ledger_path=p_null, dry_run=False)
+        self.assertFalse(res_null.success)
+        self.assertTrue(any("top-level JSON must be an object/dict" in e for e in res_null.errors))
+        self.assertEqual(res_null.deliveries_imported, 0)
+
+        # c. Missing required containers rejected with 0 writes
+        p_del_missing = self.tmp_path / "del_missing_container.json"
+        p_del_missing.write_text(json.dumps({"version": 1}), encoding="utf-8")
+        res_del_m = migrate_ledgers_to_repository(self.repo, delivery_ledger_path=p_del_missing, dry_run=False)
+        self.assertFalse(res_del_m.success)
+        self.assertTrue(any("missing required 'deliveries' container field" in e for e in res_del_m.errors))
+        self.assertEqual(res_del_m.deliveries_imported, 0)
+
+        p_bud_missing = self.tmp_path / "bud_missing_container.json"
+        p_bud_missing.write_text(json.dumps({"experiment_id": "exp"}), encoding="utf-8")
+        res_bud_m = migrate_ledgers_to_repository(self.repo, budget_ledger_path=p_bud_missing, dry_run=False)
+        self.assertFalse(res_bud_m.success)
+        self.assertTrue(any("missing required 'batches' container field" in e for e in res_bud_m.errors))
+        self.assertEqual(res_bud_m.budget_records_imported, 0)
+
+        # d. Incorrectly typed containers rejected with 0 writes
+        p_del_wrong_type = self.tmp_path / "del_wrong_type.json"
+        p_del_wrong_type.write_text(json.dumps({"deliveries": [1, 2, 3]}), encoding="utf-8")
+        res_del_w = migrate_ledgers_to_repository(self.repo, delivery_ledger_path=p_del_wrong_type, dry_run=False)
+        self.assertFalse(res_del_w.success)
+        self.assertTrue(any("'deliveries' field must be a dictionary/object" in e for e in res_del_w.errors))
+        self.assertEqual(res_del_w.deliveries_imported, 0)
+
+        p_bud_wrong_type = self.tmp_path / "bud_wrong_type.json"
+        p_bud_wrong_type.write_text(json.dumps({"batches": "invalid_type"}), encoding="utf-8")
+        res_bud_w = migrate_ledgers_to_repository(self.repo, budget_ledger_path=p_bud_wrong_type, dry_run=False)
+        self.assertFalse(res_bud_w.success)
+        self.assertTrue(any("'batches' field must be a dictionary/object" in e for e in res_bud_w.errors))
+        self.assertEqual(res_bud_w.budget_records_imported, 0)
+
+        # e. Genuinely empty but valid ledgers succeed with 0 imported, 0 skipped, 0 writes
+        p_del_empty = self.tmp_path / "del_valid_empty.json"
+        p_del_empty.write_text(json.dumps({"version": 1, "deliveries": {}}), encoding="utf-8")
+        p_bud_empty = self.tmp_path / "bud_valid_empty.json"
+        p_bud_empty.write_text(json.dumps({"batches": {}}), encoding="utf-8")
+
+        res_empty = migrate_ledgers_to_repository(self.repo, p_del_empty, p_bud_empty, dry_run=False)
+        self.assertTrue(res_empty.success)
+        self.assertEqual(res_empty.deliveries_imported, 0)
+        self.assertEqual(res_empty.deliveries_skipped, 0)
+        self.assertEqual(res_empty.budget_records_imported, 0)
+        self.assertEqual(res_empty.budget_records_skipped, 0)
+        self.assertEqual(len(res_empty.errors), 0)
+
     def test_18_budget_ledger_immutability_and_conflict(self):
         """Full event IDs, idempotent replay, conflict rejection on budget ledger."""
         ts = datetime(2026, 10, 19, 12, 0, 0, tzinfo=timezone.utc)
@@ -1195,27 +1281,29 @@ class TestPhase5B3BCloudSafetyContracts(unittest.TestCase):
         with self.assertRaises(DeliveryStatusRegressionError):
             turso_repo.update_telegram_delivery_status("del_unc_t", DeliveryStatus.SENT)
 
-        with self.assertRaises(ValueError):
-            turso_repo.reconcile_uncertain_delivery("del_unc_t", {"reconciliation_method": "check"}, operator_authorized=True)
-
         proof = {
             "reconciliation_method": "telegram_update_offset_check",
             "verified_by": "lead_operator",
             "proof_reference": "ref_123",
         }
+        # Turso reconciliation is unconditionally disabled in Phase 5B.3B regardless of flags
+        with self.assertRaises(DeliveryStateError) as t_ctx:
+            turso_repo.reconcile_uncertain_delivery("del_unc_t", proof, operator_authorized=True, live_mode=False)
+        self.assertIn("NOT IMPLEMENTED", str(t_ctx.exception))
+        self.assertIn("unconditionally disabled", str(t_ctx.exception))
+
         # Unauthorized call raises DeliveryStateError
         with self.assertRaises(DeliveryStateError):
             turso_repo.reconcile_uncertain_delivery("del_unc_t", proof, operator_authorized=False)
 
-        # Live mode permanently raises DeliveryStateError
+        # Live mode raises DeliveryStateError
         with self.assertRaises(DeliveryStateError):
             turso_repo.reconcile_uncertain_delivery("del_unc_t", proof, operator_authorized=True, live_mode=True)
 
-        # Explicit operator authorization succeeds
-        reconciled_t = turso_repo.reconcile_uncertain_delivery("del_unc_t", proof, operator_authorized=True)
-        self.assertEqual(reconciled_t.status, DeliveryStatus.SENT)
-        self.assertEqual(reconciled_t.payload["operator_reconciliation_metadata"]["verified_by"], "lead_operator")
-        self.assertIn("original_uncertainty_evidence", reconciled_t.payload)
+        # Assert no UPDATE SQL statement was ever executed on Turso client
+        for call_args in mock_client.execute.call_args_list:
+            sql = call_args[0][0]
+            self.assertNotIn("SET status = 'SENT'", sql)
 
         # Identity conflict on Turso masks raw recipient chat ID
         rec_turso_conflict = TelegramDeliveryRecord(

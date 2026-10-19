@@ -1154,103 +1154,15 @@ class TursoStateRepository(StateRepository):
         """Reconcile a DELIVERY_UNCERTAIN record to SENT using operator-supplied evidence metadata.
 
         NOTE:
-        - The metadata strings in reconciliation_proof represent operator-supplied evidence metadata only,
-          NOT independently verified authoritative evidence.
-        - Unattended or automated flows must NEVER invoke this method.
-        - In live operation (live_mode=True), reconciliation is permanently disabled in this milestone.
-        - Operator authorization (operator_authorized=True or proof['operator_authorized']=True) is strictly
-          required. Empty or fabricated metadata strings alone do not authorize delivery-state transitions.
+        - Production reconciliation for Turso-backed repositories is NOT IMPLEMENTED and is
+          unconditionally disabled during Phase 5B.3B.
+        - Neither caller-supplied live_mode=False nor operator_authorized=True may override this prohibition.
+        - Offline reconciliation testing is isolated to explicitly owned synthetic SQLite fixtures or mock helpers.
         """
-        if live_mode:
-            raise DeliveryStateError(
-                "Live automatic reconciliation of DELIVERY_UNCERTAIN records is disabled in Phase 5B.3B. "
-                "Independent proof verification is not implemented."
-            )
-
-        if not isinstance(reconciliation_proof, dict):
-            raise ValueError("Reconciliation proof must be a dictionary.")
-        method = str(reconciliation_proof.get("reconciliation_method", "")).strip()
-        verifier = str(reconciliation_proof.get("verified_by", "")).strip()
-        ref = str(reconciliation_proof.get("proof_reference", "")).strip()
-        if not method or not verifier or not ref:
-            raise ValueError(
-                "Reconciliation proof requires non-empty operator-supplied metadata "
-                "('reconciliation_method', 'verified_by', and 'proof_reference')."
-            )
-
-        is_authorized = operator_authorized or bool(reconciliation_proof.get("operator_authorized", False))
-        if not is_authorized:
-            raise DeliveryStateError(
-                "Reconciliation requires explicit operator authorization (operator_authorized=True); "
-                "operator-supplied metadata strings alone do not authorize delivery-state transitions."
-            )
-
-        rec_dt = reconciled_at or utc_now()
-        rec_iso = rec_dt.isoformat()
-
-        res = self.client.execute(
-            """
-            SELECT delivery_id, message_key, recipient_role, recipient_chat_id,
-                   category, status, attempt_count, max_attempts, error_message,
-                   payload_json, created_at, updated_at, sent_at
-            FROM telegram_delivery_records
-            WHERE delivery_id = ?
-            """,
-            [delivery_id],
-        )
-        row = res.fetchone()
-        if not row:
-            raise DeliveryStateError(f"Delivery record '{delivery_id}' not found.")
-
-        existing_status = DeliveryStatus(row["status"])
-        if existing_status != DeliveryStatus.DELIVERY_UNCERTAIN:
-            raise DeliveryStateError(
-                f"Cannot reconcile delivery '{delivery_id}' with status '{existing_status.value}'; "
-                "only DELIVERY_UNCERTAIN records can be reconciled."
-            )
-
-        payload = json.loads(row["payload_json"] or "{}")
-        payload["original_uncertainty_evidence"] = {
-            "error_message": row["error_message"],
-            "marked_uncertain_at": row["updated_at"],
-        }
-        op_meta = {
-            "reconciliation_method": method,
-            "verified_by": verifier,
-            "proof_reference": ref,
-            "proof_notes": reconciliation_proof.get("proof_notes"),
-            "operator_authorized": True,
-            "reconciled_at": rec_iso,
-        }
-        payload["operator_reconciliation_metadata"] = op_meta
-        payload["reconciliation"] = op_meta
-
-        self.client.execute(
-            """
-            UPDATE telegram_delivery_records
-            SET status = 'SENT',
-                updated_at = ?,
-                sent_at = ?,
-                payload_json = ?
-            WHERE delivery_id = ? AND status = 'DELIVERY_UNCERTAIN'
-            """,
-            [rec_iso, rec_iso, json.dumps(payload, ensure_ascii=False), delivery_id],
-        )
-
-        return TelegramDeliveryRecord(
-            delivery_id=row["delivery_id"],
-            message_key=row["message_key"],
-            recipient_role=row["recipient_role"],
-            recipient_chat_id=row["recipient_chat_id"],
-            category=TelegramNotificationCategory(row["category"]),
-            status=DeliveryStatus.SENT,
-            attempt_count=int(row["attempt_count"]),
-            max_attempts=int(row["max_attempts"]),
-            error_message=row["error_message"],
-            payload=payload,
-            created_at=datetime.fromisoformat(row["created_at"]),
-            updated_at=rec_dt,
-            sent_at=rec_dt,
+        raise DeliveryStateError(
+            "Reconciliation of DELIVERY_UNCERTAIN records on Turso-backed repositories is NOT IMPLEMENTED "
+            "and is unconditionally disabled during Phase 5B.3B. Offline reconciliation is restricted "
+            "to explicitly owned synthetic SQLite test fixtures."
         )
 
     def is_digest_delivered_to_recipient(self, recipient_chat_id: str, message_key: str) -> bool:
