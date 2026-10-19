@@ -11,21 +11,27 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Generator, Optional
+from typing import Any, Generator, Optional
 
 from efso_radar.domain import (
+    AdminOperationalReport,
     Article,
     DeliveryStatus,
+    DurableRecoveryRecord,
     EditorialAssessment,
     EditorialKind,
+    ExperimentBudgetRecord,
     Market,
     NotificationRecord,
     OwnerFeedback,
     OwnerFeedbackRating,
+    ScheduledExecutionRecord,
     Story,
     StoryCategory,
     StoryUpdate,
     SuggestedFormat,
+    TelegramDeliveryRecord,
+    TelegramNotificationCategory,
     normalize_text,
     utc_now,
 )
@@ -103,35 +109,19 @@ class SqliteStateRepository(StateRepository):
 
         with self._connection() as conn:
             cursor = conn.execute(
-                "SELECT worker_id, expires_at FROM run_locks WHERE lock_key = 'radar_cron'"
+                """
+                INSERT INTO run_locks (lock_key, worker_id, acquired_at, expires_at, heartbeat_at)
+                VALUES ('radar_cron', ?, ?, ?, ?)
+                ON CONFLICT(lock_key) DO UPDATE SET
+                    worker_id = excluded.worker_id,
+                    acquired_at = excluded.acquired_at,
+                    expires_at = excluded.expires_at,
+                    heartbeat_at = excluded.heartbeat_at
+                WHERE run_locks.expires_at < ? OR run_locks.worker_id = ?
+                """,
+                (worker_id, now_iso, expires_at, now_iso, now_iso, worker_id),
             )
-            row = cursor.fetchone()
-            if row:
-                if row["expires_at"] > now_iso and row["worker_id"] != worker_id:
-                    logger.warning(
-                        "Run lock currently held by worker %s until %s",
-                        row["worker_id"],
-                        row["expires_at"],
-                    )
-                    return False
-                # Expired or same worker: overwrite
-                conn.execute(
-                    """
-                    UPDATE run_locks
-                    SET worker_id = ?, acquired_at = ?, expires_at = ?, heartbeat_at = ?
-                    WHERE lock_key = 'radar_cron'
-                    """,
-                    (worker_id, now_iso, expires_at, now_iso),
-                )
-            else:
-                conn.execute(
-                    """
-                    INSERT INTO run_locks (lock_key, worker_id, acquired_at, expires_at, heartbeat_at)
-                    VALUES ('radar_cron', ?, ?, ?, ?)
-                    """,
-                    (worker_id, now_iso, expires_at, now_iso),
-                )
-            return True
+            return cursor.rowcount > 0
 
     def renew_run_lock(self, worker_id: str, extend_minutes: int = 15) -> bool:
         now = utc_now()
@@ -142,7 +132,7 @@ class SqliteStateRepository(StateRepository):
                 """
                 UPDATE run_locks
                 SET expires_at = ?, heartbeat_at = ?
-                WHERE lock_key = 'radar_cron' AND worker_id = ? AND expires_at > ?
+                WHERE lock_key = 'radar_cron' AND worker_id = ? AND expires_at >= ?
                 """,
                 (expires_at, now_iso, worker_id, now_iso),
             )
@@ -1079,5 +1069,379 @@ class SqliteStateRepository(StateRepository):
             )
             row = cursor.fetchone()
             return row["response_json"] if row else None
+
+    # --- Telegram Delivery Outbox & Recipient Lifecycle ---
+    def record_telegram_delivery(self, delivery: TelegramDeliveryRecord) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO telegram_delivery_records (
+                    delivery_id, message_key, recipient_role, recipient_chat_id,
+                    category, status, attempt_count, max_attempts, error_message,
+                    payload_json, created_at, updated_at, sent_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(recipient_chat_id, message_key) DO UPDATE SET
+                    status = excluded.status,
+                    attempt_count = excluded.attempt_count,
+                    error_message = excluded.error_message,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at,
+                    sent_at = COALESCE(excluded.sent_at, telegram_delivery_records.sent_at)
+                """,
+                (
+                    delivery.delivery_id,
+                    delivery.message_key,
+                    delivery.recipient_role,
+                    delivery.recipient_chat_id,
+                    delivery.category.value,
+                    delivery.status.value,
+                    delivery.attempt_count,
+                    delivery.max_attempts,
+                    delivery.error_message,
+                    json.dumps(delivery.payload, ensure_ascii=False),
+                    delivery.created_at.isoformat(),
+                    delivery.updated_at.isoformat(),
+                    delivery.sent_at.isoformat() if delivery.sent_at else None,
+                ),
+            )
+
+    def get_telegram_delivery(self, recipient_chat_id: str, message_key: str) -> Optional[TelegramDeliveryRecord]:
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT delivery_id, message_key, recipient_role, recipient_chat_id,
+                       category, status, attempt_count, max_attempts, error_message,
+                       payload_json, created_at, updated_at, sent_at
+                FROM telegram_delivery_records
+                WHERE recipient_chat_id = ? AND message_key = ?
+                """,
+                (recipient_chat_id, message_key),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return TelegramDeliveryRecord(
+                delivery_id=row["delivery_id"],
+                message_key=row["message_key"],
+                recipient_role=row["recipient_role"],
+                recipient_chat_id=row["recipient_chat_id"],
+                category=TelegramNotificationCategory(row["category"]),
+                status=DeliveryStatus(row["status"]),
+                attempt_count=int(row["attempt_count"]),
+                max_attempts=int(row["max_attempts"]),
+                error_message=row["error_message"],
+                payload=json.loads(row["payload_json"] or "{}"),
+                created_at=datetime.fromisoformat(row["created_at"]),
+                updated_at=datetime.fromisoformat(row["updated_at"]),
+                sent_at=datetime.fromisoformat(row["sent_at"]) if row["sent_at"] else None,
+            )
+
+    def update_telegram_delivery_status(
+        self,
+        delivery_id: str,
+        status: DeliveryStatus,
+        error_message: Optional[str] = None,
+        sent_at: Optional[datetime] = None,
+    ) -> bool:
+        now_iso = utc_now().isoformat()
+        sent_iso = sent_at.isoformat() if sent_at else None
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE telegram_delivery_records
+                SET status = ?,
+                    error_message = ?,
+                    updated_at = ?,
+                    sent_at = COALESCE(?, sent_at),
+                    attempt_count = attempt_count + 1
+                WHERE delivery_id = ?
+                """,
+                (status.value, error_message, now_iso, sent_iso, delivery_id),
+            )
+            return cursor.rowcount > 0
+
+    def is_digest_delivered_to_recipient(self, recipient_chat_id: str, message_key: str) -> bool:
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT 1 FROM telegram_delivery_records
+                WHERE recipient_chat_id = ? AND message_key = ? AND status = 'SENT'
+                """,
+                (recipient_chat_id, message_key),
+            )
+            return cursor.fetchone() is not None
+
+    def get_pending_telegram_deliveries(self, limit: int = 50) -> list[TelegramDeliveryRecord]:
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT delivery_id, message_key, recipient_role, recipient_chat_id,
+                       category, status, attempt_count, max_attempts, error_message,
+                       payload_json, created_at, updated_at, sent_at
+                FROM telegram_delivery_records
+                WHERE status IN ('PENDING', 'DISPATCHING')
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            records: list[TelegramDeliveryRecord] = []
+            for row in cursor.fetchall():
+                records.append(
+                    TelegramDeliveryRecord(
+                        delivery_id=row["delivery_id"],
+                        message_key=row["message_key"],
+                        recipient_role=row["recipient_role"],
+                        recipient_chat_id=row["recipient_chat_id"],
+                        category=TelegramNotificationCategory(row["category"]),
+                        status=DeliveryStatus(row["status"]),
+                        attempt_count=int(row["attempt_count"]),
+                        max_attempts=int(row["max_attempts"]),
+                        error_message=row["error_message"],
+                        payload=json.loads(row["payload_json"] or "{}"),
+                        created_at=datetime.fromisoformat(row["created_at"]),
+                        updated_at=datetime.fromisoformat(row["updated_at"]),
+                        sent_at=datetime.fromisoformat(row["sent_at"]) if row["sent_at"] else None,
+                    )
+                )
+            return records
+
+    # --- Durable Cloud Recovery State ---
+    def save_recovery_state(
+        self,
+        stage: str,
+        worker_id: str,
+        state_payload: dict[str, Any],
+        batch_id: Optional[str] = None,
+        last_processed_id: Optional[str] = None,
+    ) -> None:
+        now_iso = utc_now().isoformat()
+        state_key = f"{stage}::current"
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO durable_recovery_state (
+                    state_key, stage, worker_id, batch_id, last_processed_id,
+                    state_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(state_key) DO UPDATE SET
+                    stage = excluded.stage,
+                    worker_id = excluded.worker_id,
+                    batch_id = excluded.batch_id,
+                    last_processed_id = excluded.last_processed_id,
+                    state_json = excluded.state_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    state_key,
+                    stage,
+                    worker_id,
+                    batch_id,
+                    last_processed_id,
+                    json.dumps(state_payload, ensure_ascii=False),
+                    now_iso,
+                    now_iso,
+                ),
+            )
+
+    def get_recovery_state(self, stage: str) -> Optional[dict[str, Any]]:
+        state_key = f"{stage}::current"
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT state_key, stage, worker_id, batch_id, last_processed_id,
+                       state_json, created_at, updated_at
+                FROM durable_recovery_state
+                WHERE state_key = ?
+                """,
+                (state_key,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return {
+                "state_key": row["state_key"],
+                "stage": row["stage"],
+                "worker_id": row["worker_id"],
+                "batch_id": row["batch_id"],
+                "last_processed_id": row["last_processed_id"],
+                "state_payload": json.loads(row["state_json"] or "{}"),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+
+    def clear_recovery_state(self, stage: str) -> None:
+        state_key = f"{stage}::current"
+        with self._connection() as conn:
+            conn.execute("DELETE FROM durable_recovery_state WHERE state_key = ?", (state_key,))
+
+    # --- At-Most-Once Daily Admin Operational Reports ---
+    def record_admin_report(
+        self,
+        report_date: str,
+        worker_id: str,
+        status: DeliveryStatus,
+        recipient_chat_id: str,
+        summary_payload: dict[str, Any],
+    ) -> bool:
+        now_iso = utc_now().isoformat()
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO admin_operational_reports (
+                    report_date, dispatched_at, worker_id, status, recipient_chat_id, summary_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    report_date,
+                    now_iso,
+                    worker_id,
+                    status.value,
+                    recipient_chat_id,
+                    json.dumps(summary_payload, ensure_ascii=False),
+                ),
+            )
+            return cursor.rowcount > 0
+
+    def has_admin_report_been_dispatched(self, report_date: str) -> bool:
+        with self._connection() as conn:
+            cursor = conn.execute(
+                "SELECT 1 FROM admin_operational_reports WHERE report_date = ? AND status = 'SENT'",
+                (report_date,),
+            )
+            return cursor.fetchone() is not None
+
+    # --- Experiment Budget Ledger & Monthly Consumption ---
+    def record_budget_usage(
+        self,
+        period_month: str,
+        run_id: str,
+        worker_id: str,
+        calls_count: int,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        estimated_cost_usd: float,
+    ) -> None:
+        rec_id = f"bud_{period_month}_{run_id[:16]}"
+        now_iso = utc_now().isoformat()
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO experiment_budget_history (
+                    record_id, period_month, run_id, worker_id, timestamp,
+                    calls_count, prompt_tokens, completion_tokens, total_tokens,
+                    estimated_cost_usd
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    rec_id,
+                    period_month,
+                    run_id,
+                    worker_id,
+                    now_iso,
+                    calls_count,
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                    estimated_cost_usd,
+                ),
+            )
+
+    def get_monthly_budget_summary(self, period_month: str) -> dict[str, Any]:
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT COUNT(*) AS entry_count,
+                       COALESCE(SUM(calls_count), 0) AS total_calls,
+                       COALESCE(SUM(prompt_tokens), 0) AS total_prompt_tokens,
+                       COALESCE(SUM(completion_tokens), 0) AS total_completion_tokens,
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                       COALESCE(SUM(estimated_cost_usd), 0.0) AS total_cost_usd
+                FROM experiment_budget_history
+                WHERE period_month = ?
+                """,
+                (period_month,),
+            )
+            row = cursor.fetchone()
+            return {
+                "period_month": period_month,
+                "entry_count": int(row["entry_count"] or 0),
+                "total_calls": int(row["total_calls"] or 0),
+                "total_prompt_tokens": int(row["total_prompt_tokens"] or 0),
+                "total_completion_tokens": int(row["total_completion_tokens"] or 0),
+                "total_tokens": int(row["total_tokens"] or 0),
+                "total_cost_usd": round(float(row["total_cost_usd"] or 0.0), 6),
+            }
+
+    # --- Scheduled Cloud Execution Audit History ---
+    def record_scheduled_execution_start(
+        self,
+        run_id: str,
+        run_type: str,
+        worker_id: str,
+        started_at: Optional[datetime] = None,
+    ) -> None:
+        start_iso = (started_at or utc_now()).isoformat()
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO scheduled_execution_history (
+                    run_id, run_type, worker_id, started_at, status
+                ) VALUES (?, ?, ?, ?, 'RUNNING')
+                """,
+                (run_id, run_type, worker_id, start_iso),
+            )
+
+    def record_scheduled_execution_finish(
+        self,
+        run_id: str,
+        status: str,
+        articles_collected: int = 0,
+        candidates_evaluated: int = 0,
+        notifications_dispatched: int = 0,
+        error_message: Optional[str] = None,
+        finished_at: Optional[datetime] = None,
+    ) -> None:
+        fin_iso = (finished_at or utc_now()).isoformat()
+        with self._connection() as conn:
+            conn.execute(
+                """
+                UPDATE scheduled_execution_history
+                SET finished_at = ?,
+                    status = ?,
+                    articles_collected = ?,
+                    candidates_evaluated = ?,
+                    notifications_dispatched = ?,
+                    error_message = ?
+                WHERE run_id = ?
+                """,
+                (
+                    fin_iso,
+                    status,
+                    articles_collected,
+                    candidates_evaluated,
+                    notifications_dispatched,
+                    error_message,
+                    run_id,
+                ),
+            )
+
+    def get_scheduled_execution(self, run_id: str) -> Optional[dict[str, Any]]:
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT run_id, run_type, worker_id, started_at, finished_at,
+                       status, articles_collected, candidates_evaluated,
+                       notifications_dispatched, error_message
+                FROM scheduled_execution_history
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return dict(row)
 
 

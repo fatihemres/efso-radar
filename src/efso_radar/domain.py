@@ -265,3 +265,81 @@ class NotificationRecord(BaseModel):
     score: int
     error_message: Optional[str] = None
     category: Optional[TelegramNotificationCategory] = None
+
+
+class TelegramDeliveryRecord(BaseModel):
+    """Durable recipient-specific outbox and delivery record.
+
+    Binds message identity, recipient authorization role, and delivery lifecycle
+    to prevent duplicate alerts across crashes, retries, and runner restarts.
+    """
+    delivery_id: str
+    message_key: str  # Unique digest key or message content hash
+    recipient_role: str  # 'PRIMARY_EDITOR' or 'ADMIN'
+    recipient_chat_id: str
+    category: TelegramNotificationCategory
+    status: DeliveryStatus
+    attempt_count: int = 0
+    max_attempts: int = 3
+    error_message: Optional[str] = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    sent_at: Optional[datetime] = None
+
+    @property
+    def masked_recipient_chat_id(self) -> str:
+        cid = self.recipient_chat_id.strip()
+        if len(cid) <= 4:
+            return "***"
+        return f"{cid[:2]}...{cid[-2:]}"
+
+
+class DurableRecoveryRecord(BaseModel):
+    """Persisted recovery checkpoint allowing ephemeral cloud runs to resume without state loss."""
+    state_key: str
+    stage: str
+    worker_id: str
+    batch_id: Optional[str] = None
+    last_processed_id: Optional[str] = None
+    state_payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class AdminOperationalReport(BaseModel):
+    """Record of a daily technical health and metrics report sent to ADMIN."""
+    report_date: str  # YYYY-MM-DD in Europe/Istanbul timezone
+    dispatched_at: datetime
+    worker_id: str
+    status: DeliveryStatus
+    recipient_chat_id: str
+    summary_payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExperimentBudgetRecord(BaseModel):
+    """Persistent AI token usage and budget consumption ledger entry."""
+    record_id: str
+    period_month: str  # YYYY-MM
+    run_id: str
+    worker_id: str
+    timestamp: datetime = Field(default_factory=utc_now)
+    calls_count: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    estimated_cost_usd: float = 0.0
+
+
+class ScheduledExecutionRecord(BaseModel):
+    """Audit log of scheduled execution cycles across ephemeral runners."""
+    run_id: str
+    run_type: str  # 'SCAN_ONLY', 'FULL', 'ADMIN_REPORT'
+    worker_id: str
+    started_at: datetime = Field(default_factory=utc_now)
+    finished_at: Optional[datetime] = None
+    status: str = "RUNNING"  # 'RUNNING', 'SUCCESS', 'FAILED'
+    articles_collected: int = 0
+    candidates_evaluated: int = 0
+    notifications_dispatched: int = 0
+    error_message: Optional[str] = None

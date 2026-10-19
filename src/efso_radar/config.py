@@ -6,9 +6,9 @@ and provides explicit defaults for budgets, quiet hours, and timeouts.
 from __future__ import annotations
 
 import os
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
@@ -34,6 +34,7 @@ class Settings(BaseModel):
     max_candidates: int = Field(default=55, ge=5, le=150)
 
     # Persistence (SQLite or Turso Cloud)
+    storage_mode: Literal["sqlite", "turso", "cloud", "auto"] = Field(default="auto")
     sqlite_db_path: Path = Field(default=Path("data/radar.db"))
     legacy_state_json_path: Path = Field(default=Path("data/state.json"))
     lock_timeout_minutes: int = Field(default=15, ge=1, le=60)
@@ -99,6 +100,12 @@ class Settings(BaseModel):
     def validate_turso_configuration(self) -> Settings:
         has_url = bool(self.turso_database_url and self.turso_database_url.strip())
         has_token = bool(self.turso_auth_token and self.turso_auth_token.strip())
+        if self.storage_mode in ("turso", "cloud"):
+            if not (has_url and has_token):
+                raise ValueError(
+                    "Cloud storage mode enabled (EFSO_STORAGE_MODE=turso) but Turso configuration is missing or incomplete. "
+                    "Both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN must be provided."
+                )
         if has_url != has_token:
             raise ValueError(
                 "Partial Turso configuration detected: both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN "
@@ -323,6 +330,7 @@ class Settings(BaseModel):
             max_candidates=int(os.getenv("MAX_CANDIDATES", "55")),
             sqlite_db_path=Path(os.getenv("SQLITE_DB_PATH", "data/radar.db")),
             legacy_state_json_path=Path(os.getenv("STATE_PATH", "data/state.json")),
+            storage_mode=os.getenv("EFSO_STORAGE_MODE", "auto").lower(),  # type: ignore
             turso_database_url=os.getenv("TURSO_DATABASE_URL", ""),
             turso_auth_token=os.getenv("TURSO_AUTH_TOKEN", ""),
             quiet_hours_enabled=os.getenv("QUIET_HOURS_ENABLED", "false").lower() in ("true", "1", "yes"),
@@ -350,4 +358,44 @@ class Settings(BaseModel):
             enable_search_grounding=os.getenv("ENABLE_SEARCH_GROUNDING", "false").lower() in ("true", "1"),
             http_timeout_seconds=float(os.getenv("HTTP_TIMEOUT_SECONDS", "18.0")),
         )
+
+
+def get_istanbul_timezone() -> timezone:
+    """Return canonical Europe/Istanbul timezone (fixed UTC+3 offset)."""
+    try:
+        import zoneinfo
+        return zoneinfo.ZoneInfo("Europe/Istanbul")
+    except Exception:
+        return timezone(timedelta(hours=3), name="Europe/Istanbul")
+
+
+def to_istanbul_datetime(dt: Optional[datetime] = None) -> datetime:
+    """Convert any datetime (defaulting to current UTC) to Europe/Istanbul timezone."""
+    now = dt or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return now.astimezone(get_istanbul_timezone())
+
+
+def to_istanbul_date(dt: Optional[datetime] = None) -> str:
+    """Return calendar date (YYYY-MM-DD) in Europe/Istanbul timezone."""
+    return to_istanbul_datetime(dt).strftime("%Y-%m-%d")
+
+
+def is_admin_report_window(
+    current_time: Optional[datetime] = None,
+    window_start: str = "21:30",
+    window_end: str = "22:30",
+) -> bool:
+    """Check if current time falls within the 22:00 Europe/Istanbul admin report window.
+
+    Ensures no catch-up or replay occurs outside this strictly validated window.
+    """
+    local_dt = to_istanbul_datetime(current_time)
+    curr_t = local_dt.time()
+    s_h, s_m = map(int, window_start.split(":"))
+    e_h, e_m = map(int, window_end.split(":"))
+    start_t = time(s_h, s_m)
+    end_t = time(e_h, e_m)
+    return start_t <= curr_t <= end_t
 

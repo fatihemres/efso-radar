@@ -29,6 +29,7 @@ from efso_radar.backup.creator import (
     MalformedLedgerError,
 )
 from efso_radar.backup.envelope import decrypt_envelope
+from efso_radar.repositories.schema import CURRENT_SCHEMA_VERSION
 
 logger = logging.getLogger("efso-radar.backup.restore")
 
@@ -487,7 +488,7 @@ def safe_extract_tar(
 
 def verify_staging_database(
     db_path: Path,
-    expected_schema_version: int = 5,
+    expected_schema_version: int = CURRENT_SCHEMA_VERSION,
     manifest_row_counts: dict[str, int] | None = None,
 ) -> dict[str, int]:
     """Execute SQLite integrity, foreign key, schema compatibility, and row count checks on staged DB.
@@ -564,7 +565,7 @@ def verify_restore_archive(
     envelope_bytes: bytes,
     key: bytes,
     staging_dir: Path | None = None,
-    expected_schema_version: int = 5,
+    expected_schema_version: int = CURRENT_SCHEMA_VERSION,
 ) -> RestoreVerificationResult:
     """Authenticate, decrypt, extract, and rigorously verify a backup inside an isolated staging directory.
 

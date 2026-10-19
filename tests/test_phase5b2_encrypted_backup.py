@@ -87,6 +87,7 @@ from efso_radar.domain import (
     StoryUpdate,
     SuggestedFormat,
 )
+from efso_radar.repositories.schema import CURRENT_SCHEMA_VERSION
 from efso_radar.repositories.sqlite import SqliteStateRepository
 
 
@@ -235,14 +236,14 @@ class TestPhase5B2EncryptedBackup(unittest.TestCase):
             git_commit_sha="test_commit_sha",
         )
         self.assertTrue(backup_res.asset_name.endswith(".efbk"))
-        self.assertEqual(backup_res.manifest["schema_version"], 5)
+        self.assertEqual(backup_res.manifest["schema_version"], CURRENT_SCHEMA_VERSION)
 
         staging_dir = self.tmp_path / "restore_staging_01"
         restore_res = verify_restore_archive(
             envelope_bytes=backup_res.envelope_bytes,
             key=self.key,
             staging_dir=staging_dir,
-            expected_schema_version=5,
+            expected_schema_version=CURRENT_SCHEMA_VERSION,
         )
         self.assertTrue(restore_res.success)
         self.assertEqual(restore_res.table_row_counts["stories"], 1)
@@ -786,7 +787,7 @@ class TestPhase5B2EncryptedBackup(unittest.TestCase):
         storage.upload_asset("efso_backup_20261018_120000_badschema.efbk", b_bad_schema.envelope_bytes)
 
         # 1. Content verification: verify_inventory must run full restore verification (including SQLite check & schema version)
-        verified_points, issues = retention_mgr.verify_inventory(storage, self.key, expected_schema_version=5)
+        verified_points, issues = retention_mgr.verify_inventory(storage, self.key, expected_schema_version=CURRENT_SCHEMA_VERSION)
         self.assertEqual(len(verified_points), 3)  # Only the 3 genuine backups verified; bad schema and raw corrupted excluded!
         self.assertEqual(len(issues), 2)          # Both corrupted assets flagged in issues!
 
@@ -829,7 +830,7 @@ class TestPhase5B2EncryptedBackup(unittest.TestCase):
         corrupt_db = self.tmp_path / "corrupt_table.db"
         conn = sqlite3.connect(corrupt_db)
         conn.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);")
-        conn.execute("INSERT INTO schema_migrations (version) VALUES (5);")
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (?);", (CURRENT_SCHEMA_VERSION,))
         conn.execute("CREATE TABLE stories (id TEXT PRIMARY KEY, title TEXT);")
         conn.execute("CREATE TABLE notifications (id TEXT PRIMARY KEY);")
         conn.execute("CREATE TABLE candidate_backlog (id TEXT PRIMARY KEY);")
@@ -860,7 +861,7 @@ class TestPhase5B2EncryptedBackup(unittest.TestCase):
         manifest = {
             "key_id": "efso-2026-v1",
             "created_at_utc": "2026-10-19T12:00:00Z",
-            "schema_version": 5,
+            "schema_version": CURRENT_SCHEMA_VERSION,
             "source_engine": "sqlite",
             "plaintext_sha256": hashlib.sha256(raw_tar).hexdigest(),
         }
@@ -891,7 +892,7 @@ class TestPhase5B2EncryptedBackup(unittest.TestCase):
         bad_manifest = {
             "key_id": "efso-2026-v1",
             "created_at_utc": "2026-10-19T12:00:00Z",
-            "schema_version": 5,
+            "schema_version": CURRENT_SCHEMA_VERSION,
             "source_engine": "sqlite",
             "plaintext_sha256": hashlib.sha256(raw_bad_tar).hexdigest(),
         }
@@ -943,7 +944,7 @@ class TestPhase5B2EncryptedBackup(unittest.TestCase):
         manifest_disallowed = {
             "key_id": "efso-2026-v1",
             "created_at_utc": "2026-10-19T14:00:00Z",
-            "schema_version": 5,
+            "schema_version": CURRENT_SCHEMA_VERSION,
             "source_engine": "sqlite",
             "plaintext_sha256": hashlib.sha256(raw_tar_disallowed).hexdigest(),
         }
@@ -983,7 +984,7 @@ class TestPhase5B2EncryptedBackup(unittest.TestCase):
         manifest_trunc = {
             "key_id": "efso-2026-v1",
             "created_at_utc": "2026-10-19T14:15:00Z",
-            "schema_version": 5,
+            "schema_version": CURRENT_SCHEMA_VERSION,
             "source_engine": "sqlite",
             "plaintext_sha256": hashlib.sha256(raw_trunc_tar).hexdigest(),
         }

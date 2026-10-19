@@ -10,7 +10,7 @@ from typing import NamedTuple
 
 logger = logging.getLogger("efso-radar.repository.schema")
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 
 class MigrationStep(NamedTuple):
@@ -205,6 +205,100 @@ MIGRATIONS: list[MigrationStep] = [
             """,
         ],
     ),
+    MigrationStep(
+        version=6,
+        description="Persistent state contracts: outbox, recovery, budget, admin reports, and run history",
+        statements=[
+            """
+            CREATE TABLE IF NOT EXISTS telegram_delivery_records (
+                delivery_id TEXT PRIMARY KEY,
+                message_key TEXT NOT NULL,
+                recipient_role TEXT NOT NULL,
+                recipient_chat_id TEXT NOT NULL,
+                category TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                error_message TEXT,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                sent_at TEXT,
+                CONSTRAINT uq_recipient_message UNIQUE (recipient_chat_id, message_key)
+            );
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_telegram_delivery_records_status
+                ON telegram_delivery_records (status, updated_at);
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_telegram_delivery_records_role
+                ON telegram_delivery_records (recipient_role, created_at);
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS durable_recovery_state (
+                state_key TEXT PRIMARY KEY,
+                stage TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                batch_id TEXT,
+                last_processed_id TEXT,
+                state_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_durable_recovery_stage
+                ON durable_recovery_state (stage, updated_at);
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS admin_operational_reports (
+                report_date TEXT PRIMARY KEY,
+                dispatched_at TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                recipient_chat_id TEXT NOT NULL,
+                summary_json TEXT NOT NULL
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS experiment_budget_history (
+                record_id TEXT PRIMARY KEY,
+                period_month TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                calls_count INTEGER NOT NULL DEFAULT 0,
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                estimated_cost_usd REAL NOT NULL DEFAULT 0.0
+            );
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_budget_history_period
+                ON experiment_budget_history (period_month, timestamp);
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS scheduled_execution_history (
+                run_id TEXT PRIMARY KEY,
+                run_type TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                status TEXT NOT NULL,
+                articles_collected INTEGER NOT NULL DEFAULT 0,
+                candidates_evaluated INTEGER NOT NULL DEFAULT 0,
+                notifications_dispatched INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT
+            );
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_scheduled_execution_started
+                ON scheduled_execution_history (started_at);
+            """,
+        ],
+    ),
 ]
 
 
@@ -384,6 +478,94 @@ def get_all_init_statements() -> list[str]:
         """
         CREATE INDEX IF NOT EXISTS idx_ai_usage_ledger_batch_hash
             ON ai_usage_ledger (batch_hash, model_name);
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS telegram_delivery_records (
+            delivery_id TEXT PRIMARY KEY,
+            message_key TEXT NOT NULL,
+            recipient_role TEXT NOT NULL,
+            recipient_chat_id TEXT NOT NULL,
+            category TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL DEFAULT 3,
+            error_message TEXT,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            sent_at TEXT,
+            CONSTRAINT uq_recipient_message UNIQUE (recipient_chat_id, message_key)
+        );
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_telegram_delivery_records_status
+            ON telegram_delivery_records (status, updated_at);
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_telegram_delivery_records_role
+            ON telegram_delivery_records (recipient_role, created_at);
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS durable_recovery_state (
+            state_key TEXT PRIMARY KEY,
+            stage TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            batch_id TEXT,
+            last_processed_id TEXT,
+            state_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_durable_recovery_stage
+            ON durable_recovery_state (stage, updated_at);
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS admin_operational_reports (
+            report_date TEXT PRIMARY KEY,
+            dispatched_at TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            recipient_chat_id TEXT NOT NULL,
+            summary_json TEXT NOT NULL
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS experiment_budget_history (
+            record_id TEXT PRIMARY KEY,
+            period_month TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            calls_count INTEGER NOT NULL DEFAULT 0,
+            prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            completion_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            estimated_cost_usd REAL NOT NULL DEFAULT 0.0
+        );
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_budget_history_period
+            ON experiment_budget_history (period_month, timestamp);
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS scheduled_execution_history (
+            run_id TEXT PRIMARY KEY,
+            run_type TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            status TEXT NOT NULL,
+            articles_collected INTEGER NOT NULL DEFAULT 0,
+            candidates_evaluated INTEGER NOT NULL DEFAULT 0,
+            notifications_dispatched INTEGER NOT NULL DEFAULT 0,
+            error_message TEXT
+        );
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_scheduled_execution_started
+            ON scheduled_execution_history (started_at);
         """,
     ]
     return stmts
