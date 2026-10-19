@@ -61,6 +61,8 @@ from efso_radar.backup.restore import (
     detect_and_recover_incomplete_cutover,
     execute_production_cutover,
     safe_extract_tar,
+    simulate_offline_cutover_in_test_workspace,
+    validate_simulation_workspace,
     verify_restore_archive,
 )
 from efso_radar.backup.retention import (
@@ -491,7 +493,7 @@ class TestPhase5B2EncryptedBackup(unittest.TestCase):
         self.assertFalse(unused_dir.exists())
 
     def test_12_atomic_cutover_mechanics_crash_journal_and_step_rollback(self):
-        """Production cutover requires simulated=True and authorization; provides step rollback and crash recovery."""
+        """Production cutover unconditionally fails closed; simulated offline cutover requires authorization, validates workspace, provides step rollback and crash recovery."""
         backup_res = create_backup(
             key=self.key,
             db_path=self.db_path,
@@ -520,14 +522,22 @@ class TestPhase5B2EncryptedBackup(unittest.TestCase):
         with self.assertRaises(ProductionCutoverDisabledError):
             execute_production_cutover(restore_res, live_dir, authorized=True, simulated=False)
 
-        # 2. Simulated cutover without authorized=True fails closed
-        with self.assertRaises(CutoverAuthorizationError):
-            execute_production_cutover(restore_res, live_dir, authorized=False, simulated=True)
+        # 2. Production cutover entry point fails closed EVEN WITH simulated=True (simulation bypass closed!)
+        with self.assertRaises(ProductionCutoverDisabledError):
+            execute_production_cutover(restore_res, live_dir, authorized=True, simulated=True)
 
-        # 3. Injected failure at step 2 (delivery ledger) executes verified rollback
+        # 3. Dedicated offline simulation function refuses operational / non-test workspaces
+        with self.assertRaises(UnsafeStagingPathError):
+            simulate_offline_cutover_in_test_workspace(restore_res, Path.cwd() / "data", authorized=True)
+
+        # 4. Simulated cutover without authorized=True fails closed
+        with self.assertRaises(CutoverAuthorizationError):
+            simulate_offline_cutover_in_test_workspace(restore_res, live_dir, authorized=False)
+
+        # 5. Injected failure at step 2 (delivery ledger) executes verified rollback
         with self.assertRaises(RestoreVerificationError):
-            execute_production_cutover(
-                restore_res, live_dir, authorized=True, simulated=True, inject_failure_step=2
+            simulate_offline_cutover_in_test_workspace(
+                restore_res, live_dir, authorized=True, inject_failure_step=2
             )
 
         # Verify rollback preserved live DB
@@ -545,13 +555,13 @@ class TestPhase5B2EncryptedBackup(unittest.TestCase):
         journal_data = json.loads(journal_path.read_text(encoding="utf-8"))
         self.assertEqual(journal_data["phase"], "ROLLED_BACK")
 
-        # 4. Successful simulated cutover
-        success = execute_production_cutover(restore_res, live_dir, authorized=True, simulated=True)
+        # 6. Successful simulated cutover
+        success = simulate_offline_cutover_in_test_workspace(restore_res, live_dir, authorized=True)
         self.assertTrue(success)
         journal_data = json.loads(journal_path.read_text(encoding="utf-8"))
         self.assertEqual(journal_data["phase"], "COMPLETED")
 
-        # 5. Interrupted cutover startup recovery
+        # 7. Interrupted cutover startup recovery
         journal_data["phase"] = "REPLACED_DB"  # simulate mid-cutover crash
         journal_path.write_text(json.dumps(journal_data), encoding="utf-8")
         recovered = detect_and_recover_incomplete_cutover(live_dir)
@@ -560,7 +570,7 @@ class TestPhase5B2EncryptedBackup(unittest.TestCase):
         self.assertEqual(recovered_journal["phase"], "ROLLED_BACK")
 
     def test_13_telegram_post_restore_duplicate_prevention_and_uncertainty_gate(self):
-        """Restoring older backup reconciles with surviving ledger or blocks dispatch under DELIVERY_UNCERTAIN."""
+        """Restoring older backup reconciles with surviving ledger, creates durable recovery state, and blocks dispatch under DELIVERY_UNCERTAIN."""
         # 1. Backup A created at T1
         backup_res = create_backup(
             key=self.key,
@@ -612,14 +622,67 @@ class TestPhase5B2EncryptedBackup(unittest.TestCase):
         gate_uncertain.reconcile()
         self.assertEqual(gate_uncertain.reconciliation_status, "DELIVERY_UNCERTAIN")
 
-        # Dispatch is blocked!
-        with self.assertRaises(DeliveryBlockedUncertainRecoveryError):
-            gate_uncertain.check_can_dispatch("new_unseen_digest_hash")
+        # Durable state verification: .recovery_pending_reconciliation.json exists on disk
+        data_dir = restore_res.delivery_ledger_path.parent
+        durable_state_file = data_dir / ".recovery_pending_reconciliation.json"
+        self.assertTrue(durable_state_file.exists())
+        durable_data = json.loads(durable_state_file.read_text(encoding="utf-8"))
+        self.assertTrue(durable_data.get("dispatch_blocked"))
 
-        # Operator authorization clears uncertainty
+        # Verify classmethod is_dispatch_blocked survives process restart
+        blocked, reason = TelegramDeliveryReconciliationGate.is_dispatch_blocked(data_dir)
+        self.assertTrue(blocked)
+        self.assertIn("DELIVERY_UNCERTAIN", reason)
+
+        # Process restart simulation: a new gate instance checks dispatch and fails closed
+        gate_restarted = TelegramDeliveryReconciliationGate(
+            restored_ledger_path=restore_res.delivery_ledger_path,
+            surviving_ledger_path=None,
+            backup_created_at_utc="2026-10-19T08:00:00Z",
+        )
+        with self.assertRaises(DeliveryBlockedUncertainRecoveryError):
+            gate_restarted.check_can_dispatch("new_unseen_digest_hash")
+
+        # 5. Contradictory surviving history detection
+        contradictory_ledger = self.tmp_path / "contradictory_ledger.json"
+        contradictory_ledger.write_text(
+            json.dumps({
+                "version": 1,
+                "deliveries": {
+                    "del_1": {
+                        "digest_hash": "same_hash_123",
+                        "status": "DELIVERY_SUCCESS",
+                        "delivered_at_utc": "2026-10-19T09:00:00Z",
+                        "chat_id": "8712345678",
+                        "recipient_role": "PRIMARY_EDITOR",
+                    },
+                    "del_2": {
+                        "digest_hash": "same_hash_123",
+                        "status": "FAILED",
+                        "delivered_at_utc": "2026-10-19T09:05:00Z",
+                        "chat_id": "8712345678",
+                        "recipient_role": "PRIMARY_EDITOR",
+                    },
+                }
+            }),
+            encoding="utf-8",
+        )
+        gate_contradictory = TelegramDeliveryReconciliationGate(
+            restored_ledger_path=restore_res.delivery_ledger_path,
+            surviving_ledger_path=contradictory_ledger,
+            backup_created_at_utc="2026-10-19T08:00:00Z",
+        )
+        gate_contradictory.reconcile()
+        self.assertEqual(gate_contradictory.reconciliation_status, "DELIVERY_UNCERTAIN")
+        self.assertTrue(gate_contradictory.dispatch_blocked)
+
+        # 6. Operator authorization clears uncertainty
         gate_uncertain.authorize_resumption(
             operator_note="Reviewed channel outbox; safe to resume", token="po_auth_token_xyz"
         )
+        # Durable state updated to unblocked
+        blocked_after, _ = TelegramDeliveryReconciliationGate.is_dispatch_blocked(data_dir)
+        self.assertFalse(blocked_after)
         # Now allowed for new unseen digests
         gate_uncertain.check_can_dispatch("new_unseen_digest_hash")
 
@@ -657,18 +720,35 @@ class TestPhase5B2EncryptedBackup(unittest.TestCase):
         storage.upload_asset(b2.asset_name, b2.envelope_bytes)
         storage.upload_asset(b3.asset_name, b3.envelope_bytes)
 
-        # Upload a corrupted asset
+        # Upload a corrupted asset (raw corrupted ciphertext)
         storage.upload_asset("efso_backup_20261019_000000_deadbeef.efbk", b"corrupted payload")
 
-        # 1. Content verification
-        verified_points, issues = retention_mgr.verify_inventory(storage, self.key)
-        self.assertEqual(len(verified_points), 3)  # Only the 3 genuine backups verified
-        self.assertEqual(len(issues), 1)          # Corrupted asset flagged
+        # Upload a validly encrypted envelope that contains a corrupt SQLite database (schema version 99 != 5)
+        bad_schema_db = self.tmp_path / "bad_schema.db"
+        conn = sqlite3.connect(bad_schema_db)
+        conn.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);")
+        conn.execute("INSERT INTO schema_migrations (version) VALUES (99);")
+        conn.execute("CREATE TABLE stories (id TEXT PRIMARY KEY, title TEXT);")
+        conn.execute("CREATE TABLE notifications (id TEXT PRIMARY KEY);")
+        conn.execute("CREATE TABLE candidate_backlog (id TEXT PRIMARY KEY);")
+        conn.execute("CREATE TABLE processed_articles (id TEXT PRIMARY KEY);")
+        conn.commit()
+        conn.close()
+
+        b_bad_schema = create_backup(
+            self.key, bad_schema_db, self.del_ledger_path, self.bud_ledger_path, now=ref_now - timedelta(days=1)
+        )
+        storage.upload_asset("efso_backup_20261018_120000_badschema.efbk", b_bad_schema.envelope_bytes)
+
+        # 1. Content verification: verify_inventory must run full restore verification (including SQLite check & schema version)
+        verified_points, issues = retention_mgr.verify_inventory(storage, self.key, expected_schema_version=5)
+        self.assertEqual(len(verified_points), 3)  # Only the 3 genuine backups verified; bad schema and raw corrupted excluded!
+        self.assertEqual(len(issues), 2)          # Both corrupted assets flagged in issues!
 
         # 2. Evaluation with inventory fingerprint
         fp = storage.get_inventory_fingerprint()
         plan = retention_mgr.evaluate_retention(verified_points, storage.list_assets(), fp, now=ref_now)
-        # b1, b2 retained; b3 (>14 days) marked for deletion
+        # b1, b2 retained; b3 (>14 days) marked for deletion; bad assets not counted in verified recovery points
         self.assertEqual(len(plan.retained_assets), 2)
         self.assertEqual(len(plan.assets_to_delete), 1)
         self.assertEqual(plan.assets_to_delete[0].name, b3.asset_name)

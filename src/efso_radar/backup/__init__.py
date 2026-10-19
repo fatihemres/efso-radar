@@ -31,6 +31,8 @@ from efso_radar.backup.restore import (
     UnsafeStagingPathError,
     detect_and_recover_incomplete_cutover,
     execute_production_cutover,
+    simulate_offline_cutover_in_test_workspace,
+    validate_simulation_workspace,
     verify_restore_archive,
 )
 from efso_radar.backup.retention import (
@@ -70,6 +72,8 @@ __all__ = [
     "UnsafeStagingPathError",
     "detect_and_recover_incomplete_cutover",
     "execute_production_cutover",
+    "simulate_offline_cutover_in_test_workspace",
+    "validate_simulation_workspace",
     "verify_restore_archive",
     "BackupAsset",
     "MockGitHubReleaseStorageAdapter",

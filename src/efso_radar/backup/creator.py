@@ -330,9 +330,16 @@ def create_backup(
     current_time_utc_str = current_time.isoformat()
     barrier_dir = coordination_dir or db_path.parent
 
-    logger.info("Initiating coordinated backup creation at %s", current_time_utc_str)
+    logger.info("Initiating quiescent offline backup creation at %s", current_time_utc_str)
 
-    # Coordinated consistency barrier prevents concurrent mutations across DB and ledgers
+    # Enforce verified quiescence before snapshotting (Approach B: offline/quiescent-only)
+    from efso_radar.backup.restore import verify_quiescence, TelegramDeliveryReconciliationGate
+    verify_quiescence(db_path.parent)
+    blocked, block_reason = TelegramDeliveryReconciliationGate.is_dispatch_blocked(db_path.parent)
+    if blocked:
+        raise BackupCreationError(f"Cannot create backup while system recovery is pending: {block_reason}")
+
+    # Coordinated consistency barrier prevents concurrent mutations across cooperating callers
     with SnapshotCoordinationBarrier(barrier_dir):
         # 1. Snapshot SQLite database & extract true schema version
         db_bytes, actual_schema_version, row_counts = create_consistent_sqlite_snapshot(db_path)

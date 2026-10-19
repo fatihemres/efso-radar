@@ -119,12 +119,16 @@ class CutoverJournal:
         return journal_path
 
 
+DURABLE_RECOVERY_STATE_FILE = ".recovery_pending_reconciliation.json"
+
+
 class TelegramDeliveryReconciliationGate:
     """Post-restore delivery reconciliation safety gate.
 
     Guarantees that restoring an older backup never allows digests sent after the
     backup timestamp to be inadvertently resent to PRIMARY_EDITOR.
-    If surviving history has gaps, enters DELIVERY_UNCERTAIN state and blocks dispatch.
+    If surviving history has gaps or contradictory records, enters DELIVERY_UNCERTAIN
+    and writes a durable state file that survives process restarts.
     """
 
     def __init__(
@@ -141,6 +145,66 @@ class TelegramDeliveryReconciliationGate:
         self.reconciled_hashes: set[str] = set()
         self.audit_log: list[str] = []
 
+    def _persist_durable_state(self, blocked: bool, reason: str, operator_note: str = "") -> None:
+        """Persist recovery state to disk so blocked status survives process restarts."""
+        state_file = self.restored_ledger_path.parent / DURABLE_RECOVERY_STATE_FILE
+        payload = {
+            "status": self.reconciliation_status,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "backup_created_at_utc": self.backup_created_at_utc,
+            "dispatch_blocked": blocked,
+            "reason": reason,
+            "operator_note": operator_note,
+        }
+        try:
+            state_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except OSError as exc:
+            logger.warning("Failed to persist durable recovery state: %s", exc)
+
+    @classmethod
+    def is_dispatch_blocked(cls, data_dir: Path) -> tuple[bool, str]:
+        """Check whether automated Telegram dispatch is blocked by a durable recovery gate."""
+        state_file = data_dir / DURABLE_RECOVERY_STATE_FILE
+        if not state_file.exists():
+            return False, ""
+        try:
+            data = json.loads(state_file.read_text(encoding="utf-8"))
+            if data.get("dispatch_blocked", False):
+                return True, data.get("reason", "Restoration recovery pending reconciliation")
+        except Exception:
+            return True, "Durable recovery state file is corrupted; failing closed"
+        return False, ""
+
+    def _verify_surviving_continuity(self, surviving_deliveries: dict[str, Any]) -> None:
+        """Verify that surviving history is temporally consistent and non-contradictory.
+
+        Raises:
+            RestoreVerificationError: If records contain contradictory hashes or unparseable timestamps.
+        """
+        seen_hashes_status: dict[str, str] = {}
+        for del_id, record in surviving_deliveries.items():
+            if not isinstance(record, dict):
+                raise RestoreVerificationError(f"Surviving record {del_id} is not an object")
+
+            ts_str = record.get("delivered_at_utc") or record.get("sent_at_utc")
+            if not ts_str:
+                raise RestoreVerificationError(f"Surviving delivery record {del_id} lacks timestamp")
+            try:
+                datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            except Exception as exc:
+                raise RestoreVerificationError(f"Surviving delivery record {del_id} has invalid timestamp: {exc}")
+
+            h = record.get("digest_hash")
+            st = record.get("status")
+            if h and st:
+                # Detect contradictory records: same hash reported with mutually exclusive outcomes
+                if h in seen_hashes_status and seen_hashes_status[h] != st:
+                    if {seen_hashes_status[h], st} == {"DELIVERY_SUCCESS", "FAILED"}:
+                        raise RestoreVerificationError(
+                            f"Contradictory delivery status detected in surviving ledger for digest {h[:16]}"
+                        )
+                seen_hashes_status[h] = st
+
     def reconcile(self) -> str:
         """Reconcile restored delivery ledger with surviving operational history."""
         # Load restored ledger
@@ -156,6 +220,9 @@ class TelegramDeliveryReconciliationGate:
             try:
                 surviving_data = json.loads(self.surviving_ledger_path.read_text(encoding="utf-8"))
                 surviving_deliveries = surviving_data.get("deliveries", {})
+
+                # Execute authoritative continuity check
+                self._verify_surviving_continuity(surviving_deliveries)
 
                 merged_count = 0
                 for del_id, record in surviving_deliveries.items():
@@ -177,12 +244,14 @@ class TelegramDeliveryReconciliationGate:
                 self.dispatch_blocked = False
                 msg = f"Reconciled {merged_count} post-backup delivery records from surviving ledger."
                 self.audit_log.append(msg)
+                self._persist_durable_state(blocked=False, reason=msg)
                 return msg
             except Exception as exc:
                 self.reconciliation_status = "DELIVERY_UNCERTAIN"
                 self.dispatch_blocked = True
-                msg = f"Surviving ledger unreadable ({exc}); entered DELIVERY_UNCERTAIN."
+                msg = f"Surviving ledger failed continuity verification ({exc}); entered DELIVERY_UNCERTAIN."
                 self.audit_log.append(msg)
+                self._persist_durable_state(blocked=True, reason=msg)
                 return msg
 
         # No surviving ledger available — potential delivery gap
@@ -193,14 +262,17 @@ class TelegramDeliveryReconciliationGate:
             "Dispatch blocked under DELIVERY_UNCERTAIN policy until operator authorization."
         )
         self.audit_log.append(msg)
+        self._persist_durable_state(blocked=True, reason=msg)
         return msg
 
     def check_can_dispatch(self, digest_hash: str) -> None:
         """Verify whether automated dispatch can proceed for given digest hash."""
-        if self.dispatch_blocked:
+        # Check in-memory block as well as durable on-disk state
+        durable_blocked, durable_reason = self.is_dispatch_blocked(self.restored_ledger_path.parent)
+        if self.dispatch_blocked or durable_blocked:
+            reason = durable_reason or f"system is in {self.reconciliation_status} state"
             raise DeliveryBlockedUncertainRecoveryError(
-                f"Automated dispatch blocked: system is in {self.reconciliation_status} state. "
-                "Operator authorization required to resume delivery."
+                f"Automated dispatch blocked: {reason}. Operator authorization required to resume delivery."
             )
         if digest_hash in self.reconciled_hashes:
             raise DeliveryBlockedUncertainRecoveryError(
@@ -214,6 +286,7 @@ class TelegramDeliveryReconciliationGate:
         self.dispatch_blocked = False
         self.reconciliation_status = "AUTHORIZED_RESUMPTION"
         self.audit_log.append(f"Resumption authorized by operator: note='{operator_note}', token='{token[:8]}'")
+        self._persist_durable_state(blocked=False, reason="Operator authorized resumption", operator_note=operator_note)
 
 
 def mask_chat_id(raw_id: str | int) -> str:
@@ -612,74 +685,118 @@ def detect_and_recover_incomplete_cutover(operational_data_dir: Path) -> bool:
         return False
 
 
+def validate_simulation_workspace(test_workspace_dir: Path) -> Path:
+    """Validate that a cutover simulation workspace is an isolated temporary test fixture.
+
+    Strictly refuses:
+    - Filesystem root (/ or C:\\)
+    - User home directory
+    - Repository root and source tree
+    - Repository data/ directory or operational directories
+    - Any path not clearly marked as a temporary test fixture
+    """
+    resolved = test_workspace_dir.resolve()
+    repo_root = Path.cwd().resolve()
+
+    if resolved == resolved.parent:
+        raise UnsafeStagingPathError(f"Simulation workspace cannot be filesystem root: {resolved}")
+
+    if resolved == Path.home().resolve():
+        raise UnsafeStagingPathError(f"Simulation workspace cannot be user home directory: {resolved}")
+
+    if resolved == repo_root or str(resolved).startswith(str(repo_root / "src")):
+        raise UnsafeStagingPathError(f"Simulation workspace cannot be inside repo root or source tree: {resolved}")
+
+    if resolved == repo_root / "data" or str(resolved).startswith(str(repo_root / "data")):
+        raise UnsafeStagingPathError(f"Simulation workspace cannot be inside live repository data directory: {resolved}")
+
+    parent_str = str(resolved).lower()
+    if not any(marker in parent_str for marker in ("tmp", "temp", "test", "fixture", "staging")):
+        raise UnsafeStagingPathError(
+            f"Simulation workspace {resolved} must be a dedicated temporary test directory (containing tmp/temp/test/fixture)."
+        )
+
+    return resolved
+
+
 def execute_production_cutover(
     verification_result: RestoreVerificationResult,
     operational_data_dir: Path,
     authorized: bool = False,
-    simulated: bool = False,
+    **kwargs: Any,
+) -> bool:
+    """Public production cutover entry point.
+
+    UNCONDITIONALLY DISABLED FAIL-CLOSED in Phase 5B.2B.
+    Production cutover is NOT implemented, authorized, or active in this milestone.
+    Live operational restoration is strictly forbidden.
+    """
+    raise ProductionCutoverDisabledError(
+        "Production cutover is unconditionally disabled fail-closed in Phase 5B.2B. "
+        "Live operational restoration is not implemented or authorized. For hermetic offline testing, "
+        "use simulate_offline_cutover_in_test_workspace() on dedicated temporary fixtures."
+    )
+
+
+def simulate_offline_cutover_in_test_workspace(
+    verification_result: RestoreVerificationResult,
+    test_workspace_dir: Path,
+    authorized: bool = False,
     inject_failure_step: int | None = None,
 ) -> bool:
-    """Safely cut over verified staging files into operational directory with transactional crash journal.
+    """Simulate cutover mechanics strictly within an isolated temporary test fixture.
 
-    Requires explicit authorization and verified quiescence. Uses SQLite online backup
-    for pre-cutover database snapshot, atomic os.replace on temporary files, and
-    provides crash-recovery rollback at each step.
-
-    In Phase 5B.2B, live production cutover is disabled fail-closed.
-    Simulated cutovers (simulated=True) can be executed offline against test directories.
+    Enforces workspace isolation, quiescence checks, pre-cutover SQLite snapshot
+    via online backup API, transactional crash journal (.cutover_journal.json),
+    atomic os.replace, and step-by-step rollback.
 
     Args:
         verification_result: Successful outcome from verify_restore_archive.
-        operational_data_dir: Live data directory (e.g. data/).
-        authorized: Explicit Product Owner authorization flag.
-        simulated: Must be True in Phase 5B.2B to perform offline cutover validation.
+        test_workspace_dir: Isolated temporary directory (must NOT be repo or live data).
+        authorized: Explicit authorization flag.
         inject_failure_step: Optional step index (1, 2, 3, 4) to test rollback resilience.
 
     Returns:
-        True if cutover succeeded and passed smoke checks.
+        True if simulated cutover succeeded and passed smoke checks.
 
     Raises:
-        ProductionCutoverDisabledError: If live production cutover is attempted (simulated=False).
+        UnsafeStagingPathError: If test_workspace_dir is unsafe or inside repo/data.
         CutoverAuthorizationError: If authorized=False.
         RestoreVerificationError: If verification_result failed, quiescence failed, or smoke test failed.
     """
+    # 1. Unconditionally validate workspace isolation
+    safe_workspace = validate_simulation_workspace(test_workspace_dir)
+
     if not authorized:
         raise CutoverAuthorizationError(
-            "Production cutover blocked: requires explicit Product Owner authorization."
-        )
-
-    # In Phase 5B.2B, production cutover against real live environments is disabled fail-closed
-    if not simulated:
-        raise ProductionCutoverDisabledError(
-            "Live production cutover is disabled fail-closed in Phase 5B.2B until an authorized "
-            "operational maintenance window is approved. Use simulated=True for offline validation."
+            "Simulated cutover blocked: requires explicit authorization flag."
         )
 
     if not verification_result.success:
         raise RestoreVerificationError("Cannot cutover an unverified or failed restore result.")
 
-    operational_data_dir.mkdir(parents=True, exist_ok=True)
-    live_db = operational_data_dir / "radar.db"
-    live_del = operational_data_dir / "telegram_digest_delivery_ledger.json"
-    live_bud = operational_data_dir / "experiment_budget_ledger.json"
+    safe_workspace.mkdir(parents=True, exist_ok=True)
+    live_db = safe_workspace / "radar.db"
+    live_del = safe_workspace / "telegram_digest_delivery_ledger.json"
+    live_bud = safe_workspace / "experiment_budget_ledger.json"
 
     # Step 0: Quiescence check
-    verify_quiescence(operational_data_dir)
+    verify_quiescence(safe_workspace)
 
-    cutover_id = f"cutover_{int(time.time())}"
+    cutover_id = f"sim_cutover_{int(time.time())}"
     journal = CutoverJournal(
         cutover_id=cutover_id,
         phase="INITIATED",
-        target_dir=str(operational_data_dir),
+        target_dir=str(safe_workspace),
         timestamp_utc=datetime.now(timezone.utc).isoformat(),
         step_history=["Quiescence verified"],
     )
-    journal.save(operational_data_dir)
+    journal.save(safe_workspace)
 
     # Step 1: Pre-cutover consistent SQLite snapshot using backup API
-    bak_db = operational_data_dir / "radar.db.pre_cutover.bak"
-    bak_del = operational_data_dir / "telegram_digest_delivery_ledger.json.pre_cutover.bak"
-    bak_bud = operational_data_dir / "experiment_budget_ledger.json.pre_cutover.bak"
+    bak_db = safe_workspace / "radar.db.pre_cutover.bak"
+    bak_del = safe_workspace / "telegram_digest_delivery_ledger.json.pre_cutover.bak"
+    bak_bud = safe_workspace / "experiment_budget_ledger.json.pre_cutover.bak"
 
     if live_db.exists():
         try:
@@ -696,7 +813,7 @@ def execute_production_cutover(
         except Exception as exc:
             journal.phase = "FAILED"
             journal.step_history.append(f"Pre-cutover DB backup failed: {exc}")
-            journal.save(operational_data_dir)
+            journal.save(safe_workspace)
             raise RestoreVerificationError(f"Failed to create pre-cutover DB backup: {exc}") from exc
 
     if live_del.exists():
@@ -709,7 +826,7 @@ def execute_production_cutover(
 
     journal.phase = "PRE_BACKUP_COMPLETED"
     journal.step_history.append("Consistent pre-cutover backups created")
-    journal.save(operational_data_dir)
+    journal.save(safe_workspace)
 
     # Step 2: Atomic multi-file replacement with step-by-step rollback
     try:
@@ -717,36 +834,36 @@ def execute_production_cutover(
             raise RuntimeError("Injected fault at step 1: DB replacement")
 
         # Atomic replacement for radar.db
-        tmp_db = operational_data_dir / "radar.db.tmp_cutover"
+        tmp_db = safe_workspace / "radar.db.tmp_cutover"
         shutil.copy2(verification_result.db_path, tmp_db)
         import gc
         gc.collect()
         os.replace(tmp_db, live_db)
         journal.phase = "REPLACED_DB"
         journal.step_history.append("radar.db replaced atomically")
-        journal.save(operational_data_dir)
+        journal.save(safe_workspace)
 
         if inject_failure_step == 2:
             raise RuntimeError("Injected fault at step 2: Delivery ledger replacement")
 
         # Atomic replacement for delivery ledger
-        tmp_del = operational_data_dir / "telegram_digest_delivery_ledger.json.tmp_cutover"
+        tmp_del = safe_workspace / "telegram_digest_delivery_ledger.json.tmp_cutover"
         shutil.copy2(verification_result.delivery_ledger_path, tmp_del)
         os.replace(tmp_del, live_del)
         journal.phase = "REPLACED_DELIVERY_LEDGER"
         journal.step_history.append("delivery ledger replaced atomically")
-        journal.save(operational_data_dir)
+        journal.save(safe_workspace)
 
         if inject_failure_step == 3:
             raise RuntimeError("Injected fault at step 3: Budget ledger replacement")
 
         # Atomic replacement for budget ledger
-        tmp_bud = operational_data_dir / "experiment_budget_ledger.json.tmp_cutover"
+        tmp_bud = safe_workspace / "experiment_budget_ledger.json.tmp_cutover"
         shutil.copy2(verification_result.budget_ledger_path, tmp_bud)
         os.replace(tmp_bud, live_bud)
         journal.phase = "REPLACED_BUDGET_LEDGER"
         journal.step_history.append("budget ledger replaced atomically")
-        journal.save(operational_data_dir)
+        journal.save(safe_workspace)
 
         if inject_failure_step == 4:
             raise RuntimeError("Injected fault at step 4: Smoke test failure")
@@ -760,9 +877,9 @@ def execute_production_cutover(
 
         journal.phase = "COMPLETED"
         journal.step_history.append("Smoke test passed successfully")
-        journal.save(operational_data_dir)
+        journal.save(safe_workspace)
 
-        logger.info("Production cutover completed successfully from %s", verification_result.staging_dir)
+        logger.info("Simulated cutover completed successfully in test workspace %s", safe_workspace)
         return True
     except Exception as exc:
         logger.error("Cutover failed (%s); executing verified rollback...", exc)
@@ -776,5 +893,5 @@ def execute_production_cutover(
 
         journal.phase = "ROLLED_BACK"
         journal.step_history.append(f"Rolled back due to error: {exc}")
-        journal.save(operational_data_dir)
+        journal.save(safe_workspace)
         raise RestoreVerificationError(f"Cutover failed and was safely rolled back: {exc}") from exc

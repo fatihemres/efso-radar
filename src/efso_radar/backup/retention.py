@@ -186,12 +186,21 @@ class RetentionPolicyManager:
         self,
         storage: StorageAdapter,
         decryption_key: bytes,
+        expected_schema_version: int = 5,
     ) -> tuple[list[VerifiedRecoveryPoint], list[str]]:
-        """Download and cryptographically verify all assets, identifying genuine recovery points.
+        """Download and fully verify all assets against SQLite integrity and schema rules.
 
-        Assets that fail download, envelope decryption, or manifest checks are flagged
-        and NOT counted towards verified recovery points.
+        Executes full restore verification in an ephemeral staging directory:
+        validates payload SHA-256 against manifest, verifies SQLite PRAGMA integrity_check,
+        confirms schema migrations version matches expected_schema_version, and validates
+        essential ledgers (delivery outbox and experiment budget).
+
+        Assets that fail download, envelope decryption, SQLite integrity, or ledger
+        validation are flagged and NOT counted towards verified recovery points.
         """
+        import shutil
+        from efso_radar.backup.restore import verify_restore_archive
+
         verified_points: list[VerifiedRecoveryPoint] = []
         issues: list[str] = []
 
@@ -199,9 +208,25 @@ class RetentionPolicyManager:
         for asset in assets:
             try:
                 data = storage.download_asset(asset.asset_id)
-                _, manifest = decrypt_envelope(data, decryption_key)
-                schema_ver = manifest.get("schema_version", 0)
-                plaintext_sha = manifest.get("plaintext_sha256", "")
+                restore_res = verify_restore_archive(
+                    envelope_bytes=data,
+                    key=decryption_key,
+                    staging_dir=None,  # Ephemeral dedicated system temp
+                    expected_schema_version=expected_schema_version,
+                )
+                if not restore_res.success:
+                    issues.append(f"Asset '{asset.name}' ({asset.asset_id}) failed restore verification")
+                    continue
+
+                # Clean up ephemeral verification staging directory immediately
+                try:
+                    if restore_res.staging_dir.exists():
+                        shutil.rmtree(restore_res.staging_dir, ignore_errors=True)
+                except Exception:
+                    pass
+
+                schema_ver = restore_res.manifest.get("schema_version", 0)
+                plaintext_sha = restore_res.manifest.get("plaintext_sha256", "")
 
                 verified_points.append(
                     VerifiedRecoveryPoint(
