@@ -21,6 +21,8 @@ data/*.sqlite*
 data/*.tmp
 data/*.json
 data/state.json
+data/restore_staging/
+*.efbk
 
 # Personal editorial review and calibration files
 data/*.csv
