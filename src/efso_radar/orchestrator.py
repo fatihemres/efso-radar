@@ -222,89 +222,106 @@ class RadarOrchestrator:
             )
 
         try:
-            # 2. Maintenance: Purge old processed records
-            purged = self.repository.purge_expired_records(retention_days=35)
-            if purged > 0:
-                logger.info("Purged %d expired article records from repository", purged)
+            # 2. Maintenance: Purge old processed records and expire stale backlog
+            if not dry_run:
+                purged = self.repository.purge_expired_records(retention_days=35)
+                if purged > 0:
+                    logger.info("Purged %d expired article records from repository", purged)
+                try:
+                    expired_backlog = self.repository.expire_stale_backlog_candidates(
+                        max_age_hours=effective_backlog_hours, now=now
+                    )
+                except TypeError:
+                    expired_backlog = self.repository.expire_stale_backlog_candidates(
+                        max_age_hours=effective_backlog_hours
+                    )
+                if expired_backlog > 0:
+                    logger.info(
+                        "Expired %d stale candidates from backlog (>%dh old)",
+                        expired_backlog,
+                        effective_backlog_hours,
+                    )
 
             # 3. Load recent context stories
             recent_stories = self.repository.get_recent_stories(limit=80, days=30)
 
             # 3b. Deliver queued quiet-hours notifications if now outside quiet hours
+            # In scan-only mode, notification processing and external dispatch are strictly bypassed.
             notifications_dispatched = 0
-            if not dry_run:
-                # Recover expired dispatch claims from any interrupted workers
-                recovered = self.repository.recover_expired_dispatch_claims()
-                if recovered > 0:
-                    logger.warning("Recovered %d orphaned/expired dispatch claims", recovered)
+            if not scan_only:
+                if not dry_run:
+                    # Recover expired dispatch claims from any interrupted workers
+                    recovered = self.repository.recover_expired_dispatch_claims()
+                    if recovered > 0:
+                        logger.warning("Recovered %d orphaned/expired dispatch claims", recovered)
 
-                # Expire stale held notifications older than freshness window
-                try:
-                    expired = self.repository.expire_stale_held_notifications(
-                        self.settings.max_quiet_hours_hold_age_hours, now=now
-                    )
-                except TypeError:
-                    expired = self.repository.expire_stale_held_notifications(
-                        self.settings.max_quiet_hours_hold_age_hours
-                    )
-                if expired > 0:
-                    logger.info(
-                        "Expired %d stale quiet-hours notifications (>%dh old)",
-                        expired,
-                        self.settings.max_quiet_hours_hold_age_hours,
-                    )
+                    # Expire stale held notifications older than freshness window
+                    try:
+                        expired = self.repository.expire_stale_held_notifications(
+                            self.settings.max_quiet_hours_hold_age_hours, now=now
+                        )
+                    except TypeError:
+                        expired = self.repository.expire_stale_held_notifications(
+                            self.settings.max_quiet_hours_hold_age_hours
+                        )
+                    if expired > 0:
+                        logger.info(
+                            "Expired %d stale quiet-hours notifications (>%dh old)",
+                            expired,
+                            self.settings.max_quiet_hours_hold_age_hours,
+                        )
 
-            if not self.settings.is_in_quiet_hours(now):
-                try:
-                    held_records = self.repository.get_held_notifications(
-                        max_age_hours=self.settings.max_quiet_hours_hold_age_hours, now=now
-                    )
-                except TypeError:
-                    held_records = self.repository.get_held_notifications(
-                        max_age_hours=self.settings.max_quiet_hours_hold_age_hours
-                    )
-                if held_records:
-                    logger.info("Found %d queued quiet-hours notifications to deliver", len(held_records))
-                    for held in held_records:
-                        if not dry_run:
-                            # Claim notification with lease before attempting external dispatch
-                            claimed = self.repository.claim_notification_for_dispatch(
-                                notification_id=held.notification_id,
-                                story_id=held.story_id,
-                                kind=held.kind,
-                                headline_tr=held.headline_tr,
-                                score=held.score,
-                                message_text=held.message_text,
-                                worker_id=worker,
-                                lease_seconds=180,
-                            )
-                            if not claimed:
-                                logger.info("Notification %s claimed by another worker; skipping", held.notification_id)
-                                continue
+                if not self.settings.is_in_quiet_hours(now):
+                    try:
+                        held_records = self.repository.get_held_notifications(
+                            max_age_hours=self.settings.max_quiet_hours_hold_age_hours, now=now
+                        )
+                    except TypeError:
+                        held_records = self.repository.get_held_notifications(
+                            max_age_hours=self.settings.max_quiet_hours_hold_age_hours
+                        )
+                    if held_records:
+                        logger.info("Found %d queued quiet-hours notifications to deliver", len(held_records))
+                        for held in held_records:
+                            if not dry_run:
+                                # Claim notification with lease before attempting external dispatch
+                                claimed = self.repository.claim_notification_for_dispatch(
+                                    notification_id=held.notification_id,
+                                    story_id=held.story_id,
+                                    kind=held.kind,
+                                    headline_tr=held.headline_tr,
+                                    score=held.score,
+                                    message_text=held.message_text,
+                                    worker_id=worker,
+                                    lease_seconds=180,
+                                )
+                                if not claimed:
+                                    logger.info("Notification %s claimed by another worker; skipping", held.notification_id)
+                                    continue
 
-                            # If real telegram channel configured, dispatch
-                            try:
-                                if self.settings.telegram_bot_token and self.settings.telegram_chat_id:
-                                    dispatch_res = self.notifier._dispatch_telegram(
-                                        held.notification_id, held.story_id, held.update_id, None, held.message_text, now
-                                    ) if hasattr(self.notifier, "_dispatch_telegram") else held
-                                    if dispatch_res.status == DeliveryStatus.SENT:
+                                # If real telegram channel configured, dispatch
+                                try:
+                                    if self.settings.telegram_bot_token and self.settings.telegram_chat_id:
+                                        dispatch_res = self.notifier._dispatch_telegram(
+                                            held.notification_id, held.story_id, held.update_id, None, held.message_text, now
+                                        ) if hasattr(self.notifier, "_dispatch_telegram") else held
+                                        if dispatch_res.status == DeliveryStatus.SENT:
+                                            self.repository.mark_notification_delivered(held.notification_id, now)
+                                            notifications_dispatched += 1
+                                        else:
+                                            self.repository.record_notification_failure(
+                                                held.notification_id,
+                                                dispatch_res.error_message or "Unknown dispatch failure",
+                                            )
+                                    else:
                                         self.repository.mark_notification_delivered(held.notification_id, now)
                                         notifications_dispatched += 1
-                                    else:
-                                        self.repository.record_notification_failure(
-                                            held.notification_id,
-                                            dispatch_res.error_message or "Unknown dispatch failure",
-                                        )
-                                else:
-                                    self.repository.mark_notification_delivered(held.notification_id, now)
-                                    notifications_dispatched += 1
-                            except Exception as exc:
-                                logger.error("Failed delivering queued notification %s: %s", held.notification_id, exc)
-                                self.repository.record_notification_failure(held.notification_id, str(exc))
-                        else:
-                            logger.info("[DRY-RUN] Would deliver queued quiet-hours alert for %s", held.story_id)
-                            notifications_dispatched += 1
+                                except Exception as exc:
+                                    logger.error("Failed delivering queued notification %s: %s", held.notification_id, exc)
+                                    self.repository.record_notification_failure(held.notification_id, str(exc))
+                            else:
+                                logger.info("[DRY-RUN] Would deliver queued quiet-hours alert for %s", held.story_id)
+                                notifications_dispatched += 1
 
             # 4. Ingestion: Fetch candidates from external news sources (interval-resilient freshness)
             articles, successes = self.source.fetch_candidates(now, max_age_hours=effective_age_hours)
@@ -326,21 +343,22 @@ class RadarOrchestrator:
                 )
 
             # 4b. Retrieve unexpired pending candidates from durable backlog to prevent feed-rotation loss
-            try:
-                pending_backlog = self.repository.get_pending_candidates(
-                    max_age_hours=effective_backlog_hours, now=now
-                )
-            except TypeError:
-                pending_backlog = self.repository.get_pending_candidates(
-                    max_age_hours=effective_backlog_hours
-                )
-            if pending_backlog:
-                logger.info("Retrieved %d pending candidates from durable backlog", len(pending_backlog))
-                seen_ids = {a.id for a in articles}
-                for back_item in pending_backlog:
-                    if back_item.id not in seen_ids:
-                        articles.append(back_item)
-                        seen_ids.add(back_item.id)
+            if not scan_only:
+                try:
+                    pending_backlog = self.repository.get_pending_candidates(
+                        max_age_hours=effective_backlog_hours, now=now
+                    )
+                except TypeError:
+                    pending_backlog = self.repository.get_pending_candidates(
+                        max_age_hours=effective_backlog_hours
+                    )
+                if pending_backlog:
+                    logger.info("Retrieved %d pending candidates from durable backlog", len(pending_backlog))
+                    seen_ids = {a.id for a in articles}
+                    for back_item in pending_backlog:
+                        if back_item.id not in seen_ids:
+                            articles.append(back_item)
+                            seen_ids.add(back_item.id)
 
             # 5. Deduplication, cross-publisher clustering, and candidate prioritization
             candidates = self.deduper.filter_fresh_candidates(
@@ -360,7 +378,7 @@ class RadarOrchestrator:
                     articles_collected=len(articles),
                     candidates_evaluated=0,
                     picks_approved=0,
-                    notifications_dispatched=notifications_dispatched,
+                    notifications_dispatched=0 if scan_only else notifications_dispatched,
                     dry_run=dry_run,
                     duration_seconds=duration,
                     message=f"Scan-only completed: queued {len(all_to_queue)} candidates in backlog (0 Gemini calls).",

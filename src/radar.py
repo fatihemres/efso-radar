@@ -378,7 +378,51 @@ def telegram_send(pick: dict[str, Any]) -> None:
         raise RuntimeError("Telegram rejected message")
 
 
-def run(dry_run: bool = False, use_legacy: bool = False) -> None:
+def run(dry_run: bool = False, use_legacy: bool = False, scan_only: bool = False) -> None:
+    if scan_only:
+        from efso_radar.config import Settings
+        from efso_radar.orchestrator import RadarOrchestrator
+        from efso_radar.repositories.sqlite import SqliteStateRepository
+        from efso_radar.repositories.turso import TursoStateRepository
+
+        settings = Settings.from_env()
+        if settings.turso_database_url and settings.turso_auth_token:
+            LOG.info("Initializing Turso cloud state repository (%s)", settings.get_masked_turso_url())
+            repo = TursoStateRepository(
+                database_url=settings.turso_database_url,
+                auth_token=settings.turso_auth_token,
+            )
+        else:
+            LOG.info("Initializing SQLite state repository (%s)", settings.sqlite_db_path)
+            repo = SqliteStateRepository(settings.sqlite_db_path)
+            if STATE_PATH.exists():
+                repo.migrate_from_legacy_json(STATE_PATH)
+
+        orchestrator = RadarOrchestrator(settings=settings, repository=repo)
+        result = orchestrator.run_scan_only(dry_run=dry_run)
+        LOG.info(
+            "=== EFSO RADAR SCAN-ONLY SUMMARY ===\n"
+            "Status: %s\n"
+            "Sources Succeeded: %d\n"
+            "Articles Collected: %d\n"
+            "Candidates Evaluated: %d (Strict 0 TRY / $0.00)\n"
+            "Notifications Dispatched: %d (Zero Dispatch Guarantee)\n"
+            "Dry Run: %s\n"
+            "Duration: %.2fs\n"
+            "Message: %s",
+            "SUCCESS" if result.success else "FAILED",
+            result.sources_succeeded,
+            result.articles_collected,
+            result.candidates_evaluated,
+            result.notifications_dispatched,
+            result.dry_run,
+            result.duration_seconds,
+            result.message,
+        )
+        if not result.success:
+            sys.exit(1)
+        return
+
     if not use_legacy:
         try:
             from efso_radar.config import Settings
@@ -456,16 +500,19 @@ def demo() -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Efso Magazin news radar")
+    parser.add_argument("--scan-only", action="store_true", help="Execute decoupled RSS discovery and queue candidates without AI or notifications")
     parser.add_argument("--dry-run", action="store_true", help="AI scan, print only, do not notify or change state")
     parser.add_argument("--demo", action="store_true", help="Show a fake sample alert without network")
     parser.add_argument("--legacy", action="store_true", help="Use legacy monolithic radar runner")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if args.scan_only and args.legacy:
+        parser.error("--scan-only cannot be combined with --legacy")
     try:
         if args.demo:
             demo()
         else:
-            run(dry_run=args.dry_run, use_legacy=args.legacy)
+            run(dry_run=args.dry_run, use_legacy=args.legacy, scan_only=args.scan_only)
     except Exception as exc:
         LOG.exception("Radar failed: %s", exc)
         sys.exit(1)

@@ -127,6 +127,35 @@ class Settings(BaseModel):
             return target == str(self.telegram_chat_id).strip()
         return False
 
+    def get_masked_gemini_api_key(self) -> str:
+        """Return safely masked Gemini API key for logging/auditing without leaking secrets."""
+        if not self.gemini_api_key:
+            return "<NOT_SET>"
+        tok = self.gemini_api_key.strip()
+        if len(tok) < 10:
+            return "***REDACTED***"
+        return f"{tok[:4]}...{tok[-4:]}"
+
+    def get_masked_turso_token(self) -> str:
+        """Return safely masked Turso auth token for logging/auditing without leaking secrets."""
+        if not self.turso_auth_token:
+            return "<NOT_SET>"
+        tok = self.turso_auth_token.strip()
+        if len(tok) < 10:
+            return "***REDACTED***"
+        return f"{tok[:4]}...{tok[-4:]}"
+
+    def get_masked_turso_url(self) -> str:
+        """Return safely sanitized Turso database URL for logging without credentials."""
+        if not self.turso_database_url:
+            return "<NOT_SET>"
+        url = self.turso_database_url.strip()
+        if "@" in url:
+            prefix, rest = url.split("@", 1)
+            scheme = prefix.split("://")[0] if "://" in prefix else "libsql"
+            return f"{scheme}://***@{rest}"
+        return url
+
     def get_masked_telegram_token(self) -> str:
         """Return safely masked Telegram token for logging/auditing without leaking secrets."""
         if not self.telegram_bot_token:

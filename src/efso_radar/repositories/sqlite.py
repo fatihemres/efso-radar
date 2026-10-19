@@ -203,7 +203,7 @@ class SqliteStateRepository(StateRepository):
                 a.title,
                 a.source,
                 a.market.value,
-                a.source_category or "",
+                a.source_category or a.raw_metadata.get("kind") or "",
                 a.snippet,
                 a.image_url,
                 a.published_at.isoformat(),
@@ -224,8 +224,11 @@ class SqliteStateRepository(StateRepository):
                 records,
             )
 
-    def get_pending_candidates(self, max_age_hours: int = 16, now: Optional[datetime] = None) -> list[Article]:
-        """Retrieve unexpired candidates from backlog that are still awaiting evaluation."""
+    def get_pending_candidates(self, max_age_hours: int = 24, now: Optional[datetime] = None) -> list[Article]:
+        """Retrieve unexpired candidates from backlog that are still awaiting evaluation.
+        
+        Preserves candidates within max_age_hours, plus any genuine UPDATE candidates regardless of age.
+        """
         ref_now = now or utc_now()
         cutoff = (ref_now - timedelta(hours=max_age_hours)).isoformat()
         with self._connection() as conn:
@@ -236,7 +239,7 @@ class SqliteStateRepository(StateRepository):
                 FROM candidate_backlog cb
                 LEFT JOIN processed_articles pa ON cb.article_id = pa.article_id
                 WHERE cb.status = 'QUEUED'
-                  AND cb.published_at >= ?
+                  AND (cb.published_at >= ? OR cb.category_hint = 'UPDATE')
                   AND pa.article_id IS NULL
                 ORDER BY cb.priority_score DESC, cb.published_at DESC
                 """,
@@ -269,6 +272,23 @@ class SqliteStateRepository(StateRepository):
                 "UPDATE candidate_backlog SET status = 'EVALUATED' WHERE article_id = ?",
                 [(aid,) for aid in article_ids],
             )
+
+    def expire_stale_backlog_candidates(self, max_age_hours: int = 24, now: Optional[datetime] = None) -> int:
+        """Transition candidates older than max_age_hours to EXPIRED status, preserving legitimate UPDATEs."""
+        ref_now = now or utc_now()
+        cutoff = (ref_now - timedelta(hours=max_age_hours)).isoformat()
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE candidate_backlog
+                SET status = 'EXPIRED'
+                WHERE status = 'QUEUED'
+                  AND published_at < ?
+                  AND (category_hint IS NULL OR category_hint != 'UPDATE')
+                """,
+                (cutoff,),
+            )
+            return cursor.rowcount
 
     # --- Story Intelligence & Lineage ---
     def get_recent_stories(self, limit: int = 80, days: int = 30) -> list[Story]:
