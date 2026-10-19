@@ -9,7 +9,7 @@ import os
 from datetime import datetime, time, timezone
 from pathlib import Path
 from typing import Literal
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class Settings(BaseModel):
@@ -95,6 +95,17 @@ class Settings(BaseModel):
             raise ValueError("Hour must be 0-23 and minute 0-59")
         return f"{hour:02d}:{minute:02d}"
 
+    @model_validator(mode="after")
+    def validate_turso_configuration(self) -> Settings:
+        has_url = bool(self.turso_database_url and self.turso_database_url.strip())
+        has_token = bool(self.turso_auth_token and self.turso_auth_token.strip())
+        if has_url != has_token:
+            raise ValueError(
+                "Partial Turso configuration detected: both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN "
+                "must be provided together, or neither."
+            )
+        return self
+
     def is_in_quiet_hours(self, current_time: datetime | None = None) -> bool:
         """Check if given UTC datetime falls within configured quiet hours."""
         if not self.quiet_hours_enabled:
@@ -127,6 +138,35 @@ class Settings(BaseModel):
         if self.telegram_chat_id:
             return target == str(self.telegram_chat_id).strip()
         return False
+
+    def get_masked_gemini_api_key(self) -> str:
+        """Return safely masked Gemini API key for logging/auditing without leaking secrets."""
+        if not self.gemini_api_key:
+            return "<NOT_SET>"
+        tok = self.gemini_api_key.strip()
+        if len(tok) < 10:
+            return "***REDACTED***"
+        return f"{tok[:4]}...{tok[-4:]}"
+
+    def get_masked_turso_token(self) -> str:
+        """Return safely masked Turso auth token for logging/auditing without leaking secrets."""
+        if not self.turso_auth_token:
+            return "<NOT_SET>"
+        tok = self.turso_auth_token.strip()
+        if len(tok) < 10:
+            return "***REDACTED***"
+        return f"{tok[:4]}...{tok[-4:]}"
+
+    def get_masked_turso_url(self) -> str:
+        """Return safely sanitized Turso database URL for logging without credentials."""
+        if not self.turso_database_url:
+            return "<NOT_SET>"
+        url = self.turso_database_url.strip()
+        if "@" in url:
+            prefix, rest = url.split("@", 1)
+            scheme = prefix.split("://")[0] if "://" in prefix else "libsql"
+            return f"{scheme}://***@{rest}"
+        return url
 
     def get_masked_telegram_token(self) -> str:
         """Return safely masked Telegram token for logging/auditing without leaking secrets."""

@@ -472,6 +472,49 @@ class RepositoryContractTestMixin:
         self.assertEqual(usage["output_tokens"], 720)
         self.assertAlmostEqual(float(usage["total_cost_usd"]), 0.000528, places=6)
 
+    def test_candidate_backlog_parity_and_expiration(self):
+        """Both SQLite and Turso persist candidate backlog, deduplicate repeat inserts, and expire stale items."""
+        # 1. Save fresh candidates
+        art1 = self.make_sample_article("Tarkan turnesi duyuruldu", "https://tarkan.com/turne")
+        art2 = Article.create(
+            title="Hadise bilet güncellemesi",
+            url="https://hadise.com/update",
+            source="TestFeed",
+            published_at=self.now - timedelta(hours=30),  # Stale (>24h)
+            raw_metadata={"kind": "UPDATE", "priority_score": 12.0},
+        )
+        art3 = Article.create(
+            title="Eski magazin dedikodusu",
+            url="https://old.com/rumor",
+            source="TestFeed",
+            published_at=self.now - timedelta(hours=35),  # Stale (>24h, not UPDATE)
+            raw_metadata={"priority_score": 4.0},
+        )
+
+        self.repo.save_pending_candidates([art1, art2, art3])
+
+        # 2. Idempotency test: Repeat save_pending_candidates must not duplicate or crash
+        self.repo.save_pending_candidates([art1, art2, art3])
+
+        # 3. Retrieve pending candidates within 24h
+        # art1 (fresh) and art2 (stale but UPDATE) must be returned; art3 (>24h, not UPDATE) must NOT be returned
+        pending = self.repo.get_pending_candidates(max_age_hours=24, now=self.now)
+        pending_ids = {a.id for a in pending}
+        self.assertIn(art1.id, pending_ids)
+        self.assertIn(art2.id, pending_ids)
+        self.assertNotIn(art3.id, pending_ids)
+
+        # 4. Expire stale candidates: art3 transitions to EXPIRED, art2 is preserved
+        expired_count = self.repo.expire_stale_backlog_candidates(max_age_hours=24, now=self.now)
+        self.assertEqual(expired_count, 1)
+
+        # 5. Mark art1 evaluated: transitions to EVALUATED
+        self.repo.mark_candidates_evaluated([art1.id])
+        pending_after_eval = self.repo.get_pending_candidates(max_age_hours=24, now=self.now)
+        pending_after_eval_ids = {a.id for a in pending_after_eval}
+        self.assertNotIn(art1.id, pending_after_eval_ids)
+        self.assertIn(art2.id, pending_after_eval_ids)
+
 
 class TestSqliteRepositoryParity(unittest.TestCase, RepositoryContractTestMixin):
     def setUp(self):

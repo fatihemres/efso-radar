@@ -67,6 +67,11 @@ class StateRepository(ABC):
         """Transition candidates in backlog to EVALUATED status."""
         pass
 
+    @abstractmethod
+    def expire_stale_backlog_candidates(self, max_age_hours: int = 24, now: Optional[datetime] = None) -> int:
+        """Transition candidates older than max_age_hours to EXPIRED status, preserving legitimate UPDATEs."""
+        pass
+
     # --- Story Intelligence & Lineage ---
     @abstractmethod
     def get_recent_stories(self, limit: int = 80, days: int = 30) -> list[Story]:
