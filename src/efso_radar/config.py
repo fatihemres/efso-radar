@@ -167,12 +167,8 @@ class Settings(BaseModel):
     def get_authorized_recipients(self) -> list[dict[str, str]]:
         """Return all validated, allowlisted private recipients with their roles.
 
-        Both PRIMARY_EDITOR (Product Owner's girlfriend) and ADMIN (Product Owner)
-        receive the complete editorial experience across all categories:
-        - EDITORIAL_DIGEST
-        - VERIFIED_BREAKING
-        - SENSITIVE_EDITORIAL_REVIEW
-        - HOLD_FOR_VERIFICATION
+        Identifies PRIMARY_EDITOR (Product Owner's girlfriend) as primary editorial user
+        and ADMIN (Product Owner) as technical administrator.
         """
         recipients: list[dict[str, str]] = []
 
@@ -200,13 +196,43 @@ class Settings(BaseModel):
 
         return recipients
 
+    def get_editorial_recipients(self) -> list[dict[str, str]]:
+        """Return authorized recipient records for editorial notifications.
+
+        Per updated Product Owner policy:
+        - When PRIMARY_EDITOR is configured, PRIMARY_EDITOR is the sole recipient
+          for routine editorial notifications (EDITORIAL_DIGEST, VERIFIED_BREAKING,
+          SENSITIVE_EDITORIAL_REVIEW, HOLD_FOR_VERIFICATION).
+          ADMIN is excluded from routine editorial broadcasts.
+        - In legacy single-recipient environments where PRIMARY_EDITOR is not configured,
+          falls back to ADMIN for backward compatibility with Phase 4 test suites.
+        """
+        editor_recs = [r for r in self.get_authorized_recipients() if r["role"] == "PRIMARY_EDITOR"]
+        if editor_recs:
+            return editor_recs
+        return [r for r in self.get_authorized_recipients() if r["role"] == "ADMIN"]
+
+    def get_administrative_recipients(self) -> list[dict[str, str]]:
+        """Return authorized recipient records for administrative operational reports.
+
+        ADMIN receives operational health and metric reports.
+        """
+        return [r for r in self.get_authorized_recipients() if r["role"] == "ADMIN"]
+
     def get_recipients_for_category(self, category: Optional[Any] = None) -> list[dict[str, str]]:
         """Return authorized recipient records permitted to receive this notification category.
 
-        Per Product Owner directive, both PRIMARY_EDITOR and ADMIN receive the complete
-        editorial notification experience without restriction.
+        Routing Policy:
+        - Editorial categories (EDITORIAL_DIGEST, VERIFIED_BREAKING, SENSITIVE_EDITORIAL_REVIEW,
+          HOLD_FOR_VERIFICATION, or None) route to PRIMARY_EDITOR only.
+        - Operational/Health reporting categories route to ADMIN.
+        - ADMIN is NOT included in routine editorial broadcasts.
         """
-        return self.get_authorized_recipients()
+        cat_val = category.value if hasattr(category, "value") else str(category or "")
+        if cat_val in ("ADMIN_HEALTH_REPORT", "OPERATIONAL_HEALTH_REPORT"):
+            return self.get_administrative_recipients()
+
+        return self.get_editorial_recipients()
 
     @classmethod
     def from_env(cls) -> Settings:

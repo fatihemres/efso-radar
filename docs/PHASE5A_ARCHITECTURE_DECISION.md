@@ -180,3 +180,16 @@ flowchart LR
 * [x] **Public Repoda Açık Artifakt Yasağı & AES-256-GCM Şifreli Harici Yedekleme:** Onaylandı.
 * [x] **Canlı AI Çıkarımının Şimdilik Kapalı Tutulması:** Onaylandı.
 * [x] **Phase 5B Sıralaması (Önce 5B.1 Kalıcı Durum/RSS, Sonra 5B.2 Yedekleme):** Onaylandı.
+
+---
+
+## 7. Mimari Zeyilname: Güncellenen Telegram Alıcı Politikası ve Yönetici Sağlık Raporu
+
+**Karar Tarihi:** 19 Ekim 2026  
+**Gerekçe:** 19 Ekim canlı pilotu sırasında `PRIMARY_EDITOR` bülteni sorunsuz alırken, `ADMIN` alıcısının geriye dönük uyumluluk kodundaki çapraz alıcı eşleşmesi nedeniyle mükerrerlik filtresine takılması ve Ürün Sahibinin editoryal bildirim ayrışması kararı.
+
+### A. Güncellenen Alıcı Yönlendirme Politikası
+1. **PRIMARY_EDITOR (Baş Editör):** Efso Radar'ın tekil ana editoryal kullanıcısıdır. Dört editoryal kategorinin tamamını (`EDITORIAL_DIGEST`, `VERIFIED_BREAKING`, `SENSITIVE_EDITORIAL_REVIEW`, `HOLD_FOR_VERIFICATION`) almaya yetkili yegane alıcıdır.
+2. **ADMIN (Sistem Yöneticisi):** Rutin editoryal haber bültenlerinden tamamen çıkarılmıştır. Editoryal bülten akışıyla meşgul edilmez.
+3. **Günlük Yönetici Sağlık Raporu (Gelecek Phase 5B Özelliği):** ADMIN alıcısı, son editoryal bültenden sonra (22:00 TSİ) günde en fazla 1 adet operasyonel sistem sağlığı raporu alacaktır. Bu rapor sıfır yapay zeka maliyetiyle oluşturulur ve haber içeriği barındırmaz (Ayrıntılı sözleşme için bkz. [DAILY_ADMIN_HEALTH_REPORT_DESIGN.md](file:///c:/Dev/EfsoRadar/docs/DAILY_ADMIN_HEALTH_REPORT_DESIGN.md)).
+4. **Alıcı Kapsamlı Katı Mükerrerlik Koruması (Recipient-Scoped Deduplication):** Bir alıcıya yapılan başarılı teslimat asla diğer alıcı için mükerrerlik engeli oluşturmaz. Bozulmuş teslimat defterleri fail-closed ilkesiyle gönderimi durdurur.

@@ -100,8 +100,8 @@ class TestPhase4GTwoRecipientDelivery(unittest.TestCase):
         self.assertIsNone(self.settings.get_recipient_role("-1001234567890"))
         self.assertIsNone(self.settings.get_recipient_role("1112223334"))
 
-    def test_03_all_four_categories_delivered_to_both_recipients(self) -> None:
-        """Verify both PRIMARY_EDITOR and ADMIN receive all four notification categories."""
+    def test_03_editorial_categories_delivered_to_primary_editor_only(self) -> None:
+        """Verify updated policy: all four editorial categories route to PRIMARY_EDITOR only; ADMIN is excluded from editorial broadcasts."""
         categories = [
             TelegramNotificationCategory.EDITORIAL_DIGEST,
             TelegramNotificationCategory.VERIFIED_BREAKING,
@@ -110,10 +110,19 @@ class TestPhase4GTwoRecipientDelivery(unittest.TestCase):
         ]
         for cat in categories:
             recipients = self.settings.get_recipients_for_category(cat)
-            self.assertEqual(len(recipients), 2, f"Category {cat} should have 2 authorized recipients")
-            roles = [r["role"] for r in recipients]
-            self.assertIn("PRIMARY_EDITOR", roles)
-            self.assertIn("ADMIN", roles)
+            self.assertEqual(len(recipients), 1, f"Category {cat} should have exactly 1 recipient (PRIMARY_EDITOR)")
+            self.assertEqual(recipients[0]["role"], "PRIMARY_EDITOR")
+            self.assertEqual(recipients[0]["chat_id"], self.editor_chat_id)
+
+        # Operational health report routes to ADMIN
+        admin_recs = self.settings.get_recipients_for_category(TelegramNotificationCategory.OPERATIONAL_HEALTH_REPORT)
+        self.assertEqual(len(admin_recs), 1)
+        self.assertEqual(admin_recs[0]["role"], "ADMIN")
+        self.assertEqual(admin_recs[0]["chat_id"], self.admin_chat_id)
+
+        # Authorized recipients still lists both known identities
+        all_recs = self.settings.get_authorized_recipients()
+        self.assertEqual(len(all_recs), 2)
 
     def test_04_warning_banners_and_embargoes_intact(self) -> None:
         """Verify warning banners and embargoes are identical and intact for both recipients."""
