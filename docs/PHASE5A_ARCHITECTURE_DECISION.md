@@ -72,15 +72,16 @@ Mekanik ve kesintisiz 6 saatlik döngü (`00:00, 06:00, 12:00, 18:00 TSİ`) edit
   * Veritabanı dökümü çalıştırıcı üzerinde üretildikten hemen sonra **AES-256-GCM** (Galois/Counter Mode — AEAD) ile şifrelenir (`turso_backup_YYYYMMDD_HHMM.sql.gz.enc`).
   * Kimlik doğrulaması sağlamayan ve padding oracle riskleri barındıran unauthenticated modlar (ör. AES-CBC) kesinlikle reddedilmiştir.
   * GCM kimlik doğrulama etiketi (authentication tag) ile şifreli paketin bütünlüğü garanti edilir.
-* **Anahtar Saklama ve Güvenli Dosya Yönetimi:**
+* **Anahtar Saklama ve Düz Metin Kalıcılığının Asgariye İndirilmesi:**
   * 256-bit şifreleme anahtarı (`BACKUP_ENCRYPTION_KEY`) yalnızca GitHub Actions Secrets içinde saklanır.
-  * Şifrelenmemiş ham SQL dökümleri ve geçici dosyalar işlem tamamlanır tamamlanmaz çalıştırıcı diskinden güvenli biçimde silinir (shred / secure wipe).
-* **Pasif Özel Depo Modeli ve Git LFS Ayrımı:**
+  * Geçici (ephemeral) GitHub Actions çalıştırıcı sanal makinelerinde, sanallaştırılmış disk katmanları ve ana makine hypervisor mimarisi nedeniyle düz metin (plaintext) geçici dosyaların kalıcı olarak silinmesi (shred / secure wipe) doğrulanabilir bir garanti değil, "en iyi çaba" (best-effort) niteliğindedir. Bu nedenle mimari, düz metin verinin diske yazılmasını ve diskte kalış süresini asgariye indirmeyi (ör. bellek içi akış/pipe kullanımı veya işlem biter bitmez derhal temizleme) birincil güvenlik prensibi olarak benimser.
+* **Pasif Özel Depo Modeli ve Git Depolama Yaşam Döngüsü Sınırları:**
   * Şifreli dosya, aynı kullanıcıya ait ayrı ve **ÖZEL (PRIVATE) bir GitHub deposuna** (`efso-radar-backups`) ince taneli (fine-grained) PAT ile aktarılır.
   * **Özel depoda hiçbir workflow çalıştırılmaz.** Böylece özel depo Actions dakikaları asla tüketilmez.
-  * **Git Deposu vs. Git LFS Sınırları:** Standart GitHub depoları için önerilen boyut 1-5 GB, tekil dosya sınırı 100 MB'tır (önerilen <50 MB). Git LFS ise ücretsiz hesaplarda aylık 1 GB depolama ve 1 GB bant genişliği kotasına sahiptir. Efso Radar yedekleri sıkıştırılmış ve şifrelenmiş küçük dökümler (~1-5 MB) olacağından Git LFS'e gerek duyulmaz; standart Git nesnesi olarak saklanır.
-  * **Rotasyon ve Büyüme Sınırı:** En fazla son 7-14 günlük yedek saklanır (rolling retention). Eski dökümler otomatik silinerek pasif yedek deposunun standart Git sınırları (<200 MB) içinde kalması sağlanır.
-  * **Özel yedekleme deposu henüz oluşturulmamıştır; Phase 5B.2 aşamasında açılacaktır.**
+  * **Git Deposu vs. Git LFS Sınırları:** Standart GitHub depoları için önerilen boyut 1-5 GB, tekil dosya sınırı 100 MB'tır (önerilen <50 MB). Resmi güncel GitHub dokümantasyonuna göre GitHub Free planı **10 GiB Git LFS depolama ve 10 GiB/ay Git LFS bant genişliği** sunmaktadır. Efso Radar yedekleri sıkıştırılmış ve şifrelenmiş küçük dökümler (~1-5 MB) olacağından Git LFS'e gerek duyulmaz; standart Git nesnesi olarak saklanır.
+  * **Git Geçmişi ve Depo Büyüme Sınırı Gerçeği:** Git'in nesne tabanlı mimarisi gereği, yeni commit'lerde eski yedek dosyalarının silinmesi (`git rm`), bu dosyaların içeriklerini Git commit geçmişinden otomatik olarak kaldırmaz. Dolayısıyla, salt 7-14 günlük dosya silme mantığıyla özel deponun boyutunun 200 MB altında kalacağını iddia etmek teknik olarak yanlıştır; her commit geçmişi büyütmeye devam eder.
+  * **Güvenli ve Sıfır Maliyetli Depolama Yaşam Döngüsü Stratejisi Zorunluluğu:** Üretim ortamında yedekleme devreye alınmadan önce, yıkıcı geçmiş yeniden yazımı (destructive history rewriting / force-push) veya otomatik repo silme gibi riskli yöntemlere başvurmadan depoyu sıfır maliyetle yönetecek, ayrı olarak incelenmiş ve onaylanmış güvenli bir depolama yaşam döngüsü stratejisi (ör. GitHub Releases varlıklarının üzerine yazılması, orphan branch kullanımı veya periyodik tek commitli arşiv taktiği) tasarlanmalıdır.
+  * **Mevcut Aşama Kuralı:** Bu aşamada hiçbir geçmiş yeniden yazımı, force push, otomatik repo silme veya rotasyon mekanizması uygulanmayacaktır; bu tasarım Milestone 5B.2'de ele alınacaktır. Özel yedekleme deposu henüz oluşturulmamıştır.
 * **Turso Free PITR Değerlendirmesi:**
   * Turso Starter katmanında yalnızca 1 günlük point-in-time restore (1-day PITR) imkanı bulunmaktadır; uzun vadeli kurumsal PITR yoktur. Bu nedenle harici günlük şifreli yedekleme zorunlu bir güvenlik katmanıdır.
 * **Kurtarma ve İdempotens Gerçeği (Mükerrerlik Risk Analizi):**
@@ -126,7 +127,7 @@ Mekanik ve kesintisiz 6 saatlik döngü (`00:00, 06:00, 12:00, 18:00 TSİ`) edit
 | **Veritabanı** | Turso Cloud (Starter Plan) | 100 DB, 5 GB Depolama, 500M Okuma / 10M Yazma / ay, 1 Günlük PITR | 1 DB, ~15 MB, ~50.000 Okuma/ay | **Yok** (Kapasitenin <%0.01'i) | **Gerekmez** |
 | **Bildirim API** | Telegram Bot API | Tamamen Ücretsiz, 30 mesaj/saniye sınırı | Günde 6-10 mesaj | **Yok** | **Gerekmez** |
 | **Yapay Zeka** | Gemini API (Free Tier) | Proje bazlı değişir (AI Studio'dan doğrulanmalı) | Günde 3 batch istek | **Yok** | Free tier kart istemez; faturalandırma hesabı bağlanmaz |
-| **Yedek Depolama** | GitHub Private Repo (Git Storage) | Standart depolama (Önerilen <1 GB; Git LFS hariç) | ~15-30 MB (rolling 7-14 günlük sıkıştırılmış snapshot) | **Yok** | **Gerekmez** |
+| **Yedek Depolama** | GitHub Private Repo (Git Storage) | Standart Git depolaması (Önerilen <1 GB; Git LFS kotası: 10 GiB depolama, 10 GiB/ay bant genişliği) | ~15-30 MB (ayrı onaylanacak yaşam döngüsüyle yönetilecek) | **Yok** | **Gerekmez** |
 
 ---
 
@@ -137,6 +138,7 @@ Mekanik ve kesintisiz 6 saatlik döngü (`00:00, 06:00, 12:00, 18:00 TSİ`) edit
 3. **Telegram Ağ Zaman Aşımı (Ambiguous Timeout):** Telegram API HTTP 504 veya ağ zaman aşımı döndüğünde iletim durumu `DELIVERY_UNCERTAIN` olarak işaretlenir ve editörlere mükerrer mesaj gitmemesi için otomatik yeniden deneme yapılmaz.
 4. **Chat ID Mahremiyeti:** Kamusal depoda hiçbir kişisel Chat ID açık metin olarak loglanmaz; kod düzeyinde maskeleme zorunludur.
 5. **Yedekten Dönüşte Defter Boşluğu:** Felaket kurtarma senaryosunda son yedekleme ile çöküş anı arasındaki iletim kayıtları eski yedekte yer almayabilir; sistem fail-closed davranır.
+6. **Git Yedek Deposu Boyut Büyümesi:** Git'te dosya silmenin geçmişi temizlememesi sebebiyle pasif yedek reposu zamanla büyüyebilir. Milestone 5B.2'de incelenmiş güvenli bir yaşam döngüsü stratejisi devreye alınmadan üretim yedeklemesi başlatılmayacaktır.
 
 ---
 
@@ -157,7 +159,8 @@ flowchart LR
   * Turso/SQLite `candidate_backlog` tablosuna sıfır yapay zeka maliyetiyle haberlerin güvenle yazılması ve 24 saatlik tazelik kuralının test edilmesi.
 * **Milestone 5B.2 — Şifreli Yedekleme ve Doğrulanmış Geri Yükleme:**
   * İstemci tarafı **AES-256-GCM** authenticated şifreleme ve döküm dışa aktarma modülünün geliştirilmesi.
-  * Pasif özel yedekleme deposu (`efso-radar-backups`) entegrasyonu ve izole geri yükleme/idempotens doğrulama testlerinin yazılması.
+  * Pasif özel yedekleme deposu (`efso-radar-backups`) için güvenli, sıfır maliyetli depolama yaşam döngüsü stratejisinin tasarlanması.
+  * İzole geri yükleme ve defter idempotens doğrulama testlerinin yazılması.
 * **Milestone 5B.3 — GitHub Actions Zamanlanmış İş Akışları ve Kontrollü Bulut Entegrasyonu:**
   * `.github/workflows/` altında ayrık iş akışlarının oluşturulması (Keşif: 3 saatte bir; Bülten: 09:30, 15:30, 21:30 TSİ; Yedekleme: günlük).
   * Secrets tanımları, eşzamanlılık kilidi (`run_locks`) ve `--dry-run` ile bulut boru hattı doğrulaması.
