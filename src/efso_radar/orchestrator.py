@@ -79,10 +79,43 @@ class RadarOrchestrator:
         notifier: Optional[NotificationChannel] = None,
     ):
         self.settings = settings
-        self.repository = repository or SqliteStateRepository(settings.sqlite_db_path)
+        if repository is not None:
+            self.repository = repository
+        elif settings.storage_mode in ("turso", "cloud"):
+            has_url = bool(settings.turso_database_url and settings.turso_database_url.strip())
+            has_token = bool(settings.turso_auth_token and settings.turso_auth_token.strip())
+            if not (has_url and has_token):
+                raise ValueError(
+                    "Cloud storage mode enabled (EFSO_STORAGE_MODE=turso) but Turso configuration is missing or incomplete. "
+                    "Both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN must be provided."
+                )
+            from efso_radar.repositories.turso import TursoStateRepository
+            self.repository = TursoStateRepository(
+                database_url=settings.turso_database_url,
+                auth_token=settings.turso_auth_token,
+            )
+        elif settings.storage_mode == "auto":
+            has_url = bool(settings.turso_database_url and settings.turso_database_url.strip())
+            has_token = bool(settings.turso_auth_token and settings.turso_auth_token.strip())
+            if has_url != has_token:
+                raise ValueError(
+                    "Partial Turso configuration detected: both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN "
+                    "must be provided together, or neither."
+                )
+            if has_url and has_token:
+                from efso_radar.repositories.turso import TursoStateRepository
+                self.repository = TursoStateRepository(
+                    database_url=settings.turso_database_url,
+                    auth_token=settings.turso_auth_token,
+                )
+            else:
+                self.repository = SqliteStateRepository(settings.sqlite_db_path)
+        else:
+            self.repository = SqliteStateRepository(settings.sqlite_db_path)
+
         self.source = source or MultiSourceDiscoveryEngine(include_google_news=True)
         self.ai_engine = ai_engine or GeminiEditorialEngine(settings, repository=self.repository)
-        self.notifier = notifier or TelegramNotificationChannel(settings)
+        self.notifier = notifier or TelegramNotificationChannel(settings, repository=self.repository)
         self.deduper = DeduplicationEngine(self.repository)
 
     def run_scan_only(
@@ -90,9 +123,10 @@ class RadarOrchestrator:
         dry_run: bool = False,
         worker_id: Optional[str] = None,
         now: Optional[datetime] = None,
+        run_id: Optional[str] = None,
     ) -> RadarRunResult:
         """Execute RSS discovery, deduplication, and durable backlog persistence without calling Gemini."""
-        return self.run(dry_run=dry_run, worker_id=worker_id, now=now, scan_only=True)
+        return self.run(dry_run=dry_run, worker_id=worker_id, now=now, scan_only=True, run_id=run_id)
 
     def is_digest_due(self, now: Optional[datetime] = None) -> bool:
         """Check if enough time has elapsed since the last consolidated digest delivery."""
@@ -197,11 +231,13 @@ class RadarOrchestrator:
         now: Optional[datetime] = None,
         scan_only: bool = False,
         use_hybrid_digest: bool = False,
+        run_id: Optional[str] = None,
     ) -> RadarRunResult:
         start_time = time.monotonic()
         run_now = now or utc_now()
         now = run_now
         worker = worker_id or f"worker-{run_now.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        active_run_id = run_id or f"run_{run_now.strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}"
         effective_age_hours = self.settings.effective_max_age_hours()
         effective_backlog_hours = self.settings.effective_backlog_retention_hours()
 
@@ -219,6 +255,26 @@ class RadarOrchestrator:
                 dry_run=dry_run,
                 duration_seconds=time.monotonic() - start_time,
                 message=msg,
+            )
+
+        if not dry_run:
+            self.repository.record_scheduled_execution_start(
+                run_id=active_run_id,
+                run_type="SCAN_ONLY" if scan_only else "CRON",
+                worker_id=worker,
+                started_at=run_now,
+            )
+            self.repository.save_recovery_state(
+                stage="RADAR_PIPELINE",
+                worker_id=worker,
+                state_payload={
+                    "stage": "INITIATED",
+                    "run_id": active_run_id,
+                    "worker_id": worker,
+                    "scan_only": scan_only,
+                    "dry_run": dry_run,
+                },
+                batch_id=active_run_id,
             )
 
         try:
@@ -329,6 +385,22 @@ class RadarOrchestrator:
             if successes == 0:
                 msg = "All news feeds failed to respond; aborting run to prevent state corruption."
                 logger.error(msg)
+                if not dry_run:
+                    self.repository.save_recovery_state(
+                        stage="RADAR_PIPELINE",
+                        worker_id=worker,
+                        state_payload={"stage": "FEED_DISCOVERY_FAILED", "error": msg, "run_id": active_run_id},
+                        batch_id=active_run_id,
+                    )
+                    self.repository.record_scheduled_execution_finish(
+                        run_id=active_run_id,
+                        status="FAILED",
+                        articles_collected=0,
+                        candidates_evaluated=0,
+                        notifications_dispatched=notifications_dispatched,
+                        error_message=msg,
+                        finished_at=utc_now(),
+                    )
                 return RadarRunResult(
                     success=False,
                     sources_succeeded=0,
@@ -366,11 +438,34 @@ class RadarOrchestrator:
             )
             deprioritized = getattr(self.deduper, "last_deprioritized", [])
 
+            if not dry_run:
+                self.repository.save_recovery_state(
+                    stage="RADAR_PIPELINE",
+                    worker_id=worker,
+                    state_payload={
+                        "stage": "DISCOVERY_COMPLETED",
+                        "run_id": active_run_id,
+                        "articles_count": len(articles),
+                        "candidates_count": len(candidates),
+                    },
+                    batch_id=active_run_id,
+                )
+
             # 5b. Scan-Only / Decoupled Discovery Mode: persist all fresh candidates to backlog without calling Gemini
             if scan_only or not self.settings.ai_evaluation_enabled:
                 all_to_queue = list(candidates) + list(deprioritized)
                 if not dry_run and all_to_queue:
                     self.repository.save_pending_candidates(all_to_queue)
+                if not dry_run:
+                    self.repository.clear_recovery_state("RADAR_PIPELINE")
+                    self.repository.record_scheduled_execution_finish(
+                        run_id=active_run_id,
+                        status="SUCCESS",
+                        articles_collected=len(articles),
+                        candidates_evaluated=0,
+                        notifications_dispatched=0 if scan_only else notifications_dispatched,
+                        finished_at=utc_now(),
+                    )
                 duration = time.monotonic() - start_time
                 return RadarRunResult(
                     success=True,
@@ -626,6 +721,17 @@ class RadarOrchestrator:
                 self.repository.mark_articles_processed(candidates)
                 self.repository.mark_candidates_evaluated([c.id for c in candidates])
 
+            if not dry_run:
+                self.repository.clear_recovery_state("RADAR_PIPELINE")
+                self.repository.record_scheduled_execution_finish(
+                    run_id=active_run_id,
+                    status="SUCCESS",
+                    articles_collected=len(articles),
+                    candidates_evaluated=len(candidates),
+                    notifications_dispatched=notifications_dispatched,
+                    finished_at=utc_now(),
+                )
+
             duration = time.monotonic() - start_time
             return RadarRunResult(
                 success=True,
@@ -639,6 +745,25 @@ class RadarOrchestrator:
                 message=f"Completed successfully in {duration:.2f}s",
                 discovery_metrics=discovery_metrics,
             )
+
+        except Exception as exc:
+            if not dry_run:
+                self.repository.save_recovery_state(
+                    stage="RADAR_PIPELINE",
+                    worker_id=worker,
+                    state_payload={"stage": "FAILED", "run_id": active_run_id, "error": str(exc)},
+                    batch_id=active_run_id,
+                )
+                self.repository.record_scheduled_execution_finish(
+                    run_id=active_run_id,
+                    status="FAILED",
+                    articles_collected=len(articles) if "articles" in locals() else 0,
+                    candidates_evaluated=len(candidates) if "candidates" in locals() else 0,
+                    notifications_dispatched=notifications_dispatched if "notifications_dispatched" in locals() else 0,
+                    error_message=str(exc),
+                    finished_at=utc_now(),
+                )
+            raise
 
         finally:
             if not dry_run:

@@ -172,10 +172,12 @@ class SqliteStateRepository(StateRepository):
             return int(row["ver"]) if row and row["ver"] is not None else 0
 
     # --- Run Locking & Concurrency ---
-    def acquire_run_lock(self, worker_id: str, timeout_minutes: int = 15) -> bool:
-        now = utc_now()
-        now_iso = now.isoformat()
-        expires_at = (now + timedelta(minutes=timeout_minutes)).isoformat()
+    def acquire_run_lock(
+        self, worker_id: str, timeout_minutes: int = 15, now: Optional[datetime] = None
+    ) -> bool:
+        ref_now = (now or utc_now()).astimezone(timezone.utc)
+        now_iso = ref_now.isoformat()
+        expires_at = (ref_now + timedelta(minutes=timeout_minutes)).isoformat()
 
         with self._connection() as conn:
             cursor = conn.execute(

@@ -32,11 +32,13 @@ from efso_radar.domain import (
     EditorialDisposition,
     EditorialKind,
     NotificationRecord,
+    TelegramDeliveryRecord,
     TelegramNotificationCategory,
     VerificationStatus,
     utc_now,
 )
 from efso_radar.notifications.base import NotificationChannel
+from efso_radar.repositories.base import StateRepository
 from efso_radar.notifications.formatters import (
     compute_stable_digest_identity,
     format_telegram_alert,
@@ -115,10 +117,12 @@ class TelegramNotificationChannel(NotificationChannel):
         settings: Settings,
         transport: Optional[httpx.BaseTransport] = None,
         client: Optional[httpx.Client] = None,
+        repository: Optional[StateRepository] = None,
     ):
         self.settings = settings
         self.transport = transport
         self._client = client
+        self.repository = repository
 
     def _sanitize(self, text: str) -> str:
         return sanitize_telegram_text(text, self.settings.telegram_bot_token)
@@ -559,6 +563,25 @@ class TelegramNotificationChannel(NotificationChannel):
                             notification_id,
                             msg_id,
                         )
+                        if self.repository is not None:
+                            deliv_rec = TelegramDeliveryRecord(
+                                delivery_id=f"DELIV-{notification_id}",
+                                message_key=notification_id,
+                                recipient_role=self.settings.get_recipient_role(target_chat_id) or "AUTHORIZED_RECIPIENT",
+                                recipient_chat_id=target_chat_id,
+                                category=category,
+                                status=DeliveryStatus.SENT,
+                                attempt_count=attempt,
+                                max_attempts=max_attempts,
+                                payload={"message_id": msg_id},
+                                created_at=now,
+                                updated_at=now,
+                                sent_at=now,
+                            )
+                            try:
+                                self.repository.record_telegram_delivery(deliv_rec)
+                            except Exception as ex:
+                                logger.warning("Failed to record delivery in repository: %s", ex)
                         return NotificationRecord(
                             notification_id=notification_id,
                             story_id=story_id,
@@ -584,6 +607,24 @@ class TelegramNotificationChannel(NotificationChannel):
                     last_error = f"Ambiguous delivery timeout: {sanitized_exc}. Automatic retry skipped to prevent duplicate delivery."
                     logger.warning("Ambiguous timeout during Telegram delivery attempt %d: %s", attempt, last_error)
                     final_status = DeliveryStatus.DELIVERY_UNCERTAIN
+                    if self.repository is not None:
+                        deliv_rec = TelegramDeliveryRecord(
+                            delivery_id=f"DELIV-{notification_id}",
+                            message_key=notification_id,
+                            recipient_role=self.settings.get_recipient_role(target_chat_id) or "AUTHORIZED_RECIPIENT",
+                            recipient_chat_id=target_chat_id,
+                            category=category,
+                            status=DeliveryStatus.DELIVERY_UNCERTAIN,
+                            attempt_count=attempt,
+                            max_attempts=max_attempts,
+                            error_message=last_error,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                        try:
+                            self.repository.record_telegram_delivery(deliv_rec)
+                        except Exception as ex:
+                            logger.warning("Failed to record delivery in repository: %s", ex)
                     break
 
                 except httpx.TransportError as exc:
@@ -943,6 +984,7 @@ def deliver_one_shot_editorial_digest(
     is_ux_test: bool = False,
     target_chat_id: Optional[str] = None,
     target_recipient_role: Optional[str] = None,
+    repository: Optional[StateRepository] = None,
 ) -> dict[str, Any]:
     """Execute a dedicated, one-shot editorial digest delivery with persistent per-recipient duplicate protection.
 
@@ -1101,7 +1143,7 @@ def deliver_one_shot_editorial_digest(
     is_live_dispatch = (not dry_run) and settings.telegram_delivery_enabled
 
     if not ledger_file.exists():
-        if is_live_dispatch:
+        if is_live_dispatch and repository is None:
             return {
                 "status": "MISSING_LEDGER",
                 "error": f"Delivery ledger file does not exist at '{ledger_path}'. In live dispatch mode (dry_run=False and delivery enabled), an initialized persistent ledger is strictly required to prevent duplicate deliveries. Failing closed with zero network attempts.",
@@ -1239,10 +1281,51 @@ def deliver_one_shot_editorial_digest(
         # If ADMIN, also write to digest_hash for legacy single-recipient tests
         if r_role == "ADMIN" or r_chat == settings.telegram_chat_id:
             ledger_data["deliveries"][digest_hash] = rec
-        tmp_path = ledger_file.with_suffix(".tmp")
-        with open(tmp_path, "w", encoding="utf-8") as f_tmp:
-            json.dump(ledger_data, f_tmp, ensure_ascii=False, indent=2)
-        tmp_path.replace(ledger_file)
+        try:
+            tmp_path = ledger_file.with_suffix(".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f_tmp:
+                json.dump(ledger_data, f_tmp, ensure_ascii=False, indent=2)
+            tmp_path.replace(ledger_file)
+        except Exception as exc:
+            logger.warning("Could not persist local ledger file '%s': %s", ledger_file, exc)
+
+        if repository is not None:
+            status_map = {
+                "DELIVERY_SUCCESS": DeliveryStatus.SENT,
+                "DELIVERY_UNCERTAIN": DeliveryStatus.DELIVERY_UNCERTAIN,
+                "DELIVERY_FAILED": DeliveryStatus.FAILED,
+                "VALIDATION_ERROR": DeliveryStatus.FAILED,
+                "ACCESS_DENIED": DeliveryStatus.FAILED,
+                "RATE_LIMITED": DeliveryStatus.FAILED,
+                "SERVER_ERROR": DeliveryStatus.FAILED,
+                "SAFE_PREVIEW_PASSED": DeliveryStatus.PENDING,
+            }
+            repo_status = status_map.get(rec_status, DeliveryStatus.FAILED)
+            deliv_id = f"DELIV-{digest_hash[:8]}-{abs(hash(r_chat)) % 1000000:06d}"
+            deliv_rec = TelegramDeliveryRecord(
+                delivery_id=deliv_id,
+                message_key=digest_hash,
+                recipient_role=r_role,
+                recipient_chat_id=r_chat,
+                category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                status=repo_status,
+                attempt_count=1 if rec_status != "SAFE_PREVIEW_PASSED" else 0,
+                max_attempts=1,
+                error_message=err_desc,
+                payload={
+                    "stable_digest_id": stable_digest_id,
+                    "is_ux_test": is_ux_test,
+                    "stories_count": len(assessments),
+                    "message_id": msg_id,
+                },
+                created_at=now_dt,
+                updated_at=now_dt,
+                sent_at=now_dt if repo_status == DeliveryStatus.SENT else None,
+            )
+            try:
+                repository.record_telegram_delivery(deliv_rec)
+            except Exception as exc:
+                logger.warning("Failed to record delivery in repository: %s", exc)
 
     should_close_client = client is None
     http_client = client or httpx.Client(
@@ -1268,26 +1351,48 @@ def deliver_one_shot_editorial_digest(
         # Check existing record
         existing_record = _find_existing_record(r_chat, r_role)
 
+        repo_rec = None
+        if repository is not None:
+            repo_rec = repository.get_telegram_delivery(r_chat, digest_hash)
+            if not repo_rec:
+                repo_rec = repository.get_telegram_delivery(r_chat, stable_digest_id)
+
+        rec_status = None
+        delivered_at_str = None
+        msg_id_val = None
+
         if existing_record:
             rec_status = existing_record.get("status")
+            delivered_at_str = existing_record.get("delivered_at_tsi") or existing_record.get("delivered_at_utc")
+            msg_id_val = existing_record.get("message_id")
+        elif repo_rec:
+            if repo_rec.status == DeliveryStatus.SENT:
+                rec_status = "DELIVERY_SUCCESS"
+                delivered_at_str = repo_rec.sent_at.isoformat() if repo_rec.sent_at else repo_rec.updated_at.isoformat()
+                msg_id_val = repo_rec.payload.get("message_id")
+            elif repo_rec.status == DeliveryStatus.DELIVERY_UNCERTAIN:
+                rec_status = "DELIVERY_UNCERTAIN"
+                delivered_at_str = repo_rec.updated_at.isoformat()
+
+        if rec_status:
             rec_label = "UX test message" if is_ux_test else "digest"
             if rec_status == "DELIVERY_SUCCESS":
                 _record_public_result(r_role, r_masked, {
                     "status": "DUPLICATE_DELIVERY_PREVENTED",
-                    "error": f"Duplicate delivery prevented: This exact {rec_label} was already delivered to {r_role} on {existing_record.get('delivered_at_tsi') or existing_record.get('delivered_at_utc')}.",
+                    "error": f"Duplicate delivery prevented: This exact {rec_label} was already delivered to {r_role} on {delivered_at_str}.",
                     "digest_hash": digest_hash,
                     "stable_digest_id": stable_digest_id,
                     "stories_count": len(assessments),
                     "attempt_made": False,
                     "attempts_count": 0,
-                    "message_id": existing_record.get("message_id"),
+                    "message_id": msg_id_val,
                     "is_ux_test": is_ux_test,
                 })
                 continue
             elif rec_status == "DELIVERY_UNCERTAIN":
                 _record_public_result(r_role, r_masked, {
                     "status": "DUPLICATE_DELIVERY_PREVENTED",
-                    "error": f"Duplicate delivery prevented: A prior attempt for {r_role} resulted in an ambiguous timeout on {existing_record.get('delivered_at_utc')}. Automatic resend is blocked.",
+                    "error": f"Duplicate delivery prevented: A prior attempt for {r_role} resulted in an ambiguous timeout on {delivered_at_str}. Automatic resend is blocked.",
                     "digest_hash": digest_hash,
                     "stable_digest_id": stable_digest_id,
                     "stories_count": len(assessments),
