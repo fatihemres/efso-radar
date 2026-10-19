@@ -17,6 +17,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from efso_radar.backup.envelope import decrypt_envelope
+from efso_radar.backup.restore import SUPPORTED_BACKUP_SCHEMA_VERSIONS
+from efso_radar.repositories.schema import CURRENT_SCHEMA_VERSION
 
 logger = logging.getLogger("efso-radar.backup.retention")
 
@@ -186,7 +188,7 @@ class RetentionPolicyManager:
         self,
         storage: StorageAdapter,
         decryption_key: bytes,
-        expected_schema_version: int = 5,
+        expected_schema_version: int | set[int] | None = None,
     ) -> tuple[list[VerifiedRecoveryPoint], list[str]]:
         """Download and fully verify all assets against SQLite integrity and schema rules.
 

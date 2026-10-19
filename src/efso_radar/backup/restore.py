@@ -29,10 +29,12 @@ from efso_radar.backup.creator import (
     MalformedLedgerError,
 )
 from efso_radar.backup.envelope import decrypt_envelope
+from efso_radar.repositories.schema import CURRENT_SCHEMA_VERSION
 
 logger = logging.getLogger("efso-radar.backup.restore")
 
 MAX_EXTRACTED_BYTES = 500 * 1024 * 1024  # 500 MB limit against decompression bombs
+SUPPORTED_BACKUP_SCHEMA_VERSIONS: set[int] = {5, 6}
 ALLOWED_ARCHIVE_MEMBERS = {
     "radar.db",
     "telegram_digest_delivery_ledger.json",
@@ -487,14 +489,14 @@ def safe_extract_tar(
 
 def verify_staging_database(
     db_path: Path,
-    expected_schema_version: int = 5,
+    expected_schema_version: int | set[int] | None = None,
     manifest_row_counts: dict[str, int] | None = None,
 ) -> dict[str, int]:
     """Execute SQLite integrity, foreign key, schema compatibility, and row count checks on staged DB.
 
     Args:
         db_path: Path to staged SQLite database.
-        expected_schema_version: Required schema version from migrations.
+        expected_schema_version: Required schema version(s) from migrations (default: SUPPORTED_BACKUP_SCHEMA_VERSIONS).
         manifest_row_counts: Expected table row counts recorded in the manifest.
 
     Returns:
@@ -503,6 +505,13 @@ def verify_staging_database(
     Raises:
         RestoreVerificationError: If any consistency or schema check fails.
     """
+    if expected_schema_version is None:
+        allowed_versions = SUPPORTED_BACKUP_SCHEMA_VERSIONS
+    elif isinstance(expected_schema_version, int):
+        allowed_versions = {expected_schema_version}
+    else:
+        allowed_versions = set(expected_schema_version)
+
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10.0)
     except Exception as exc:
@@ -527,9 +536,9 @@ def verify_staging_database(
         cursor.execute("SELECT MAX(version) FROM schema_migrations;")
         ver_row = cursor.fetchone()
         current_ver = ver_row[0] if ver_row else None
-        if current_ver != expected_schema_version:
+        if current_ver not in allowed_versions:
             raise RestoreVerificationError(
-                f"Schema version mismatch: database has version {current_ver}, expected {expected_schema_version}"
+                f"Schema version mismatch: database has version {current_ver}, allowed versions {allowed_versions}"
             )
 
         # 4. Table row counts
@@ -564,7 +573,7 @@ def verify_restore_archive(
     envelope_bytes: bytes,
     key: bytes,
     staging_dir: Path | None = None,
-    expected_schema_version: int = 5,
+    expected_schema_version: int | set[int] | None = None,
 ) -> RestoreVerificationResult:
     """Authenticate, decrypt, extract, and rigorously verify a backup inside an isolated staging directory.
 
@@ -575,7 +584,7 @@ def verify_restore_archive(
         envelope_bytes: Raw binary bytes of the .efbk file.
         key: 32-byte AES-256 decryption key.
         staging_dir: Optional isolated staging directory (defaults to clean system temp).
-        expected_schema_version: Required database schema version.
+        expected_schema_version: Required database schema version(s) (defaults to SUPPORTED_BACKUP_SCHEMA_VERSIONS).
 
     Returns:
         RestoreVerificationResult containing verification status, paths, and report.
@@ -584,6 +593,13 @@ def verify_restore_archive(
         RestoreVerificationError: On any authentication, integrity, or validation failure.
     """
     errors: list[str] = []
+
+    if expected_schema_version is None:
+        allowed_versions = SUPPORTED_BACKUP_SCHEMA_VERSIONS
+    elif isinstance(expected_schema_version, int):
+        allowed_versions = {expected_schema_version}
+    else:
+        allowed_versions = set(expected_schema_version)
 
     # 1. Decrypt and authenticate envelope FIRST before modifying any filesystem path
     try:
@@ -601,10 +617,10 @@ def verify_restore_archive(
 
     # 3. Verify manifest schema version matches expected application version
     manifest_schema_ver = manifest.get("schema_version")
-    if manifest_schema_ver != expected_schema_version:
+    if manifest_schema_ver not in allowed_versions:
         raise RestoreVerificationError(
             f"Manifest schema version mismatch: manifest declared {manifest_schema_ver}, "
-            f"expected {expected_schema_version}"
+            f"allowed versions {allowed_versions}"
         )
 
     target_staging: Path | None = None
@@ -638,7 +654,7 @@ def verify_restore_archive(
         manifest_row_counts = manifest.get("table_row_counts", {})
         table_counts = verify_staging_database(
             db_path,
-            expected_schema_version=expected_schema_version,
+            expected_schema_version={manifest_schema_ver},
             manifest_row_counts=manifest_row_counts,
         )
 

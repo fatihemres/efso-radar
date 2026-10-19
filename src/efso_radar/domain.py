@@ -85,6 +85,7 @@ class StoryCategory(str, Enum):
 
 
 class DeliveryStatus(str, Enum):
+    PENDING = "PENDING"
     SENT = "SENT"
     HELD_QUIET_HOURS = "HELD_QUIET_HOURS"
     DISPATCHING = "DISPATCHING"
@@ -95,6 +96,142 @@ class DeliveryStatus(str, Enum):
     HELD_FOR_VERIFICATION = "HELD_FOR_VERIFICATION"
     HELD_FOR_SENSITIVE_REVIEW = "HELD_FOR_SENSITIVE_REVIEW"
     DELIVERY_UNCERTAIN = "DELIVERY_UNCERTAIN"
+
+
+class DeliveryStateError(Exception):
+    """Base exception for telegram delivery state violations."""
+
+
+class DeliveryStatusRegressionError(DeliveryStateError):
+    """Raised when an illegal delivery status transition or regression is attempted."""
+
+
+class DeliveryIdentityConflictError(DeliveryStateError):
+    """Raised when delivery record recipient or message identities conflict."""
+
+
+class BudgetHistoryConflictError(Exception):
+    """Raised when an existing immutable budget event is overwritten with conflicting data."""
+
+
+# Explicit legal transition model for telegram delivery lifecycle
+LEGAL_DELIVERY_TRANSITIONS: dict[DeliveryStatus, set[DeliveryStatus]] = {
+    DeliveryStatus.PENDING: {
+        DeliveryStatus.PENDING,
+        DeliveryStatus.DISPATCHING,
+        DeliveryStatus.SENT,
+        DeliveryStatus.FAILED,
+        DeliveryStatus.DELIVERY_UNCERTAIN,
+        DeliveryStatus.HELD_QUIET_HOURS,
+    },
+    DeliveryStatus.DISPATCHING: {
+        DeliveryStatus.DISPATCHING,
+        DeliveryStatus.PENDING,
+        DeliveryStatus.SENT,
+        DeliveryStatus.FAILED,
+        DeliveryStatus.DELIVERY_UNCERTAIN,
+        DeliveryStatus.HELD_QUIET_HOURS,
+    },
+    DeliveryStatus.HELD_QUIET_HOURS: {
+        DeliveryStatus.HELD_QUIET_HOURS,
+        DeliveryStatus.PENDING,
+        DeliveryStatus.DISPATCHING,
+        DeliveryStatus.SENT,
+        DeliveryStatus.FAILED,
+        DeliveryStatus.EXPIRED_STALE,
+    },
+    DeliveryStatus.FAILED: {
+        DeliveryStatus.FAILED,
+        DeliveryStatus.PENDING,
+        DeliveryStatus.DISPATCHING,
+        DeliveryStatus.SENT,
+        DeliveryStatus.DELIVERY_UNCERTAIN,
+    },
+    # Uncertainty-sensitive: blind retry to PENDING or DISPATCHING is strictly prohibited.
+    # Generic transition to SENT is also blocked without authoritative reconciliation proof.
+    DeliveryStatus.DELIVERY_UNCERTAIN: {
+        DeliveryStatus.DELIVERY_UNCERTAIN,
+    },
+    # Terminal success: once SENT, cannot regress to any prior or failed state.
+    DeliveryStatus.SENT: {
+        DeliveryStatus.SENT,
+    },
+    DeliveryStatus.EXPIRED_STALE: {
+        DeliveryStatus.EXPIRED_STALE,
+    },
+    DeliveryStatus.SKIPPED_BELOW_THRESHOLD: {
+        DeliveryStatus.SKIPPED_BELOW_THRESHOLD,
+    },
+    DeliveryStatus.HELD_FOR_VERIFICATION: {
+        DeliveryStatus.HELD_FOR_VERIFICATION,
+        DeliveryStatus.PENDING,
+        DeliveryStatus.DISPATCHING,
+        DeliveryStatus.SENT,
+        DeliveryStatus.EXPIRED_STALE,
+    },
+    DeliveryStatus.HELD_FOR_SENSITIVE_REVIEW: {
+        DeliveryStatus.HELD_FOR_SENSITIVE_REVIEW,
+        DeliveryStatus.PENDING,
+        DeliveryStatus.DISPATCHING,
+        DeliveryStatus.SENT,
+        DeliveryStatus.EXPIRED_STALE,
+    },
+}
+
+
+def mask_chat_id(chat_id: str | int | None) -> str:
+    """Mask sensitive chat IDs in logs and public reports (e.g. 87...78)."""
+    if chat_id is None:
+        return "***"
+    clean = str(chat_id).strip()
+    if len(clean) >= 6:
+        return f"{clean[:2]}...{clean[-2:]}"
+    elif len(clean) > 0:
+        return f"{clean[0]}...{clean[-1]}"
+    return "***"
+
+
+class ReconciliationProof(BaseModel):
+    """Operator-supplied evidence metadata required to request reconciliation of a DELIVERY_UNCERTAIN record.
+
+    NOTE: This model captures operator-supplied evidence metadata only, not independently verified
+    cryptographic proof. Automated or unattended flows must never automatically authorize reconciliation.
+    """
+    reconciliation_method: str = Field(min_length=3)
+    verified_by: str = Field(min_length=2)
+    proof_reference: str = Field(min_length=1)
+    proof_notes: Optional[str] = None
+    operator_authorized: bool = False
+    reconciled_at: datetime = Field(default_factory=utc_now)
+
+
+def validate_delivery_status_transition(
+    current_status: DeliveryStatus | str,
+    new_status: DeliveryStatus | str,
+    allow_reconciliation: bool = False,
+) -> None:
+    """Validate that transition from current_status to new_status is legal.
+
+    Raises:
+        DeliveryStatusRegressionError: If the transition represents an illegal status regression.
+    """
+    curr = DeliveryStatus(current_status) if isinstance(current_status, str) else current_status
+    nxt = DeliveryStatus(new_status) if isinstance(new_status, str) else new_status
+
+    if curr == DeliveryStatus.DELIVERY_UNCERTAIN and nxt == DeliveryStatus.SENT:
+        if not allow_reconciliation:
+            raise DeliveryStatusRegressionError(
+                "Generic delivery status transition from DELIVERY_UNCERTAIN to SENT is blocked. "
+                "Explicit operator-authorized reconciliation is required via reconcile_uncertain_delivery()."
+            )
+        return
+
+    allowed = LEGAL_DELIVERY_TRANSITIONS.get(curr, {curr})
+    if nxt not in allowed:
+        raise DeliveryStatusRegressionError(
+            f"Illegal delivery status transition: cannot transition from {curr.value} to {nxt.value}. "
+            f"Allowed next states: {[s.value for s in allowed]}."
+        )
 
 
 class NotificationUrgencyTier(str, Enum):
@@ -265,3 +402,81 @@ class NotificationRecord(BaseModel):
     score: int
     error_message: Optional[str] = None
     category: Optional[TelegramNotificationCategory] = None
+
+
+class TelegramDeliveryRecord(BaseModel):
+    """Durable recipient-specific outbox and delivery record.
+
+    Binds message identity, recipient authorization role, and delivery lifecycle
+    to prevent duplicate alerts across crashes, retries, and runner restarts.
+    """
+    delivery_id: str
+    message_key: str  # Unique digest key or message content hash
+    recipient_role: str  # 'PRIMARY_EDITOR' or 'ADMIN'
+    recipient_chat_id: str
+    category: TelegramNotificationCategory
+    status: DeliveryStatus
+    attempt_count: int = 0
+    max_attempts: int = 3
+    error_message: Optional[str] = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    sent_at: Optional[datetime] = None
+
+    @property
+    def masked_recipient_chat_id(self) -> str:
+        cid = self.recipient_chat_id.strip()
+        if len(cid) <= 4:
+            return "***"
+        return f"{cid[:2]}...{cid[-2:]}"
+
+
+class DurableRecoveryRecord(BaseModel):
+    """Persisted recovery checkpoint allowing ephemeral cloud runs to resume without state loss."""
+    state_key: str
+    stage: str
+    worker_id: str
+    batch_id: Optional[str] = None
+    last_processed_id: Optional[str] = None
+    state_payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class AdminOperationalReport(BaseModel):
+    """Record of a daily technical health and metrics report sent to ADMIN."""
+    report_date: str  # YYYY-MM-DD in Europe/Istanbul timezone
+    dispatched_at: datetime
+    worker_id: str
+    status: DeliveryStatus
+    recipient_chat_id: str
+    summary_payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExperimentBudgetRecord(BaseModel):
+    """Persistent AI token usage and budget consumption ledger entry."""
+    record_id: str
+    period_month: str  # YYYY-MM
+    run_id: str
+    worker_id: str
+    timestamp: datetime = Field(default_factory=utc_now)
+    calls_count: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    estimated_cost_usd: float = 0.0
+
+
+class ScheduledExecutionRecord(BaseModel):
+    """Audit log of scheduled execution cycles across ephemeral runners."""
+    run_id: str
+    run_type: str  # 'SCAN_ONLY', 'FULL', 'ADMIN_REPORT'
+    worker_id: str
+    started_at: datetime = Field(default_factory=utc_now)
+    finished_at: Optional[datetime] = None
+    status: str = "RUNNING"  # 'RUNNING', 'SUCCESS', 'FAILED'
+    articles_collected: int = 0
+    candidates_evaluated: int = 0
+    notifications_dispatched: int = 0
+    error_message: Optional[str] = None

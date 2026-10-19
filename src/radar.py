@@ -378,12 +378,65 @@ def telegram_send(pick: dict[str, Any]) -> None:
         raise RuntimeError("Telegram rejected message")
 
 
+def get_legacy_offline_fixture_articles() -> list[dict[str, Any]]:
+    """Deterministic offline fixture for legacy dry-run mode (zero network, zero Gemini tokens)."""
+    return [
+        {
+            "id": "offline_fix_001",
+            "title": "[OFFLINE ÖNİZLEME] Küresel Müzik Ödülleri Adayları Açıklandı",
+            "link": "https://example.org/news/music-awards-offline-preview",
+            "source": "Offline Fixture News",
+            "published_utc": "2026-10-19T10:00:00Z",
+            "market": "EN",
+            "description": "Yılın müzik ödülleri için aday listeleri resmen kamuoyuyla paylaşıldı.",
+        },
+        {
+            "id": "offline_fix_002",
+            "title": "[OFFLINE ÖNİZLEME] Yeni Dizi Rekor İzlenme Oranına Ulaştı",
+            "link": "https://example.org/news/tv-series-record-offline-preview",
+            "source": "Offline Fixture Pop",
+            "published_utc": "2026-10-19T11:00:00Z",
+            "market": "TR",
+            "description": "Dijital platformda yayınlanan yeni yapım ilk hafta sonunda rekor kırdı.",
+        },
+    ]
+
+
 def run(
     dry_run: bool = False,
     use_legacy: bool = False,
     scan_only: bool = False,
     settings: Optional[Any] = None,
 ) -> None:
+    if use_legacy:
+        if not dry_run:
+            raise RuntimeError(
+                "--legacy mode cannot be run live; legacy live execution has been permanently discontinued. "
+                "Use the modular orchestrator for live runs or use --dry-run for legacy offline preview."
+            )
+        # Deterministic offline dry-run (strictly 0 network requests, 0 Gemini API tokens)
+        LOG.info("[LEGACY DRY-RUN] Executing legacy dry-run using deterministic offline fixtures. No external RSS or Gemini calls.")
+        articles = get_legacy_offline_fixture_articles()
+        preview_picks = [
+            {
+                "kind": "NEW",
+                "headline_tr": "[OFFLINE ÖNİZLEME] Küresel Müzik Ödülleri Adayları Açıklandı",
+                "cover_title_tr": "MÜZİK ÖDÜLLERİ ADAYLARI",
+                "score": 85,
+                "suggested_format": "POST",
+                "category": "GLOBAL",
+                "why_efso_tr": "Genç kitle ve popüler kültür için küresel gündem değeri yüksek bir gelişme.",
+                "caption_idea_tr": "Ödül sezonu resmen başladı! İşte bu yılın en çok konuşulan adayları.",
+                "article_ids": [articles[0]["id"]],
+                "articles": [articles[0]],
+                "parent_story_id": "",
+                "development": "",
+            }
+        ]
+        for p in preview_picks:
+            print("\n=== PREVIEW: NO MESSAGE SENT (LEGACY OFFLINE FIXTURE) ===\n" + telegram_text(p) + "\n")
+        return
+
     if scan_only:
         import tempfile
         from efso_radar.config import Settings as ConfigSettings
@@ -393,8 +446,16 @@ def run(
 
         active_settings = settings or ConfigSettings.from_env()
 
+        storage_mode = getattr(active_settings, "storage_mode", os.getenv("EFSO_STORAGE_MODE", "auto")).lower()
         has_turso_url = bool(active_settings.turso_database_url and active_settings.turso_database_url.strip())
         has_turso_token = bool(active_settings.turso_auth_token and active_settings.turso_auth_token.strip())
+
+        if storage_mode in ("turso", "cloud"):
+            if not (has_turso_url and has_turso_token):
+                raise ValueError(
+                    "Cloud storage mode enabled (EFSO_STORAGE_MODE=turso) but Turso configuration is missing or incomplete. "
+                    "Both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN must be provided."
+                )
 
         if has_turso_url != has_turso_token:
             raise ValueError(
@@ -427,7 +488,7 @@ def run(
             finally:
                 temp_dir.cleanup()
         else:
-            if has_turso_url and has_turso_token:
+            if storage_mode in ("turso", "cloud") or (storage_mode == "auto" and has_turso_url and has_turso_token):
                 LOG.info("Initializing Turso cloud state repository (%s)", active_settings.get_masked_turso_url())
                 repo = TursoStateRepository(
                     database_url=active_settings.turso_database_url,
@@ -466,107 +527,82 @@ def run(
         return
 
     if not use_legacy:
-        try:
-            import tempfile
-            from efso_radar.config import Settings as ConfigSettings
-            from efso_radar.orchestrator import RadarOrchestrator
-            from efso_radar.repositories.sqlite import SqliteStateRepository
-            from efso_radar.repositories.turso import TursoStateRepository
+        import tempfile
+        from efso_radar.config import Settings as ConfigSettings
+        from efso_radar.orchestrator import RadarOrchestrator
+        from efso_radar.repositories.sqlite import SqliteStateRepository
+        from efso_radar.repositories.turso import TursoStateRepository
 
-            active_settings = settings or ConfigSettings.from_env()
-            has_turso_url = bool(active_settings.turso_database_url and active_settings.turso_database_url.strip())
-            has_turso_token = bool(active_settings.turso_auth_token and active_settings.turso_auth_token.strip())
+        active_settings = settings or ConfigSettings.from_env()
+        storage_mode = getattr(active_settings, "storage_mode", os.getenv("EFSO_STORAGE_MODE", "auto")).lower()
+        has_turso_url = bool(active_settings.turso_database_url and active_settings.turso_database_url.strip())
+        has_turso_token = bool(active_settings.turso_auth_token and active_settings.turso_auth_token.strip())
 
-            if has_turso_url != has_turso_token:
+        if storage_mode in ("turso", "cloud"):
+            if not (has_turso_url and has_turso_token):
                 raise ValueError(
-                    "Partial Turso configuration detected: both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN "
-                    "must be provided together, or neither."
+                    "Cloud storage mode enabled (EFSO_STORAGE_MODE=turso) but Turso configuration is missing or incomplete. "
+                    "Both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN must be provided."
                 )
 
-            if dry_run:
-                LOG.info(
-                    "[DRY-RUN ISOLATION] Running in dry-run mode. Initializing ephemeral temporary SQLite repository. "
-                    "Operational database (%s) and Turso cloud are completely untouched. "
-                    "NOTE: Ephemeral database cannot reflect production duplicate history.",
-                    active_settings.sqlite_db_path,
-                )
-                print(
-                    "[DRY-RUN ISOLATION] Using ephemeral temporary database. Operational database was untouched. "
-                    "NOTE: Ephemeral database cannot reflect production duplicate history."
-                )
-                temp_dir = tempfile.TemporaryDirectory(prefix="efso_radar_dryrun_")
-                try:
-                    temp_db_path = Path(temp_dir.name) / "ephemeral_radar.db"
-                    isolated_settings = active_settings.model_copy(update={
-                        "sqlite_db_path": temp_db_path,
-                        "turso_database_url": "",
-                        "turso_auth_token": "",
-                    })
-                    repo = SqliteStateRepository(temp_db_path)
-                    orchestrator = RadarOrchestrator(settings=isolated_settings, repository=repo)
-                    result = orchestrator.run(dry_run=True)
-                    LOG.info("Modular Radar run complete: %s (picks=%d, dispatched=%d)",
-                             result.message, result.picks_approved, result.notifications_dispatched)
-                    return
-                finally:
-                    temp_dir.cleanup()
-            else:
-                if has_turso_url and has_turso_token:
-                    LOG.info("Initializing Turso cloud state repository (%s)", active_settings.get_masked_turso_url())
-                    repo = TursoStateRepository(
-                        database_url=active_settings.turso_database_url,
-                        auth_token=active_settings.turso_auth_token,
-                    )
-                else:
-                    LOG.info("Initializing SQLite state repository (%s)", active_settings.sqlite_db_path)
-                    repo = SqliteStateRepository(active_settings.sqlite_db_path)
-                    if active_settings.legacy_state_json_path.exists():
-                        repo.migrate_from_legacy_json(active_settings.legacy_state_json_path)
+        if has_turso_url != has_turso_token:
+            raise ValueError(
+                "Partial Turso configuration detected: both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN "
+                "must be provided together, or neither."
+            )
 
-                orchestrator = RadarOrchestrator(settings=active_settings, repository=repo)
-                result = orchestrator.run(dry_run=False)
+        if dry_run:
+            LOG.info(
+                "[DRY-RUN ISOLATION] Running in dry-run mode. Initializing ephemeral temporary SQLite repository. "
+                "Operational database (%s) and Turso cloud are completely untouched. "
+                "NOTE: Ephemeral database cannot reflect production duplicate history.",
+                active_settings.sqlite_db_path,
+            )
+            print(
+                "[DRY-RUN ISOLATION] Using ephemeral temporary database. Operational database was untouched. "
+                "NOTE: Ephemeral database cannot reflect production duplicate history."
+            )
+            temp_dir = tempfile.TemporaryDirectory(prefix="efso_radar_dryrun_")
+            try:
+                temp_db_path = Path(temp_dir.name) / "ephemeral_radar.db"
+                isolated_settings = active_settings.model_copy(update={
+                    "sqlite_db_path": temp_db_path,
+                    "turso_database_url": "",
+                    "turso_auth_token": "",
+                })
+                repo = SqliteStateRepository(temp_db_path)
+                orchestrator = RadarOrchestrator(settings=isolated_settings, repository=repo)
+                result = orchestrator.run(dry_run=True)
                 LOG.info("Modular Radar run complete: %s (picks=%d, dispatched=%d)",
                          result.message, result.picks_approved, result.notifications_dispatched)
+                if not result.success:
+                    raise RuntimeError(f"Modular Radar dry-run execution failed: {result.message}")
                 return
-        except ValueError:
-            raise
-        except Exception as exc:
-            LOG.warning("Modular orchestrator encountered error (%s); falling back to legacy runner", exc)
-
-    now = datetime.now(UTC)
-    state = load_state(STATE_PATH)
-    expire_state(state, now)
-    articles, success = fetch_articles(now)
-    if success == 0:
-        raise RuntimeError("All news feeds failed; stopping to avoid marking articles processed")
-    candidates = unique_new(articles, state["processed"])
-    LOG.info("Sources: %s/%s, recent: %s, new candidate(s): %s",
-             success, len(QUERIES), len(articles), len(candidates))
-    if not candidates:
-        if not dry_run:
-            save_state(STATE_PATH, state)
-        return
-    raw_picks = judge(candidates, state, now)
-    picks = validate_picks(raw_picks, candidates, state["sent"])
-    LOG.info("Editorially selected %s noteworthy story/stories", len(picks))
-    for p in picks:
-        if dry_run:
-            print("\n=== PREVIEW: NO MESSAGE SENT ===\n" + telegram_text(p) + "\n")
+            finally:
+                temp_dir.cleanup()
         else:
-            telegram_send(p)
-            story_id = "EFSO-" + now.strftime("%Y%m%d") + "-" + p["article_ids"][0][:8]
-            state["sent"].append({
-                "story_id": story_id, "headline_tr": p["headline_tr"],
-                "sent_at": now.isoformat(), "kind": p["kind"],
-                "parent_story_id": p["parent_story_id"], "development": p["development"],
-            })
-            for a in p["articles"]:
-                state["processed"][a["id"]] = now.isoformat()
-            save_state(STATE_PATH, state)
-    if not dry_run:
-        for a in candidates:
-            state["processed"][a["id"]] = now.isoformat()
-        save_state(STATE_PATH, state)
+            if storage_mode in ("turso", "cloud") or (storage_mode == "auto" and has_turso_url and has_turso_token):
+                LOG.info("Initializing Turso cloud state repository (%s)", active_settings.get_masked_turso_url())
+                repo = TursoStateRepository(
+                    database_url=active_settings.turso_database_url,
+                    auth_token=active_settings.turso_auth_token,
+                )
+            else:
+                LOG.info("Initializing SQLite state repository (%s)", active_settings.sqlite_db_path)
+                repo = SqliteStateRepository(active_settings.sqlite_db_path)
+                if active_settings.legacy_state_json_path.exists():
+                    repo.migrate_from_legacy_json(active_settings.legacy_state_json_path)
+
+            orchestrator = RadarOrchestrator(settings=active_settings, repository=repo)
+            result = orchestrator.run(dry_run=False)
+            LOG.info("Modular Radar run complete: %s (picks=%d, dispatched=%d)",
+                     result.message, result.picks_approved, result.notifications_dispatched)
+            if not result.success:
+                raise RuntimeError(f"Modular Radar run failed: {result.message}")
+            return
+
+    # Defensive fail-closed guard
+    raise RuntimeError("Unexpected execution path reached in radar.run")
 
 
 def demo() -> None:
@@ -592,6 +628,8 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.scan_only and args.legacy:
         parser.error("--scan-only cannot be combined with --legacy")
+    if args.legacy and not args.dry_run:
+        parser.error("--legacy mode cannot be run live; it is strictly restricted to --dry-run")
     try:
         if args.demo:
             demo()

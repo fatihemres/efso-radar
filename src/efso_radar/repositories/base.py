@@ -7,17 +7,22 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from efso_radar.domain import (
+    AdminOperationalReport,
     Article,
     DeliveryStatus,
+    DurableRecoveryRecord,
     EditorialAssessment,
     EditorialKind,
+    ExperimentBudgetRecord,
     NotificationRecord,
     OwnerFeedback,
+    ScheduledExecutionRecord,
     Story,
     StoryUpdate,
+    TelegramDeliveryRecord,
 )
 
 
@@ -259,5 +264,157 @@ class StateRepository(ABC):
     def get_cached_ai_batch_response(self, batch_hash: str, model_name: str) -> Optional[str]:
         """Retrieve cached JSON response for an identical candidate batch and model, if available."""
         pass
+
+    # --- Telegram Delivery Outbox & Recipient Lifecycle ---
+    @abstractmethod
+    def record_telegram_delivery(self, delivery: TelegramDeliveryRecord) -> None:
+        """Persist or insert an initial delivery record into the durable outbox."""
+        pass
+
+    @abstractmethod
+    def get_telegram_delivery(self, recipient_chat_id: str, message_key: str) -> Optional[TelegramDeliveryRecord]:
+        """Fetch delivery record for a specific recipient and message key."""
+        pass
+
+    @abstractmethod
+    def update_telegram_delivery_status(
+        self,
+        delivery_id: str,
+        status: DeliveryStatus,
+        error_message: Optional[str] = None,
+        sent_at: Optional[datetime] = None,
+    ) -> bool:
+        """Update status of a delivery record (e.g. SENT, FAILED, DELIVERY_UNCERTAIN)."""
+        pass
+
+    @abstractmethod
+    def reconcile_uncertain_delivery(
+        self,
+        delivery_id: str,
+        reconciliation_proof: dict[str, Any],
+        reconciled_at: Optional[datetime] = None,
+        *,
+        operator_authorized: bool = False,
+        live_mode: bool = False,
+    ) -> TelegramDeliveryRecord:
+        """Reconcile a DELIVERY_UNCERTAIN record to SENT using operator-supplied evidence metadata."""
+        pass
+
+    @abstractmethod
+    def is_digest_delivered_to_recipient(self, recipient_chat_id: str, message_key: str) -> bool:
+        """Check if a specific digest has already been delivered to this recipient."""
+        pass
+
+    @abstractmethod
+    def get_pending_telegram_deliveries(self, limit: int = 50) -> list[TelegramDeliveryRecord]:
+        """Fetch outbox records pending delivery attempt."""
+        pass
+
+    # --- Durable Cloud Recovery State ---
+    @abstractmethod
+    def save_recovery_state(
+        self,
+        stage: str,
+        worker_id: str,
+        state_payload: dict[str, Any],
+        batch_id: Optional[str] = None,
+        last_processed_id: Optional[str] = None,
+    ) -> None:
+        """Persist or update recovery checkpoint for a specific pipeline stage."""
+        pass
+
+    @abstractmethod
+    def get_recovery_state(self, stage: str) -> Optional[dict[str, Any]]:
+        """Retrieve latest recovery checkpoint for a stage, if present."""
+        pass
+
+    @abstractmethod
+    def clear_recovery_state(self, stage: str) -> None:
+        """Clear recovery checkpoint after stage completes successfully."""
+        pass
+
+    # --- At-Most-Once Daily Admin Operational Reports ---
+    @abstractmethod
+    def record_admin_report(
+        self,
+        report_date: str,
+        worker_id: str,
+        status: DeliveryStatus,
+        recipient_chat_id: str,
+        summary_payload: dict[str, Any],
+    ) -> bool:
+        """Record daily admin operational report for date (Europe/Istanbul YYYY-MM-DD).
+
+        Returns True if inserted, False if report for this date was already recorded.
+        """
+        pass
+
+    @abstractmethod
+    def has_admin_report_been_dispatched(self, report_date: str) -> bool:
+        """Check if admin report for this Europe/Istanbul date was already dispatched."""
+        pass
+
+    # --- Experiment Budget Ledger & Monthly Consumption ---
+    @abstractmethod
+    def record_budget_usage(
+        self,
+        period_month: str,
+        run_id: str,
+        worker_id: str,
+        calls_count: int,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        estimated_cost_usd: float,
+        timestamp: Optional[datetime] = None,
+        record_id: Optional[str] = None,
+    ) -> bool:
+        """Persist immutable budget consumption entry.
+
+        Idempotent for identical replays; raises BudgetHistoryConflictError on conflicting values.
+        """
+        pass
+
+    @abstractmethod
+    def get_monthly_budget_summary(self, period_month: str) -> dict[str, Any]:
+        """Retrieve aggregated token usage and cost for month (YYYY-MM)."""
+        pass
+
+    @abstractmethod
+    def get_budget_record(self, record_id: str) -> Optional[dict[str, Any]]:
+        """Retrieve a specific budget usage record by record_id."""
+        pass
+
+    # --- Scheduled Cloud Execution Audit History ---
+    @abstractmethod
+    def record_scheduled_execution_start(
+        self,
+        run_id: str,
+        run_type: str,
+        worker_id: str,
+        started_at: Optional[datetime] = None,
+    ) -> None:
+        """Log start of a scheduled runner execution."""
+        pass
+
+    @abstractmethod
+    def record_scheduled_execution_finish(
+        self,
+        run_id: str,
+        status: str,
+        articles_collected: int = 0,
+        candidates_evaluated: int = 0,
+        notifications_dispatched: int = 0,
+        error_message: Optional[str] = None,
+        finished_at: Optional[datetime] = None,
+    ) -> None:
+        """Log completion or failure of a scheduled runner execution."""
+        pass
+
+    @abstractmethod
+    def get_scheduled_execution(self, run_id: str) -> Optional[dict[str, Any]]:
+        """Retrieve execution history record by run_id."""
+        pass
+
 
 
