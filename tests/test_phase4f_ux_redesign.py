@@ -360,6 +360,7 @@ class TestPhase4FTelegramUXRedesign(unittest.TestCase):
                 telegram_chat_id="1000000001",
                 telegram_allowed_chat_ids=["1000000001"],
                 telegram_delivery_enabled=True,
+                legacy_editorial_fallback=True,
             )
 
             # 2. Attempt delivery with new Phase 4F formatting
@@ -449,6 +450,7 @@ class TestPhase4FTelegramUXRedesign(unittest.TestCase):
                 telegram_chat_id="1000000001",
                 telegram_allowed_chat_ids=["1000000001"],
                 telegram_delivery_enabled=False,
+                legacy_editorial_fallback=True,
             )
             res = deliver_one_shot_editorial_digest(
                 settings=settings,

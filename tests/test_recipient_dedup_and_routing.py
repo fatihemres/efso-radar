@@ -93,9 +93,11 @@ class TestRecipientDedupAndRouting(unittest.TestCase):
 
         self.assertEqual(result["status"], "SAFE_PREVIEW_PASSED")
         self.assertEqual(result["recipients_count"], 1)
-        self.assertIn(self.editor_chat_id, result["recipient_results"])
+        self.assertIn("PRIMARY_EDITOR", result["recipient_results"])
+        self.assertNotIn(self.editor_chat_id, result["recipient_results"])
         self.assertNotIn(self.admin_chat_id, result["recipient_results"])
-        self.assertEqual(result["recipient_results"][self.editor_chat_id]["recipient_role"], "PRIMARY_EDITOR")
+        self.assertNotIn("ADMIN", result["recipient_results"])
+        self.assertEqual(result["recipient_results"]["PRIMARY_EDITOR"]["recipient_role"], "PRIMARY_EDITOR")
 
     def test_03_historical_19_october_incident_scenario_admin_not_blocked(self) -> None:
         """Historical 19 October incident: PRIMARY_EDITOR delivery success must NOT block ADMIN."""
@@ -139,7 +141,7 @@ class TestRecipientDedupAndRouting(unittest.TestCase):
         self.assertNotEqual(admin_res["status"], "DUPLICATE_DELIVERY_PREVENTED")
         self.assertEqual(admin_res["status"], "SAFE_PREVIEW_PASSED")
         self.assertEqual(admin_res["recipients_count"], 1)
-        self.assertEqual(admin_res["recipient_results"][self.admin_chat_id]["status"], "SAFE_PREVIEW_PASSED")
+        self.assertEqual(admin_res["recipient_results"]["ADMIN"]["status"], "SAFE_PREVIEW_PASSED")
 
         # But PRIMARY_EDITOR must remain blocked as genuine duplicate
         editor_res = deliver_one_shot_editorial_digest(
@@ -360,8 +362,22 @@ class TestRecipientDedupAndRouting(unittest.TestCase):
         serialized = json.dumps(result)
         # Raw bot token must never appear
         self.assertNotIn(self.bot_token, serialized)
-        # Masked token should appear
+        # Raw chat IDs for both ADMIN and PRIMARY_EDITOR must never appear in public serialized results
+        self.assertNotIn(self.admin_chat_id, serialized)
+        self.assertNotIn(self.editor_chat_id, serialized)
+        # Masked token and masked chat IDs must appear
         self.assertIn("123456...2345", serialized)
+        self.assertIn("11...01", serialized)
+        self.assertIn("22...02", serialized)
+        # Verify keys in recipient_results do not contain raw chat IDs
+        for key in result["recipient_results"].keys():
+            self.assertNotEqual(key, self.admin_chat_id)
+            self.assertNotEqual(key, self.editor_chat_id)
+        # Keys must be accessible via role and masked ID
+        self.assertIn("ADMIN", result["recipient_results"])
+        self.assertIn("PRIMARY_EDITOR", result["recipient_results"])
+        self.assertIn("11...01", result["recipient_results"])
+        self.assertIn("22...02", result["recipient_results"])
 
     def test_10_operational_health_report_routing(self) -> None:
         """Verify operational health report category routes strictly to ADMIN."""
@@ -402,6 +418,87 @@ class TestRecipientDedupAndRouting(unittest.TestCase):
             dry_run=True,
         )
         self.assertEqual(record_batch.status.value, "SENT")
+
+    def test_12_editorial_routing_fails_closed_when_primary_editor_missing(self) -> None:
+        """ADMIN must never become an implicit fallback when PRIMARY_EDITOR is missing or invalid."""
+        # Config with only ADMIN configured, legacy fallback disabled (default)
+        admin_only_settings = Settings(
+            telegram_bot_token=self.bot_token,
+            telegram_chat_id=self.admin_chat_id,
+            telegram_primary_editor_chat_id="",
+            telegram_allowed_chat_ids=[self.admin_chat_id],
+            telegram_delivery_enabled=False,
+            legacy_editorial_fallback=False,  # Production default
+        )
+        # 1. get_editorial_recipients must fail closed (return empty list)
+        self.assertEqual(admin_only_settings.get_editorial_recipients(), [])
+        self.assertEqual(
+            admin_only_settings.get_recipients_for_category(TelegramNotificationCategory.EDITORIAL_DIGEST),
+            [],
+        )
+
+        # 2. deliver_one_shot_editorial_digest must fail closed with CONFIG_ERROR
+        assessments = build_final_three_assessments()
+        digest_res = deliver_one_shot_editorial_digest(
+            settings=admin_only_settings,
+            assessments=assessments,
+            dry_run=True,
+            ledger_path=self.ledger_path,
+        )
+        self.assertEqual(digest_res["status"], "CONFIG_ERROR")
+        self.assertFalse(digest_res["attempt_made"])
+        self.assertIn("PRIMARY_EDITOR", digest_res["error"])
+
+        # 3. Channel send and send_digest_batch must fail closed with DeliveryStatus.FAILED
+        channel = TelegramNotificationChannel(settings=admin_only_settings)
+        single_rec = channel.send(assessment=assessments[0], story_id="test_fail_closed", dry_run=True)
+        self.assertEqual(single_rec.status.value, "FAILED")
+        self.assertIn("Routing failed closed", single_rec.error_message or "")
+
+        batch_rec = channel.send_digest_batch(
+            assessments=assessments,
+            notification_id="BATCH-FAIL-01",
+            dry_run=True,
+        )
+        self.assertEqual(batch_rec.status.value, "FAILED")
+        self.assertIn("Routing failed closed", batch_rec.error_message or "")
+
+        # 4. Explicit legacy flag restores ADMIN fallback for backward compatibility
+        legacy_settings = admin_only_settings.model_copy(update={"legacy_editorial_fallback": True})
+        self.assertEqual(len(legacy_settings.get_editorial_recipients()), 1)
+        self.assertEqual(legacy_settings.get_editorial_recipients()[0]["role"], "ADMIN")
+
+    def test_13_missing_ledger_fails_closed_in_live_mode(self) -> None:
+        """Missing delivery ledger must fail closed with MISSING_LEDGER in live mode, allowed in dry-run."""
+        missing_ledger_path = Path(self.temp_dir.name) / "non_existent_ledger_file.json"
+        self.assertFalse(missing_ledger_path.exists())
+
+        assessments = build_final_three_assessments()
+
+        # 1. Dry run allows empty ledger
+        dry_res = deliver_one_shot_editorial_digest(
+            settings=self.settings,
+            assessments=assessments,
+            dry_run=True,
+            ledger_path=missing_ledger_path,
+            target_recipient_role="PRIMARY_EDITOR",
+        )
+        self.assertEqual(dry_res["status"], "SAFE_PREVIEW_PASSED")
+        self.assertFalse(dry_res["attempt_made"])
+
+        # 2. Live mode (dry_run=False, delivery enabled) fails closed with MISSING_LEDGER
+        live_settings = self.settings.model_copy(update={"telegram_delivery_enabled": True})
+        live_res = deliver_one_shot_editorial_digest(
+            settings=live_settings,
+            assessments=assessments,
+            dry_run=False,
+            ledger_path=missing_ledger_path,
+            target_recipient_role="PRIMARY_EDITOR",
+        )
+        self.assertEqual(live_res["status"], "MISSING_LEDGER")
+        self.assertFalse(live_res["attempt_made"])
+        self.assertEqual(live_res["attempts_count"], 0)
+        self.assertIn("does not exist", live_res["error"])
 
 
 if __name__ == "__main__":

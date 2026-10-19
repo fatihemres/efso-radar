@@ -71,6 +71,7 @@ class TestPhase4ATelegramPilot(unittest.TestCase):
             telegram_delivery_enabled=True,
             telegram_max_retries=3,
             telegram_retry_backoff_base=0.0,  # Fast tests without sleeping
+            legacy_editorial_fallback=True,
             min_score=75,
             breaking_alert_min_score=90,
         )

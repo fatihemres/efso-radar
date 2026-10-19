@@ -144,15 +144,6 @@ class TelegramNotificationChannel(NotificationChannel):
         """Send or preview an editorial assessment in the private owner chat."""
         current_now = now or utc_now()
         derived_category = category or derive_telegram_category(assessment)
-        if target_chat_id:
-            chat_id = str(target_chat_id).strip()
-        else:
-            recipients = self.settings.get_recipients_for_category(derived_category)
-            if recipients:
-                chat_id = recipients[0]["chat_id"]
-            else:
-                chat_id = (self.settings.telegram_primary_editor_chat_id or self.settings.telegram_chat_id).strip()
-
         # 1. Format message according to its logical category
         if derived_category == TelegramNotificationCategory.SENSITIVE_EDITORIAL_REVIEW:
             message_text = format_telegram_sensitive_review(assessment)
@@ -205,6 +196,34 @@ class TelegramNotificationChannel(NotificationChannel):
                     score=assessment.score,
                     category=derived_category,
                 )
+
+        # 3. Resolve recipient and enforce fail-closed editorial routing
+        if target_chat_id:
+            chat_id = str(target_chat_id).strip()
+        else:
+            recipients = self.settings.get_recipients_for_category(derived_category)
+            if recipients:
+                chat_id = recipients[0]["chat_id"]
+            elif self.settings.telegram_chat_id or self.settings.telegram_primary_editor_chat_id or self.settings.telegram_delivery_enabled:
+                cat_name = derived_category.value if hasattr(derived_category, "value") else str(derived_category)
+                err_msg = f"No authorized recipient configured or allowlisted for category '{cat_name}'. Routing failed closed."
+                logger.error("%s", err_msg)
+                return NotificationRecord(
+                    notification_id=notification_id,
+                    story_id=story_id,
+                    update_id=update_id,
+                    kind=assessment.kind,
+                    channel=channel_name,
+                    sent_at=current_now,
+                    status=DeliveryStatus.FAILED,
+                    message_text=message_text,
+                    headline_tr=assessment.headline_tr,
+                    score=assessment.score,
+                    error_message=err_msg,
+                    category=derived_category,
+                )
+            else:
+                chat_id = ""
 
         # 3. Safe Delivery Control: Dry-run or delivery disabled by default
         is_live_enabled = (
@@ -284,8 +303,26 @@ class TelegramNotificationChannel(NotificationChannel):
             recipients = self.settings.get_recipients_for_category(TelegramNotificationCategory.EDITORIAL_DIGEST)
             if recipients:
                 chat_id = recipients[0]["chat_id"]
+            elif self.settings.telegram_chat_id or self.settings.telegram_primary_editor_chat_id or self.settings.telegram_delivery_enabled:
+                err_msg = "No authorized recipient configured or allowlisted for category 'EDITORIAL_DIGEST'. Routing failed closed."
+                logger.error("%s", err_msg)
+                story_id = assessments[0].parent_story_id or assessments[0].article_ids[0][:8] if assessments else "DIGEST"
+                return NotificationRecord(
+                    notification_id=notification_id,
+                    story_id=story_id,
+                    update_id=None,
+                    kind=EditorialKind.NEW,
+                    channel="TELEGRAM_DIGEST",
+                    sent_at=current_now,
+                    status=DeliveryStatus.FAILED,
+                    message_text="",
+                    headline_tr=f"Editoryal Özet ({len(assessments)} Haber)",
+                    score=85,
+                    error_message=err_msg,
+                    category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                )
             else:
-                chat_id = (self.settings.telegram_primary_editor_chat_id or self.settings.telegram_chat_id).strip()
+                chat_id = ""
         digest_text = format_telegram_digest(assessments, window_label=window_label)
         story_id = assessments[0].parent_story_id or assessments[0].article_ids[0][:8] if assessments else "DIGEST"
 
@@ -954,9 +991,10 @@ def deliver_one_shot_editorial_digest(
                 "masked_token": token_masked,
             }
         if not settings.is_chat_id_allowed(t_chat):
+            masked_allowlist = [settings.get_masked_chat_id(cid) for cid in settings.telegram_allowed_chat_ids]
             return {
                 "status": "UNAUTHORIZED_RECIPIENT",
-                "error": f"Recipient chat_id '{t_masked}' is not in configured allowlist: {settings.telegram_allowed_chat_ids}",
+                "error": f"Recipient chat_id '{t_masked}' is not in configured allowlist: {masked_allowlist}",
                 "attempt_made": False,
                 "masked_chat_id": t_masked,
                 "masked_token": token_masked,
@@ -988,11 +1026,13 @@ def deliver_one_shot_editorial_digest(
                 "masked_token": token_masked,
             }
         if not settings.is_chat_id_allowed(admin_chat):
+            admin_masked = settings.get_masked_chat_id(admin_chat)
+            masked_allowlist = [settings.get_masked_chat_id(cid) for cid in settings.telegram_allowed_chat_ids]
             return {
                 "status": "UNAUTHORIZED_RECIPIENT",
-                "error": f"Recipient chat_id '{settings.get_masked_chat_id(admin_chat)}' is not in configured allowlist: {settings.telegram_allowed_chat_ids}",
+                "error": f"Recipient chat_id '{admin_masked}' is not in configured allowlist: {masked_allowlist}",
                 "attempt_made": False,
-                "masked_chat_id": settings.get_masked_chat_id(admin_chat),
+                "masked_chat_id": admin_masked,
                 "masked_token": token_masked,
             }
 
@@ -1055,10 +1095,23 @@ def deliver_one_shot_editorial_digest(
     stable_digest_id = ("ux_test_" if is_ux_test else "") + compute_stable_digest_identity(assessments)
     candidate_article_ids = sorted(set(aid for a in assessments for aid in a.article_ids if aid))
 
-    # Gate 6: Load ledger data (fail closed on corrupted or invalid ledger)
+    # Gate 6: Load ledger data (fail closed on missing ledger in live mode, or corrupted/invalid ledger)
     ledger_file = Path(ledger_path)
     ledger_data: dict[str, Any] = {}
-    if ledger_file.exists():
+    is_live_dispatch = (not dry_run) and settings.telegram_delivery_enabled
+
+    if not ledger_file.exists():
+        if is_live_dispatch:
+            return {
+                "status": "MISSING_LEDGER",
+                "error": f"Delivery ledger file does not exist at '{ledger_path}'. In live dispatch mode (dry_run=False and delivery enabled), an initialized persistent ledger is strictly required to prevent duplicate deliveries. Failing closed with zero network attempts.",
+                "attempt_made": False,
+                "attempts_count": 0,
+                "masked_chat_id": target_recipients[0]["masked_chat_id"] if target_recipients else "<NOT_SET>",
+                "masked_token": token_masked,
+            }
+        ledger_data = {"deliveries": {}}
+    else:
         try:
             with open(ledger_file, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
@@ -1199,6 +1252,14 @@ def deliver_one_shot_editorial_digest(
 
     recipient_results: dict[str, dict[str, Any]] = {}
 
+    def _record_public_result(role_key: str, masked_key: str, res: dict[str, Any]) -> None:
+        # Guarantee raw chat ID is completely removed from public-facing results
+        res.pop("chat_id", None)
+        res["masked_chat_id"] = masked_key
+        res["recipient_role"] = role_key
+        recipient_results[role_key] = res
+        recipient_results[masked_key] = res
+
     for rec_target in target_recipients:
         r_chat = rec_target["chat_id"]
         r_role = rec_target["role"]
@@ -1211,7 +1272,7 @@ def deliver_one_shot_editorial_digest(
             rec_status = existing_record.get("status")
             rec_label = "UX test message" if is_ux_test else "digest"
             if rec_status == "DELIVERY_SUCCESS":
-                recipient_results[r_chat] = {
+                _record_public_result(r_role, r_masked, {
                     "status": "DUPLICATE_DELIVERY_PREVENTED",
                     "error": f"Duplicate delivery prevented: This exact {rec_label} was already delivered to {r_role} on {existing_record.get('delivered_at_tsi') or existing_record.get('delivered_at_utc')}.",
                     "digest_hash": digest_hash,
@@ -1220,14 +1281,11 @@ def deliver_one_shot_editorial_digest(
                     "attempt_made": False,
                     "attempts_count": 0,
                     "message_id": existing_record.get("message_id"),
-                    "masked_chat_id": r_masked,
-                    "chat_id": r_chat,
-                    "recipient_role": r_role,
                     "is_ux_test": is_ux_test,
-                }
+                })
                 continue
             elif rec_status == "DELIVERY_UNCERTAIN":
-                recipient_results[r_chat] = {
+                _record_public_result(r_role, r_masked, {
                     "status": "DUPLICATE_DELIVERY_PREVENTED",
                     "error": f"Duplicate delivery prevented: A prior attempt for {r_role} resulted in an ambiguous timeout on {existing_record.get('delivered_at_utc')}. Automatic resend is blocked.",
                     "digest_hash": digest_hash,
@@ -1235,16 +1293,13 @@ def deliver_one_shot_editorial_digest(
                     "stories_count": len(assessments),
                     "attempt_made": False,
                     "attempts_count": 0,
-                    "masked_chat_id": r_masked,
-                    "chat_id": r_chat,
-                    "recipient_role": r_role,
                     "is_ux_test": is_ux_test,
-                }
+                })
                 continue
 
         # Dry run / delivery disabled check
         if dry_run or not settings.telegram_delivery_enabled:
-            recipient_results[r_chat] = {
+            _record_public_result(r_role, r_masked, {
                 "status": "SAFE_PREVIEW_PASSED",
                 "message": (
                     f"Pre-flight audit PASSED for {r_role} ({r_masked}) for {'UX TEST' if is_ux_test else 'EDITORIAL_DIGEST'}. "
@@ -1256,11 +1311,8 @@ def deliver_one_shot_editorial_digest(
                 "stable_digest_id": stable_digest_id,
                 "stories_count": len(assessments),
                 "rendered_html": rendered_html,
-                "masked_chat_id": r_masked,
-                "chat_id": r_chat,
-                "recipient_role": r_role,
                 "is_ux_test": is_ux_test,
-            }
+            })
             continue
 
         # Single-Shot Live Dispatch (EXACTLY ONE ATTEMPT, ZERO RETRIES)
@@ -1280,7 +1332,7 @@ def deliver_one_shot_editorial_digest(
                 if resp_json.get("ok"):
                     msg_id = resp_json.get("result", {}).get("message_id")
                     _save_delivery_record(r_chat, r_role, r_masked, "DELIVERY_SUCCESS", msg_id=msg_id)
-                    recipient_results[r_chat] = {
+                    _record_public_result(r_role, r_masked, {
                         "status": "DELIVERY_SUCCESS",
                         "message": f"Telegram editorial digest successfully delivered to {r_role} (message_id: {msg_id}).",
                         "message_id": msg_id,
@@ -1289,23 +1341,17 @@ def deliver_one_shot_editorial_digest(
                         "stories_count": len(assessments),
                         "attempt_made": True,
                         "attempts_count": 1,
-                        "masked_chat_id": r_masked,
-                        "chat_id": r_chat,
-                        "recipient_role": r_role,
-                    }
+                    })
                 else:
                     err_msg = sanitize_telegram_text(f"Telegram API response not ok: {resp_json}", settings.telegram_bot_token)
                     _save_delivery_record(r_chat, r_role, r_masked, "DELIVERY_FAILED", err_desc=err_msg)
-                    recipient_results[r_chat] = {
+                    _record_public_result(r_role, r_masked, {
                         "status": "DELIVERY_FAILED",
                         "error": err_msg,
                         "digest_hash": digest_hash,
                         "attempt_made": True,
                         "attempts_count": 1,
-                        "masked_chat_id": r_masked,
-                        "chat_id": r_chat,
-                        "recipient_role": r_role,
-                    }
+                    })
             elif resp.status_code == 400:
                 desc = ""
                 try:
@@ -1314,16 +1360,13 @@ def deliver_one_shot_editorial_digest(
                     desc = resp.text[:200]
                 err_msg = sanitize_telegram_text(f"Telegram request validation error (HTTP 400): {desc}", settings.telegram_bot_token)
                 _save_delivery_record(r_chat, r_role, r_masked, "VALIDATION_ERROR", err_desc=err_msg)
-                recipient_results[r_chat] = {
+                _record_public_result(r_role, r_masked, {
                     "status": "VALIDATION_ERROR",
                     "error": err_msg,
                     "digest_hash": digest_hash,
                     "attempt_made": True,
                     "attempts_count": 1,
-                    "masked_chat_id": r_masked,
-                    "chat_id": r_chat,
-                    "recipient_role": r_role,
-                }
+                })
             elif resp.status_code == 403:
                 desc = ""
                 try:
@@ -1332,107 +1375,83 @@ def deliver_one_shot_editorial_digest(
                     desc = resp.text[:200]
                 err_msg = sanitize_telegram_text(f"Telegram access failure (HTTP 403): {desc}", settings.telegram_bot_token)
                 _save_delivery_record(r_chat, r_role, r_masked, "ACCESS_DENIED", err_desc=err_msg)
-                recipient_results[r_chat] = {
+                _record_public_result(r_role, r_masked, {
                     "status": "ACCESS_DENIED",
                     "error": err_msg,
                     "digest_hash": digest_hash,
                     "attempt_made": True,
                     "attempts_count": 1,
-                    "masked_chat_id": r_masked,
-                    "chat_id": r_chat,
-                    "recipient_role": r_role,
-                }
+                })
             elif resp.status_code == 429:
                 err_msg = "Telegram rate limit (HTTP 429). Exactly one attempt allowed; no retries."
                 _save_delivery_record(r_chat, r_role, r_masked, "RATE_LIMITED", err_desc=err_msg)
-                recipient_results[r_chat] = {
+                _record_public_result(r_role, r_masked, {
                     "status": "RATE_LIMITED",
                     "error": err_msg,
                     "digest_hash": digest_hash,
                     "attempt_made": True,
                     "attempts_count": 1,
-                    "masked_chat_id": r_masked,
-                    "chat_id": r_chat,
-                    "recipient_role": r_role,
-                }
+                })
             elif resp.status_code >= 500:
                 err_msg = sanitize_telegram_text(f"Telegram server error (HTTP {resp.status_code}): {resp.text[:200]}", settings.telegram_bot_token)
                 if resp.status_code == 504:
                     _save_delivery_record(r_chat, r_role, r_masked, "DELIVERY_UNCERTAIN", err_desc=err_msg)
-                    recipient_results[r_chat] = {
+                    _record_public_result(r_role, r_masked, {
                         "status": "DELIVERY_UNCERTAIN",
                         "error": f"Ambiguous gateway timeout (HTTP 504): {err_msg}. Message may have been accepted; automatic retry skipped.",
                         "digest_hash": digest_hash,
                         "attempt_made": True,
                         "attempts_count": 1,
-                        "masked_chat_id": r_masked,
-                        "chat_id": r_chat,
-                        "recipient_role": r_role,
-                    }
+                    })
                 else:
                     _save_delivery_record(r_chat, r_role, r_masked, "SERVER_ERROR", err_desc=err_msg)
-                    recipient_results[r_chat] = {
+                    _record_public_result(r_role, r_masked, {
                         "status": "SERVER_ERROR",
                         "error": err_msg,
                         "digest_hash": digest_hash,
                         "attempt_made": True,
                         "attempts_count": 1,
-                        "masked_chat_id": r_masked,
-                        "chat_id": r_chat,
-                        "recipient_role": r_role,
-                    }
+                    })
             else:
                 err_msg = sanitize_telegram_text(f"Unexpected HTTP status {resp.status_code}: {resp.text[:200]}", settings.telegram_bot_token)
                 _save_delivery_record(r_chat, r_role, r_masked, "DELIVERY_FAILED", err_desc=err_msg)
-                recipient_results[r_chat] = {
+                _record_public_result(r_role, r_masked, {
                     "status": "DELIVERY_FAILED",
                     "error": err_msg,
                     "digest_hash": digest_hash,
                     "attempt_made": True,
                     "attempts_count": 1,
-                    "masked_chat_id": r_masked,
-                    "chat_id": r_chat,
-                    "recipient_role": r_role,
-                }
+                })
         except httpx.TimeoutException as exc:
             sanitized_exc = sanitize_telegram_text(str(exc), settings.telegram_bot_token)
             _save_delivery_record(r_chat, r_role, r_masked, "DELIVERY_UNCERTAIN", err_desc=sanitized_exc)
-            recipient_results[r_chat] = {
+            _record_public_result(r_role, r_masked, {
                 "status": "DELIVERY_UNCERTAIN",
                 "error": f"Ambiguous timeout during digest delivery for {r_role}: {sanitized_exc}. Message may have been accepted; automatic retry skipped to prevent duplicates.",
                 "digest_hash": digest_hash,
                 "attempt_made": True,
                 "attempts_count": 1,
-                "masked_chat_id": r_masked,
-                "chat_id": r_chat,
-                "recipient_role": r_role,
-            }
+            })
         except httpx.TransportError as exc:
             sanitized_exc = sanitize_telegram_text(str(exc), settings.telegram_bot_token)
             _save_delivery_record(r_chat, r_role, r_masked, "NETWORK_ERROR", err_desc=sanitized_exc)
-            recipient_results[r_chat] = {
+            _record_public_result(r_role, r_masked, {
                 "status": "NETWORK_ERROR",
                 "error": f"Network transport error for {r_role}: {sanitized_exc}",
                 "digest_hash": digest_hash,
                 "attempt_made": True,
                 "attempts_count": 1,
-                "masked_chat_id": r_masked,
-                "chat_id": r_chat,
-                "recipient_role": r_role,
-            }
+            })
         except Exception as exc:
             sanitized_exc = sanitize_telegram_text(str(exc), settings.telegram_bot_token)
             _save_delivery_record(r_chat, r_role, r_masked, "UNEXPECTED_ERROR", err_desc=sanitized_exc)
-            recipient_results[r_chat] = {
+            _record_public_result(r_role, r_masked, {
                 "status": "UNEXPECTED_ERROR",
                 "error": f"Unexpected error during digest delivery for {r_role}: {sanitized_exc}",
                 "digest_hash": digest_hash,
                 "attempt_made": True,
                 "attempts_count": 1,
-                "masked_chat_id": r_masked,
-                "chat_id": r_chat,
-                "recipient_role": r_role,
-            }
+            })
 
     if should_close_client:
         try:
@@ -1440,9 +1459,11 @@ def deliver_one_shot_editorial_digest(
         except Exception:
             pass
 
-    # Synthesize return dictionary
-    if len(target_recipients) == 1:
-        single_res = list(recipient_results.values())[0]
+    # Synthesize return dictionary using unique results per recipient
+    unique_results = [recipient_results[r["role"]] for r in target_recipients if r["role"] in recipient_results]
+
+    if len(target_recipients) == 1 and unique_results:
+        single_res = unique_results[0]
         return {
             "status": single_res["status"],
             "message": single_res.get("message") or (f"Telegram editorial digest successfully delivered (message_id: {single_res.get('message_id')})." if single_res["status"] == "DELIVERY_SUCCESS" else single_res.get("error", "")),
@@ -1461,7 +1482,7 @@ def deliver_one_shot_editorial_digest(
             "recipient_results": recipient_results,
         }
 
-    statuses = [res["status"] for res in recipient_results.values()]
+    statuses = [res["status"] for res in unique_results]
     if all(s == "DELIVERY_SUCCESS" for s in statuses):
         overall_status = "DELIVERY_SUCCESS"
     elif all(s == "SAFE_PREVIEW_PASSED" for s in statuses):
@@ -1478,8 +1499,8 @@ def deliver_one_shot_editorial_digest(
         "message": f"Processed delivery for {len(target_recipients)} recipients.",
         "recipients_count": len(target_recipients),
         "recipient_results": recipient_results,
-        "attempt_made": any(res["attempt_made"] for res in recipient_results.values()),
-        "attempts_count": sum(res["attempts_count"] for res in recipient_results.values()),
+        "attempt_made": any(res["attempt_made"] for res in unique_results),
+        "attempts_count": sum(res["attempts_count"] for res in unique_results),
         "digest_hash": digest_hash,
         "stable_digest_id": stable_digest_id,
         "stories_count": len(assessments),

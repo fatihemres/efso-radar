@@ -24,6 +24,7 @@ class Settings(BaseModel):
     telegram_delivery_enabled: bool = Field(default=False)
     telegram_max_retries: int = Field(default=3, ge=1, le=10)
     telegram_retry_backoff_base: float = Field(default=0.5, ge=0.0, le=10.0)
+    legacy_editorial_fallback: bool = Field(default=False)  # Explicit flag for legacy test fallback to ADMIN; fails closed in prod
     instagram_publishing_enabled: bool = Field(default=False)  # Automated Instagram posting is strictly disabled
 
     # Editorial thresholds
@@ -200,17 +201,21 @@ class Settings(BaseModel):
         """Return authorized recipient records for editorial notifications.
 
         Per updated Product Owner policy:
-        - When PRIMARY_EDITOR is configured, PRIMARY_EDITOR is the sole recipient
+        - When PRIMARY_EDITOR is configured and allowed, PRIMARY_EDITOR is the sole recipient
           for routine editorial notifications (EDITORIAL_DIGEST, VERIFIED_BREAKING,
           SENSITIVE_EDITORIAL_REVIEW, HOLD_FOR_VERIFICATION).
           ADMIN is excluded from routine editorial broadcasts.
-        - In legacy single-recipient environments where PRIMARY_EDITOR is not configured,
-          falls back to ADMIN for backward compatibility with Phase 4 test suites.
+        - Fail-closed security: If PRIMARY_EDITOR is missing, invalid, or not allowlisted,
+          returns an empty list [] so delivery operations fail closed.
+        - Legacy fallback: Only returns ADMIN if self.legacy_editorial_fallback is explicitly True
+          (for Phase 4 single-recipient backward test compatibility).
         """
         editor_recs = [r for r in self.get_authorized_recipients() if r["role"] == "PRIMARY_EDITOR"]
         if editor_recs:
             return editor_recs
-        return [r for r in self.get_authorized_recipients() if r["role"] == "ADMIN"]
+        if self.legacy_editorial_fallback:
+            return [r for r in self.get_authorized_recipients() if r["role"] == "ADMIN"]
+        return []
 
     def get_administrative_recipients(self) -> list[dict[str, str]]:
         """Return authorized recipient records for administrative operational reports.
@@ -270,6 +275,7 @@ class Settings(BaseModel):
             telegram_delivery_enabled=os.getenv("TELEGRAM_DELIVERY_ENABLED", "false").lower() in ("true", "1", "yes"),
             telegram_max_retries=int(os.getenv("TELEGRAM_MAX_RETRIES", "3")),
             telegram_retry_backoff_base=float(os.getenv("TELEGRAM_RETRY_BACKOFF_BASE", "0.5")),
+            legacy_editorial_fallback=os.getenv("LEGACY_EDITORIAL_FALLBACK", "false").lower() in ("true", "1", "yes"),
             instagram_publishing_enabled=os.getenv("INSTAGRAM_PUBLISHING_ENABLED", "false").lower() in ("true", "1", "yes"),
             min_score=int(os.getenv("MIN_SCORE", "82")),
             max_per_run=int(os.getenv("MAX_PER_RUN", "3")),

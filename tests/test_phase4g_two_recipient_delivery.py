@@ -69,6 +69,8 @@ class TestPhase4GTwoRecipientDelivery(unittest.TestCase):
         )
         self.temp_dir = tempfile.TemporaryDirectory()
         self.ledger_path = Path(self.temp_dir.name) / "test_delivery_ledger.json"
+        with open(self.ledger_path, "w", encoding="utf-8") as f:
+            json.dump({"deliveries": {}}, f)
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -200,10 +202,13 @@ class TestPhase4GTwoRecipientDelivery(unittest.TestCase):
         self.assertEqual(result["status"], "DELIVERY_SUCCESS")
         self.assertEqual(result["recipients_count"], 2)
         rec_res = result["recipient_results"]
-        self.assertEqual(rec_res[self.admin_chat_id]["status"], "DELIVERY_SUCCESS")
-        self.assertEqual(rec_res[self.admin_chat_id]["message_id"], 501)
-        self.assertEqual(rec_res[self.editor_chat_id]["status"], "DELIVERY_SUCCESS")
-        self.assertEqual(rec_res[self.editor_chat_id]["message_id"], 502)
+        # Raw chat IDs must not be keys in recipient_results
+        self.assertNotIn(self.admin_chat_id, rec_res)
+        self.assertNotIn(self.editor_chat_id, rec_res)
+        self.assertEqual(rec_res["ADMIN"]["status"], "DELIVERY_SUCCESS")
+        self.assertEqual(rec_res["ADMIN"]["message_id"], 501)
+        self.assertEqual(rec_res["PRIMARY_EDITOR"]["status"], "DELIVERY_SUCCESS")
+        self.assertEqual(rec_res["PRIMARY_EDITOR"]["message_id"], 502)
 
         # Inspect persisted ledger file
         with open(self.ledger_path, "r", encoding="utf-8") as f:
@@ -258,11 +263,13 @@ class TestPhase4GTwoRecipientDelivery(unittest.TestCase):
 
         rec_res = result["recipient_results"]
         # Admin must be blocked
-        self.assertEqual(rec_res[self.admin_chat_id]["status"], "DUPLICATE_DELIVERY_PREVENTED")
-        self.assertEqual(rec_res[self.admin_chat_id]["message_id"], 999)
+        self.assertNotIn(self.admin_chat_id, rec_res)
+        self.assertNotIn(self.editor_chat_id, rec_res)
+        self.assertEqual(rec_res["ADMIN"]["status"], "DUPLICATE_DELIVERY_PREVENTED")
+        self.assertEqual(rec_res["ADMIN"]["message_id"], 999)
 
         # Primary Editor must be eligible and pass preview
-        self.assertEqual(rec_res[self.editor_chat_id]["status"], "SAFE_PREVIEW_PASSED")
+        self.assertEqual(rec_res["PRIMARY_EDITOR"]["status"], "SAFE_PREVIEW_PASSED")
 
     def test_07_partial_delivery_handling(self) -> None:
         """Verify partial delivery where Admin succeeds and Primary Editor fails with HTTP 403."""
@@ -289,9 +296,11 @@ class TestPhase4GTwoRecipientDelivery(unittest.TestCase):
 
         self.assertEqual(result["status"], "PARTIAL_DELIVERY")
         rec_res = result["recipient_results"]
-        self.assertEqual(rec_res[self.admin_chat_id]["status"], "DELIVERY_SUCCESS")
-        self.assertEqual(rec_res[self.admin_chat_id]["message_id"], 777)
-        self.assertEqual(rec_res[self.editor_chat_id]["status"], "ACCESS_DENIED")
+        self.assertNotIn(self.admin_chat_id, rec_res)
+        self.assertNotIn(self.editor_chat_id, rec_res)
+        self.assertEqual(rec_res["ADMIN"]["status"], "DELIVERY_SUCCESS")
+        self.assertEqual(rec_res["ADMIN"]["message_id"], 777)
+        self.assertEqual(rec_res["PRIMARY_EDITOR"]["status"], "ACCESS_DENIED")
 
         # In ledger, Admin is SUCCESS, Editor is ACCESS_DENIED
         with open(self.ledger_path, "r", encoding="utf-8") as f:
