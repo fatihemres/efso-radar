@@ -9,7 +9,7 @@ import os
 from datetime import datetime, time, timezone
 from pathlib import Path
 from typing import Literal
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class Settings(BaseModel):
@@ -94,6 +94,17 @@ class Settings(BaseModel):
         if not (0 <= hour <= 23 and 0 <= minute <= 59):
             raise ValueError("Hour must be 0-23 and minute 0-59")
         return f"{hour:02d}:{minute:02d}"
+
+    @model_validator(mode="after")
+    def validate_turso_configuration(self) -> Settings:
+        has_url = bool(self.turso_database_url and self.turso_database_url.strip())
+        has_token = bool(self.turso_auth_token and self.turso_auth_token.strip())
+        if has_url != has_token:
+            raise ValueError(
+                "Partial Turso configuration detected: both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN "
+                "must be provided together, or neither."
+            )
+        return self
 
     def is_in_quiet_hours(self, current_time: datetime | None = None) -> bool:
         """Check if given UTC datetime falls within configured quiet hours."""

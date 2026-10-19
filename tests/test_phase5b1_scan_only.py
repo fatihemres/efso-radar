@@ -16,6 +16,7 @@ Verifies:
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
 import sqlite3
@@ -24,6 +25,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -35,6 +37,7 @@ from efso_radar.domain import (
     EditorialKind,
     Market,
     NotificationRecord,
+    Story,
     StoryCategory,
     SuggestedFormat,
     VerificationStatus,
@@ -445,6 +448,169 @@ class TestPhase5B1ScanOnlyPipeline(unittest.TestCase):
         )
 
         mem_conn.close()
+
+
+class TestPhase5B1DryRunIsolationRegression(unittest.TestCase):
+    """Hermetic regression suite verifying dry-run persistence isolation and Turso fail-safe behavior."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self.tmp_dir.name)
+        self.now = datetime(2026, 10, 19, 12, 0, tzinfo=timezone.utc)
+        self.mock_articles = [
+            Article.create("Dry Run Test Haber 1", "https://example.com/dry1", "TestNews", self.now),
+            Article.create("Dry Run Test Haber 2", "https://example.com/dry2", "TestNews", self.now),
+        ]
+
+    def tearDown(self):
+        try:
+            self.tmp_dir.cleanup()
+        except Exception:
+            pass
+
+    def _compute_sha256(self, file_path: Path) -> str:
+        h = hashlib.sha256()
+        with file_path.open("rb") as f:
+            while chunk := f.read(65536):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def test_dry_run_leaves_operational_sqlite_byte_identical(self):
+        """Create a populated operational SQLite DB, record SHA-256 and size, run scan-only in dry-run mode, verify byte-identical and zero WAL/SHM."""
+        op_db = self.tmp_path / "operational_radar.db"
+        repo = SqliteStateRepository(op_db)
+        # Populate operational DB with real records
+        pre_art = Article.create("Pre-existing Article", "https://example.com/pre", "PreSource", self.now)
+        repo.mark_articles_processed([pre_art])
+        repo.record_new_story(
+            Story(
+                story_id="STORY-PRE-001",
+                headline_tr="Pre-existing Story",
+                category=StoryCategory.YERLI,
+                first_seen_at=self.now,
+                last_updated_at=self.now,
+                article_ids=[pre_art.id],
+            ),
+            EditorialAssessment(
+                article_ids=[pre_art.id],
+                score=85,
+                kind=EditorialKind.NEW,
+                headline_tr="Pre-existing Story",
+                cover_title_tr="PRE COVER",
+                caption_idea_tr="Pre caption",
+                why_efso_tr="Pre why",
+                suggested_format=SuggestedFormat.POST,
+                category=StoryCategory.YERLI,
+            ),
+        )
+
+        wal_file = op_db.with_name(op_db.name + "-wal")
+        shm_file = op_db.with_name(op_db.name + "-shm")
+        self.assertFalse(wal_file.exists(), "WAL file existed before dry-run")
+        self.assertFalse(shm_file.exists(), "SHM file existed before dry-run")
+
+        # Confirm initial state
+        initial_hash = self._compute_sha256(op_db)
+        initial_size = op_db.stat().st_size
+        self.assertGreater(initial_size, 0)
+
+        # Run scan-only in dry-run mode with mocked source to prevent external network calls
+        settings = Settings(sqlite_db_path=op_db)
+        with patch("efso_radar.sources.multi_source.MultiSourceDiscoveryEngine.fetch_candidates", return_value=(self.mock_articles, 2)):
+            with self.assertLogs("efso-radar", level="INFO") as log_capture:
+                radar.run(dry_run=True, scan_only=True, settings=settings)
+
+        # Verify operational DB is byte-for-byte identical
+        final_hash = self._compute_sha256(op_db)
+        final_size = op_db.stat().st_size
+        self.assertEqual(initial_hash, final_hash, "Operational database SHA-256 hash changed during dry-run!")
+        self.assertEqual(initial_size, final_size, "Operational database byte size changed during dry-run!")
+
+        # Verify no WAL or SHM temporary files were created/left behind
+        self.assertFalse(wal_file.exists(), f"WAL file was created during dry-run: {wal_file}")
+        self.assertFalse(shm_file.exists(), f"SHM file was created during dry-run: {shm_file}")
+
+        # Verify dry-run log message
+        log_output = "\n".join(log_capture.output)
+        self.assertIn("[DRY-RUN ISOLATION]", log_output)
+        self.assertIn("Ephemeral database cannot reflect production duplicate history", log_output)
+
+    def test_dry_run_does_not_create_missing_database(self):
+        """Verify dry-run does not create data/radar.db if it didn't exist."""
+        missing_db = self.tmp_path / "nonexistent_folder" / "radar.db"
+        self.assertFalse(missing_db.exists())
+        self.assertFalse(missing_db.parent.exists())
+
+        settings = Settings(sqlite_db_path=missing_db)
+        with patch("efso_radar.sources.multi_source.MultiSourceDiscoveryEngine.fetch_candidates", return_value=(self.mock_articles, 2)):
+            radar.run(dry_run=True, scan_only=True, settings=settings)
+
+        self.assertFalse(missing_db.exists(), "Missing database was created during dry-run!")
+        self.assertFalse(missing_db.parent.exists(), "Missing database directory was created during dry-run!")
+
+    def test_dry_run_never_calls_turso_transport(self):
+        """Verify Turso transport is never called during dry-run even if credentials are set."""
+        mock_transport = MagicMock()
+        settings = Settings(
+            turso_database_url="libsql://test-db.turso.io",
+            turso_auth_token="secret-token-xyz",
+            sqlite_db_path=self.tmp_path / "operational_unused.db",
+        )
+
+        with patch("efso_radar.sources.multi_source.MultiSourceDiscoveryEngine.fetch_candidates", return_value=(self.mock_articles, 2)):
+            with patch("efso_radar.repositories.turso.TursoStateRepository") as mock_turso_repo:
+                radar.run(dry_run=True, scan_only=True, settings=settings)
+
+                # TursoStateRepository MUST NOT be instantiated during dry-run
+                mock_turso_repo.assert_not_called()
+                mock_transport.handle_request.assert_not_called()
+
+    def test_dry_run_does_not_import_legacy_json_state(self):
+        """Ensure legacy state migration is not triggered against operational DB."""
+        legacy_state_file = self.tmp_path / "legacy_state.json"
+        legacy_state_file.write_text(
+            '{"processed": {"legacy_article_123": "2026-10-19T10:00:00Z"}, "sent": []}',
+            encoding="utf-8",
+        )
+        op_db = self.tmp_path / "op_no_legacy.db"
+        op_repo = SqliteStateRepository(op_db)
+        self.assertFalse(op_repo.is_article_processed("legacy_article_123"))
+
+        settings = Settings(
+            sqlite_db_path=op_db,
+            legacy_state_json_path=legacy_state_file,
+        )
+
+        with patch("efso_radar.sources.multi_source.MultiSourceDiscoveryEngine.fetch_candidates", return_value=(self.mock_articles, 2)):
+            radar.run(dry_run=True, scan_only=True, settings=settings)
+
+        # Operational DB must NOT have the legacy state imported
+        self.assertFalse(
+            op_repo.is_article_processed("legacy_article_123"),
+            "Legacy JSON state was migrated into operational database during dry-run!",
+        )
+
+    def test_partial_turso_configuration_fails_safely(self):
+        """Validate partial Turso settings fail cleanly with ValueError."""
+        # 1. URL set, token missing
+        with self.assertRaises(ValueError) as ctx1:
+            Settings(turso_database_url="libsql://test.turso.io", turso_auth_token="")
+        self.assertIn("Partial Turso configuration detected", str(ctx1.exception))
+
+        # 2. Token set, URL missing
+        with self.assertRaises(ValueError) as ctx2:
+            Settings(turso_database_url="", turso_auth_token="some-token")
+        self.assertIn("Partial Turso configuration detected", str(ctx2.exception))
+
+        # 3. Fail fast in radar.run if partial config somehow passed
+        mock_settings = MagicMock()
+        mock_settings.turso_database_url = "libsql://test.turso.io"
+        mock_settings.turso_auth_token = ""
+        mock_settings.sqlite_db_path = self.tmp_path / "dummy.db"
+
+        with self.assertRaises(ValueError) as ctx3:
+            radar.run(dry_run=False, scan_only=True, settings=mock_settings)
+        self.assertIn("Partial Turso configuration detected", str(ctx3.exception))
 
 
 if __name__ == "__main__":
