@@ -199,6 +199,9 @@ class RadarOrchestrator:
                 if res.status != DeliveryStatus.SENT:
                     return 0
             elif self.settings.telegram_bot_token and hasattr(self.notifier, "_dispatch_telegram"):
+                if not self.settings.telegram_delivery_enabled or dry_run:
+                    logger.info("Digest delivery skipped: telegram_delivery_enabled is False or dry_run is True")
+                    return 0
                 target_chat = self.settings.telegram_primary_editor_chat_id or (self.settings.telegram_chat_id if dry_run else "")
                 if not target_chat:
                     logger.error("No PRIMARY_EDITOR chat ID configured for editorial digest dispatch")

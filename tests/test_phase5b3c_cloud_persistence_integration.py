@@ -1702,5 +1702,286 @@ class TestPhase5B3CCloudPersistenceIntegration(unittest.TestCase):
             body = json.loads(req.content.decode("utf-8"))
             self.assertEqual(body.get("chat_id"), editor_chat)
 
+
+    # --- Tests 25 - 31: Low-Level Dispatch Safety Gates & Operational Telemetry ---
+
+    def test_25_delivery_disabled_direct_dispatch_telegram_makes_zero_http_calls(self):
+        """Verify direct _dispatch_telegram() call when telegram_delivery_enabled is False makes zero HTTP calls and fails closed."""
+        disabled_settings = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": False,
+            "telegram_bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+        })
+
+        http_requests = []
+        def recording_transport(request: httpx.Request) -> httpx.Response:
+            http_requests.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 99999}})
+
+        transport = httpx.MockTransport(recording_transport)
+        channel = TelegramNotificationChannel(settings=disabled_settings, transport=transport)
+
+        rec = channel._dispatch_telegram(
+            notification_id="DIRECT-DIS-01",
+            story_id="STORY-DIS-01",
+            update_id=None,
+            assessment=None,
+            message_text="Test direct dispatch with delivery disabled",
+            now=utc_now(),
+            target_chat_id=self.test_settings.telegram_primary_editor_chat_id,
+            category=TelegramNotificationCategory.VERIFIED_BREAKING,
+            channel_name="TELEGRAM",
+        )
+
+        self.assertEqual(rec.status, DeliveryStatus.FAILED)
+        self.assertIn("Delivery disabled: TELEGRAM_DELIVERY_ENABLED is False", rec.error_message or "")
+        self.assertFalse(rec.status == DeliveryStatus.SENT)
+        self.assertEqual(len(http_requests), 0)
+
+    def test_26_delivery_disabled_orchestrator_fallback_makes_zero_http_calls(self):
+        """Verify orchestrator fallback when telegram_delivery_enabled is False makes zero HTTP calls."""
+        disabled_settings = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": False,
+            "telegram_bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+        })
+
+        http_requests = []
+        def recording_transport(request: httpx.Request) -> httpx.Response:
+            http_requests.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 99999}})
+
+        transport = httpx.MockTransport(recording_transport)
+        channel = TelegramNotificationChannel(settings=disabled_settings, transport=transport)
+        repo = self._create_turso_repo()
+
+        # Orchestrator with notifier
+        from unittest.mock import MagicMock
+        orchestrator = RadarOrchestrator(
+            settings=disabled_settings,
+            repository=repo,
+            source=MagicMock(),
+            ai_engine=MagicMock(),
+            notifier=channel,
+        )
+
+        # 1. flush_due_digest() with delivery disabled
+        res_flush = orchestrator.flush_due_digest(now=utc_now(), dry_run=False)
+        self.assertEqual(res_flush, 0)
+        self.assertEqual(len(http_requests), 0)
+
+    def test_27_operational_report_addressed_to_primary_editor_rejected(self):
+        """Verify OPERATIONAL_HEALTH_REPORT addressed to PRIMARY_EDITOR is rejected across send() and direct dispatch."""
+        live_settings = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": True,
+            "telegram_bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+        })
+        editor_chat = self.test_settings.telegram_primary_editor_chat_id
+
+        http_requests = []
+        def recording_transport(request: httpx.Request) -> httpx.Response:
+            http_requests.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 99999}})
+
+        transport = httpx.MockTransport(recording_transport)
+        channel = TelegramNotificationChannel(settings=live_settings, transport=transport)
+
+        # Path A: channel.send()
+        rec_send = channel.send(
+            assessment=None,
+            story_id="SYS-OP-01",
+            category=TelegramNotificationCategory.OPERATIONAL_HEALTH_REPORT,
+            target_chat_id=editor_chat,
+            dry_run=False,
+            custom_message="Operational Health Status: OK",
+        )
+        self.assertEqual(rec_send.status, DeliveryStatus.FAILED)
+        self.assertIn("Recipient separation violation: OPERATIONAL_HEALTH_REPORT is strictly restricted to ADMIN", rec_send.error_message or "")
+
+        # Path B: channel._dispatch_telegram()
+        rec_direct = channel._dispatch_telegram(
+            notification_id="NOTIF-OP-01",
+            story_id="SYS-OP-01",
+            update_id=None,
+            assessment=None,
+            message_text="Operational Health Status: OK",
+            now=utc_now(),
+            target_chat_id=editor_chat,
+            category=TelegramNotificationCategory.OPERATIONAL_HEALTH_REPORT,
+            channel_name="TELEGRAM_OPS",
+        )
+        self.assertEqual(rec_direct.status, DeliveryStatus.FAILED)
+        self.assertIn("Recipient separation violation: OPERATIONAL_HEALTH_REPORT is strictly restricted to ADMIN", rec_direct.error_message or "")
+
+        self.assertEqual(len(http_requests), 0)
+
+    def test_28_operational_report_addressed_to_authorized_recipient_rejected(self):
+        """Verify OPERATIONAL_HEALTH_REPORT addressed to AUTHORIZED_RECIPIENT is rejected across send() and direct dispatch."""
+        auth_recip_chat_id = "555555555"
+        live_settings = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": True,
+            "telegram_bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            "telegram_allowed_chat_ids": [
+                self.test_settings.telegram_chat_id,
+                self.test_settings.telegram_primary_editor_chat_id,
+                auth_recip_chat_id,
+            ],
+        })
+        self.assertEqual(live_settings.get_recipient_role(auth_recip_chat_id), "AUTHORIZED_RECIPIENT")
+
+        http_requests = []
+        def recording_transport(request: httpx.Request) -> httpx.Response:
+            http_requests.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 99999}})
+
+        transport = httpx.MockTransport(recording_transport)
+        channel = TelegramNotificationChannel(settings=live_settings, transport=transport)
+
+        # Path A: channel.send()
+        rec_send = channel.send(
+            assessment=None,
+            story_id="SYS-OP-02",
+            category=TelegramNotificationCategory.OPERATIONAL_HEALTH_REPORT,
+            target_chat_id=auth_recip_chat_id,
+            dry_run=False,
+            custom_message="Operational Health Status: OK",
+        )
+        self.assertEqual(rec_send.status, DeliveryStatus.FAILED)
+        self.assertIn("Recipient separation violation: OPERATIONAL_HEALTH_REPORT is strictly restricted to ADMIN", rec_send.error_message or "")
+
+        # Path B: channel._dispatch_telegram()
+        rec_direct = channel._dispatch_telegram(
+            notification_id="NOTIF-OP-02",
+            story_id="SYS-OP-02",
+            update_id=None,
+            assessment=None,
+            message_text="Operational Health Status: OK",
+            now=utc_now(),
+            target_chat_id=auth_recip_chat_id,
+            category=TelegramNotificationCategory.OPERATIONAL_HEALTH_REPORT,
+            channel_name="TELEGRAM_OPS",
+        )
+        self.assertEqual(rec_direct.status, DeliveryStatus.FAILED)
+        self.assertIn("Recipient separation violation: OPERATIONAL_HEALTH_REPORT is strictly restricted to ADMIN", rec_direct.error_message or "")
+
+        self.assertEqual(len(http_requests), 0)
+
+    def test_29_direct_dispatch_to_unallowlisted_chat_id_rejected(self):
+        """Verify direct _dispatch_telegram() call targeting an unallowlisted chat ID fails closed without HTTP requests."""
+        live_settings = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": True,
+            "telegram_bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+        })
+
+        http_requests = []
+        def recording_transport(request: httpx.Request) -> httpx.Response:
+            http_requests.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 99999}})
+
+        transport = httpx.MockTransport(recording_transport)
+        channel = TelegramNotificationChannel(settings=live_settings, transport=transport)
+
+        rec = channel._dispatch_telegram(
+            notification_id="NOTIF-UNAUTH-01",
+            story_id="SYS-01",
+            update_id=None,
+            assessment=None,
+            message_text="Test unallowlisted dispatch",
+            now=utc_now(),
+            target_chat_id="999888777_not_in_allowlist",
+            category=TelegramNotificationCategory.VERIFIED_BREAKING,
+            channel_name="TELEGRAM",
+        )
+
+        self.assertEqual(rec.status, DeliveryStatus.FAILED)
+        self.assertIn("Unauthorized recipient", rec.error_message or "")
+        self.assertEqual(len(http_requests), 0)
+
+    def test_30_valid_admin_operational_report_permitted_in_synthetic_live_simulation(self):
+        """Verify valid ADMIN operational report succeeds across send() and direct dispatch in synthetic live mode."""
+        live_settings = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": True,
+            "telegram_bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+        })
+        admin_chat = self.test_settings.telegram_chat_id
+        repo = self._create_turso_repo()
+
+        http_requests = []
+        def recording_transport(request: httpx.Request) -> httpx.Response:
+            http_requests.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 44444}})
+
+        transport = httpx.MockTransport(recording_transport)
+        channel = TelegramNotificationChannel(settings=live_settings, transport=transport, repository=repo)
+
+        # 1. Via channel.send()
+        rec_send = channel.send(
+            assessment=None,
+            story_id="SYS-ADMIN-OK-01",
+            category=TelegramNotificationCategory.OPERATIONAL_HEALTH_REPORT,
+            target_chat_id=admin_chat,
+            dry_run=False,
+            custom_message="<b>Efso Radar Operational Health: ALL GREEN</b>",
+        )
+        self.assertEqual(rec_send.status, DeliveryStatus.SENT)
+
+        # 2. Via direct channel._dispatch_telegram()
+        rec_direct = channel._dispatch_telegram(
+            notification_id="NOTIF-ADMIN-OK-02",
+            story_id="SYS-ADMIN-OK-02",
+            update_id=None,
+            assessment=None,
+            message_text="<b>Efso Radar Operational Health: ALL GREEN</b>",
+            now=utc_now(),
+            target_chat_id=admin_chat,
+            category=TelegramNotificationCategory.OPERATIONAL_HEALTH_REPORT,
+            channel_name="TELEGRAM_OPS",
+        )
+        self.assertEqual(rec_direct.status, DeliveryStatus.SENT)
+
+        self.assertEqual(len(http_requests), 2)
+        for req in http_requests:
+            body = json.loads(req.content.decode("utf-8"))
+            self.assertEqual(body.get("chat_id"), admin_chat)
+
+    def test_31_valid_primary_editor_editorial_delivery_remains_intact(self):
+        """Verify valid PRIMARY_EDITOR editorial delivery remains fully intact."""
+        live_settings = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": True,
+            "telegram_bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+        })
+        editor_chat = self.test_settings.telegram_primary_editor_chat_id
+        repo = self._create_turso_repo()
+
+        http_requests = []
+        def recording_transport(request: httpx.Request) -> httpx.Response:
+            http_requests.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 33333}})
+
+        transport = httpx.MockTransport(recording_transport)
+        channel = TelegramNotificationChannel(settings=live_settings, transport=transport, repository=repo)
+
+        assessment = EditorialAssessment(
+            headline_tr="Baş Editör Flaş Haber",
+            why_efso_tr="Test",
+            suggested_format=SuggestedFormat.POST,
+            category=StoryCategory.VIRAL,
+            disposition=EditorialDisposition.DIGEST,
+            verification_status=VerificationStatus.OFFICIAL_CONFIRMATION,
+            confidence_score=0.98,
+            kind=EditorialKind.NEW,
+            score=95,
+            article_ids=["pe_flash_001"],
+        )
+
+        rec = channel.send(
+            assessment=assessment,
+            story_id="STORY-PE-FLASH-01",
+            category=TelegramNotificationCategory.VERIFIED_BREAKING,
+            dry_run=False,
+        )
+        self.assertEqual(rec.status, DeliveryStatus.SENT)
+        self.assertEqual(len(http_requests), 1)
+        body = json.loads(http_requests[0].content.decode("utf-8"))
+        self.assertEqual(body.get("chat_id"), editor_chat)
+
 if __name__ == "__main__":
     unittest.main()

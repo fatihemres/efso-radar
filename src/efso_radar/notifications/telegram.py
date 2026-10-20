@@ -137,34 +137,42 @@ class TelegramNotificationChannel(NotificationChannel):
 
     def send(
         self,
-        assessment: EditorialAssessment,
-        story_id: str,
+        assessment: Optional[EditorialAssessment] = None,
+        story_id: str = "SYSTEM",
         update_id: Optional[str] = None,
         category: Optional[TelegramNotificationCategory] = None,
         dry_run: bool = False,
         now: Optional[datetime] = None,
         target_chat_id: Optional[str] = None,
         notification_id: Optional[str] = None,
+        custom_message: Optional[str] = None,
     ) -> NotificationRecord:
-        """Send or preview an editorial assessment in the private owner chat."""
+        """Send or preview an editorial assessment or operational report in the private owner chat."""
         current_now = now or utc_now()
-        derived_category = category or derive_telegram_category(assessment)
+        derived_category = category or (derive_telegram_category(assessment) if assessment else TelegramNotificationCategory.OPERATIONAL_HEALTH_REPORT)
         # 1. Format message according to its logical category
         if derived_category == TelegramNotificationCategory.SENSITIVE_EDITORIAL_REVIEW:
-            message_text = format_telegram_sensitive_review(assessment)
+            message_text = format_telegram_sensitive_review(assessment) if assessment else (custom_message or "")
             channel_name = "TELEGRAM_SENSITIVE_REVIEW"
         elif derived_category == TelegramNotificationCategory.HOLD_FOR_VERIFICATION:
-            message_text = format_telegram_verification_hold(assessment)
+            message_text = format_telegram_verification_hold(assessment) if assessment else (custom_message or "")
             channel_name = "TELEGRAM_HOLD_VERIFICATION"
+        elif derived_category == TelegramNotificationCategory.OPERATIONAL_HEALTH_REPORT:
+            message_text = custom_message or (format_telegram_breaking(assessment) if assessment else "<b>Efso Radar Operational Health Report</b>")
+            channel_name = "TELEGRAM_OPS"
         else:
-            message_text = format_telegram_breaking(assessment)
+            message_text = format_telegram_breaking(assessment) if assessment else (custom_message or "")
             channel_name = "TELEGRAM"
+
+        kind = assessment.kind if assessment else EditorialKind.NEW
+        headline_tr = assessment.headline_tr if assessment else "Efso Radar Bildirimi"
+        score = assessment.score if assessment else 100
 
         # Generate stable idempotency key
         prefix = "NOTIF-UPD" if update_id else "NOTIF"
         if not notification_id:
-            art_ids = sorted(assessment.article_ids) if assessment.article_ids else []
-            art_key = ":".join(art_ids) if art_ids else (assessment.headline_tr or "")
+            art_ids = sorted(assessment.article_ids) if (assessment and assessment.article_ids) else []
+            art_key = ":".join(art_ids) if art_ids else ((assessment.headline_tr if assessment else "") or custom_message or "OPS")
             stable_seed = f"{story_id}:{update_id or 'BASE'}:{derived_category.value}:{art_key}"
             stable_hash = hashlib.sha256(stable_seed.encode("utf-8")).hexdigest()[:16]
             notification_id = f"{prefix}-{stable_hash}"
@@ -174,36 +182,36 @@ class TelegramNotificationChannel(NotificationChannel):
             derived_category == TelegramNotificationCategory.VERIFIED_BREAKING
             and self.settings.is_in_quiet_hours(current_now)
         ):
-            if self.settings.quiet_hours_behavior == "ALLOW_BREAKING_95" and assessment.score >= 95:
-                logger.info("Bypassing quiet hours for breaking news with score %d", assessment.score)
+            if self.settings.quiet_hours_behavior == "ALLOW_BREAKING_95" and score >= 95:
+                logger.info("Bypassing quiet hours for breaking news with score %d", score)
             elif self.settings.quiet_hours_behavior == "DISCARD":
-                logger.info("Discarding notification during quiet hours: %s", assessment.headline_tr)
+                logger.info("Discarding notification during quiet hours: %s", headline_tr)
                 return NotificationRecord(
                     notification_id=notification_id,
                     story_id=story_id,
                     update_id=update_id,
-                    kind=assessment.kind,
+                    kind=kind,
                     channel=channel_name,
                     sent_at=current_now,
                     status=DeliveryStatus.SKIPPED_BELOW_THRESHOLD,
                     message_text=message_text,
-                    headline_tr=assessment.headline_tr,
-                    score=assessment.score,
+                    headline_tr=headline_tr,
+                    score=score,
                     category=derived_category,
                 )
             else:  # "HOLD" default
-                logger.info("Holding notification for quiet hours: %s", assessment.headline_tr)
+                logger.info("Holding notification for quiet hours: %s", headline_tr)
                 return NotificationRecord(
                     notification_id=notification_id,
                     story_id=story_id,
                     update_id=update_id,
-                    kind=assessment.kind,
+                    kind=kind,
                     channel=channel_name,
                     sent_at=current_now,
                     status=DeliveryStatus.HELD_QUIET_HOURS,
                     message_text=message_text,
-                    headline_tr=assessment.headline_tr,
-                    score=assessment.score,
+                    headline_tr=headline_tr,
+                    score=score,
                     category=derived_category,
                 )
 
@@ -220,13 +228,13 @@ class TelegramNotificationChannel(NotificationChannel):
                     notification_id=notification_id,
                     story_id=story_id,
                     update_id=update_id,
-                    kind=assessment.kind,
+                    kind=kind,
                     channel=channel_name,
                     sent_at=current_now,
                     status=DeliveryStatus.FAILED,
                     message_text=message_text,
-                    headline_tr=assessment.headline_tr,
-                    score=assessment.score,
+                    headline_tr=headline_tr,
+                    score=score,
                     error_message=err_msg,
                     category=derived_category,
                 )
@@ -234,91 +242,98 @@ class TelegramNotificationChannel(NotificationChannel):
             # PRIMARY_EDITOR: editorial bulletins and verified news.
             # ADMIN: operational health reporting only.
             role = self.settings.get_recipient_role(chat_id)
-            if is_live_delivery and is_editorial:
-                if role != "PRIMARY_EDITOR":
+            if is_editorial:
+                if is_live_delivery:
+                    if role != "PRIMARY_EDITOR":
+                        err_msg = (
+                            f"Recipient separation violation: In live delivery, editorial notification '{derived_category.value}' "
+                            f"is strictly restricted to PRIMARY_EDITOR. Target recipient role '{role}' is rejected."
+                        )
+                        logger.error("%s", err_msg)
+                        return NotificationRecord(
+                            notification_id=notification_id,
+                            story_id=story_id,
+                            update_id=update_id,
+                            kind=kind,
+                            channel=channel_name,
+                            sent_at=current_now,
+                            status=DeliveryStatus.FAILED,
+                            message_text=message_text,
+                            headline_tr=headline_tr,
+                            score=score,
+                            error_message=err_msg,
+                            category=derived_category,
+                        )
+                elif role == "ADMIN":
+                    if not self.settings.legacy_editorial_fallback:
+                        err_msg = (
+                            "Recipient separation violation: ADMIN is restricted to operational health reporting only. "
+                            f"Editorial notification '{derived_category.value}' cannot be sent to ADMIN."
+                        )
+                        logger.error("%s", err_msg)
+                        return NotificationRecord(
+                            notification_id=notification_id,
+                            story_id=story_id,
+                            update_id=update_id,
+                            kind=kind,
+                            channel=channel_name,
+                            sent_at=current_now,
+                            status=DeliveryStatus.FAILED,
+                            message_text=message_text,
+                            headline_tr=headline_tr,
+                            score=score,
+                            error_message=err_msg,
+                            category=derived_category,
+                        )
+                    else:
+                        logger.info("Permitting legacy offline editorial preview for ADMIN (legacy_editorial_fallback=True)")
+            else:
+                # Operational health report: strictly ADMIN only in all live/active modes
+                if role != "ADMIN":
                     err_msg = (
-                        f"Recipient separation violation: In live delivery, editorial notification '{derived_category.value}' "
-                        f"is strictly restricted to PRIMARY_EDITOR. Target recipient role '{role}' is rejected."
+                        "Recipient separation violation: OPERATIONAL_HEALTH_REPORT is strictly restricted to ADMIN. "
+                        f"Target recipient role '{role}' is prohibited."
                     )
                     logger.error("%s", err_msg)
                     return NotificationRecord(
                         notification_id=notification_id,
                         story_id=story_id,
                         update_id=update_id,
-                        kind=assessment.kind,
+                        kind=kind,
                         channel=channel_name,
                         sent_at=current_now,
                         status=DeliveryStatus.FAILED,
                         message_text=message_text,
-                        headline_tr=assessment.headline_tr,
-                        score=assessment.score,
+                        headline_tr=headline_tr,
+                        score=score,
                         error_message=err_msg,
                         category=derived_category,
                     )
-            elif not is_live_delivery and is_editorial and role == "ADMIN":
-                if not self.settings.legacy_editorial_fallback:
-                    err_msg = (
-                        "Recipient separation violation: ADMIN is restricted to operational health reporting only. "
-                        f"Editorial notification '{derived_category.value}' cannot be sent to ADMIN."
-                    )
-                    logger.error("%s", err_msg)
-                    return NotificationRecord(
-                        notification_id=notification_id,
-                        story_id=story_id,
-                        update_id=update_id,
-                        kind=assessment.kind,
-                        channel=channel_name,
-                        sent_at=current_now,
-                        status=DeliveryStatus.FAILED,
-                        message_text=message_text,
-                        headline_tr=assessment.headline_tr,
-                        score=assessment.score,
-                        error_message=err_msg,
-                        category=derived_category,
-                    )
-                else:
-                    logger.info("Permitting legacy offline editorial preview for ADMIN (legacy_editorial_fallback=True)")
-            if not is_editorial and role == "PRIMARY_EDITOR":
-                err_msg = (
-                    "Recipient separation violation: PRIMARY_EDITOR cannot receive operational telemetry. "
-                    f"Operational notification '{derived_category.value}' is restricted to ADMIN."
-                )
-                logger.error("%s", err_msg)
-                return NotificationRecord(
-                    notification_id=notification_id,
-                    story_id=story_id,
-                    update_id=update_id,
-                    kind=assessment.kind,
-                    channel=channel_name,
-                    sent_at=current_now,
-                    status=DeliveryStatus.FAILED,
-                    message_text=message_text,
-                    headline_tr=assessment.headline_tr,
-                    score=assessment.score,
-                    error_message=err_msg,
-                    category=derived_category,
-                )
         else:
             recipients = self.settings.get_recipients_for_category(derived_category)
-            if is_live_delivery and is_editorial:
-                recipients = [r for r in recipients if r.get("role") == "PRIMARY_EDITOR"]
+            if is_live_delivery:
+                if is_editorial:
+                    recipients = [r for r in recipients if r.get("role") == "PRIMARY_EDITOR"]
+                else:
+                    recipients = [r for r in recipients if r.get("role") == "ADMIN"]
             if recipients:
                 chat_id = recipients[0]["chat_id"]
             elif self.settings.telegram_chat_id or self.settings.telegram_primary_editor_chat_id or self.settings.telegram_delivery_enabled:
                 cat_name = derived_category.value if hasattr(derived_category, "value") else str(derived_category)
-                err_msg = f"No authorized PRIMARY_EDITOR recipient configured or allowlisted for category '{cat_name}'. Routing failed closed."
+                expected_role = "PRIMARY_EDITOR" if is_editorial else "ADMIN"
+                err_msg = f"No authorized {expected_role} recipient configured or allowlisted for category '{cat_name}'. Routing failed closed."
                 logger.error("%s", err_msg)
                 return NotificationRecord(
                     notification_id=notification_id,
                     story_id=story_id,
                     update_id=update_id,
-                    kind=assessment.kind,
+                    kind=kind,
                     channel=channel_name,
                     sent_at=current_now,
                     status=DeliveryStatus.FAILED,
                     message_text=message_text,
-                    headline_tr=assessment.headline_tr,
-                    score=assessment.score,
+                    headline_tr=headline_tr,
+                    score=score,
                     error_message=err_msg,
                     category=derived_category,
                 )
@@ -746,17 +761,33 @@ class TelegramNotificationChannel(NotificationChannel):
         is_one_shot = max_attempts == 1
         last_error: Optional[str] = None
         final_status: DeliveryStatus = DeliveryStatus.FAILED
-        recipient_role = self.settings.get_recipient_role(target_chat_id) or "AUTHORIZED_RECIPIENT"
-        is_editorial = category != TelegramNotificationCategory.OPERATIONAL_HEALTH_REPORT
-        is_live_delivery = bool(self.settings.telegram_delivery_enabled)
-        delivery_id = f"DELIV-{notification_id}"
-
-        # 1. Enforce strict recipient separation in live delivery
-        if is_live_delivery and is_editorial and recipient_role != "PRIMARY_EDITOR":
+        # 0. Global Delivery Activation Gate: fail closed if delivery is disabled
+        if not self.settings.telegram_delivery_enabled:
             err_msg = (
-                f"Recipient separation violation: In live delivery, editorial notification '{category.value}' "
-                f"is strictly restricted to PRIMARY_EDITOR. Target recipient role '{recipient_role}' is prohibited."
+                "Delivery disabled: TELEGRAM_DELIVERY_ENABLED is False. "
+                "Failing closed before dispatch without making external network calls."
             )
+            logger.warning("%s", err_msg)
+            return NotificationRecord(
+                notification_id=notification_id,
+                story_id=story_id,
+                update_id=update_id,
+                kind=kind,
+                channel=channel_name,
+                sent_at=now,
+                status=DeliveryStatus.FAILED,
+                message_text=message_text,
+                headline_tr=headline_tr,
+                score=score,
+                error_message=err_msg,
+                category=category,
+            )
+
+        # 1. Privacy & Authentication Gate: Enforce chat ID allowlist on lowest dispatch boundary
+        target_chat = str(target_chat_id).strip()
+        if not target_chat or not self.settings.is_chat_id_allowed(target_chat):
+            masked_id = f"{target_chat[:2]}...{target_chat[-2:]}" if len(target_chat) > 4 else "***"
+            err_msg = f"Unauthorized recipient: target_chat_id '{masked_id}' is not in allowed_chat_ids."
             logger.error("%s", err_msg)
             return NotificationRecord(
                 notification_id=notification_id,
@@ -773,7 +804,57 @@ class TelegramNotificationChannel(NotificationChannel):
                 category=category,
             )
 
-        # 2. Enforce durable StateRepository requirement in cloud storage mode
+        # 2. Category-to-Role Authorization Gate:
+        # OPERATIONAL_HEALTH_REPORT -> strictly ADMIN only
+        # Editorial categories -> strictly PRIMARY_EDITOR only
+        # AUTHORIZED_RECIPIENT, unknown or mismatched roles are rejected
+        recipient_role = self.settings.get_recipient_role(target_chat)
+        if category == TelegramNotificationCategory.OPERATIONAL_HEALTH_REPORT:
+            if recipient_role != "ADMIN":
+                err_msg = (
+                    "Recipient separation violation: OPERATIONAL_HEALTH_REPORT is strictly restricted to ADMIN. "
+                    f"Target recipient role '{recipient_role}' is prohibited."
+                )
+                logger.error("%s", err_msg)
+                return NotificationRecord(
+                    notification_id=notification_id,
+                    story_id=story_id,
+                    update_id=update_id,
+                    kind=kind,
+                    channel=channel_name,
+                    sent_at=now,
+                    status=DeliveryStatus.FAILED,
+                    message_text=message_text,
+                    headline_tr=headline_tr,
+                    score=score,
+                    error_message=err_msg,
+                    category=category,
+                )
+        else:
+            if recipient_role != "PRIMARY_EDITOR":
+                err_msg = (
+                    f"Recipient separation violation: In live delivery, editorial notification '{category.value}' "
+                    f"is strictly restricted to PRIMARY_EDITOR. Target recipient role '{recipient_role}' is prohibited."
+                )
+                logger.error("%s", err_msg)
+                return NotificationRecord(
+                    notification_id=notification_id,
+                    story_id=story_id,
+                    update_id=update_id,
+                    kind=kind,
+                    channel=channel_name,
+                    sent_at=now,
+                    status=DeliveryStatus.FAILED,
+                    message_text=message_text,
+                    headline_tr=headline_tr,
+                    score=score,
+                    error_message=err_msg,
+                    category=category,
+                )
+
+        delivery_id = f"DELIV-{notification_id}"
+
+        # 3. Enforce durable StateRepository requirement in cloud storage mode
         is_cloud_storage = self.settings.storage_mode in ("turso", "cloud")
         if is_cloud_storage and self.repository is None:
             err_msg = (
