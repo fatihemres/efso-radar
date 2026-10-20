@@ -48,6 +48,7 @@ class TestPhase4EDigestDelivery(unittest.TestCase):
         self.settings = Settings(
             telegram_bot_token="test_bot_token_secret_12345",
             telegram_chat_id="1000000001",
+            telegram_primary_editor_chat_id="1000000001",
             telegram_allowed_chat_ids=["1000000001"],
             telegram_delivery_enabled=False,
             legacy_editorial_fallback=True,

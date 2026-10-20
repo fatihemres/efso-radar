@@ -100,10 +100,12 @@ class TursoStateRepository(StateRepository):
         return int(row["ver"]) if row and row.get("ver") is not None else 0
 
     # --- Run Locking & Concurrency ---
-    def acquire_run_lock(self, worker_id: str, timeout_minutes: int = 15) -> bool:
-        now = utc_now()
-        now_iso = now.isoformat()
-        expires_at = (now + timedelta(minutes=timeout_minutes)).isoformat()
+    def acquire_run_lock(
+        self, worker_id: str, timeout_minutes: int = 15, now: Optional[datetime] = None
+    ) -> bool:
+        ref_now = (now or utc_now()).astimezone(timezone.utc)
+        now_iso = ref_now.isoformat()
+        expires_at = (ref_now + timedelta(minutes=timeout_minutes)).isoformat()
 
         res = self.client.execute(
             """
@@ -1004,6 +1006,83 @@ class TursoStateRepository(StateRepository):
         return str(row["response_json"]) if row and row.get("response_json") else None
 
     # --- Telegram Delivery Outbox & Recipient Lifecycle ---
+    def claim_telegram_delivery(
+        self,
+        delivery_id: str,
+        message_key: str,
+        recipient_role: str,
+        recipient_chat_id: str,
+        category: TelegramNotificationCategory,
+        payload: Optional[dict[str, Any]] = None,
+        max_attempts: int = 1,
+    ) -> bool:
+        """Atomically acquire a recipient-specific delivery claim before external HTTP dispatch."""
+        now_iso = utc_now().isoformat()
+        res = self.client.execute(
+            """
+            SELECT delivery_id, message_key, recipient_role, recipient_chat_id,
+                   category, status, attempt_count, max_attempts
+            FROM telegram_delivery_records
+            WHERE recipient_chat_id = ? AND message_key = ?
+            """,
+            [recipient_chat_id, message_key],
+        )
+        existing = res.fetchone()
+        if existing:
+            # 1. Reject conflicting identities
+            if existing["recipient_role"] != recipient_role:
+                raise DeliveryIdentityConflictError(
+                    f"Conflicting recipient role for {recipient_chat_id}:{message_key}: "
+                    f"existing '{existing['recipient_role']}' vs new '{recipient_role}'"
+                )
+            if existing["category"] != category.value:
+                raise DeliveryIdentityConflictError(
+                    f"Conflicting notification category for {recipient_chat_id}:{message_key}: "
+                    f"existing '{existing['category']}' vs new '{category.value}'"
+                )
+
+            # 2. Block if already SENT, DELIVERY_UNCERTAIN, or in-flight DISPATCHING
+            existing_status = DeliveryStatus(existing["status"])
+            if existing_status in (
+                DeliveryStatus.SENT,
+                DeliveryStatus.DELIVERY_UNCERTAIN,
+                DeliveryStatus.DISPATCHING,
+            ):
+                return False
+
+            # 3. Block if max_attempts reached
+            if int(existing["attempt_count"]) >= int(existing["max_attempts"]):
+                return False
+
+        # 4. Atomic conditional insert or update
+        res_exec = self.client.execute(
+            """
+            INSERT INTO telegram_delivery_records (
+                delivery_id, message_key, recipient_role, recipient_chat_id,
+                category, status, attempt_count, max_attempts, error_message,
+                payload_json, created_at, updated_at, sent_at
+            ) VALUES (?, ?, ?, ?, ?, 'DISPATCHING', 1, ?, NULL, ?, ?, ?, NULL)
+            ON CONFLICT(recipient_chat_id, message_key) DO UPDATE SET
+                status = 'DISPATCHING',
+                attempt_count = telegram_delivery_records.attempt_count + 1,
+                updated_at = excluded.updated_at
+            WHERE telegram_delivery_records.status NOT IN ('SENT', 'DELIVERY_UNCERTAIN', 'DISPATCHING')
+              AND telegram_delivery_records.attempt_count < telegram_delivery_records.max_attempts
+            """,
+            [
+                delivery_id,
+                message_key,
+                recipient_role,
+                recipient_chat_id,
+                category.value,
+                max_attempts,
+                json.dumps(payload or {}, ensure_ascii=False),
+                now_iso,
+                now_iso,
+            ],
+        )
+        return res_exec.affected_row_count > 0
+
     def record_telegram_delivery(self, delivery: TelegramDeliveryRecord) -> None:
         # 1. Fetch existing delivery record if any
         res = self.client.execute(

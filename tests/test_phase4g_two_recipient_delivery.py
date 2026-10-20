@@ -176,20 +176,47 @@ class TestPhase4GTwoRecipientDelivery(unittest.TestCase):
         self.assertIn("YAYINLANAMAZ — EDİTORYAL TEYİT BEKLEMESİNDE", html_hold)
 
     def test_05_independent_delivery_ledger_tracking(self) -> None:
-        """Verify delivery ledger tracks each recipient independently with distinct keys and message IDs."""
+        """Verify historical Admin delivery is preserved and live delivery routes exclusively to Primary Editor."""
         call_count = {self.admin_chat_id: 0, self.editor_chat_id: 0}
 
         def mock_handler(request: httpx.Request) -> httpx.Response:
             data = json.loads(request.content.decode("utf-8"))
             cid = str(data.get("chat_id"))
             call_count[cid] += 1
-            msg_id = 501 if cid == self.admin_chat_id else 502
+            msg_id = 502
             return httpx.Response(200, json={"ok": True, "result": {"message_id": msg_id}})
 
         transport = httpx.MockTransport(mock_handler)
         live_settings = self.settings.model_copy(update={"telegram_delivery_enabled": True})
         assessments = build_final_three_assessments()
 
+        # Compute stable digest keys to pre-seed historical Admin entry
+        rendered_html = format_telegram_digest(assessments, window_label="6 Saatlik Editoryal Özet", deduplicate=False)
+        import hashlib
+        digest_hash = hashlib.sha256(rendered_html.encode("utf-8")).hexdigest()[:24]
+        stable_digest_id = compute_stable_digest_identity(assessments)
+
+        # Pre-seed historical ledger with Admin entry (Phase 4 pilot)
+        admin_key = f"{self.admin_chat_id}:{digest_hash}"
+        editor_key = f"{self.editor_chat_id}:{digest_hash}"
+        pre_ledger = {
+            "deliveries": {
+                admin_key: {
+                    "status": "DELIVERY_SUCCESS",
+                    "chat_id": self.admin_chat_id,
+                    "target_chat_id": "10...01",
+                    "recipient_role": "ADMIN",
+                    "digest_hash": digest_hash,
+                    "stable_digest_id": stable_digest_id,
+                    "delivered_at_tsi": "18 Ekim 2026 21:00 TSİ",
+                    "message_id": 501,
+                }
+            }
+        }
+        with open(self.ledger_path, "w", encoding="utf-8") as f:
+            json.dump(pre_ledger, f)
+
+        # In live delivery, target_recipient_role="ALL" must strictly deliver to PRIMARY_EDITOR only (ADMIN excluded)
         result = deliver_one_shot_editorial_digest(
             settings=live_settings,
             assessments=assessments,
@@ -200,31 +227,30 @@ class TestPhase4GTwoRecipientDelivery(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "DELIVERY_SUCCESS")
-        self.assertEqual(result["recipients_count"], 2)
+        self.assertEqual(result["recipients_count"], 1)
+        # ADMIN received ZERO live HTTP calls
+        self.assertEqual(call_count[self.admin_chat_id], 0)
+        # PRIMARY_EDITOR received exactly 1 live HTTP call
+        self.assertEqual(call_count[self.editor_chat_id], 1)
+
         rec_res = result["recipient_results"]
-        # Raw chat IDs must not be keys in recipient_results
         self.assertNotIn(self.admin_chat_id, rec_res)
         self.assertNotIn(self.editor_chat_id, rec_res)
-        self.assertEqual(rec_res["ADMIN"]["status"], "DELIVERY_SUCCESS")
-        self.assertEqual(rec_res["ADMIN"]["message_id"], 501)
         self.assertEqual(rec_res["PRIMARY_EDITOR"]["status"], "DELIVERY_SUCCESS")
         self.assertEqual(rec_res["PRIMARY_EDITOR"]["message_id"], 502)
 
-        # Inspect persisted ledger file
+        # Inspect persisted ledger file: Both recipient entries exist independently
         with open(self.ledger_path, "r", encoding="utf-8") as f:
             ledger_data = json.load(f)
 
-        digest_hash = result["digest_hash"]
         deliveries = ledger_data.get("deliveries", {})
-
-        # Assert per-recipient keys exist
-        admin_key = f"{self.admin_chat_id}:{digest_hash}"
-        editor_key = f"{self.editor_chat_id}:{digest_hash}"
         self.assertIn(admin_key, deliveries)
         self.assertIn(editor_key, deliveries)
 
+        # Historical Admin record was not overwritten or corrupted
         self.assertEqual(deliveries[admin_key]["message_id"], 501)
         self.assertEqual(deliveries[admin_key]["recipient_role"], "ADMIN")
+        # Live Primary Editor record was recorded accurately
         self.assertEqual(deliveries[editor_key]["message_id"], 502)
         self.assertEqual(deliveries[editor_key]["recipient_role"], "PRIMARY_EDITOR")
 
@@ -272,18 +298,42 @@ class TestPhase4GTwoRecipientDelivery(unittest.TestCase):
         self.assertEqual(rec_res["PRIMARY_EDITOR"]["status"], "SAFE_PREVIEW_PASSED")
 
     def test_07_partial_delivery_handling(self) -> None:
-        """Verify partial delivery where Admin succeeds and Primary Editor fails with HTTP 403."""
+        """Verify historical Admin success is preserved while Primary Editor live dispatch encounters HTTP 403."""
         def mock_handler(request: httpx.Request) -> httpx.Response:
             data = json.loads(request.content.decode("utf-8"))
             cid = str(data.get("chat_id"))
             if cid == self.admin_chat_id:
-                return httpx.Response(200, json={"ok": True, "result": {"message_id": 777}})
-            else:
-                return httpx.Response(403, json={"ok": False, "description": "Forbidden: bot was blocked by the user"})
+                raise AssertionError("ADMIN must never receive live editorial HTTP calls")
+            return httpx.Response(403, json={"ok": False, "description": "Forbidden: bot was blocked by the user"})
 
         transport = httpx.MockTransport(mock_handler)
         live_settings = self.settings.model_copy(update={"telegram_delivery_enabled": True})
         assessments = build_final_three_assessments()
+
+        rendered_html = format_telegram_digest(assessments, window_label="6 Saatlik Editoryal Özet", deduplicate=False)
+        import hashlib
+        digest_hash = hashlib.sha256(rendered_html.encode("utf-8")).hexdigest()[:24]
+        stable_digest_id = compute_stable_digest_identity(assessments)
+
+        # Pre-seed historical Admin success
+        admin_key = f"{self.admin_chat_id}:{digest_hash}"
+        editor_key = f"{self.editor_chat_id}:{digest_hash}"
+        pre_ledger = {
+            "deliveries": {
+                admin_key: {
+                    "status": "DELIVERY_SUCCESS",
+                    "chat_id": self.admin_chat_id,
+                    "target_chat_id": "10...01",
+                    "recipient_role": "ADMIN",
+                    "digest_hash": digest_hash,
+                    "stable_digest_id": stable_digest_id,
+                    "delivered_at_tsi": "18 Ekim 2026 20:30 TSİ",
+                    "message_id": 777,
+                }
+            }
+        }
+        with open(self.ledger_path, "w", encoding="utf-8") as f:
+            json.dump(pre_ledger, f)
 
         result = deliver_one_shot_editorial_digest(
             settings=live_settings,
@@ -291,23 +341,21 @@ class TestPhase4GTwoRecipientDelivery(unittest.TestCase):
             dry_run=False,
             ledger_path=self.ledger_path,
             transport=transport,
-            target_recipient_role="ALL",
+            target_recipient_role="PRIMARY_EDITOR",
         )
 
-        self.assertEqual(result["status"], "PARTIAL_DELIVERY")
+        self.assertEqual(result["status"], "ACCESS_DENIED")
         rec_res = result["recipient_results"]
         self.assertNotIn(self.admin_chat_id, rec_res)
         self.assertNotIn(self.editor_chat_id, rec_res)
-        self.assertEqual(rec_res["ADMIN"]["status"], "DELIVERY_SUCCESS")
-        self.assertEqual(rec_res["ADMIN"]["message_id"], 777)
         self.assertEqual(rec_res["PRIMARY_EDITOR"]["status"], "ACCESS_DENIED")
 
-        # In ledger, Admin is SUCCESS, Editor is ACCESS_DENIED
+        # In ledger, Admin remains historically SUCCESS (777), Editor is recorded as ACCESS_DENIED
         with open(self.ledger_path, "r", encoding="utf-8") as f:
             ledger_data = json.load(f)
-        digest_hash = result["digest_hash"]
-        self.assertEqual(ledger_data["deliveries"][f"{self.admin_chat_id}:{digest_hash}"]["status"], "DELIVERY_SUCCESS")
-        self.assertEqual(ledger_data["deliveries"][f"{self.editor_chat_id}:{digest_hash}"]["status"], "ACCESS_DENIED")
+        self.assertEqual(ledger_data["deliveries"][admin_key]["status"], "DELIVERY_SUCCESS")
+        self.assertEqual(ledger_data["deliveries"][admin_key]["message_id"], 777)
+        self.assertEqual(ledger_data["deliveries"][editor_key]["status"], "ACCESS_DENIED")
 
     def test_08_ambiguous_network_timeout_recorded_uncertain_no_retry(self) -> None:
         """Verify network timeout marks recipient DELIVERY_UNCERTAIN without retry, blocking subsequent sends."""

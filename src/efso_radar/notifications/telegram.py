@@ -32,11 +32,13 @@ from efso_radar.domain import (
     EditorialDisposition,
     EditorialKind,
     NotificationRecord,
+    TelegramDeliveryRecord,
     TelegramNotificationCategory,
     VerificationStatus,
     utc_now,
 )
 from efso_radar.notifications.base import NotificationChannel
+from efso_radar.repositories.base import StateRepository
 from efso_radar.notifications.formatters import (
     compute_stable_digest_identity,
     format_telegram_alert,
@@ -115,10 +117,12 @@ class TelegramNotificationChannel(NotificationChannel):
         settings: Settings,
         transport: Optional[httpx.BaseTransport] = None,
         client: Optional[httpx.Client] = None,
+        repository: Optional[StateRepository] = None,
     ):
         self.settings = settings
         self.transport = transport
         self._client = client
+        self.repository = repository
 
     def _sanitize(self, text: str) -> str:
         return sanitize_telegram_text(text, self.settings.telegram_bot_token)
@@ -133,92 +137,203 @@ class TelegramNotificationChannel(NotificationChannel):
 
     def send(
         self,
-        assessment: EditorialAssessment,
-        story_id: str,
+        assessment: Optional[EditorialAssessment] = None,
+        story_id: str = "SYSTEM",
         update_id: Optional[str] = None,
         category: Optional[TelegramNotificationCategory] = None,
         dry_run: bool = False,
         now: Optional[datetime] = None,
         target_chat_id: Optional[str] = None,
+        notification_id: Optional[str] = None,
+        custom_message: Optional[str] = None,
     ) -> NotificationRecord:
-        """Send or preview an editorial assessment in the private owner chat."""
+        """Send or preview an editorial assessment or operational report in the private owner chat."""
         current_now = now or utc_now()
-        derived_category = category or derive_telegram_category(assessment)
+        derived_category = category or (derive_telegram_category(assessment) if assessment else TelegramNotificationCategory.OPERATIONAL_HEALTH_REPORT)
         # 1. Format message according to its logical category
         if derived_category == TelegramNotificationCategory.SENSITIVE_EDITORIAL_REVIEW:
-            message_text = format_telegram_sensitive_review(assessment)
+            message_text = format_telegram_sensitive_review(assessment) if assessment else (custom_message or "")
             channel_name = "TELEGRAM_SENSITIVE_REVIEW"
         elif derived_category == TelegramNotificationCategory.HOLD_FOR_VERIFICATION:
-            message_text = format_telegram_verification_hold(assessment)
+            message_text = format_telegram_verification_hold(assessment) if assessment else (custom_message or "")
             channel_name = "TELEGRAM_HOLD_VERIFICATION"
+        elif derived_category == TelegramNotificationCategory.OPERATIONAL_HEALTH_REPORT:
+            message_text = custom_message or (format_telegram_breaking(assessment) if assessment else "<b>Efso Radar Operational Health Report</b>")
+            channel_name = "TELEGRAM_OPS"
         else:
-            message_text = format_telegram_breaking(assessment)
+            message_text = format_telegram_breaking(assessment) if assessment else (custom_message or "")
             channel_name = "TELEGRAM"
 
-        # Generate unique idempotency key
+        kind = assessment.kind if assessment else EditorialKind.NEW
+        headline_tr = assessment.headline_tr if assessment else "Efso Radar Bildirimi"
+        score = assessment.score if assessment else 100
+
+        # Generate stable idempotency key
         prefix = "NOTIF-UPD" if update_id else "NOTIF"
-        notification_id = f"{prefix}-{current_now.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        if not notification_id:
+            art_ids = sorted(assessment.article_ids) if (assessment and assessment.article_ids) else []
+            art_key = ":".join(art_ids) if art_ids else ((assessment.headline_tr if assessment else "") or custom_message or "OPS")
+            stable_seed = f"{story_id}:{update_id or 'BASE'}:{derived_category.value}:{art_key}"
+            stable_hash = hashlib.sha256(stable_seed.encode("utf-8")).hexdigest()[:16]
+            notification_id = f"{prefix}-{stable_hash}"
 
         # 2. Check quiet hours (sensitive review and verification hold are not suppressed by quiet hours)
         if (
             derived_category == TelegramNotificationCategory.VERIFIED_BREAKING
             and self.settings.is_in_quiet_hours(current_now)
         ):
-            if self.settings.quiet_hours_behavior == "ALLOW_BREAKING_95" and assessment.score >= 95:
-                logger.info("Bypassing quiet hours for breaking news with score %d", assessment.score)
+            if self.settings.quiet_hours_behavior == "ALLOW_BREAKING_95" and score >= 95:
+                logger.info("Bypassing quiet hours for breaking news with score %d", score)
             elif self.settings.quiet_hours_behavior == "DISCARD":
-                logger.info("Discarding notification during quiet hours: %s", assessment.headline_tr)
+                logger.info("Discarding notification during quiet hours: %s", headline_tr)
                 return NotificationRecord(
                     notification_id=notification_id,
                     story_id=story_id,
                     update_id=update_id,
-                    kind=assessment.kind,
+                    kind=kind,
                     channel=channel_name,
                     sent_at=current_now,
                     status=DeliveryStatus.SKIPPED_BELOW_THRESHOLD,
                     message_text=message_text,
-                    headline_tr=assessment.headline_tr,
-                    score=assessment.score,
+                    headline_tr=headline_tr,
+                    score=score,
                     category=derived_category,
                 )
             else:  # "HOLD" default
-                logger.info("Holding notification for quiet hours: %s", assessment.headline_tr)
+                logger.info("Holding notification for quiet hours: %s", headline_tr)
                 return NotificationRecord(
                     notification_id=notification_id,
                     story_id=story_id,
                     update_id=update_id,
-                    kind=assessment.kind,
+                    kind=kind,
                     channel=channel_name,
                     sent_at=current_now,
                     status=DeliveryStatus.HELD_QUIET_HOURS,
                     message_text=message_text,
-                    headline_tr=assessment.headline_tr,
-                    score=assessment.score,
+                    headline_tr=headline_tr,
+                    score=score,
                     category=derived_category,
                 )
 
         # 3. Resolve recipient and enforce fail-closed editorial routing
+        is_live_delivery = bool(self.settings.telegram_delivery_enabled and not dry_run)
+        is_editorial = derived_category != TelegramNotificationCategory.OPERATIONAL_HEALTH_REPORT
         if target_chat_id:
             chat_id = str(target_chat_id).strip()
-        else:
-            recipients = self.settings.get_recipients_for_category(derived_category)
-            if recipients:
-                chat_id = recipients[0]["chat_id"]
-            elif self.settings.telegram_chat_id or self.settings.telegram_primary_editor_chat_id or self.settings.telegram_delivery_enabled:
-                cat_name = derived_category.value if hasattr(derived_category, "value") else str(derived_category)
-                err_msg = f"No authorized recipient configured or allowlisted for category '{cat_name}'. Routing failed closed."
+            if not self.settings.is_chat_id_allowed(chat_id):
+                masked_id = f"{chat_id[:2]}...{chat_id[-2:]}" if len(chat_id) > 4 else "***"
+                err_msg = f"Unauthorized recipient: chat_id '{masked_id}' is not in allowed_chat_ids"
                 logger.error("%s", err_msg)
                 return NotificationRecord(
                     notification_id=notification_id,
                     story_id=story_id,
                     update_id=update_id,
-                    kind=assessment.kind,
+                    kind=kind,
                     channel=channel_name,
                     sent_at=current_now,
                     status=DeliveryStatus.FAILED,
                     message_text=message_text,
-                    headline_tr=assessment.headline_tr,
-                    score=assessment.score,
+                    headline_tr=headline_tr,
+                    score=score,
+                    error_message=err_msg,
+                    category=derived_category,
+                )
+            # Enforce recipient separation:
+            # PRIMARY_EDITOR: editorial bulletins and verified news.
+            # ADMIN: operational health reporting only.
+            role = self.settings.get_recipient_role(chat_id)
+            if is_editorial:
+                if is_live_delivery:
+                    if role != "PRIMARY_EDITOR":
+                        err_msg = (
+                            f"Recipient separation violation: In live delivery, editorial notification '{derived_category.value}' "
+                            f"is strictly restricted to PRIMARY_EDITOR. Target recipient role '{role}' is rejected."
+                        )
+                        logger.error("%s", err_msg)
+                        return NotificationRecord(
+                            notification_id=notification_id,
+                            story_id=story_id,
+                            update_id=update_id,
+                            kind=kind,
+                            channel=channel_name,
+                            sent_at=current_now,
+                            status=DeliveryStatus.FAILED,
+                            message_text=message_text,
+                            headline_tr=headline_tr,
+                            score=score,
+                            error_message=err_msg,
+                            category=derived_category,
+                        )
+                elif role == "ADMIN":
+                    if not self.settings.legacy_editorial_fallback:
+                        err_msg = (
+                            "Recipient separation violation: ADMIN is restricted to operational health reporting only. "
+                            f"Editorial notification '{derived_category.value}' cannot be sent to ADMIN."
+                        )
+                        logger.error("%s", err_msg)
+                        return NotificationRecord(
+                            notification_id=notification_id,
+                            story_id=story_id,
+                            update_id=update_id,
+                            kind=kind,
+                            channel=channel_name,
+                            sent_at=current_now,
+                            status=DeliveryStatus.FAILED,
+                            message_text=message_text,
+                            headline_tr=headline_tr,
+                            score=score,
+                            error_message=err_msg,
+                            category=derived_category,
+                        )
+                    else:
+                        logger.info("Permitting legacy offline editorial preview for ADMIN (legacy_editorial_fallback=True)")
+            else:
+                # Operational health report: strictly ADMIN only in all live/active modes
+                if role != "ADMIN":
+                    err_msg = (
+                        "Recipient separation violation: OPERATIONAL_HEALTH_REPORT is strictly restricted to ADMIN. "
+                        f"Target recipient role '{role}' is prohibited."
+                    )
+                    logger.error("%s", err_msg)
+                    return NotificationRecord(
+                        notification_id=notification_id,
+                        story_id=story_id,
+                        update_id=update_id,
+                        kind=kind,
+                        channel=channel_name,
+                        sent_at=current_now,
+                        status=DeliveryStatus.FAILED,
+                        message_text=message_text,
+                        headline_tr=headline_tr,
+                        score=score,
+                        error_message=err_msg,
+                        category=derived_category,
+                    )
+        else:
+            recipients = self.settings.get_recipients_for_category(derived_category)
+            if is_live_delivery:
+                if is_editorial:
+                    recipients = [r for r in recipients if r.get("role") == "PRIMARY_EDITOR"]
+                else:
+                    recipients = [r for r in recipients if r.get("role") == "ADMIN"]
+            if recipients:
+                chat_id = recipients[0]["chat_id"]
+            elif self.settings.telegram_chat_id or self.settings.telegram_primary_editor_chat_id or self.settings.telegram_delivery_enabled:
+                cat_name = derived_category.value if hasattr(derived_category, "value") else str(derived_category)
+                expected_role = "PRIMARY_EDITOR" if is_editorial else "ADMIN"
+                err_msg = f"No authorized {expected_role} recipient configured or allowlisted for category '{cat_name}'. Routing failed closed."
+                logger.error("%s", err_msg)
+                return NotificationRecord(
+                    notification_id=notification_id,
+                    story_id=story_id,
+                    update_id=update_id,
+                    kind=kind,
+                    channel=channel_name,
+                    sent_at=current_now,
+                    status=DeliveryStatus.FAILED,
+                    message_text=message_text,
+                    headline_tr=headline_tr,
+                    score=score,
                     error_message=err_msg,
                     category=derived_category,
                 )
@@ -251,6 +366,7 @@ class TelegramNotificationChannel(NotificationChannel):
                 headline_tr=assessment.headline_tr,
                 score=assessment.score,
                 category=derived_category,
+                is_preview=True,
             )
 
         # 4. Privacy & Authentication Gate: Enforce chat ID allowlist on live dispatch
@@ -289,7 +405,7 @@ class TelegramNotificationChannel(NotificationChannel):
     def send_digest_batch(
         self,
         assessments: list[EditorialAssessment],
-        notification_id: str,
+        notification_id: Optional[str] = None,
         window_label: str = "6 Saatlik Editoryal Özet",
         dry_run: bool = False,
         now: Optional[datetime] = None,
@@ -297,14 +413,87 @@ class TelegramNotificationChannel(NotificationChannel):
     ) -> NotificationRecord:
         """Send or preview a grouped periodic editorial digest (EDITORIAL_DIGEST)."""
         current_now = now or utc_now()
+        if not notification_id:
+            stable_digest_id = compute_stable_digest_identity(assessments)
+            notification_id = f"DIGEST-{stable_digest_id[:16]}"
+
+        is_live_delivery = bool(self.settings.telegram_delivery_enabled and not dry_run)
         if target_chat_id:
             chat_id = str(target_chat_id).strip()
+            if not self.settings.is_chat_id_allowed(chat_id):
+                masked_id = f"{chat_id[:2]}...{chat_id[-2:]}" if len(chat_id) > 4 else "***"
+                err_msg = f"Unauthorized recipient: chat_id '{masked_id}' is not in allowed_chat_ids"
+                logger.error("%s", err_msg)
+                story_id = assessments[0].parent_story_id or assessments[0].article_ids[0][:8] if assessments else "DIGEST"
+                return NotificationRecord(
+                    notification_id=notification_id,
+                    story_id=story_id,
+                    update_id=None,
+                    kind=EditorialKind.NEW,
+                    channel="TELEGRAM_DIGEST",
+                    sent_at=current_now,
+                    status=DeliveryStatus.FAILED,
+                    message_text="",
+                    headline_tr=f"Editoryal Özet ({len(assessments)} Haber)",
+                    score=85,
+                    error_message=err_msg,
+                    category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                )
+            role = self.settings.get_recipient_role(chat_id)
+            if is_live_delivery:
+                if role != "PRIMARY_EDITOR":
+                    err_msg = (
+                        "Recipient separation violation: In live delivery, editorial digest batch "
+                        f"is strictly restricted to PRIMARY_EDITOR. Target recipient role '{role}' is rejected."
+                    )
+                    logger.error("%s", err_msg)
+                    story_id = assessments[0].parent_story_id or assessments[0].article_ids[0][:8] if assessments else "DIGEST"
+                    return NotificationRecord(
+                        notification_id=notification_id,
+                        story_id=story_id,
+                        update_id=None,
+                        kind=EditorialKind.NEW,
+                        channel="TELEGRAM_DIGEST",
+                        sent_at=current_now,
+                        status=DeliveryStatus.FAILED,
+                        message_text="",
+                        headline_tr=f"Editoryal Özet ({len(assessments)} Haber)",
+                        score=85,
+                        error_message=err_msg,
+                        category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                    )
+            elif role == "ADMIN":
+                if not self.settings.legacy_editorial_fallback:
+                    err_msg = (
+                        "Recipient separation violation: ADMIN is restricted to operational health reporting only. "
+                        "Editorial digest batch cannot be sent to ADMIN."
+                    )
+                    logger.error("%s", err_msg)
+                    story_id = assessments[0].parent_story_id or assessments[0].article_ids[0][:8] if assessments else "DIGEST"
+                    return NotificationRecord(
+                        notification_id=notification_id,
+                        story_id=story_id,
+                        update_id=None,
+                        kind=EditorialKind.NEW,
+                        channel="TELEGRAM_DIGEST",
+                        sent_at=current_now,
+                        status=DeliveryStatus.FAILED,
+                        message_text="",
+                        headline_tr=f"Editoryal Özet ({len(assessments)} Haber)",
+                        score=85,
+                        error_message=err_msg,
+                        category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                    )
+                else:
+                    logger.info("Permitting legacy offline editorial digest preview for ADMIN (legacy_editorial_fallback=True)")
         else:
             recipients = self.settings.get_recipients_for_category(TelegramNotificationCategory.EDITORIAL_DIGEST)
+            if is_live_delivery:
+                recipients = [r for r in recipients if r.get("role") == "PRIMARY_EDITOR"]
             if recipients:
                 chat_id = recipients[0]["chat_id"]
             elif self.settings.telegram_chat_id or self.settings.telegram_primary_editor_chat_id or self.settings.telegram_delivery_enabled:
-                err_msg = "No authorized recipient configured or allowlisted for category 'EDITORIAL_DIGEST'. Routing failed closed."
+                err_msg = "No authorized PRIMARY_EDITOR recipient configured or allowlisted for category 'EDITORIAL_DIGEST'. Routing failed closed."
                 logger.error("%s", err_msg)
                 story_id = assessments[0].parent_story_id or assessments[0].article_ids[0][:8] if assessments else "DIGEST"
                 return NotificationRecord(
@@ -350,6 +539,7 @@ class TelegramNotificationChannel(NotificationChannel):
                 headline_tr=f"Editoryal Özet ({len(assessments)} Haber)",
                 score=85,
                 category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                is_preview=True,
             )
 
         # Check allowlist on live dispatch
@@ -395,10 +585,57 @@ class TelegramNotificationChannel(NotificationChannel):
         target_role: Optional[str] = None,
     ) -> list[NotificationRecord]:
         """Dispatch an assessment to all authorized recipients for its category, tracked independently."""
+        current_now = now or utc_now()
         derived_category = category or derive_telegram_category(assessment)
+        is_live_delivery = bool(self.settings.telegram_delivery_enabled and not dry_run)
+        is_editorial = derived_category != TelegramNotificationCategory.OPERATIONAL_HEALTH_REPORT
         recipients = self.settings.get_recipients_for_category(derived_category)
-        if target_role and target_role.upper() != "ALL":
-            recipients = [r for r in recipients if r["role"].upper() == target_role.upper()]
+
+        if is_live_delivery and is_editorial:
+            if target_role and target_role.upper() not in ("ALL", "PRIMARY_EDITOR"):
+                err_msg = (
+                    f"Recipient separation violation: In live delivery, editorial notification '{derived_category.value}' "
+                    f"cannot target role '{target_role}'. Strictly restricted to PRIMARY_EDITOR."
+                )
+                logger.error("%s", err_msg)
+                return [NotificationRecord(
+                    notification_id=f"NOTIF-REJECT-{story_id[:8]}",
+                    story_id=story_id,
+                    update_id=update_id,
+                    kind=assessment.kind,
+                    channel="TELEGRAM",
+                    sent_at=current_now,
+                    status=DeliveryStatus.FAILED,
+                    message_text="",
+                    headline_tr=assessment.headline_tr,
+                    score=assessment.score,
+                    error_message=err_msg,
+                    category=derived_category,
+                )]
+            recipients = [r for r in recipients if r.get("role") == "PRIMARY_EDITOR"]
+            if not recipients:
+                err_msg = (
+                    f"No authorized PRIMARY_EDITOR recipient configured or allowlisted for editorial category '{derived_category.value}'. "
+                    "Routing failed closed."
+                )
+                logger.error("%s", err_msg)
+                return [NotificationRecord(
+                    notification_id=f"NOTIF-REJECT-{story_id[:8]}",
+                    story_id=story_id,
+                    update_id=update_id,
+                    kind=assessment.kind,
+                    channel="TELEGRAM",
+                    sent_at=current_now,
+                    status=DeliveryStatus.FAILED,
+                    message_text="",
+                    headline_tr=assessment.headline_tr,
+                    score=assessment.score,
+                    error_message=err_msg,
+                    category=derived_category,
+                )]
+        else:
+            if target_role and target_role.upper() != "ALL":
+                recipients = [r for r in recipients if r["role"].upper() == target_role.upper()]
 
         records: list[NotificationRecord] = []
         for r in recipients:
@@ -408,7 +645,7 @@ class TelegramNotificationChannel(NotificationChannel):
                 update_id=update_id,
                 category=derived_category,
                 dry_run=dry_run,
-                now=now,
+                now=current_now,
                 target_chat_id=r["chat_id"],
             )
             records.append(rec)
@@ -424,9 +661,54 @@ class TelegramNotificationChannel(NotificationChannel):
         target_role: Optional[str] = None,
     ) -> list[NotificationRecord]:
         """Dispatch an editorial digest batch to all authorized recipients, tracked independently."""
+        current_now = now or utc_now()
+        is_live_delivery = bool(self.settings.telegram_delivery_enabled and not dry_run)
         recipients = self.settings.get_recipients_for_category(TelegramNotificationCategory.EDITORIAL_DIGEST)
-        if target_role and target_role.upper() != "ALL":
-            recipients = [r for r in recipients if r["role"].upper() == target_role.upper()]
+
+        if is_live_delivery:
+            if target_role and target_role.upper() not in ("ALL", "PRIMARY_EDITOR"):
+                err_msg = (
+                    "Recipient separation violation: In live delivery, editorial digest batch "
+                    f"cannot target role '{target_role}'. Strictly restricted to PRIMARY_EDITOR."
+                )
+                logger.error("%s", err_msg)
+                story_id = assessments[0].parent_story_id or assessments[0].article_ids[0][:8] if assessments else "DIGEST"
+                return [NotificationRecord(
+                    notification_id=notification_id,
+                    story_id=story_id,
+                    update_id=None,
+                    kind=EditorialKind.NEW,
+                    channel="TELEGRAM_DIGEST",
+                    sent_at=current_now,
+                    status=DeliveryStatus.FAILED,
+                    message_text="",
+                    headline_tr=f"Editoryal Özet ({len(assessments)} Haber)",
+                    score=85,
+                    error_message=err_msg,
+                    category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                )]
+            recipients = [r for r in recipients if r.get("role") == "PRIMARY_EDITOR"]
+            if not recipients:
+                err_msg = "No authorized PRIMARY_EDITOR recipient configured or allowlisted for category 'EDITORIAL_DIGEST'."
+                logger.error("%s", err_msg)
+                story_id = assessments[0].parent_story_id or assessments[0].article_ids[0][:8] if assessments else "DIGEST"
+                return [NotificationRecord(
+                    notification_id=notification_id,
+                    story_id=story_id,
+                    update_id=None,
+                    kind=EditorialKind.NEW,
+                    channel="TELEGRAM_DIGEST",
+                    sent_at=current_now,
+                    status=DeliveryStatus.FAILED,
+                    message_text="",
+                    headline_tr=f"Editoryal Özet ({len(assessments)} Haber)",
+                    score=85,
+                    error_message=err_msg,
+                    category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                )]
+        else:
+            if target_role and target_role.upper() != "ALL":
+                recipients = [r for r in recipients if r["role"].upper() == target_role.upper()]
 
         records: list[NotificationRecord] = []
         for r in recipients:
@@ -435,7 +717,7 @@ class TelegramNotificationChannel(NotificationChannel):
                 notification_id=notification_id,
                 window_label=window_label,
                 dry_run=dry_run,
-                now=now,
+                now=current_now,
                 target_chat_id=r["chat_id"],
             )
             records.append(rec)
@@ -481,6 +763,171 @@ class TelegramNotificationChannel(NotificationChannel):
         is_one_shot = max_attempts == 1
         last_error: Optional[str] = None
         final_status: DeliveryStatus = DeliveryStatus.FAILED
+        # 0. Global Delivery Activation Gate: fail closed if delivery is disabled
+        if not self.settings.telegram_delivery_enabled:
+            err_msg = (
+                "Delivery disabled: TELEGRAM_DELIVERY_ENABLED is False. "
+                "Failing closed before dispatch without making external network calls."
+            )
+            logger.warning("%s", err_msg)
+            return NotificationRecord(
+                notification_id=notification_id,
+                story_id=story_id,
+                update_id=update_id,
+                kind=kind,
+                channel=channel_name,
+                sent_at=now,
+                status=DeliveryStatus.FAILED,
+                message_text=message_text,
+                headline_tr=headline_tr,
+                score=score,
+                error_message=err_msg,
+                category=category,
+            )
+
+        # 1. Privacy & Authentication Gate: Enforce chat ID allowlist on lowest dispatch boundary
+        target_chat = str(target_chat_id).strip()
+        if not target_chat or not self.settings.is_chat_id_allowed(target_chat):
+            masked_id = f"{target_chat[:2]}...{target_chat[-2:]}" if len(target_chat) > 4 else "***"
+            err_msg = f"Unauthorized recipient: target_chat_id '{masked_id}' is not in allowed_chat_ids."
+            logger.error("%s", err_msg)
+            return NotificationRecord(
+                notification_id=notification_id,
+                story_id=story_id,
+                update_id=update_id,
+                kind=kind,
+                channel=channel_name,
+                sent_at=now,
+                status=DeliveryStatus.FAILED,
+                message_text=message_text,
+                headline_tr=headline_tr,
+                score=score,
+                error_message=err_msg,
+                category=category,
+            )
+
+        # 2. Category-to-Role Authorization Gate:
+        # OPERATIONAL_HEALTH_REPORT -> strictly ADMIN only
+        # Editorial categories -> strictly PRIMARY_EDITOR only
+        # AUTHORIZED_RECIPIENT, unknown or mismatched roles are rejected
+        recipient_role = self.settings.get_recipient_role(target_chat)
+        if category == TelegramNotificationCategory.OPERATIONAL_HEALTH_REPORT:
+            if recipient_role != "ADMIN":
+                err_msg = (
+                    "Recipient separation violation: OPERATIONAL_HEALTH_REPORT is strictly restricted to ADMIN. "
+                    f"Target recipient role '{recipient_role}' is prohibited."
+                )
+                logger.error("%s", err_msg)
+                return NotificationRecord(
+                    notification_id=notification_id,
+                    story_id=story_id,
+                    update_id=update_id,
+                    kind=kind,
+                    channel=channel_name,
+                    sent_at=now,
+                    status=DeliveryStatus.FAILED,
+                    message_text=message_text,
+                    headline_tr=headline_tr,
+                    score=score,
+                    error_message=err_msg,
+                    category=category,
+                )
+        else:
+            if recipient_role != "PRIMARY_EDITOR":
+                err_msg = (
+                    f"Recipient separation violation: In live delivery, editorial notification '{category.value}' "
+                    f"is strictly restricted to PRIMARY_EDITOR. Target recipient role '{recipient_role}' is prohibited."
+                )
+                logger.error("%s", err_msg)
+                return NotificationRecord(
+                    notification_id=notification_id,
+                    story_id=story_id,
+                    update_id=update_id,
+                    kind=kind,
+                    channel=channel_name,
+                    sent_at=now,
+                    status=DeliveryStatus.FAILED,
+                    message_text=message_text,
+                    headline_tr=headline_tr,
+                    score=score,
+                    error_message=err_msg,
+                    category=category,
+                )
+
+        delivery_id = f"DELIV-{notification_id}"
+
+        # 3. Enforce durable StateRepository requirement in cloud storage mode
+        is_cloud_storage = self.settings.storage_mode in ("turso", "cloud")
+        if is_cloud_storage and self.repository is None:
+            err_msg = (
+                "Cloud delivery rejected: authoritative StateRepository is strictly required in cloud storage mode "
+                "to ensure durable pre-send claims. Failing closed before HTTP dispatch."
+            )
+            logger.error("%s", err_msg)
+            return NotificationRecord(
+                notification_id=notification_id,
+                story_id=story_id,
+                update_id=update_id,
+                kind=kind,
+                channel=channel_name,
+                sent_at=now,
+                status=DeliveryStatus.FAILED,
+                message_text=message_text,
+                headline_tr=headline_tr,
+                score=score,
+                error_message=err_msg,
+                category=category,
+            )
+
+        # Durable Pre-Send Delivery Claim:
+        # Atomically claim the delivery attempt in telegram_delivery_records before any external HTTP dispatch.
+        if self.repository is not None:
+            try:
+                claimed = self.repository.claim_telegram_delivery(
+                    delivery_id=delivery_id,
+                    message_key=notification_id,
+                    recipient_role=recipient_role,
+                    recipient_chat_id=target_chat_id,
+                    category=category,
+                    payload={"story_id": story_id, "update_id": update_id},
+                    max_attempts=max_attempts,
+                )
+            except Exception as exc:
+                err_msg = f"Delivery claim failed closed: repository error {self._sanitize(str(exc))}"
+                logger.error("%s", err_msg)
+                return NotificationRecord(
+                    notification_id=notification_id,
+                    story_id=story_id,
+                    update_id=update_id,
+                    kind=kind,
+                    channel=channel_name,
+                    sent_at=now,
+                    status=DeliveryStatus.FAILED,
+                    message_text=message_text,
+                    headline_tr=headline_tr,
+                    score=score,
+                    error_message=err_msg,
+                    category=category,
+                )
+
+            if not claimed:
+                err_msg = f"Delivery claim rejected: duplicate message or in-flight claim holds {notification_id}"
+                logger.warning("%s", err_msg)
+                existing = self.repository.get_telegram_delivery(target_chat_id, notification_id)
+                return NotificationRecord(
+                    notification_id=notification_id,
+                    story_id=story_id,
+                    update_id=update_id,
+                    kind=kind,
+                    channel=channel_name,
+                    sent_at=now,
+                    status=existing.status if existing else DeliveryStatus.FAILED,
+                    message_text=message_text,
+                    headline_tr=headline_tr,
+                    score=score,
+                    error_message=err_msg,
+                    category=category,
+                )
 
         with self._get_http_client() as client:
             for attempt in range(1, max_attempts + 1):
@@ -529,26 +976,40 @@ class TelegramNotificationChannel(NotificationChannel):
                         final_status = DeliveryStatus.FAILED
                         break
 
-                    # 4. Gateway Timeout (HTTP 504) - Ambiguous outcome: Telegram server may have processed message!
-                    if resp.status_code == 504:
-                        last_error = "Ambiguous Telegram server outcome (HTTP 504 Gateway Timeout): Automatic retry skipped to prevent duplicate delivery."
-                        logger.warning("%s", last_error)
-                        final_status = DeliveryStatus.DELIVERY_UNCERTAIN
-                        break
-
-                    # 5. Other Server errors (HTTP 5xx)
+                    # 4. Ambiguous Server Errors (HTTP 500, 502, 503, 504, 5xx)
+                    # Telegram server or upstream reverse proxy may have processed and delivered the message.
+                    # Never retry automatically to prevent duplicate message deliveries.
                     if resp.status_code >= 500:
-                        last_error = self._sanitize(f"Telegram server error (HTTP {resp.status_code}): {resp.text[:200]}")
-                        logger.warning("Telegram server error on attempt %d: %s", attempt, last_error)
-                        if not is_one_shot and attempt < max_attempts:
-                            if self.settings.telegram_retry_backoff_base > 0:
-                                backoff = self.settings.telegram_retry_backoff_base * (2 ** (attempt - 1))
-                                time.sleep(backoff)
-                            continue
-                        final_status = DeliveryStatus.FAILED
+                        if resp.status_code == 504:
+                            last_error = "Ambiguous Telegram server outcome (HTTP 504 Gateway Timeout): Automatic retry skipped to prevent duplicate delivery."
+                        else:
+                            last_error = self._sanitize(
+                                f"Ambiguous Telegram server error (HTTP {resp.status_code}): {resp.text[:200]}. "
+                                "Automatic retry skipped to prevent duplicate delivery."
+                            )
+                        logger.warning("Ambiguous server response (HTTP %d) on attempt %d: %s", resp.status_code, attempt, last_error)
+                        final_status = DeliveryStatus.DELIVERY_UNCERTAIN
+                        if self.repository is not None:
+                            deliv_rec = TelegramDeliveryRecord(
+                                delivery_id=f"DELIV-{notification_id}",
+                                message_key=notification_id,
+                                recipient_role=self.settings.get_recipient_role(target_chat_id) or "AUTHORIZED_RECIPIENT",
+                                recipient_chat_id=target_chat_id,
+                                category=category,
+                                status=DeliveryStatus.DELIVERY_UNCERTAIN,
+                                attempt_count=attempt,
+                                max_attempts=max_attempts,
+                                error_message=last_error,
+                                created_at=now,
+                                updated_at=now,
+                            )
+                            try:
+                                self.repository.record_telegram_delivery(deliv_rec)
+                            except Exception as ex:
+                                logger.error("Failed to record DELIVERY_UNCERTAIN in repository: %s", ex)
                         break
 
-                    # 6. Success (HTTP 200)
+                    # 5. Success (HTTP 200)
                     resp_json = resp.json()
                     if resp_json.get("ok"):
                         msg_id = resp_json.get("result", {}).get("message_id")
@@ -559,6 +1020,39 @@ class TelegramNotificationChannel(NotificationChannel):
                             notification_id,
                             msg_id,
                         )
+                        if self.repository is not None:
+                            deliv_rec = TelegramDeliveryRecord(
+                                delivery_id=f"DELIV-{notification_id}",
+                                message_key=notification_id,
+                                recipient_role=self.settings.get_recipient_role(target_chat_id) or "AUTHORIZED_RECIPIENT",
+                                recipient_chat_id=target_chat_id,
+                                category=category,
+                                status=DeliveryStatus.SENT,
+                                attempt_count=attempt,
+                                max_attempts=max_attempts,
+                                payload={"message_id": msg_id},
+                                created_at=now,
+                                updated_at=now,
+                                sent_at=now,
+                            )
+                            try:
+                                self.repository.record_telegram_delivery(deliv_rec)
+                            except Exception as ex:
+                                logger.error("Post-send persistence failure in repository: %s", ex)
+                                return NotificationRecord(
+                                    notification_id=notification_id,
+                                    story_id=story_id,
+                                    update_id=update_id,
+                                    kind=kind,
+                                    channel=channel_name,
+                                    sent_at=now,
+                                    status=DeliveryStatus.DELIVERY_UNCERTAIN,
+                                    message_text=message_text,
+                                    headline_tr=headline_tr,
+                                    score=score,
+                                    error_message=f"Post-send persistence failure: Telegram accepted delivery (message_id: {msg_id}) but repository confirmation failed: {self._sanitize(str(ex))}. Requires reconciliation.",
+                                    category=category,
+                                )
                         return NotificationRecord(
                             notification_id=notification_id,
                             story_id=story_id,
@@ -584,18 +1078,51 @@ class TelegramNotificationChannel(NotificationChannel):
                     last_error = f"Ambiguous delivery timeout: {sanitized_exc}. Automatic retry skipped to prevent duplicate delivery."
                     logger.warning("Ambiguous timeout during Telegram delivery attempt %d: %s", attempt, last_error)
                     final_status = DeliveryStatus.DELIVERY_UNCERTAIN
+                    if self.repository is not None:
+                        deliv_rec = TelegramDeliveryRecord(
+                            delivery_id=f"DELIV-{notification_id}",
+                            message_key=notification_id,
+                            recipient_role=self.settings.get_recipient_role(target_chat_id) or "AUTHORIZED_RECIPIENT",
+                            recipient_chat_id=target_chat_id,
+                            category=category,
+                            status=DeliveryStatus.DELIVERY_UNCERTAIN,
+                            attempt_count=attempt,
+                            max_attempts=max_attempts,
+                            error_message=last_error,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                        try:
+                            self.repository.record_telegram_delivery(deliv_rec)
+                        except Exception as ex:
+                            logger.error("Failed to record DELIVERY_UNCERTAIN in repository: %s", ex)
                     break
 
                 except httpx.TransportError as exc:
+                    # Ambiguous network transport error: connection broken after request sent
+                    # Do NOT retry automatically to avoid duplicate delivery!
                     sanitized_exc = self._sanitize(str(exc))
-                    last_error = f"Network transport error: {sanitized_exc}"
-                    logger.warning("Delivery transport attempt %d failed: %s", attempt, last_error)
-                    if not is_one_shot and attempt < max_attempts:
-                        if self.settings.telegram_retry_backoff_base > 0:
-                            backoff = self.settings.telegram_retry_backoff_base * (2 ** (attempt - 1))
-                            time.sleep(backoff)
-                        continue
-                    final_status = DeliveryStatus.FAILED
+                    last_error = f"Ambiguous network transport interruption: {sanitized_exc}. Automatic retry skipped to prevent duplicate delivery."
+                    logger.warning("Ambiguous transport error on attempt %d: %s", attempt, last_error)
+                    final_status = DeliveryStatus.DELIVERY_UNCERTAIN
+                    if self.repository is not None:
+                        deliv_rec = TelegramDeliveryRecord(
+                            delivery_id=f"DELIV-{notification_id}",
+                            message_key=notification_id,
+                            recipient_role=self.settings.get_recipient_role(target_chat_id) or "AUTHORIZED_RECIPIENT",
+                            recipient_chat_id=target_chat_id,
+                            category=category,
+                            status=DeliveryStatus.DELIVERY_UNCERTAIN,
+                            attempt_count=attempt,
+                            max_attempts=max_attempts,
+                            error_message=last_error,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                        try:
+                            self.repository.record_telegram_delivery(deliv_rec)
+                        except Exception as ex:
+                            logger.error("Failed to record DELIVERY_UNCERTAIN in repository: %s", ex)
                     break
 
                 except Exception as exc:
@@ -943,6 +1470,8 @@ def deliver_one_shot_editorial_digest(
     is_ux_test: bool = False,
     target_chat_id: Optional[str] = None,
     target_recipient_role: Optional[str] = None,
+    repository: Optional[StateRepository] = None,
+    allow_legacy_admin_broadcast: bool = False,
 ) -> dict[str, Any]:
     """Execute a dedicated, one-shot editorial digest delivery with persistent per-recipient duplicate protection.
 
@@ -1000,6 +1529,19 @@ def deliver_one_shot_editorial_digest(
                 "masked_token": token_masked,
             }
         t_role = settings.get_recipient_role(t_chat) or "AUTHORIZED_RECIPIENT"
+        is_live_delivery = bool(not dry_run and settings.telegram_delivery_enabled)
+        if is_live_delivery:
+            if t_role != "PRIMARY_EDITOR":
+                return {
+                    "status": "RECIPIENT_ROLE_VIOLATION",
+                    "error": (
+                        "Recipient separation violation: In live delivery, editorial digest is strictly restricted to PRIMARY_EDITOR. "
+                        f"Target recipient role '{t_role}' is rejected."
+                    ),
+                    "attempt_made": False,
+                    "masked_chat_id": t_masked,
+                    "masked_token": token_masked,
+                }
         target_recipients = [{
             "chat_id": t_chat,
             "role": t_role,
@@ -1036,13 +1578,38 @@ def deliver_one_shot_editorial_digest(
                 "masked_token": token_masked,
             }
 
+        is_live_delivery = bool(not dry_run and settings.telegram_delivery_enabled)
         if target_recipient_role:
             req_role = target_recipient_role.upper()
             all_recs = settings.get_authorized_recipients()
-            if req_role == "ALL":
-                target_recipients = all_recs
+            if is_live_delivery:
+                if req_role not in ("ALL", "PRIMARY_EDITOR"):
+                    return {
+                        "status": "RECIPIENT_ROLE_VIOLATION",
+                        "error": (
+                            f"Recipient separation violation: In live delivery, editorial digest cannot target role '{target_recipient_role}'. "
+                            "Strictly restricted to PRIMARY_EDITOR."
+                        ),
+                        "attempt_made": False,
+                        "masked_chat_id": "<NOT_SET>",
+                        "masked_token": token_masked,
+                    }
+                target_recipients = settings.get_recipients_for_category(TelegramNotificationCategory.EDITORIAL_DIGEST)
+                target_recipients = [r for r in target_recipients if r.get("role") == "PRIMARY_EDITOR"]
+                if not target_recipients:
+                    return {
+                        "status": "CONFIG_ERROR",
+                        "error": "PRIMARY_EDITOR is not configured or allowlisted for live editorial digest.",
+                        "attempt_made": False,
+                        "masked_chat_id": "<NOT_SET>",
+                        "masked_token": token_masked,
+                    }
             else:
-                target_recipients = [r for r in all_recs if r["role"] == req_role]
+                # Offline legacy simulation / historical inspection mode
+                if req_role == "ALL":
+                    target_recipients = all_recs
+                else:
+                    target_recipients = [r for r in all_recs if r["role"] == req_role]
                 if not target_recipients:
                     return {
                         "status": "CONFIG_ERROR",
@@ -1056,6 +1623,8 @@ def deliver_one_shot_editorial_digest(
             # Editorial notifications go to PRIMARY_EDITOR only.
             # ADMIN is not automatically included in routine editorial broadcasts.
             target_recipients = settings.get_recipients_for_category(TelegramNotificationCategory.EDITORIAL_DIGEST)
+            if is_live_delivery:
+                target_recipients = [r for r in target_recipients if r.get("role") == "PRIMARY_EDITOR"]
             if not target_recipients:
                 return {
                     "status": "CONFIG_ERROR",
@@ -1099,9 +1668,20 @@ def deliver_one_shot_editorial_digest(
     ledger_file = Path(ledger_path)
     ledger_data: dict[str, Any] = {}
     is_live_dispatch = (not dry_run) and settings.telegram_delivery_enabled
+    is_cloud_storage = settings.storage_mode in ("turso", "cloud")
+
+    if is_cloud_storage and is_live_dispatch and repository is None:
+        return {
+            "status": "DURABLE_STORAGE_REQUIRED",
+            "error": "Cloud delivery rejected: authoritative StateRepository is strictly required in cloud storage mode. Ephemeral JSON ledger fallback is prohibited in cloud mode.",
+            "attempt_made": False,
+            "attempts_count": 0,
+            "masked_chat_id": target_recipients[0]["masked_chat_id"] if target_recipients else "<NOT_SET>",
+            "masked_token": token_masked,
+        }
 
     if not ledger_file.exists():
-        if is_live_dispatch:
+        if is_live_dispatch and repository is None:
             return {
                 "status": "MISSING_LEDGER",
                 "error": f"Delivery ledger file does not exist at '{ledger_path}'. In live dispatch mode (dry_run=False and delivery enabled), an initialized persistent ledger is strictly required to prevent duplicate deliveries. Failing closed with zero network attempts.",
@@ -1177,8 +1757,8 @@ def deliver_one_shot_editorial_digest(
                 belongs_to_this_recipient = (record_role == r_role)
             else:
                 # Legacy Phase 4 record without explicit chat_id, role, or colon key
-                # Historical Phase 4 was strictly single-recipient (ADMIN only)
-                belongs_to_this_recipient = is_admin_recipient
+                # Historical Phase 4 was strictly single-recipient
+                belongs_to_this_recipient = (is_admin_recipient or (settings.telegram_chat_id and r_chat == settings.telegram_chat_id))
 
             if not belongs_to_this_recipient:
                 continue
@@ -1201,14 +1781,14 @@ def deliver_one_shot_editorial_digest(
                     if KNOWN_HISTORICAL_HASHES[rec_k] == set(candidate_article_ids):
                         return rec_v
 
-        # 4. Backward compatibility check for ADMIN with legacy un-prefixed keys
-        if is_admin_recipient:
+        # 4. Backward compatibility check for legacy un-prefixed keys
+        if is_admin_recipient or (settings.telegram_chat_id and r_chat == settings.telegram_chat_id):
             if not is_ux_test and digest_hash in deliveries:
                 legacy_rec = deliveries[digest_hash]
                 if isinstance(legacy_rec, dict) and not legacy_rec.get("is_ux_test"):
                     leg_chat = str(legacy_rec.get("chat_id") or "").strip()
                     leg_role = str(legacy_rec.get("recipient_role") or "").strip()
-                    if (not leg_chat or leg_chat == r_chat) and (not leg_role or leg_role == "ADMIN"):
+                    if (not leg_chat or leg_chat == r_chat) and (not leg_role or leg_role in ("ADMIN", r_role)):
                         return legacy_rec
 
         return None
@@ -1239,10 +1819,53 @@ def deliver_one_shot_editorial_digest(
         # If ADMIN, also write to digest_hash for legacy single-recipient tests
         if r_role == "ADMIN" or r_chat == settings.telegram_chat_id:
             ledger_data["deliveries"][digest_hash] = rec
-        tmp_path = ledger_file.with_suffix(".tmp")
-        with open(tmp_path, "w", encoding="utf-8") as f_tmp:
-            json.dump(ledger_data, f_tmp, ensure_ascii=False, indent=2)
-        tmp_path.replace(ledger_file)
+        try:
+            tmp_path = ledger_file.with_suffix(".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f_tmp:
+                json.dump(ledger_data, f_tmp, ensure_ascii=False, indent=2)
+            tmp_path.replace(ledger_file)
+        except Exception as exc:
+            logger.warning("Could not persist local ledger file '%s': %s", ledger_file, exc)
+
+        if repository is not None:
+            status_map = {
+                "DELIVERY_SUCCESS": DeliveryStatus.SENT,
+                "DELIVERY_UNCERTAIN": DeliveryStatus.DELIVERY_UNCERTAIN,
+                "DELIVERY_FAILED": DeliveryStatus.FAILED,
+                "VALIDATION_ERROR": DeliveryStatus.FAILED,
+                "ACCESS_DENIED": DeliveryStatus.FAILED,
+                "RATE_LIMITED": DeliveryStatus.FAILED,
+                "SERVER_ERROR": DeliveryStatus.FAILED,
+                "SAFE_PREVIEW_PASSED": DeliveryStatus.PENDING,
+            }
+            repo_status = status_map.get(rec_status, DeliveryStatus.FAILED)
+            deliv_id = f"DELIV-{digest_hash[:8]}-{abs(hash(r_chat)) % 1000000:06d}"
+            deliv_rec = TelegramDeliveryRecord(
+                delivery_id=deliv_id,
+                message_key=digest_hash,
+                recipient_role=r_role,
+                recipient_chat_id=r_chat,
+                category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                status=repo_status,
+                attempt_count=1 if rec_status != "SAFE_PREVIEW_PASSED" else 0,
+                max_attempts=1,
+                error_message=err_desc,
+                payload={
+                    "stable_digest_id": stable_digest_id,
+                    "is_ux_test": is_ux_test,
+                    "stories_count": len(assessments),
+                    "message_id": msg_id,
+                },
+                created_at=now_dt,
+                updated_at=now_dt,
+                sent_at=now_dt if repo_status == DeliveryStatus.SENT else None,
+            )
+            try:
+                repository.record_telegram_delivery(deliv_rec)
+            except Exception as exc:
+                logger.error("Failed to record delivery in repository: %s", exc)
+                if rec_status == "DELIVERY_SUCCESS":
+                    raise
 
     should_close_client = client is None
     http_client = client or httpx.Client(
@@ -1268,26 +1891,48 @@ def deliver_one_shot_editorial_digest(
         # Check existing record
         existing_record = _find_existing_record(r_chat, r_role)
 
+        repo_rec = None
+        if repository is not None:
+            repo_rec = repository.get_telegram_delivery(r_chat, digest_hash)
+            if not repo_rec:
+                repo_rec = repository.get_telegram_delivery(r_chat, stable_digest_id)
+
+        rec_status = None
+        delivered_at_str = None
+        msg_id_val = None
+
         if existing_record:
             rec_status = existing_record.get("status")
+            delivered_at_str = existing_record.get("delivered_at_tsi") or existing_record.get("delivered_at_utc")
+            msg_id_val = existing_record.get("message_id")
+        elif repo_rec:
+            if repo_rec.status == DeliveryStatus.SENT:
+                rec_status = "DELIVERY_SUCCESS"
+                delivered_at_str = repo_rec.sent_at.isoformat() if repo_rec.sent_at else repo_rec.updated_at.isoformat()
+                msg_id_val = repo_rec.payload.get("message_id")
+            elif repo_rec.status == DeliveryStatus.DELIVERY_UNCERTAIN:
+                rec_status = "DELIVERY_UNCERTAIN"
+                delivered_at_str = repo_rec.updated_at.isoformat()
+
+        if rec_status:
             rec_label = "UX test message" if is_ux_test else "digest"
             if rec_status == "DELIVERY_SUCCESS":
                 _record_public_result(r_role, r_masked, {
                     "status": "DUPLICATE_DELIVERY_PREVENTED",
-                    "error": f"Duplicate delivery prevented: This exact {rec_label} was already delivered to {r_role} on {existing_record.get('delivered_at_tsi') or existing_record.get('delivered_at_utc')}.",
+                    "error": f"Duplicate delivery prevented: This exact {rec_label} was already delivered to {r_role} on {delivered_at_str}.",
                     "digest_hash": digest_hash,
                     "stable_digest_id": stable_digest_id,
                     "stories_count": len(assessments),
                     "attempt_made": False,
                     "attempts_count": 0,
-                    "message_id": existing_record.get("message_id"),
+                    "message_id": msg_id_val,
                     "is_ux_test": is_ux_test,
                 })
                 continue
             elif rec_status == "DELIVERY_UNCERTAIN":
                 _record_public_result(r_role, r_masked, {
                     "status": "DUPLICATE_DELIVERY_PREVENTED",
-                    "error": f"Duplicate delivery prevented: A prior attempt for {r_role} resulted in an ambiguous timeout on {existing_record.get('delivered_at_utc')}. Automatic resend is blocked.",
+                    "error": f"Duplicate delivery prevented: A prior attempt for {r_role} resulted in an ambiguous timeout on {delivered_at_str}. Automatic resend is blocked.",
                     "digest_hash": digest_hash,
                     "stable_digest_id": stable_digest_id,
                     "stories_count": len(assessments),
@@ -1315,6 +1960,64 @@ def deliver_one_shot_editorial_digest(
             })
             continue
 
+        # Durable Pre-Send Delivery Claim:
+        # Atomically acquire delivery claim before external HTTP call to guarantee no duplicate dispatches
+        # and prevent competing workers from sending the same logical message.
+        if repository is not None:
+            deliv_id = f"DELIV-{digest_hash[:8]}-{abs(hash(r_chat)) % 1000000:06d}"
+            try:
+                claimed = repository.claim_telegram_delivery(
+                    delivery_id=deliv_id,
+                    message_key=digest_hash,
+                    recipient_role=r_role,
+                    recipient_chat_id=r_chat,
+                    category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                    payload={
+                        "stable_digest_id": stable_digest_id,
+                        "is_ux_test": is_ux_test,
+                        "stories_count": len(assessments),
+                    },
+                    max_attempts=1,
+                )
+            except Exception as exc:
+                _record_public_result(r_role, r_masked, {
+                    "status": "REPOSITORY_ERROR",
+                    "error": f"Failed closed: repository claim error: {sanitize_telegram_text(str(exc), settings.telegram_bot_token)}",
+                    "digest_hash": digest_hash,
+                    "stable_digest_id": stable_digest_id,
+                    "attempt_made": False,
+                    "attempts_count": 0,
+                    "is_ux_test": is_ux_test,
+                })
+                continue
+
+            if not claimed:
+                existing_deliv = repository.get_telegram_delivery(r_chat, digest_hash)
+                deliv_st = existing_deliv.status.value if existing_deliv else "UNKNOWN"
+                if existing_deliv and existing_deliv.status in (DeliveryStatus.SENT, DeliveryStatus.DELIVERY_UNCERTAIN):
+                    _record_public_result(r_role, r_masked, {
+                        "status": "DUPLICATE_DELIVERY_PREVENTED",
+                        "error": f"Duplicate delivery prevented: prior durable repository delivery status is {deliv_st}.",
+                        "digest_hash": digest_hash,
+                        "stable_digest_id": stable_digest_id,
+                        "stories_count": len(assessments),
+                        "attempt_made": False,
+                        "attempts_count": 0,
+                        "is_ux_test": is_ux_test,
+                    })
+                else:
+                    _record_public_result(r_role, r_masked, {
+                        "status": "CLAIM_REJECTED",
+                        "error": f"Delivery claim rejected: an in-flight worker or prior attempt holds this message (status: {deliv_st}).",
+                        "digest_hash": digest_hash,
+                        "stable_digest_id": stable_digest_id,
+                        "stories_count": len(assessments),
+                        "attempt_made": False,
+                        "attempts_count": 0,
+                        "is_ux_test": is_ux_test,
+                    })
+                continue
+
         # Single-Shot Live Dispatch (EXACTLY ONE ATTEMPT, ZERO RETRIES)
         endpoint = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
         payload = {
@@ -1331,17 +2034,37 @@ def deliver_one_shot_editorial_digest(
                 resp_json = resp.json()
                 if resp_json.get("ok"):
                     msg_id = resp_json.get("result", {}).get("message_id")
-                    _save_delivery_record(r_chat, r_role, r_masked, "DELIVERY_SUCCESS", msg_id=msg_id)
-                    _record_public_result(r_role, r_masked, {
-                        "status": "DELIVERY_SUCCESS",
-                        "message": f"Telegram editorial digest successfully delivered to {r_role} (message_id: {msg_id}).",
-                        "message_id": msg_id,
-                        "digest_hash": digest_hash,
-                        "stable_digest_id": stable_digest_id,
-                        "stories_count": len(assessments),
-                        "attempt_made": True,
-                        "attempts_count": 1,
-                    })
+                    persistence_failed = False
+                    persistence_err = None
+                    try:
+                        _save_delivery_record(r_chat, r_role, r_masked, "DELIVERY_SUCCESS", msg_id=msg_id)
+                    except Exception as exc:
+                        persistence_failed = True
+                        persistence_err = sanitize_telegram_text(str(exc), settings.telegram_bot_token)
+                        logger.error("Post-send persistence failure in repository: %s", exc)
+
+                    if persistence_failed:
+                        _record_public_result(r_role, r_masked, {
+                            "status": "POST_SEND_PERSISTENCE_FAILED",
+                            "error": f"Post-send persistence failure: Telegram accepted delivery (message_id: {msg_id}) but durable repository recording failed: {persistence_err}. Requires reconciliation.",
+                            "message_id": msg_id,
+                            "digest_hash": digest_hash,
+                            "stable_digest_id": stable_digest_id,
+                            "stories_count": len(assessments),
+                            "attempt_made": True,
+                            "attempts_count": 1,
+                        })
+                    else:
+                        _record_public_result(r_role, r_masked, {
+                            "status": "DELIVERY_SUCCESS",
+                            "message": f"Telegram editorial digest successfully delivered to {r_role} (message_id: {msg_id}).",
+                            "message_id": msg_id,
+                            "digest_hash": digest_hash,
+                            "stable_digest_id": stable_digest_id,
+                            "stories_count": len(assessments),
+                            "attempt_made": True,
+                            "attempts_count": 1,
+                        })
                 else:
                     err_msg = sanitize_telegram_text(f"Telegram API response not ok: {resp_json}", settings.telegram_bot_token)
                     _save_delivery_record(r_chat, r_role, r_masked, "DELIVERY_FAILED", err_desc=err_msg)
@@ -1394,24 +2117,14 @@ def deliver_one_shot_editorial_digest(
                 })
             elif resp.status_code >= 500:
                 err_msg = sanitize_telegram_text(f"Telegram server error (HTTP {resp.status_code}): {resp.text[:200]}", settings.telegram_bot_token)
-                if resp.status_code == 504:
-                    _save_delivery_record(r_chat, r_role, r_masked, "DELIVERY_UNCERTAIN", err_desc=err_msg)
-                    _record_public_result(r_role, r_masked, {
-                        "status": "DELIVERY_UNCERTAIN",
-                        "error": f"Ambiguous gateway timeout (HTTP 504): {err_msg}. Message may have been accepted; automatic retry skipped.",
-                        "digest_hash": digest_hash,
-                        "attempt_made": True,
-                        "attempts_count": 1,
-                    })
-                else:
-                    _save_delivery_record(r_chat, r_role, r_masked, "SERVER_ERROR", err_desc=err_msg)
-                    _record_public_result(r_role, r_masked, {
-                        "status": "SERVER_ERROR",
-                        "error": err_msg,
-                        "digest_hash": digest_hash,
-                        "attempt_made": True,
-                        "attempts_count": 1,
-                    })
+                _save_delivery_record(r_chat, r_role, r_masked, "DELIVERY_UNCERTAIN", err_desc=err_msg)
+                _record_public_result(r_role, r_masked, {
+                    "status": "DELIVERY_UNCERTAIN",
+                    "error": f"Ambiguous server outcome (HTTP {resp.status_code}): {err_msg}. Message may have been accepted; automatic retry skipped.",
+                    "digest_hash": digest_hash,
+                    "attempt_made": True,
+                    "attempts_count": 1,
+                })
             else:
                 err_msg = sanitize_telegram_text(f"Unexpected HTTP status {resp.status_code}: {resp.text[:200]}", settings.telegram_bot_token)
                 _save_delivery_record(r_chat, r_role, r_masked, "DELIVERY_FAILED", err_desc=err_msg)
@@ -1434,10 +2147,10 @@ def deliver_one_shot_editorial_digest(
             })
         except httpx.TransportError as exc:
             sanitized_exc = sanitize_telegram_text(str(exc), settings.telegram_bot_token)
-            _save_delivery_record(r_chat, r_role, r_masked, "NETWORK_ERROR", err_desc=sanitized_exc)
+            _save_delivery_record(r_chat, r_role, r_masked, "DELIVERY_UNCERTAIN", err_desc=sanitized_exc)
             _record_public_result(r_role, r_masked, {
-                "status": "NETWORK_ERROR",
-                "error": f"Network transport error for {r_role}: {sanitized_exc}",
+                "status": "DELIVERY_UNCERTAIN",
+                "error": f"Ambiguous network transport interruption for {r_role}: {sanitized_exc}. Message may have reached Telegram; automatic retry skipped.",
                 "digest_hash": digest_hash,
                 "attempt_made": True,
                 "attempts_count": 1,

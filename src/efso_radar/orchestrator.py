@@ -37,6 +37,7 @@ from efso_radar.domain import (
 )
 from efso_radar.notifications.base import NotificationChannel
 from efso_radar.notifications.formatters import (
+    compute_stable_digest_identity,
     format_telegram_alert,
     format_telegram_breaking,
     format_telegram_digest,
@@ -79,10 +80,43 @@ class RadarOrchestrator:
         notifier: Optional[NotificationChannel] = None,
     ):
         self.settings = settings
-        self.repository = repository or SqliteStateRepository(settings.sqlite_db_path)
+        if repository is not None:
+            self.repository = repository
+        elif settings.storage_mode in ("turso", "cloud"):
+            has_url = bool(settings.turso_database_url and settings.turso_database_url.strip())
+            has_token = bool(settings.turso_auth_token and settings.turso_auth_token.strip())
+            if not (has_url and has_token):
+                raise ValueError(
+                    "Cloud storage mode enabled (EFSO_STORAGE_MODE=turso) but Turso configuration is missing or incomplete. "
+                    "Both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN must be provided."
+                )
+            from efso_radar.repositories.turso import TursoStateRepository
+            self.repository = TursoStateRepository(
+                database_url=settings.turso_database_url,
+                auth_token=settings.turso_auth_token,
+            )
+        elif settings.storage_mode == "auto":
+            has_url = bool(settings.turso_database_url and settings.turso_database_url.strip())
+            has_token = bool(settings.turso_auth_token and settings.turso_auth_token.strip())
+            if has_url != has_token:
+                raise ValueError(
+                    "Partial Turso configuration detected: both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN "
+                    "must be provided together, or neither."
+                )
+            if has_url and has_token:
+                from efso_radar.repositories.turso import TursoStateRepository
+                self.repository = TursoStateRepository(
+                    database_url=settings.turso_database_url,
+                    auth_token=settings.turso_auth_token,
+                )
+            else:
+                self.repository = SqliteStateRepository(settings.sqlite_db_path)
+        else:
+            self.repository = SqliteStateRepository(settings.sqlite_db_path)
+
         self.source = source or MultiSourceDiscoveryEngine(include_google_news=True)
         self.ai_engine = ai_engine or GeminiEditorialEngine(settings, repository=self.repository)
-        self.notifier = notifier or TelegramNotificationChannel(settings)
+        self.notifier = notifier or TelegramNotificationChannel(settings, repository=self.repository)
         self.deduper = DeduplicationEngine(self.repository)
 
     def run_scan_only(
@@ -90,9 +124,10 @@ class RadarOrchestrator:
         dry_run: bool = False,
         worker_id: Optional[str] = None,
         now: Optional[datetime] = None,
+        run_id: Optional[str] = None,
     ) -> RadarRunResult:
         """Execute RSS discovery, deduplication, and durable backlog persistence without calling Gemini."""
-        return self.run(dry_run=dry_run, worker_id=worker_id, now=now, scan_only=True)
+        return self.run(dry_run=dry_run, worker_id=worker_id, now=now, scan_only=True, run_id=run_id)
 
     def is_digest_due(self, now: Optional[datetime] = None) -> bool:
         """Check if enough time has elapsed since the last consolidated digest delivery."""
@@ -149,45 +184,113 @@ class RadarOrchestrator:
             window_label=f"{hours_label} Saatlik Editoryal Özet",
         )
 
-        if not dry_run:
+        stable_digest_id = compute_stable_digest_identity(synthetic_assessments)
+        digest_notif_id = f"DIGEST-{stable_digest_id[:16]}"
+
+        # External Delivery Activation Gate:
+        # If running in dry_run mode, external delivery cannot occur.
+        if dry_run:
+            logger.info("Digest external delivery not active (dry_run=True); preserving queue")
             if hasattr(self.notifier, "send_digest_batch"):
-                res = self.notifier.send_digest_batch(
-                    synthetic_assessments,
-                    notification_id=f"DIGEST-{ref_now.strftime('%Y%m%d%H%M%S')}",
-                    window_label=f"{hours_label} Saatlik Editoryal Özet",
-                    dry_run=dry_run,
-                    now=ref_now,
-                )
-                if res.status != DeliveryStatus.SENT:
-                    return 0
-            elif self.settings.telegram_bot_token and self.settings.telegram_chat_id and hasattr(self.notifier, "_dispatch_telegram"):
                 try:
-                    res = self.notifier._dispatch_telegram(
-                        f"DIGEST-{ref_now.strftime('%Y%m%d%H%M%S')}",
-                        batch[0].story_id,
-                        None,
-                        None,
-                        digest_text,
-                        ref_now,
-                        self.settings.telegram_chat_id,
-                        TelegramNotificationCategory.EDITORIAL_DIGEST,
-                        "TELEGRAM_DIGEST",
+                    self.notifier.send_digest_batch(
+                        synthetic_assessments,
+                        notification_id=digest_notif_id,
+                        window_label=f"{hours_label} Saatlik Editoryal Özet",
+                        dry_run=True,
+                        now=ref_now,
                     )
-                except TypeError:
-                    res = self.notifier._dispatch_telegram(
-                        f"DIGEST-{ref_now.strftime('%Y%m%d%H%M%S')}",
-                        batch[0].story_id,
-                        None,
-                        None,
-                        digest_text,
-                        ref_now,
+                except Exception as preview_err:
+                    logger.debug("Digest preview generation exception: %s", preview_err)
+            return 0
+
+        # When Telegram delivery is disabled for Telegram notification channels,
+        # external delivery must never occur and queued records must remain untouched.
+        is_telegram_channel = (
+            isinstance(self.notifier, TelegramNotificationChannel)
+            or hasattr(self.notifier, "_dispatch_telegram")
+            or self.notifier.__class__.__name__ == "TelegramNotificationChannel"
+        )
+        if is_telegram_channel and not self.settings.telegram_delivery_enabled:
+            logger.info("Digest external delivery not active (telegram_delivery_enabled=False); preserving queue")
+            if hasattr(self.notifier, "send_digest_batch"):
+                try:
+                    self.notifier.send_digest_batch(
+                        synthetic_assessments,
+                        notification_id=digest_notif_id,
+                        window_label=f"{hours_label} Saatlik Editoryal Özet",
+                        dry_run=True,
+                        now=ref_now,
                     )
-                if res.status != DeliveryStatus.SENT:
-                    return 0
-            self.repository.mark_digest_notifications_dispatched(
-                [q.notification_id for q in batch],
-                delivered_at=ref_now,
+                except Exception as preview_err:
+                    logger.debug("Digest preview generation exception: %s", preview_err)
+            return 0
+
+        # Live external delivery path
+        res: Optional[NotificationRecord] = None
+        delivery_attempted = False
+
+        if hasattr(self.notifier, "send_digest_batch"):
+            delivery_attempted = True
+            res = self.notifier.send_digest_batch(
+                synthetic_assessments,
+                notification_id=digest_notif_id,
+                window_label=f"{hours_label} Saatlik Editoryal Özet",
+                dry_run=False,
+                now=ref_now,
             )
+        elif self.settings.telegram_bot_token and hasattr(self.notifier, "_dispatch_telegram"):
+            target_chat = self.settings.telegram_primary_editor_chat_id or ""
+            if not target_chat:
+                logger.error("No PRIMARY_EDITOR chat ID configured for editorial digest dispatch; preserving queue")
+                return 0
+            delivery_attempted = True
+            try:
+                res = self.notifier._dispatch_telegram(
+                    digest_notif_id,
+                    batch[0].story_id,
+                    None,
+                    None,
+                    digest_text,
+                    ref_now,
+                    target_chat,
+                    TelegramNotificationCategory.EDITORIAL_DIGEST,
+                    "TELEGRAM_DIGEST",
+                )
+            except TypeError:
+                res = self.notifier._dispatch_telegram(
+                    digest_notif_id,
+                    batch[0].story_id,
+                    None,
+                    None,
+                    digest_text,
+                    ref_now,
+                )
+
+        # 1. No valid notifier dispatch path executed -> return safely and preserve queue
+        if not delivery_attempted or res is None:
+            logger.warning("No valid notifier dispatch path executed for editorial digest; preserving queue")
+            return 0
+
+        # 2. A preview must not be interpreted as confirmed external delivery
+        if getattr(res, "is_preview", False):
+            logger.info("Digest dispatch returned preview record; external delivery not confirmed, preserving queue")
+            return 0
+
+        # 3. Never mark queued records as dispatched unless an actual delivery was durably confirmed as SENT
+        if res.status != DeliveryStatus.SENT:
+            logger.warning(
+                "Digest delivery not confirmed as SENT (status=%s, error=%s); preserving queue",
+                res.status,
+                res.error_message,
+            )
+            return 0
+
+        # 4. Durably transition queued notifications to dispatched
+        self.repository.mark_digest_notifications_dispatched(
+            [q.notification_id for q in batch],
+            delivered_at=ref_now,
+        )
         return 1
 
     def run(
@@ -197,11 +300,13 @@ class RadarOrchestrator:
         now: Optional[datetime] = None,
         scan_only: bool = False,
         use_hybrid_digest: bool = False,
+        run_id: Optional[str] = None,
     ) -> RadarRunResult:
         start_time = time.monotonic()
         run_now = now or utc_now()
         now = run_now
         worker = worker_id or f"worker-{run_now.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        active_run_id = run_id or f"run_{run_now.strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}"
         effective_age_hours = self.settings.effective_max_age_hours()
         effective_backlog_hours = self.settings.effective_backlog_retention_hours()
 
@@ -222,6 +327,26 @@ class RadarOrchestrator:
             )
 
         try:
+            if not dry_run:
+                self.repository.record_scheduled_execution_start(
+                    run_id=active_run_id,
+                    run_type="SCAN_ONLY" if scan_only else "CRON",
+                    worker_id=worker,
+                    started_at=run_now,
+                )
+                self.repository.save_recovery_state(
+                    stage="RADAR_PIPELINE",
+                    worker_id=worker,
+                    state_payload={
+                        "stage": "INITIATED",
+                        "run_id": active_run_id,
+                        "worker_id": worker,
+                        "scan_only": scan_only,
+                        "dry_run": dry_run,
+                    },
+                    batch_id=active_run_id,
+                )
+
             # 2. Maintenance: Purge old processed records and expire stale backlog
             if not dry_run:
                 purged = self.repository.purge_expired_records(retention_days=35)
@@ -301,9 +426,22 @@ class RadarOrchestrator:
 
                                 # If real telegram channel configured, dispatch
                                 try:
-                                    if self.settings.telegram_bot_token and self.settings.telegram_chat_id:
+                                    if self.settings.telegram_bot_token:
+                                        target_editor = self.settings.telegram_primary_editor_chat_id or (self.settings.telegram_chat_id if not self.settings.telegram_delivery_enabled else "")
+                                        if not target_editor and self.settings.telegram_delivery_enabled:
+                                            logger.error("No PRIMARY_EDITOR chat ID configured to release held notification %s", held.notification_id)
+                                            continue
+                                        held_cat = held.category if held.category else TelegramNotificationCategory.VERIFIED_BREAKING
                                         dispatch_res = self.notifier._dispatch_telegram(
-                                            held.notification_id, held.story_id, held.update_id, None, held.message_text, now
+                                            held.notification_id,
+                                            held.story_id,
+                                            held.update_id,
+                                            None,
+                                            held.message_text,
+                                            now,
+                                            target_editor,
+                                            held_cat,
+                                            held.channel or "TELEGRAM",
                                         ) if hasattr(self.notifier, "_dispatch_telegram") else held
                                         if dispatch_res.status == DeliveryStatus.SENT:
                                             self.repository.mark_notification_delivered(held.notification_id, now)
@@ -329,6 +467,22 @@ class RadarOrchestrator:
             if successes == 0:
                 msg = "All news feeds failed to respond; aborting run to prevent state corruption."
                 logger.error(msg)
+                if not dry_run:
+                    self.repository.save_recovery_state(
+                        stage="RADAR_PIPELINE",
+                        worker_id=worker,
+                        state_payload={"stage": "FEED_DISCOVERY_FAILED", "error": msg, "run_id": active_run_id},
+                        batch_id=active_run_id,
+                    )
+                    self.repository.record_scheduled_execution_finish(
+                        run_id=active_run_id,
+                        status="FAILED",
+                        articles_collected=0,
+                        candidates_evaluated=0,
+                        notifications_dispatched=notifications_dispatched,
+                        error_message=msg,
+                        finished_at=utc_now(),
+                    )
                 return RadarRunResult(
                     success=False,
                     sources_succeeded=0,
@@ -366,11 +520,34 @@ class RadarOrchestrator:
             )
             deprioritized = getattr(self.deduper, "last_deprioritized", [])
 
+            if not dry_run:
+                self.repository.save_recovery_state(
+                    stage="RADAR_PIPELINE",
+                    worker_id=worker,
+                    state_payload={
+                        "stage": "DISCOVERY_COMPLETED",
+                        "run_id": active_run_id,
+                        "articles_count": len(articles),
+                        "candidates_count": len(candidates),
+                    },
+                    batch_id=active_run_id,
+                )
+
             # 5b. Scan-Only / Decoupled Discovery Mode: persist all fresh candidates to backlog without calling Gemini
             if scan_only or not self.settings.ai_evaluation_enabled:
                 all_to_queue = list(candidates) + list(deprioritized)
                 if not dry_run and all_to_queue:
                     self.repository.save_pending_candidates(all_to_queue)
+                if not dry_run:
+                    self.repository.clear_recovery_state("RADAR_PIPELINE")
+                    self.repository.record_scheduled_execution_finish(
+                        run_id=active_run_id,
+                        status="SUCCESS",
+                        articles_collected=len(articles),
+                        candidates_evaluated=0,
+                        notifications_dispatched=0 if scan_only else notifications_dispatched,
+                        finished_at=utc_now(),
+                    )
                 duration = time.monotonic() - start_time
                 return RadarRunResult(
                     success=True,
@@ -524,7 +701,7 @@ class RadarOrchestrator:
                 if is_sensitive_review:
                     notif_suffix = update_id if update_id else story_id
                     record = NotificationRecord(
-                        notification_id=f"HOLD-SENSITIVE-{now.strftime('%Y%m%d%H%M%S')}-{notif_suffix}",
+                        notification_id=f"HOLD-SENSITIVE-{notif_suffix}",
                         story_id=story_id,
                         update_id=update_id,
                         kind=pick.kind,
@@ -540,7 +717,7 @@ class RadarOrchestrator:
                 elif is_unverified:
                     notif_suffix = update_id if update_id else story_id
                     record = NotificationRecord(
-                        notification_id=f"HOLD-VERIF-{now.strftime('%Y%m%d%H%M%S')}-{notif_suffix}",
+                        notification_id=f"HOLD-VERIF-{notif_suffix}",
                         story_id=story_id,
                         update_id=update_id,
                         kind=pick.kind,
@@ -556,7 +733,7 @@ class RadarOrchestrator:
                 elif should_queue_digest:
                     notif_suffix = update_id if update_id else story_id
                     record = NotificationRecord(
-                        notification_id=f"DIGEST-Q-{now.strftime('%Y%m%d%H%M%S')}-{notif_suffix}",
+                        notification_id=f"DIGEST-Q-{notif_suffix}",
                         story_id=story_id,
                         update_id=update_id,
                         kind=pick.kind,
@@ -626,6 +803,17 @@ class RadarOrchestrator:
                 self.repository.mark_articles_processed(candidates)
                 self.repository.mark_candidates_evaluated([c.id for c in candidates])
 
+            if not dry_run:
+                self.repository.clear_recovery_state("RADAR_PIPELINE")
+                self.repository.record_scheduled_execution_finish(
+                    run_id=active_run_id,
+                    status="SUCCESS",
+                    articles_collected=len(articles),
+                    candidates_evaluated=len(candidates),
+                    notifications_dispatched=notifications_dispatched,
+                    finished_at=utc_now(),
+                )
+
             duration = time.monotonic() - start_time
             return RadarRunResult(
                 success=True,
@@ -640,8 +828,37 @@ class RadarOrchestrator:
                 discovery_metrics=discovery_metrics,
             )
 
+        except Exception as exc:
+            if not dry_run:
+                try:
+                    self.repository.save_recovery_state(
+                        stage="RADAR_PIPELINE",
+                        worker_id=worker,
+                        state_payload={"stage": "FAILED", "run_id": active_run_id, "error": str(exc)},
+                        batch_id=active_run_id,
+                    )
+                except Exception as save_err:
+                    logger.warning("Failed recording failure recovery state: %s", save_err)
+
+                try:
+                    self.repository.record_scheduled_execution_finish(
+                        run_id=active_run_id,
+                        status="FAILED",
+                        articles_collected=len(articles) if "articles" in locals() else 0,
+                        candidates_evaluated=len(candidates) if "candidates" in locals() else 0,
+                        notifications_dispatched=notifications_dispatched if "notifications_dispatched" in locals() else 0,
+                        error_message=str(exc),
+                        finished_at=utc_now(),
+                    )
+                except Exception as finish_err:
+                    logger.warning("Failed recording execution finish status: %s", finish_err)
+            raise
+
         finally:
             if not dry_run:
-                self.repository.release_run_lock(worker)
+                try:
+                    self.repository.release_run_lock(worker)
+                except Exception as release_err:
+                    logger.warning("Failed releasing run lock for worker %s: %s", worker, release_err)
 
 

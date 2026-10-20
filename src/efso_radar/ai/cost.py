@@ -42,6 +42,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NamedTuple, Optional, Sequence
 
@@ -353,11 +354,13 @@ class ExperimentBudgetGuard:
         budget_ceiling_usd: float = 0.050000,
         canary1_db_path: Path = Path("data/canary_radar.db"),
         canary2_db_path: Path = Path("data/canary2_radar.db"),
+        repository: Optional[Any] = None,
     ):
         self.ledger_path = Path(ledger_path)
         self.budget_ceiling_usd = budget_ceiling_usd
         self.canary1_db_path = Path(canary1_db_path)
         self.canary2_db_path = Path(canary2_db_path)
+        self.repository = repository
         self.data: dict[str, Any] = {}
         self._load_or_initialize()
 
@@ -429,7 +432,7 @@ class ExperimentBudgetGuard:
     def get_prior_canaries_cost_usd(self) -> float:
         return sum(c["cost_usd"] for c in self.data.get("prior_canaries", []))
 
-    def get_total_consumed_usd(self) -> float:
+    def get_total_consumed_usd(self, period_month: Optional[str] = None) -> float:
         total = self.get_prior_canaries_cost_usd()
         for b in self.data.get("batches", {}).values():
             if b.get("status") == "COMPLETED":
@@ -437,6 +440,13 @@ class ExperimentBudgetGuard:
             else:
                 # RESERVED or FAILED_AMBIGUOUS: fail-closed, treat worst-case as spent
                 total += b.get("estimated_worst_case_usd", 0.0)
+        if self.repository is not None:
+            month = period_month or datetime.now(timezone.utc).strftime("%Y-%m")
+            # Authoritative cloud repository read MUST fail closed on any error:
+            # Never silently ignore repository failures or assume 0 prior spend!
+            repo_sum = self.repository.get_monthly_budget_summary(month)
+            repo_cost = float(repo_sum.get("total_cost_usd", 0.0))
+            total = max(total, repo_cost)
         return round(total, 6)
 
     def get_remaining_allowance_usd(self) -> float:
@@ -483,6 +493,8 @@ class ExperimentBudgetGuard:
         input_tokens: int,
         output_tokens: int,
         model_name: str = "gemini-3.5-flash-lite",
+        run_id: str = "experiment_run",
+        worker_id: str = "worker-default",
     ) -> None:
         b = self.data.setdefault("batches", {}).setdefault(batch_hash, {})
         b["status"] = "COMPLETED"
@@ -491,6 +503,23 @@ class ExperimentBudgetGuard:
         b["output_tokens"] = output_tokens
         b["model_name"] = model_name
         self._save()
+
+        if self.repository is not None:
+            now_utc = datetime.now(timezone.utc)
+            period_month = now_utc.strftime("%Y-%m")
+            record_id = f"BUDGET-{batch_hash[:12]}"
+            self.repository.record_budget_usage(
+                period_month=period_month,
+                run_id=run_id,
+                worker_id=worker_id,
+                calls_count=1,
+                prompt_tokens=input_tokens,
+                completion_tokens=output_tokens,
+                total_tokens=input_tokens + output_tokens,
+                estimated_cost_usd=round(actual_cost_usd, 6),
+                timestamp=now_utc,
+                record_id=record_id,
+            )
 
     def record_failure(self, batch_hash: str, error_message: str) -> None:
         b = self.data.setdefault("batches", {}).setdefault(batch_hash, {})

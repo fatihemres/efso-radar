@@ -23,6 +23,7 @@ from efso_radar.domain import (
     Story,
     StoryUpdate,
     TelegramDeliveryRecord,
+    TelegramNotificationCategory,
 )
 
 
@@ -31,7 +32,9 @@ class StateRepository(ABC):
 
     # --- Run Locking & Concurrency ---
     @abstractmethod
-    def acquire_run_lock(self, worker_id: str, timeout_minutes: int = 15) -> bool:
+    def acquire_run_lock(
+        self, worker_id: str, timeout_minutes: int = 15, now: Optional[datetime] = None
+    ) -> bool:
         """Attempt to acquire a mutually exclusive run lock to prevent overlapping runs."""
         pass
 
@@ -266,6 +269,20 @@ class StateRepository(ABC):
         pass
 
     # --- Telegram Delivery Outbox & Recipient Lifecycle ---
+    @abstractmethod
+    def claim_telegram_delivery(
+        self,
+        delivery_id: str,
+        message_key: str,
+        recipient_role: str,
+        recipient_chat_id: str,
+        category: TelegramNotificationCategory,
+        payload: Optional[dict[str, Any]] = None,
+        max_attempts: int = 1,
+    ) -> bool:
+        """Atomically acquire a recipient-specific delivery claim before external HTTP dispatch."""
+        pass
+
     @abstractmethod
     def record_telegram_delivery(self, delivery: TelegramDeliveryRecord) -> None:
         """Persist or insert an initial delivery record into the durable outbox."""
