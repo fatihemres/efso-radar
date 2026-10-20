@@ -366,6 +366,7 @@ class TelegramNotificationChannel(NotificationChannel):
                 headline_tr=assessment.headline_tr,
                 score=assessment.score,
                 category=derived_category,
+                is_preview=True,
             )
 
         # 4. Privacy & Authentication Gate: Enforce chat ID allowlist on live dispatch
@@ -538,6 +539,7 @@ class TelegramNotificationChannel(NotificationChannel):
                 headline_tr=f"Editoryal Özet ({len(assessments)} Haber)",
                 score=85,
                 category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                is_preview=True,
             )
 
         # Check allowlist on live dispatch

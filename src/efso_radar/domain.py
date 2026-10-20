@@ -402,6 +402,7 @@ class NotificationRecord(BaseModel):
     score: int
     error_message: Optional[str] = None
     category: Optional[TelegramNotificationCategory] = None
+    is_preview: bool = False
 
 
 class TelegramDeliveryRecord(BaseModel):

@@ -1983,5 +1983,330 @@ class TestPhase5B3CCloudPersistenceIntegration(unittest.TestCase):
         body = json.loads(http_requests[0].content.decode("utf-8"))
         self.assertEqual(body.get("chat_id"), editor_chat)
 
+    # --- Tests 32-37: Digest Queue Integrity & External Delivery Safety ---
+    def test_32_delivery_disabled_flush_due_digest_preserves_queue_and_makes_zero_http_calls(self):
+        """When Telegram delivery is disabled, flush_due_digest() must never transition queued notifications to SENT."""
+        disabled_settings = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": False,
+            "telegram_bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+        })
+        repo = self._create_turso_repo()
+        http_requests = []
+        def recording_transport(request: httpx.Request) -> httpx.Response:
+            http_requests.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 99999}})
+
+        transport = httpx.MockTransport(recording_transport)
+        channel = TelegramNotificationChannel(settings=disabled_settings, transport=transport, repository=repo)
+
+        q_item = NotificationRecord(
+            notification_id="NOTIF-Q-TEST-32",
+            story_id="STORY-TEST-32",
+            kind=EditorialKind.NEW,
+            channel="TELEGRAM_DIGEST",
+            sent_at=utc_now(),
+            status=DeliveryStatus.QUEUED_FOR_DIGEST,
+            message_text="Queued digest item text",
+            headline_tr="Test Kuyrukta Bekleyen Haber 32",
+            score=88,
+        )
+        repo.record_notification(q_item)
+
+        orchestrator = RadarOrchestrator(
+            settings=disabled_settings,
+            source=MagicMock(spec=NewsSource),
+            ai_engine=MagicMock(),
+            notifier=channel,
+            repository=repo,
+        )
+
+        with unittest.mock.patch.object(repo, "mark_digest_notifications_dispatched", wraps=repo.mark_digest_notifications_dispatched) as spy_mark:
+            res = orchestrator.flush_due_digest(dry_run=False, force=True, now=utc_now())
+
+        self.assertEqual(res, 0)
+        self.assertEqual(len(http_requests), 0)
+        spy_mark.assert_not_called()
+
+        queued = repo.get_queued_digest_notifications()
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0].notification_id, "NOTIF-Q-TEST-32")
+        self.assertEqual(queued[0].status, DeliveryStatus.QUEUED_FOR_DIGEST)
+
+    def test_33_no_valid_notifier_dispatch_path_preserves_queue(self):
+        """When no valid notifier dispatch path exists, flush_due_digest() returns safely and preserves queue."""
+        live_settings = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": True,
+            "telegram_bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+        })
+        repo = self._create_turso_repo()
+
+        q_item = NotificationRecord(
+            notification_id="NOTIF-Q-TEST-33",
+            story_id="STORY-TEST-33",
+            kind=EditorialKind.NEW,
+            channel="TELEGRAM_DIGEST",
+            sent_at=utc_now(),
+            status=DeliveryStatus.QUEUED_FOR_DIGEST,
+            message_text="Queued digest item text",
+            headline_tr="Test Kuyrukta Bekleyen Haber 33",
+            score=88,
+        )
+        repo.record_notification(q_item)
+
+        # Notifier has no send_digest_batch and no _dispatch_telegram
+        class DummyNotifier:
+            pass
+
+        orchestrator = RadarOrchestrator(
+            settings=live_settings,
+            source=MagicMock(spec=NewsSource),
+            ai_engine=MagicMock(),
+            notifier=DummyNotifier(),
+            repository=repo,
+        )
+
+        with unittest.mock.patch.object(repo, "mark_digest_notifications_dispatched", wraps=repo.mark_digest_notifications_dispatched) as spy_mark:
+            res = orchestrator.flush_due_digest(dry_run=False, force=True, now=utc_now())
+
+        self.assertEqual(res, 0)
+        spy_mark.assert_not_called()
+
+        queued = repo.get_queued_digest_notifications()
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0].notification_id, "NOTIF-Q-TEST-33")
+        self.assertEqual(queued[0].status, DeliveryStatus.QUEUED_FOR_DIGEST)
+
+    def test_34_dry_run_preserves_queued_digest_notifications(self):
+        """Dry-run execution preserves queued digest notifications without marking them dispatched."""
+        live_settings = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": True,
+            "telegram_bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+        })
+        repo = self._create_turso_repo()
+        http_requests = []
+        def recording_transport(request: httpx.Request) -> httpx.Response:
+            http_requests.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 99999}})
+
+        transport = httpx.MockTransport(recording_transport)
+        channel = TelegramNotificationChannel(settings=live_settings, transport=transport, repository=repo)
+
+        q_item = NotificationRecord(
+            notification_id="NOTIF-Q-TEST-34",
+            story_id="STORY-TEST-34",
+            kind=EditorialKind.NEW,
+            channel="TELEGRAM_DIGEST",
+            sent_at=utc_now(),
+            status=DeliveryStatus.QUEUED_FOR_DIGEST,
+            message_text="Queued digest item text",
+            headline_tr="Test Kuyrukta Bekleyen Haber 34",
+            score=88,
+        )
+        repo.record_notification(q_item)
+
+        orchestrator = RadarOrchestrator(
+            settings=live_settings,
+            source=MagicMock(spec=NewsSource),
+            ai_engine=MagicMock(),
+            notifier=channel,
+            repository=repo,
+        )
+
+        with unittest.mock.patch.object(repo, "mark_digest_notifications_dispatched", wraps=repo.mark_digest_notifications_dispatched) as spy_mark:
+            res = orchestrator.flush_due_digest(dry_run=True, force=True, now=utc_now())
+
+        self.assertEqual(res, 0)
+        self.assertEqual(len(http_requests), 0)
+        spy_mark.assert_not_called()
+
+        queued = repo.get_queued_digest_notifications()
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0].notification_id, "NOTIF-Q-TEST-34")
+        self.assertEqual(queued[0].status, DeliveryStatus.QUEUED_FOR_DIGEST)
+
+    def test_35_confirmed_synthetic_telegram_delivery_transitions_queued_records(self):
+        """Genuinely confirmed synthetic Telegram delivery successfully transitions queued records to SENT."""
+        live_settings = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": True,
+            "telegram_bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+        })
+        repo = self._create_turso_repo()
+        http_requests = []
+        def recording_transport(request: httpx.Request) -> httpx.Response:
+            http_requests.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 12345}})
+
+        transport = httpx.MockTransport(recording_transport)
+        channel = TelegramNotificationChannel(settings=live_settings, transport=transport, repository=repo)
+
+        q_item = NotificationRecord(
+            notification_id="NOTIF-Q-TEST-35",
+            story_id="STORY-TEST-35",
+            kind=EditorialKind.NEW,
+            channel="TELEGRAM_DIGEST",
+            sent_at=utc_now(),
+            status=DeliveryStatus.QUEUED_FOR_DIGEST,
+            message_text="Queued digest item text",
+            headline_tr="Test Kuyrukta Bekleyen Haber 35",
+            score=88,
+        )
+        repo.record_notification(q_item)
+
+        orchestrator = RadarOrchestrator(
+            settings=live_settings,
+            source=MagicMock(spec=NewsSource),
+            ai_engine=MagicMock(),
+            notifier=channel,
+            repository=repo,
+        )
+
+        with unittest.mock.patch.object(repo, "mark_digest_notifications_dispatched", wraps=repo.mark_digest_notifications_dispatched) as spy_mark:
+            res = orchestrator.flush_due_digest(dry_run=False, force=True, now=utc_now())
+
+        self.assertEqual(res, 1)
+        self.assertEqual(len(http_requests), 1)
+        spy_mark.assert_called_once()
+
+        # Queue is now drained
+        queued = repo.get_queued_digest_notifications()
+        self.assertEqual(len(queued), 0)
+
+        # Record in DB is marked SENT
+        cursor = repo.client.execute(
+            "SELECT status, channel, delivered_at FROM notifications WHERE notification_id = 'NOTIF-Q-TEST-35'"
+        )
+        row = cursor.fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row.get("status"), "SENT")
+        self.assertEqual(row.get("channel"), "TELEGRAM_DIGEST")
+        self.assertIsNotNone(row.get("delivered_at"))
+
+    def test_36_ambiguous_or_failed_delivery_does_not_mark_notifications_as_sent(self):
+        """Ambiguous (DELIVERY_UNCERTAIN) or failed (FAILED) dispatch never transitions queued records to SENT."""
+        live_settings = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": True,
+            "telegram_bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+        })
+        repo = self._create_turso_repo()
+
+        # 1. Ambiguous timeout -> DELIVERY_UNCERTAIN
+        def timeout_transport(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(504, json={"ok": False, "description": "Gateway Timeout"})
+
+        transport = httpx.MockTransport(timeout_transport)
+        channel = TelegramNotificationChannel(settings=live_settings, transport=transport, repository=repo)
+
+        q_item1 = NotificationRecord(
+            notification_id="NOTIF-Q-TEST-36A",
+            story_id="STORY-TEST-36A",
+            kind=EditorialKind.NEW,
+            channel="TELEGRAM_DIGEST",
+            sent_at=utc_now(),
+            status=DeliveryStatus.QUEUED_FOR_DIGEST,
+            message_text="Queued digest item text",
+            headline_tr="Test Kuyrukta Bekleyen Haber 36A",
+            score=88,
+        )
+        repo.record_notification(q_item1)
+
+        orchestrator = RadarOrchestrator(
+            settings=live_settings,
+            source=MagicMock(spec=NewsSource),
+            ai_engine=MagicMock(),
+            notifier=channel,
+            repository=repo,
+        )
+
+        with unittest.mock.patch.object(repo, "mark_digest_notifications_dispatched", wraps=repo.mark_digest_notifications_dispatched) as spy_mark:
+            res1 = orchestrator.flush_due_digest(dry_run=False, force=True, now=utc_now())
+
+        self.assertEqual(res1, 0)
+        spy_mark.assert_not_called()
+        queued = repo.get_queued_digest_notifications()
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0].notification_id, "NOTIF-Q-TEST-36A")
+        self.assertEqual(queued[0].status, DeliveryStatus.QUEUED_FOR_DIGEST)
+
+        # 2. Definite failure (HTTP 403 Forbidden) -> FAILED
+        def forbidden_transport(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(403, json={"ok": False, "description": "Forbidden: bot was blocked by the user"})
+
+        channel_forbidden = TelegramNotificationChannel(
+            settings=live_settings,
+            transport=httpx.MockTransport(forbidden_transport),
+            repository=repo,
+        )
+        orchestrator_forbidden = RadarOrchestrator(
+            settings=live_settings,
+            source=MagicMock(spec=NewsSource),
+            ai_engine=MagicMock(),
+            notifier=channel_forbidden,
+            repository=repo,
+        )
+
+        with unittest.mock.patch.object(repo, "mark_digest_notifications_dispatched", wraps=repo.mark_digest_notifications_dispatched) as spy_mark:
+            res2 = orchestrator_forbidden.flush_due_digest(dry_run=False, force=True, now=utc_now())
+
+        self.assertEqual(res2, 0)
+        spy_mark.assert_not_called()
+        queued_after = repo.get_queued_digest_notifications()
+        self.assertEqual(len(queued_after), 1)
+        self.assertEqual(queued_after[0].notification_id, "NOTIF-Q-TEST-36A")
+        self.assertEqual(queued_after[0].status, DeliveryStatus.QUEUED_FOR_DIGEST)
+
+    def test_37_preview_record_from_notifier_not_interpreted_as_external_delivery(self):
+        """A preview record (is_preview=True) must never be interpreted as confirmed external delivery."""
+        live_settings = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": True,
+            "telegram_bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+        })
+        repo = self._create_turso_repo()
+
+        q_item = NotificationRecord(
+            notification_id="NOTIF-Q-TEST-37",
+            story_id="STORY-TEST-37",
+            kind=EditorialKind.NEW,
+            channel="TELEGRAM_DIGEST",
+            sent_at=utc_now(),
+            status=DeliveryStatus.QUEUED_FOR_DIGEST,
+            message_text="Queued digest item text",
+            headline_tr="Test Kuyrukta Bekleyen Haber 37",
+            score=88,
+        )
+        repo.record_notification(q_item)
+
+        class PreviewNotifier:
+            def send_digest_batch(self, *args, **kwargs):
+                return NotificationRecord(
+                    notification_id="DIGEST-PREVIEW-01",
+                    story_id="STORY-TEST-37",
+                    kind=EditorialKind.NEW,
+                    channel="TELEGRAM_DIGEST",
+                    sent_at=utc_now(),
+                    status=DeliveryStatus.SENT,
+                    message_text="Preview text",
+                    headline_tr="Preview headline",
+                    score=85,
+                    is_preview=True,
+                )
+
+        orchestrator = RadarOrchestrator(
+            settings=live_settings,
+            source=MagicMock(spec=NewsSource),
+            ai_engine=MagicMock(),
+            notifier=PreviewNotifier(),
+            repository=repo,
+        )
+
+        with unittest.mock.patch.object(repo, "mark_digest_notifications_dispatched", wraps=repo.mark_digest_notifications_dispatched) as spy_mark:
+            res = orchestrator.flush_due_digest(dry_run=False, force=True, now=utc_now())
+
+        self.assertEqual(res, 0)
+        spy_mark.assert_not_called()
+        queued = repo.get_queued_digest_notifications()
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0].notification_id, "NOTIF-Q-TEST-37")
+        self.assertEqual(queued[0].status, DeliveryStatus.QUEUED_FOR_DIGEST)
+
 if __name__ == "__main__":
     unittest.main()

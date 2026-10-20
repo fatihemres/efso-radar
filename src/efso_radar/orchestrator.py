@@ -187,52 +187,110 @@ class RadarOrchestrator:
         stable_digest_id = compute_stable_digest_identity(synthetic_assessments)
         digest_notif_id = f"DIGEST-{stable_digest_id[:16]}"
 
-        if not dry_run:
+        # External Delivery Activation Gate:
+        # If running in dry_run mode, external delivery cannot occur.
+        if dry_run:
+            logger.info("Digest external delivery not active (dry_run=True); preserving queue")
             if hasattr(self.notifier, "send_digest_batch"):
-                res = self.notifier.send_digest_batch(
-                    synthetic_assessments,
-                    notification_id=digest_notif_id,
-                    window_label=f"{hours_label} Saatlik Editoryal Özet",
-                    dry_run=dry_run,
-                    now=ref_now,
-                )
-                if res.status != DeliveryStatus.SENT:
-                    return 0
-            elif self.settings.telegram_bot_token and hasattr(self.notifier, "_dispatch_telegram"):
-                if not self.settings.telegram_delivery_enabled or dry_run:
-                    logger.info("Digest delivery skipped: telegram_delivery_enabled is False or dry_run is True")
-                    return 0
-                target_chat = self.settings.telegram_primary_editor_chat_id or (self.settings.telegram_chat_id if dry_run else "")
-                if not target_chat:
-                    logger.error("No PRIMARY_EDITOR chat ID configured for editorial digest dispatch")
-                    return 0
                 try:
-                    res = self.notifier._dispatch_telegram(
-                        digest_notif_id,
-                        batch[0].story_id,
-                        None,
-                        None,
-                        digest_text,
-                        ref_now,
-                        target_chat,
-                        TelegramNotificationCategory.EDITORIAL_DIGEST,
-                        "TELEGRAM_DIGEST",
+                    self.notifier.send_digest_batch(
+                        synthetic_assessments,
+                        notification_id=digest_notif_id,
+                        window_label=f"{hours_label} Saatlik Editoryal Özet",
+                        dry_run=True,
+                        now=ref_now,
                     )
-                except TypeError:
-                    res = self.notifier._dispatch_telegram(
-                        digest_notif_id,
-                        batch[0].story_id,
-                        None,
-                        None,
-                        digest_text,
-                        ref_now,
+                except Exception as preview_err:
+                    logger.debug("Digest preview generation exception: %s", preview_err)
+            return 0
+
+        # When Telegram delivery is disabled for Telegram notification channels,
+        # external delivery must never occur and queued records must remain untouched.
+        is_telegram_channel = (
+            isinstance(self.notifier, TelegramNotificationChannel)
+            or hasattr(self.notifier, "_dispatch_telegram")
+            or self.notifier.__class__.__name__ == "TelegramNotificationChannel"
+        )
+        if is_telegram_channel and not self.settings.telegram_delivery_enabled:
+            logger.info("Digest external delivery not active (telegram_delivery_enabled=False); preserving queue")
+            if hasattr(self.notifier, "send_digest_batch"):
+                try:
+                    self.notifier.send_digest_batch(
+                        synthetic_assessments,
+                        notification_id=digest_notif_id,
+                        window_label=f"{hours_label} Saatlik Editoryal Özet",
+                        dry_run=True,
+                        now=ref_now,
                     )
-                if res.status != DeliveryStatus.SENT:
-                    return 0
-            self.repository.mark_digest_notifications_dispatched(
-                [q.notification_id for q in batch],
-                delivered_at=ref_now,
+                except Exception as preview_err:
+                    logger.debug("Digest preview generation exception: %s", preview_err)
+            return 0
+
+        # Live external delivery path
+        res: Optional[NotificationRecord] = None
+        delivery_attempted = False
+
+        if hasattr(self.notifier, "send_digest_batch"):
+            delivery_attempted = True
+            res = self.notifier.send_digest_batch(
+                synthetic_assessments,
+                notification_id=digest_notif_id,
+                window_label=f"{hours_label} Saatlik Editoryal Özet",
+                dry_run=False,
+                now=ref_now,
             )
+        elif self.settings.telegram_bot_token and hasattr(self.notifier, "_dispatch_telegram"):
+            target_chat = self.settings.telegram_primary_editor_chat_id or ""
+            if not target_chat:
+                logger.error("No PRIMARY_EDITOR chat ID configured for editorial digest dispatch; preserving queue")
+                return 0
+            delivery_attempted = True
+            try:
+                res = self.notifier._dispatch_telegram(
+                    digest_notif_id,
+                    batch[0].story_id,
+                    None,
+                    None,
+                    digest_text,
+                    ref_now,
+                    target_chat,
+                    TelegramNotificationCategory.EDITORIAL_DIGEST,
+                    "TELEGRAM_DIGEST",
+                )
+            except TypeError:
+                res = self.notifier._dispatch_telegram(
+                    digest_notif_id,
+                    batch[0].story_id,
+                    None,
+                    None,
+                    digest_text,
+                    ref_now,
+                )
+
+        # 1. No valid notifier dispatch path executed -> return safely and preserve queue
+        if not delivery_attempted or res is None:
+            logger.warning("No valid notifier dispatch path executed for editorial digest; preserving queue")
+            return 0
+
+        # 2. A preview must not be interpreted as confirmed external delivery
+        if getattr(res, "is_preview", False):
+            logger.info("Digest dispatch returned preview record; external delivery not confirmed, preserving queue")
+            return 0
+
+        # 3. Never mark queued records as dispatched unless an actual delivery was durably confirmed as SENT
+        if res.status != DeliveryStatus.SENT:
+            logger.warning(
+                "Digest delivery not confirmed as SENT (status=%s, error=%s); preserving queue",
+                res.status,
+                res.error_message,
+            )
+            return 0
+
+        # 4. Durably transition queued notifications to dispatched
+        self.repository.mark_digest_notifications_dispatched(
+            [q.notification_id for q in batch],
+            delivered_at=ref_now,
+        )
         return 1
 
     def run(

@@ -58,6 +58,27 @@ class MockNotifier(NotificationChannel):
         self.sent_records.append(record)
         return record
 
+    def send_digest_batch(
+        self,
+        assessments,
+        notification_id=None,
+        window_label="6 Saatlik Editoryal Özet",
+        dry_run=False,
+        now=None,
+    ) -> NotificationRecord:
+        record = NotificationRecord(
+            notification_id=notification_id or f"MOCK-DIGEST-{len(self.sent_records)}",
+            story_id=assessments[0].article_ids[0] if assessments else "DIGEST",
+            kind=EditorialKind.NEW,
+            sent_at=now or utc_now(),
+            status=DeliveryStatus.SENT,
+            message_text=f"Mock digest ({len(assessments)} items)",
+            headline_tr=assessments[0].headline_tr if assessments else "Digest",
+            score=85,
+        )
+        self.sent_records.append(record)
+        return record
+
 
 class TestOrchestrator(unittest.TestCase):
     def setUp(self):
