@@ -358,6 +358,7 @@ class TestPhase4FTelegramUXRedesign(unittest.TestCase):
             settings = Settings(
                 telegram_bot_token="test_token_12345",
                 telegram_chat_id="1000000001",
+                telegram_primary_editor_chat_id="1000000001",
                 telegram_allowed_chat_ids=["1000000001"],
                 telegram_delivery_enabled=True,
                 legacy_editorial_fallback=True,

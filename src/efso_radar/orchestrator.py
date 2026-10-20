@@ -198,7 +198,11 @@ class RadarOrchestrator:
                 )
                 if res.status != DeliveryStatus.SENT:
                     return 0
-            elif self.settings.telegram_bot_token and self.settings.telegram_chat_id and hasattr(self.notifier, "_dispatch_telegram"):
+            elif self.settings.telegram_bot_token and hasattr(self.notifier, "_dispatch_telegram"):
+                target_chat = self.settings.telegram_primary_editor_chat_id or (self.settings.telegram_chat_id if dry_run else "")
+                if not target_chat:
+                    logger.error("No PRIMARY_EDITOR chat ID configured for editorial digest dispatch")
+                    return 0
                 try:
                     res = self.notifier._dispatch_telegram(
                         digest_notif_id,
@@ -207,7 +211,7 @@ class RadarOrchestrator:
                         None,
                         digest_text,
                         ref_now,
-                        self.settings.telegram_chat_id,
+                        target_chat,
                         TelegramNotificationCategory.EDITORIAL_DIGEST,
                         "TELEGRAM_DIGEST",
                     )
@@ -361,9 +365,22 @@ class RadarOrchestrator:
 
                                 # If real telegram channel configured, dispatch
                                 try:
-                                    if self.settings.telegram_bot_token and self.settings.telegram_chat_id:
+                                    if self.settings.telegram_bot_token:
+                                        target_editor = self.settings.telegram_primary_editor_chat_id or (self.settings.telegram_chat_id if not self.settings.telegram_delivery_enabled else "")
+                                        if not target_editor and self.settings.telegram_delivery_enabled:
+                                            logger.error("No PRIMARY_EDITOR chat ID configured to release held notification %s", held.notification_id)
+                                            continue
+                                        held_cat = held.category if held.category else TelegramNotificationCategory.VERIFIED_BREAKING
                                         dispatch_res = self.notifier._dispatch_telegram(
-                                            held.notification_id, held.story_id, held.update_id, None, held.message_text, now
+                                            held.notification_id,
+                                            held.story_id,
+                                            held.update_id,
+                                            None,
+                                            held.message_text,
+                                            now,
+                                            target_editor,
+                                            held_cat,
+                                            held.channel or "TELEGRAM",
                                         ) if hasattr(self.notifier, "_dispatch_telegram") else held
                                         if dispatch_res.status == DeliveryStatus.SENT:
                                             self.repository.mark_notification_delivered(held.notification_id, now)

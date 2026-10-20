@@ -52,6 +52,7 @@ from efso_radar.notifications.telegram import (
     deliver_one_shot_editorial_digest,
 )
 from efso_radar.orchestrator import RadarOrchestrator
+from efso_radar.repositories.base import StateRepository
 from efso_radar.repositories.schema import CURRENT_SCHEMA_VERSION, get_all_init_statements
 from efso_radar.repositories.sqlite import SqliteStateRepository
 from efso_radar.repositories.turso import TursoStateRepository
@@ -1276,6 +1277,430 @@ class TestPhase5B3CCloudPersistenceIntegration(unittest.TestCase):
         )
         self.assertEqual(res_admin_chat.get("status"), "RECIPIENT_ROLE_VIOLATION")
         self.assertEqual(len(http_requests), 1)  # Still exactly 1 call total, 0 to ADMIN!
+
+
+    def test_19_admin_never_receives_live_editorial_even_with_legacy_flags(self):
+        """Verify ADMIN never receives a live editorial message across ANY dispatch path, even when legacy flags are enabled."""
+        repo = self._create_turso_repo()
+        admin_chat = self.test_settings.telegram_chat_id
+        editor_chat = self.test_settings.telegram_primary_editor_chat_id
+
+        live_settings = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": True,
+            "telegram_bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            "legacy_editorial_fallback": True,  # Legacy flag enabled!
+        })
+
+        http_requests = []
+        def recording_transport(request: httpx.Request) -> httpx.Response:
+            http_requests.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 99999}})
+
+        transport = httpx.MockTransport(recording_transport)
+        channel = TelegramNotificationChannel(settings=live_settings, transport=transport, repository=repo)
+
+        assessment = EditorialAssessment(
+            headline_tr="Admin İzolasyon Testi",
+            why_efso_tr="Test",
+            suggested_format=SuggestedFormat.POST,
+            category=StoryCategory.VIRAL,
+            disposition=EditorialDisposition.DIGEST,
+            verification_status=VerificationStatus.OFFICIAL_CONFIRMATION,
+            confidence_score=0.95,
+            kind=EditorialKind.NEW,
+            score=90,
+            article_ids=["admin_iso_001"],
+        )
+
+        # Path 1: channel.send() targeting ADMIN
+        res_send = channel.send(
+            assessment=assessment,
+            story_id="STORY-ADMIN-01",
+            target_chat_id=admin_chat,
+            dry_run=False,
+        )
+        self.assertEqual(res_send.status, DeliveryStatus.FAILED)
+        self.assertIn("Recipient separation violation", res_send.error_message or "")
+
+        # Path 2: channel.send_digest_batch() targeting ADMIN
+        res_batch = channel.send_digest_batch(
+            assessments=[assessment],
+            target_chat_id=admin_chat,
+            dry_run=False,
+        )
+        self.assertEqual(res_batch.status, DeliveryStatus.FAILED)
+        self.assertIn("Recipient separation violation", res_batch.error_message or "")
+
+        # Path 3: channel.send_multicast() targeting ADMIN
+        res_multi = channel.send_multicast(
+            assessment=assessment,
+            story_id="STORY-ADMIN-02",
+            target_role="ADMIN",
+            dry_run=False,
+        )
+        self.assertEqual(len(res_multi), 1)
+        self.assertEqual(res_multi[0].status, DeliveryStatus.FAILED)
+        self.assertIn("Recipient separation violation", res_multi[0].error_message or "")
+
+        # Path 4: channel.send_digest_batch_multicast() targeting ADMIN
+        res_batch_multi = channel.send_digest_batch_multicast(
+            assessments=[assessment],
+            notification_id="DIGEST-ADMIN-01",
+            target_role="ADMIN",
+            dry_run=False,
+        )
+        self.assertEqual(len(res_batch_multi), 1)
+        self.assertEqual(res_batch_multi[0].status, DeliveryStatus.FAILED)
+        self.assertIn("Recipient separation violation", res_batch_multi[0].error_message or "")
+
+        # Path 5: deliver_one_shot_editorial_digest() with target_chat_id=ADMIN and allow_legacy_admin_broadcast=True
+        test_ledger = self.tmp_path / "ledger_admin_never.json"
+        res_oneshot_chat = deliver_one_shot_editorial_digest(
+            settings=live_settings,
+            assessments=[assessment, assessment, assessment],
+            dry_run=False,
+            target_chat_id=admin_chat,
+            allow_legacy_admin_broadcast=True,
+            repository=repo,
+            transport=transport,
+            ledger_path=test_ledger,
+        )
+        self.assertEqual(res_oneshot_chat.get("status"), "RECIPIENT_ROLE_VIOLATION")
+
+        # Path 6: deliver_one_shot_editorial_digest() with target_recipient_role="ADMIN" and allow_legacy_admin_broadcast=True
+        res_oneshot_role = deliver_one_shot_editorial_digest(
+            settings=live_settings,
+            assessments=[assessment, assessment, assessment],
+            dry_run=False,
+            target_recipient_role="ADMIN",
+            allow_legacy_admin_broadcast=True,
+            repository=repo,
+            transport=transport,
+            ledger_path=test_ledger,
+        )
+        self.assertEqual(res_oneshot_role.get("status"), "RECIPIENT_ROLE_VIOLATION")
+
+        # Invariant: EXACTLY 0 HTTP calls to ADMIN or anywhere across all 6 live paths!
+        self.assertEqual(len(http_requests), 0)
+
+    def test_20_explicit_allowlisted_non_primary_editor_chat_id_rejected(self):
+        """Verify explicit target_chat_id with an allowlisted but non-PRIMARY_EDITOR role is rejected in live delivery."""
+        third_chat_id = "555555555"
+        live_settings = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": True,
+            "telegram_bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            "telegram_allowed_chat_ids": [
+                self.test_settings.telegram_chat_id,
+                self.test_settings.telegram_primary_editor_chat_id,
+                third_chat_id,  # Allowlisted, but role is AUTHORIZED_RECIPIENT
+            ],
+        })
+        self.assertEqual(live_settings.get_recipient_role(third_chat_id), "AUTHORIZED_RECIPIENT")
+
+        http_requests = []
+        def recording_transport(request: httpx.Request) -> httpx.Response:
+            http_requests.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 11111}})
+
+        transport = httpx.MockTransport(recording_transport)
+        repo = self._create_turso_repo()
+        channel = TelegramNotificationChannel(settings=live_settings, transport=transport, repository=repo)
+
+        assessment = EditorialAssessment(
+            headline_tr="Non-Editor Allowlist Testi",
+            why_efso_tr="Test",
+            suggested_format=SuggestedFormat.POST,
+            category=StoryCategory.VIRAL,
+            disposition=EditorialDisposition.DIGEST,
+            verification_status=VerificationStatus.OFFICIAL_CONFIRMATION,
+            confidence_score=0.95,
+            kind=EditorialKind.NEW,
+            score=90,
+            article_ids=["non_editor_001"],
+        )
+
+        # 1. channel.send() targeting third_chat_id rejected
+        res1 = channel.send(assessment=assessment, story_id="STORY-NONED-01", target_chat_id=third_chat_id, dry_run=False)
+        self.assertEqual(res1.status, DeliveryStatus.FAILED)
+        self.assertIn("Recipient separation violation", res1.error_message or "")
+
+        # 2. channel.send_digest_batch() targeting third_chat_id rejected
+        res2 = channel.send_digest_batch(assessments=[assessment], target_chat_id=third_chat_id, dry_run=False)
+        self.assertEqual(res2.status, DeliveryStatus.FAILED)
+        self.assertIn("Recipient separation violation", res2.error_message or "")
+
+        # 3. deliver_one_shot_editorial_digest() targeting third_chat_id rejected
+        test_ledger = self.tmp_path / "ledger_non_editor.json"
+        res3 = deliver_one_shot_editorial_digest(
+            settings=live_settings,
+            assessments=[assessment, assessment, assessment],
+            dry_run=False,
+            target_chat_id=third_chat_id,
+            repository=repo,
+            transport=transport,
+            ledger_path=test_ledger,
+        )
+        self.assertEqual(res3.get("status"), "RECIPIENT_ROLE_VIOLATION")
+
+        # Zero HTTP calls made!
+        self.assertEqual(len(http_requests), 0)
+
+    def test_21_target_all_never_includes_admin_in_live_editorial(self):
+        """Verify target_recipient_role='ALL' never includes ADMIN in live editorial delivery across all multicast and digest paths."""
+        repo = self._create_turso_repo()
+        admin_chat = self.test_settings.telegram_chat_id
+        editor_chat = self.test_settings.telegram_primary_editor_chat_id
+
+        live_settings = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": True,
+            "telegram_bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            "legacy_editorial_fallback": True,
+        })
+
+        http_requests = []
+        def recording_transport(request: httpx.Request) -> httpx.Response:
+            http_requests.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 88888}})
+
+        transport = httpx.MockTransport(recording_transport)
+        channel = TelegramNotificationChannel(settings=live_settings, transport=transport, repository=repo)
+
+        assessment = EditorialAssessment(
+            headline_tr="Target All Testi",
+            why_efso_tr="Test",
+            suggested_format=SuggestedFormat.POST,
+            category=StoryCategory.VIRAL,
+            disposition=EditorialDisposition.DIGEST,
+            verification_status=VerificationStatus.OFFICIAL_CONFIRMATION,
+            confidence_score=0.95,
+            kind=EditorialKind.NEW,
+            score=90,
+            article_ids=["target_all_001"],
+        )
+
+        # 1. send_multicast with target_role="ALL" delivers strictly to PRIMARY_EDITOR
+        records_multi = channel.send_multicast(
+            assessment=assessment,
+            story_id="STORY-ALL-01",
+            target_role="ALL",
+            dry_run=False,
+        )
+        self.assertEqual(len(records_multi), 1)
+        self.assertEqual(records_multi[0].status, DeliveryStatus.SENT)
+
+        # 2. send_digest_batch_multicast with target_role="ALL" delivers strictly to PRIMARY_EDITOR
+        records_batch_multi = channel.send_digest_batch_multicast(
+            assessments=[assessment],
+            notification_id="DIGEST-ALL-01",
+            target_role="ALL",
+            dry_run=False,
+        )
+        self.assertEqual(len(records_batch_multi), 1)
+        self.assertEqual(records_batch_multi[0].status, DeliveryStatus.SENT)
+
+        # 3. deliver_one_shot_editorial_digest with target_recipient_role="ALL"
+        test_ledger = self.tmp_path / "ledger_target_all.json"
+        res_oneshot = deliver_one_shot_editorial_digest(
+            settings=live_settings,
+            assessments=[assessment, assessment, assessment],
+            dry_run=False,
+            target_recipient_role="ALL",
+            repository=repo,
+            transport=transport,
+            ledger_path=test_ledger,
+        )
+        self.assertEqual(res_oneshot.get("status"), "DELIVERY_SUCCESS")
+        self.assertEqual(res_oneshot.get("recipients_count"), 1)
+
+        # Total 3 HTTP calls made across the 3 tests
+        self.assertEqual(len(http_requests), 3)
+        # Every single call was addressed to PRIMARY_EDITOR; NONE to ADMIN!
+        for req in http_requests:
+            body = json.loads(req.content.decode("utf-8"))
+            self.assertEqual(body.get("chat_id"), editor_chat)
+            self.assertNotEqual(body.get("chat_id"), admin_chat)
+
+    def test_22_cloud_delivery_without_durable_repo_or_claim_makes_zero_http_calls(self):
+        """Verify cloud-mode delivery without authoritative StateRepository or successful claim strictly makes zero HTTP calls."""
+        cloud_settings = self.test_settings.model_copy(update={
+            "storage_mode": "turso",
+            "telegram_delivery_enabled": True,
+            "telegram_bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+        })
+
+        http_requests = []
+        def recording_transport(request: httpx.Request) -> httpx.Response:
+            http_requests.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 77777}})
+
+        transport = httpx.MockTransport(recording_transport)
+
+        assessment = EditorialAssessment(
+            headline_tr="Cloud Claim Requirement Testi",
+            why_efso_tr="Test",
+            suggested_format=SuggestedFormat.POST,
+            category=StoryCategory.VIRAL,
+            disposition=EditorialDisposition.DIGEST,
+            verification_status=VerificationStatus.OFFICIAL_CONFIRMATION,
+            confidence_score=0.95,
+            kind=EditorialKind.NEW,
+            score=90,
+            article_ids=["cloud_claim_001"],
+        )
+
+        # 1. channel without repository in cloud storage mode fails closed before HTTP
+        channel_no_repo = TelegramNotificationChannel(settings=cloud_settings, transport=transport, repository=None)
+        res_no_repo = channel_no_repo.send(assessment=assessment, story_id="STORY-CLOUD-01", dry_run=False)
+        self.assertEqual(res_no_repo.status, DeliveryStatus.FAILED)
+        self.assertIn("Cloud delivery rejected: authoritative StateRepository is strictly required", res_no_repo.error_message or "")
+        self.assertEqual(len(http_requests), 0)
+
+        # 2. deliver_one_shot_editorial_digest without repository in cloud mode returns DURABLE_STORAGE_REQUIRED
+        test_ledger = self.tmp_path / "ledger_cloud_req.json"
+        res_oneshot_no_repo = deliver_one_shot_editorial_digest(
+            settings=cloud_settings,
+            assessments=[assessment, assessment, assessment],
+            dry_run=False,
+            repository=None,
+            transport=transport,
+            ledger_path=test_ledger,
+        )
+        self.assertEqual(res_oneshot_no_repo.get("status"), "DURABLE_STORAGE_REQUIRED")
+        self.assertEqual(len(http_requests), 0)
+
+        # 3. channel with repository where claim is rejected (duplicate / in-flight) makes zero HTTP calls
+        mock_repo = MagicMock(spec=StateRepository)
+        mock_repo.claim_telegram_delivery.return_value = False
+        mock_repo.get_telegram_delivery.return_value = None
+
+        channel_claim_rej = TelegramNotificationChannel(settings=cloud_settings, transport=transport, repository=mock_repo)
+        res_claim_rej = channel_claim_rej.send(assessment=assessment, story_id="STORY-CLOUD-02", dry_run=False)
+        self.assertEqual(res_claim_rej.status, DeliveryStatus.FAILED)
+        self.assertIn("Delivery claim rejected", res_claim_rej.error_message or "")
+        self.assertEqual(len(http_requests), 0)
+
+        # 4. deliver_one_shot_editorial_digest where claim is rejected makes zero HTTP calls
+        res_oneshot_rej = deliver_one_shot_editorial_digest(
+            settings=cloud_settings,
+            assessments=[assessment, assessment, assessment],
+            dry_run=False,
+            repository=mock_repo,
+            transport=transport,
+            ledger_path=test_ledger,
+        )
+        self.assertEqual(res_oneshot_rej.get("status"), "CLAIM_REJECTED")
+        self.assertEqual(len(http_requests), 0)
+
+        # 5. channel where claim raises repository exception fails closed with zero HTTP calls
+        mock_repo.claim_telegram_delivery.side_effect = RuntimeError("Turso connection reset")
+        res_claim_exc = channel_claim_rej.send(assessment=assessment, story_id="STORY-CLOUD-03", dry_run=False)
+        self.assertEqual(res_claim_exc.status, DeliveryStatus.FAILED)
+        self.assertIn("Delivery claim failed closed: repository error", res_claim_exc.error_message or "")
+        self.assertEqual(len(http_requests), 0)
+
+    def test_23_offline_legacy_error_handling_no_unbound_local_error(self):
+        """Verify offline legacy paths handle errors safely and never raise UnboundLocalError."""
+        admin_chat = self.test_settings.telegram_chat_id
+        assessment = EditorialAssessment(
+            headline_tr="Offline Preview Error Handling Testi",
+            why_efso_tr="Test",
+            suggested_format=SuggestedFormat.POST,
+            category=StoryCategory.VIRAL,
+            disposition=EditorialDisposition.DIGEST,
+            verification_status=VerificationStatus.OFFICIAL_CONFIRMATION,
+            confidence_score=0.95,
+            kind=EditorialKind.NEW,
+            score=90,
+            article_ids=["offline_preview_001"],
+        )
+
+        # Case A: legacy_editorial_fallback=True in offline mode (dry_run=True)
+        settings_fallback_on = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": False,
+            "legacy_editorial_fallback": True,
+        })
+        channel_fb_on = TelegramNotificationChannel(settings=settings_fallback_on)
+
+        # send() must NOT raise UnboundLocalError and must return safe preview
+        rec1 = channel_fb_on.send(assessment=assessment, story_id="STORY-OFF-01", target_chat_id=admin_chat, dry_run=True)
+        self.assertEqual(rec1.status, DeliveryStatus.SENT)
+
+        # send_digest_batch() must NOT raise UnboundLocalError and must return safe preview
+        rec2 = channel_fb_on.send_digest_batch(assessments=[assessment], target_chat_id=admin_chat, dry_run=True)
+        self.assertEqual(rec2.status, DeliveryStatus.SENT)
+
+        # Case B: legacy_editorial_fallback=False in offline mode (dry_run=True)
+        settings_fallback_off = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": False,
+            "legacy_editorial_fallback": False,
+        })
+        channel_fb_off = TelegramNotificationChannel(settings=settings_fallback_off)
+
+        # send() must NOT raise UnboundLocalError and must return FAILED with properly assigned error_message
+        rec3 = channel_fb_off.send(assessment=assessment, story_id="STORY-OFF-02", target_chat_id=admin_chat, dry_run=True)
+        self.assertEqual(rec3.status, DeliveryStatus.FAILED)
+        self.assertIn("Recipient separation violation: ADMIN is restricted to operational health reporting only", rec3.error_message or "")
+
+        # send_digest_batch() must NOT raise UnboundLocalError and must return FAILED with properly assigned error_message
+        rec4 = channel_fb_off.send_digest_batch(assessments=[assessment], target_chat_id=admin_chat, dry_run=True)
+        self.assertEqual(rec4.status, DeliveryStatus.FAILED)
+        self.assertIn("Recipient separation violation: ADMIN is restricted to operational health reporting only", rec4.error_message or "")
+
+    def test_24_primary_editor_delivery_success_remains_intact(self):
+        """Verify valid PRIMARY_EDITOR delivery succeeds with HTTP 200 and durable persistence across all paths."""
+        repo = self._create_turso_repo()
+        editor_chat = self.test_settings.telegram_primary_editor_chat_id
+
+        live_settings = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": True,
+            "telegram_bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+        })
+
+        http_requests = []
+        def recording_transport(request: httpx.Request) -> httpx.Response:
+            http_requests.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 654321}})
+
+        transport = httpx.MockTransport(recording_transport)
+        channel = TelegramNotificationChannel(settings=live_settings, transport=transport, repository=repo)
+
+        assessment = EditorialAssessment(
+            headline_tr="Primary Editor Başarılı Dağıtım",
+            why_efso_tr="Test",
+            suggested_format=SuggestedFormat.POST,
+            category=StoryCategory.VIRAL,
+            disposition=EditorialDisposition.DIGEST,
+            verification_status=VerificationStatus.OFFICIAL_CONFIRMATION,
+            confidence_score=0.95,
+            kind=EditorialKind.NEW,
+            score=90,
+            article_ids=["pe_success_001"],
+        )
+
+        # 1. channel.send() succeeds
+        rec1 = channel.send(assessment=assessment, story_id="STORY-PE-01", dry_run=False)
+        self.assertEqual(rec1.status, DeliveryStatus.SENT)
+
+        # 2. channel.send_digest_batch() succeeds
+        rec2 = channel.send_digest_batch(assessments=[assessment], notification_id="DIGEST-PE-01", dry_run=False)
+        self.assertEqual(rec2.status, DeliveryStatus.SENT)
+
+        # 3. deliver_one_shot_editorial_digest() succeeds
+        test_ledger = self.tmp_path / "ledger_pe_success.json"
+        res3 = deliver_one_shot_editorial_digest(
+            settings=live_settings,
+            assessments=[assessment, assessment, assessment],
+            dry_run=False,
+            repository=repo,
+            transport=transport,
+            ledger_path=test_ledger,
+        )
+        self.assertEqual(res3.get("status"), "DELIVERY_SUCCESS")
+
+        self.assertEqual(len(http_requests), 3)
+        for req in http_requests:
+            body = json.loads(req.content.decode("utf-8"))
+            self.assertEqual(body.get("chat_id"), editor_chat)
 
 if __name__ == "__main__":
     unittest.main()

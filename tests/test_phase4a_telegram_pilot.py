@@ -67,6 +67,7 @@ class TestPhase4ATelegramPilot(unittest.TestCase):
         self.settings = Settings(
             telegram_bot_token=self.bot_token,
             telegram_chat_id=self.authorized_chat_id,
+            telegram_primary_editor_chat_id=self.authorized_chat_id,
             telegram_allowed_chat_ids=[self.authorized_chat_id],
             telegram_delivery_enabled=True,
             telegram_max_retries=3,
