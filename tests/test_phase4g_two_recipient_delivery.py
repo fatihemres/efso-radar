@@ -197,6 +197,7 @@ class TestPhase4GTwoRecipientDelivery(unittest.TestCase):
             ledger_path=self.ledger_path,
             transport=transport,
             target_recipient_role="ALL",
+            allow_legacy_admin_broadcast=True,
         )
 
         self.assertEqual(result["status"], "DELIVERY_SUCCESS")
@@ -292,6 +293,7 @@ class TestPhase4GTwoRecipientDelivery(unittest.TestCase):
             ledger_path=self.ledger_path,
             transport=transport,
             target_recipient_role="ALL",
+            allow_legacy_admin_broadcast=True,
         )
 
         self.assertEqual(result["status"], "PARTIAL_DELIVERY")

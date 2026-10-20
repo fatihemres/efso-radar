@@ -893,5 +893,389 @@ class TestPhase5B3CCloudPersistenceIntegration(unittest.TestCase):
         sent_body = json.loads(http_calls[0].content.decode("utf-8"))
         self.assertEqual(sent_body.get("chat_id"), editor_chat)
 
+    # --- Test 15: Stable Delivery Idempotency Keys Across Replays and Restarts ---
+    def test_15_stable_delivery_idempotency_keys_across_replays(self):
+        """Derive stable logical identities without caller-supplied IDs; duplicate suppression on restart."""
+        repo = self._create_turso_repo()
+        editor_chat = self.test_settings.telegram_primary_editor_chat_id
+
+        live_settings = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": True,
+            "telegram_bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+        })
+
+        http_calls = []
+
+        def mock_dispatch(request: httpx.Request) -> httpx.Response:
+            http_calls.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 55001}})
+
+        transport = httpx.MockTransport(mock_dispatch)
+
+        channel1 = TelegramNotificationChannel(settings=live_settings, transport=transport, repository=repo)
+
+        assessment = EditorialAssessment(
+            headline_tr="Kar Sporlari Sampiyonasi",
+            why_efso_tr="Kis sporlari ilgisi yuksek",
+            suggested_format=SuggestedFormat.POST,
+            category=StoryCategory.YERLI,
+            disposition=EditorialDisposition.DIGEST,
+            verification_status=VerificationStatus.OFFICIAL_CONFIRMATION,
+            confidence_score=0.98,
+            kind=EditorialKind.NEW,
+            score=91,
+            article_ids=["sport_art_100"],
+        )
+
+        # Worker 1 sends without supplying notification_id
+        res1 = channel1.send(
+            assessment=assessment,
+            story_id="STORY-SKI-100",
+            dry_run=False,
+            # notification_id is omitted!
+        )
+        self.assertEqual(res1.status, DeliveryStatus.SENT)
+        self.assertEqual(len(http_calls), 1)
+        notif_id_1 = res1.notification_id
+        self.assertTrue(notif_id_1.startswith("NOTIF-"))
+
+        # Worker 2 restarts in independent instance, evaluates same story without supplying notification_id
+        channel2 = TelegramNotificationChannel(settings=live_settings, transport=transport, repository=repo)
+        res2 = channel2.send(
+            assessment=assessment,
+            story_id="STORY-SKI-100",
+            dry_run=False,
+            # notification_id is omitted!
+        )
+        self.assertEqual(res2.status, DeliveryStatus.SENT)
+        # Verify notification_id is identical!
+        self.assertEqual(res2.notification_id, notif_id_1)
+        # Verify ZERO second external HTTP call was made (duplicate prevented)
+        self.assertEqual(len(http_calls), 1)
+
+        # Worker with a new development (update_id provided) generates distinct key
+        update_assessment = assessment.model_copy(update={"kind": EditorialKind.UPDATE})
+        res3 = channel2.send(
+            assessment=update_assessment,
+            story_id="STORY-SKI-100",
+            update_id="UPD-SKI-002",
+            dry_run=False,
+        )
+        self.assertEqual(res3.status, DeliveryStatus.SENT)
+        self.assertTrue(res3.notification_id.startswith("NOTIF-UPD-"))
+        self.assertNotEqual(res3.notification_id, notif_id_1)
+        self.assertEqual(len(http_calls), 2)
+
+        # Two independent runner instances flush due digest with identical items -> identical key
+        q_item = NotificationRecord(
+            notification_id="DIGEST-Q-ITEM-01",
+            story_id="STORY-DIG-01",
+            kind=EditorialKind.NEW,
+            channel="TELEGRAM_DIGEST",
+            sent_at=utc_now(),
+            status=DeliveryStatus.QUEUED_FOR_DIGEST,
+            message_text="Digest item preview",
+            headline_tr="Ozet Haberi 1",
+            score=88,
+        )
+        repo.record_notification(q_item)
+
+        orchestrator1 = RadarOrchestrator(
+            settings=live_settings,
+            source=MagicMock(spec=NewsSource),
+            ai_engine=MagicMock(),
+            notifier=channel1,
+            repository=repo,
+        )
+        orchestrator2 = RadarOrchestrator(
+            settings=live_settings,
+            source=MagicMock(spec=NewsSource),
+            ai_engine=MagicMock(),
+            notifier=channel2,
+            repository=repo,
+        )
+
+        ref_time = datetime(2026, 10, 20, 15, 0, tzinfo=timezone.utc)
+        dispatched1 = orchestrator1.flush_due_digest(dry_run=False, now=ref_time, force=True)
+        self.assertEqual(dispatched1, 1)
+        calls_after_first_flush = len(http_calls)
+
+        # Second runner tries to flush
+        dispatched2 = orchestrator2.flush_due_digest(dry_run=False, now=ref_time, force=True)
+        # Duplicate delivery suppressed, zero extra HTTP calls!
+        self.assertEqual(len(http_calls), calls_after_first_flush)
+
+    # --- Test 16: Post-Send Persistence Failure Safety ---
+    def test_16_post_send_persistence_failure_safety(self):
+        """Never report SENT when persistence fails post-dispatch; retain protective claim and require reconciliation."""
+        repo = self._create_turso_repo()
+        editor_chat = self.test_settings.telegram_primary_editor_chat_id
+
+        live_settings = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": True,
+            "telegram_bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+        })
+
+        http_calls = []
+
+        def mock_dispatch(request: httpx.Request) -> httpx.Response:
+            http_calls.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 778899}})
+
+        transport = httpx.MockTransport(mock_dispatch)
+
+        faulty_repo = self._create_turso_repo()
+        original_record = faulty_repo.record_telegram_delivery
+
+        def failing_record_delivery(record):
+            if record.status == DeliveryStatus.SENT:
+                raise sqlite3.OperationalError("Simulated disk I/O failure during delivery commit")
+            return original_record(record)
+
+        faulty_repo.record_telegram_delivery = failing_record_delivery
+
+        channel = TelegramNotificationChannel(settings=live_settings, transport=transport, repository=faulty_repo)
+
+        assessment = EditorialAssessment(
+            headline_tr="Teknoloji Devrimi Haberi",
+            why_efso_tr="Onemli yapay zeka gelismesi",
+            suggested_format=SuggestedFormat.POST,
+            category=StoryCategory.GLOBAL,
+            disposition=EditorialDisposition.DIGEST,
+            verification_status=VerificationStatus.OFFICIAL_CONFIRMATION,
+            confidence_score=0.95,
+            kind=EditorialKind.NEW,
+            score=93,
+            article_ids=["tech_art_01"],
+        )
+
+        res = channel.send(
+            assessment=assessment,
+            story_id="STORY-TECH-01",
+            dry_run=False,
+        )
+
+        # 1. Must NEVER report durable SENT! Must report DELIVERY_UNCERTAIN
+        self.assertEqual(res.status, DeliveryStatus.DELIVERY_UNCERTAIN)
+        self.assertIn("Post-send persistence failure", res.error_message or "")
+        self.assertIn("Requires reconciliation", res.error_message or "")
+        # Exactly 1 HTTP attempt was made
+        self.assertEqual(len(http_calls), 1)
+
+        # 2. Check that the pre-send claim is STILL protected in the database
+        delivery_row = faulty_repo.get_telegram_delivery(editor_chat, res.notification_id)
+        self.assertIsNotNone(delivery_row)
+        # Status must not be PENDING or released; it remains DISPATCHING (or UNCERTAIN)
+        self.assertIn(delivery_row.status, (DeliveryStatus.DISPATCHING, DeliveryStatus.DELIVERY_UNCERTAIN))
+
+        # 3. Another worker trying to dispatch the same notification must be REJECTED (no duplicate HTTP send!)
+        channel_worker2 = TelegramNotificationChannel(settings=live_settings, transport=transport, repository=faulty_repo)
+        res_worker2 = channel_worker2.send(
+            assessment=assessment,
+            story_id="STORY-TECH-01",
+            dry_run=False,
+        )
+        self.assertNotEqual(res_worker2.status, DeliveryStatus.SENT)
+        self.assertEqual(len(http_calls), 1)  # Still exactly 1 call!
+
+        # 4. deliver_one_shot_editorial_digest also reports POST_SEND_PERSISTENCE_FAILED when persistence fails
+        test_ledger_path = self.tmp_path / "ledger_post_send_fail.json"
+        res_oneshot = deliver_one_shot_editorial_digest(
+            settings=live_settings,
+            assessments=[assessment, assessment, assessment],
+            dry_run=False,
+            repository=faulty_repo,
+            transport=transport,
+            ledger_path=test_ledger_path,
+        )
+        self.assertEqual(res_oneshot.get("status"), "POST_SEND_PERSISTENCE_FAILED")
+        self.assertIn("Post-send persistence failure", res_oneshot.get("error", ""))
+
+    # --- Test 17: Unsafe HTTP Retry Semantics Elimination ---
+    def test_17_elimination_of_unsafe_http_retries_for_ambiguous_outcomes(self):
+        """Ambiguous HTTP 5xx, timeouts, and transport errors execute at most 1 attempt, yielding DELIVERY_UNCERTAIN."""
+        repo = self._create_turso_repo()
+        editor_chat = self.test_settings.telegram_primary_editor_chat_id
+
+        live_settings = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": True,
+            "telegram_bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            "telegram_max_retries": 3,
+        })
+
+        assessment = EditorialAssessment(
+            headline_tr="Ekonomi Raporu",
+            why_efso_tr="Test",
+            suggested_format=SuggestedFormat.POST,
+            category=StoryCategory.YERLI,
+            disposition=EditorialDisposition.DIGEST,
+            verification_status=VerificationStatus.OFFICIAL_CONFIRMATION,
+            confidence_score=0.90,
+            kind=EditorialKind.NEW,
+            score=90,
+            article_ids=["econ_001"],
+        )
+
+        ambiguous_cases = [
+            ("http_500", httpx.Response(500, text="Internal Server Error")),
+            ("http_502", httpx.Response(502, text="Bad Gateway")),
+            ("http_503", httpx.Response(503, text="Service Unavailable")),
+            ("http_504", httpx.Response(504, text="Gateway Timeout")),
+            ("timeout", httpx.ReadTimeout("Read timed out on socket")),
+            ("transport_error", httpx.RemoteProtocolError("Server disconnected unexpectedly")),
+        ]
+
+        for case_name, response_or_exc in ambiguous_cases:
+            attempt_count = 0
+
+            def make_handler(resp_or_ex):
+                def handler(request: httpx.Request) -> httpx.Response:
+                    nonlocal attempt_count
+                    attempt_count += 1
+                    if isinstance(resp_or_ex, Exception):
+                        raise resp_or_ex
+                    return resp_or_ex
+                return handler
+
+            transport = httpx.MockTransport(make_handler(response_or_exc))
+            channel = TelegramNotificationChannel(settings=live_settings, transport=transport, repository=repo)
+
+            story_id = f"STORY-AMBIG-{case_name}"
+            rec = channel.send(
+                assessment=assessment,
+                story_id=story_id,
+                dry_run=False,
+            )
+
+            # Assert exactly 1 attempt made (ZERO retries)
+            self.assertEqual(attempt_count, 1, f"Ambiguous case {case_name} made {attempt_count} attempts, expected 1!")
+            self.assertEqual(rec.status, DeliveryStatus.DELIVERY_UNCERTAIN, f"Case {case_name} did not yield DELIVERY_UNCERTAIN!")
+
+            # Assert repository record is DELIVERY_UNCERTAIN
+            deliv = repo.get_telegram_delivery(editor_chat, rec.notification_id)
+            self.assertIsNotNone(deliv)
+            self.assertEqual(deliv.status, DeliveryStatus.DELIVERY_UNCERTAIN)
+
+        # Definitive errors (HTTP 400, 403) are FAILED with exactly 1 attempt
+        for def_code in (400, 403):
+            def_attempts = 0
+
+            def def_handler(request: httpx.Request) -> httpx.Response:
+                nonlocal def_attempts
+                def_attempts += 1
+                return httpx.Response(def_code, json={"ok": False, "description": "Definitive client rejection"})
+
+            transport_def = httpx.MockTransport(def_handler)
+            channel_def = TelegramNotificationChannel(settings=live_settings, transport=transport_def, repository=repo)
+
+            rec_def = channel_def.send(
+                assessment=assessment,
+                story_id=f"STORY-DEF-{def_code}",
+                dry_run=False,
+            )
+            self.assertEqual(def_attempts, 1)
+            self.assertEqual(rec_def.status, DeliveryStatus.FAILED)
+
+    # --- Test 18: Live Mode Recipient Boundary Enforcement ---
+    def test_18_live_mode_recipient_boundary_enforcement(self):
+        """In live delivery, editorial content NEVER reaches ADMIN even if overrides/fallbacks are supplied."""
+        repo = self._create_turso_repo()
+        admin_chat = self.test_settings.telegram_chat_id
+        editor_chat = self.test_settings.telegram_primary_editor_chat_id
+
+        live_settings = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": True,
+            "telegram_bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            "legacy_editorial_fallback": True,  # Explicitly configured fallback!
+        })
+
+        http_requests = []
+
+        def recording_transport(request: httpx.Request) -> httpx.Response:
+            http_requests.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 12345}})
+
+        transport = httpx.MockTransport(recording_transport)
+        channel = TelegramNotificationChannel(settings=live_settings, transport=transport, repository=repo)
+
+        assessment = EditorialAssessment(
+            headline_tr="Canli Mod Sinir Testi",
+            why_efso_tr="Test",
+            suggested_format=SuggestedFormat.POST,
+            category=StoryCategory.VIRAL,
+            disposition=EditorialDisposition.DIGEST,
+            verification_status=VerificationStatus.OFFICIAL_CONFIRMATION,
+            confidence_score=0.95,
+            kind=EditorialKind.NEW,
+            score=90,
+            article_ids=["live_art_001"],
+        )
+
+        # 1. channel.send() targeting ADMIN in live delivery fails closed
+        res_send = channel.send(
+            assessment=assessment,
+            story_id="STORY-LIVE-01",
+            target_chat_id=admin_chat,
+            dry_run=False,
+        )
+        self.assertEqual(res_send.status, DeliveryStatus.FAILED)
+        self.assertIn("Recipient separation violation", res_send.error_message or "")
+        # Zero HTTP calls to ADMIN!
+        self.assertEqual(len(http_requests), 0)
+
+        # 2. channel.send_digest_batch() targeting ADMIN in live delivery fails closed
+        res_batch = channel.send_digest_batch(
+            assessments=[assessment],
+            target_chat_id=admin_chat,
+            dry_run=False,
+        )
+        self.assertEqual(res_batch.status, DeliveryStatus.FAILED)
+        self.assertIn("Recipient separation violation", res_batch.error_message or "")
+        self.assertEqual(len(http_requests), 0)
+
+        # 3. deliver_one_shot_editorial_digest() with target_recipient_role="ALL" delivers ONLY to PRIMARY_EDITOR
+        test_ledger = self.tmp_path / "ledger_live_boundary.json"
+        res_all = deliver_one_shot_editorial_digest(
+            settings=live_settings,
+            assessments=[assessment, assessment, assessment],
+            dry_run=False,
+            target_recipient_role="ALL",
+            repository=repo,
+            transport=transport,
+            ledger_path=test_ledger,
+        )
+        self.assertEqual(res_all.get("status"), "DELIVERY_SUCCESS")
+        # Exactly 1 HTTP call made, and it was to PRIMARY_EDITOR, NEVER ADMIN
+        self.assertEqual(len(http_requests), 1)
+        body = json.loads(http_requests[0].content.decode("utf-8"))
+        self.assertEqual(body.get("chat_id"), editor_chat)
+        self.assertNotEqual(body.get("chat_id"), admin_chat)
+
+        # 4. deliver_one_shot_editorial_digest() with target_recipient_role="ADMIN" rejected
+        res_admin_role = deliver_one_shot_editorial_digest(
+            settings=live_settings,
+            assessments=[assessment, assessment, assessment],
+            dry_run=False,
+            target_recipient_role="ADMIN",
+            repository=repo,
+            transport=transport,
+            ledger_path=test_ledger,
+        )
+        self.assertEqual(res_admin_role.get("status"), "RECIPIENT_ROLE_VIOLATION")
+        self.assertEqual(len(http_requests), 1)  # Still exactly 1 call total, 0 to ADMIN!
+
+        # 5. deliver_one_shot_editorial_digest() with target_chat_id=ADMIN rejected
+        res_admin_chat = deliver_one_shot_editorial_digest(
+            settings=live_settings,
+            assessments=[assessment, assessment, assessment],
+            dry_run=False,
+            target_chat_id=admin_chat,
+            repository=repo,
+            transport=transport,
+            ledger_path=test_ledger,
+        )
+        self.assertEqual(res_admin_chat.get("status"), "RECIPIENT_ROLE_VIOLATION")
+        self.assertEqual(len(http_requests), 1)  # Still exactly 1 call total, 0 to ADMIN!
+
 if __name__ == "__main__":
     unittest.main()

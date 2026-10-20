@@ -37,6 +37,7 @@ from efso_radar.domain import (
 )
 from efso_radar.notifications.base import NotificationChannel
 from efso_radar.notifications.formatters import (
+    compute_stable_digest_identity,
     format_telegram_alert,
     format_telegram_breaking,
     format_telegram_digest,
@@ -183,11 +184,14 @@ class RadarOrchestrator:
             window_label=f"{hours_label} Saatlik Editoryal Özet",
         )
 
+        stable_digest_id = compute_stable_digest_identity(synthetic_assessments)
+        digest_notif_id = f"DIGEST-{stable_digest_id[:16]}"
+
         if not dry_run:
             if hasattr(self.notifier, "send_digest_batch"):
                 res = self.notifier.send_digest_batch(
                     synthetic_assessments,
-                    notification_id=f"DIGEST-{ref_now.strftime('%Y%m%d%H%M%S')}",
+                    notification_id=digest_notif_id,
                     window_label=f"{hours_label} Saatlik Editoryal Özet",
                     dry_run=dry_run,
                     now=ref_now,
@@ -197,7 +201,7 @@ class RadarOrchestrator:
             elif self.settings.telegram_bot_token and self.settings.telegram_chat_id and hasattr(self.notifier, "_dispatch_telegram"):
                 try:
                     res = self.notifier._dispatch_telegram(
-                        f"DIGEST-{ref_now.strftime('%Y%m%d%H%M%S')}",
+                        digest_notif_id,
                         batch[0].story_id,
                         None,
                         None,
@@ -209,7 +213,7 @@ class RadarOrchestrator:
                     )
                 except TypeError:
                     res = self.notifier._dispatch_telegram(
-                        f"DIGEST-{ref_now.strftime('%Y%m%d%H%M%S')}",
+                        digest_notif_id,
                         batch[0].story_id,
                         None,
                         None,
@@ -619,7 +623,7 @@ class RadarOrchestrator:
                 if is_sensitive_review:
                     notif_suffix = update_id if update_id else story_id
                     record = NotificationRecord(
-                        notification_id=f"HOLD-SENSITIVE-{now.strftime('%Y%m%d%H%M%S')}-{notif_suffix}",
+                        notification_id=f"HOLD-SENSITIVE-{notif_suffix}",
                         story_id=story_id,
                         update_id=update_id,
                         kind=pick.kind,
@@ -635,7 +639,7 @@ class RadarOrchestrator:
                 elif is_unverified:
                     notif_suffix = update_id if update_id else story_id
                     record = NotificationRecord(
-                        notification_id=f"HOLD-VERIF-{now.strftime('%Y%m%d%H%M%S')}-{notif_suffix}",
+                        notification_id=f"HOLD-VERIF-{notif_suffix}",
                         story_id=story_id,
                         update_id=update_id,
                         kind=pick.kind,
@@ -651,7 +655,7 @@ class RadarOrchestrator:
                 elif should_queue_digest:
                     notif_suffix = update_id if update_id else story_id
                     record = NotificationRecord(
-                        notification_id=f"DIGEST-Q-{now.strftime('%Y%m%d%H%M%S')}-{notif_suffix}",
+                        notification_id=f"DIGEST-Q-{notif_suffix}",
                         story_id=story_id,
                         update_id=update_id,
                         kind=pick.kind,

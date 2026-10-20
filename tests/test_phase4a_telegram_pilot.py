@@ -229,7 +229,7 @@ class TestPhase4ATelegramPilot(unittest.TestCase):
         self.assertIn("403", record.error_message)
 
     def test_simulated_delivery_error_500_with_bounded_retries(self):
-        """Transient 500 server errors are retried up to telegram_max_retries and succeed on recovery."""
+        """Ambiguous 500 server errors are NOT retried automatically to prevent duplicate delivery."""
         call_count = 0
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -243,8 +243,8 @@ class TestPhase4ATelegramPilot(unittest.TestCase):
         channel = TelegramNotificationChannel(self.settings, transport=transport)
 
         record = channel.send(self.assessment, "STORY-001")
-        self.assertEqual(record.status, DeliveryStatus.SENT)
-        self.assertEqual(call_count, 3, "Must have retried twice and succeeded on 3rd attempt")
+        self.assertEqual(record.status, DeliveryStatus.DELIVERY_UNCERTAIN)
+        self.assertEqual(call_count, 1, "Must NOT automatically retry ambiguous 500 server errors")
 
     def test_simulated_delivery_network_timeout_exhaustion(self):
         """Ambiguous network timeout must NOT automatically retry to prevent duplicate deliveries.
@@ -269,7 +269,7 @@ class TestPhase4ATelegramPilot(unittest.TestCase):
         self.assertNotIn("ABC-DEF1234ghIkl", record.error_message)
 
     def test_simulated_delivery_transport_connection_error_retries(self):
-        """Non-timeout transport connection errors are retried up to telegram_max_retries."""
+        """Ambiguous transport connection errors are NOT retried automatically to prevent duplicate delivery."""
         attempts = 0
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -281,9 +281,9 @@ class TestPhase4ATelegramPilot(unittest.TestCase):
         channel = TelegramNotificationChannel(self.settings, transport=transport)
 
         record = channel.send(self.assessment, "STORY-001")
-        self.assertEqual(record.status, DeliveryStatus.FAILED)
-        self.assertEqual(attempts, 3, "Non-timeout transport errors retry up to max_retries")
-        self.assertIn("Network transport error", record.error_message)
+        self.assertEqual(record.status, DeliveryStatus.DELIVERY_UNCERTAIN)
+        self.assertEqual(attempts, 1, "Must NOT automatically retry ambiguous transport errors")
+        self.assertIn("Ambiguous network transport interruption", record.error_message)
         self.assertNotIn("ABC-DEF1234ghIkl", record.error_message)
 
     def test_token_and_chat_id_redaction(self):
