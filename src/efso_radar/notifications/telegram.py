@@ -144,6 +144,7 @@ class TelegramNotificationChannel(NotificationChannel):
         dry_run: bool = False,
         now: Optional[datetime] = None,
         target_chat_id: Optional[str] = None,
+        notification_id: Optional[str] = None,
     ) -> NotificationRecord:
         """Send or preview an editorial assessment in the private owner chat."""
         current_now = now or utc_now()
@@ -161,7 +162,7 @@ class TelegramNotificationChannel(NotificationChannel):
 
         # Generate unique idempotency key
         prefix = "NOTIF-UPD" if update_id else "NOTIF"
-        notification_id = f"{prefix}-{current_now.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        notification_id = notification_id or f"{prefix}-{current_now.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
 
         # 2. Check quiet hours (sensitive review and verification hold are not suppressed by quiet hours)
         if (
@@ -204,6 +205,51 @@ class TelegramNotificationChannel(NotificationChannel):
         # 3. Resolve recipient and enforce fail-closed editorial routing
         if target_chat_id:
             chat_id = str(target_chat_id).strip()
+            # Enforce recipient separation:
+            # PRIMARY_EDITOR: editorial bulletins and verified news.
+            # ADMIN: operational health reporting only.
+            is_editorial = derived_category != TelegramNotificationCategory.OPERATIONAL_HEALTH_REPORT
+            role = self.settings.get_recipient_role(chat_id)
+            if is_editorial and role == "ADMIN" and not self.settings.legacy_editorial_fallback:
+                err_msg = (
+                    "Recipient separation violation: ADMIN is restricted to operational health reporting only. "
+                    f"Editorial notification '{derived_category.value}' cannot be sent to ADMIN."
+                )
+                logger.error("%s", err_msg)
+                return NotificationRecord(
+                    notification_id=notification_id,
+                    story_id=story_id,
+                    update_id=update_id,
+                    kind=assessment.kind,
+                    channel=channel_name,
+                    sent_at=current_now,
+                    status=DeliveryStatus.FAILED,
+                    message_text=message_text,
+                    headline_tr=assessment.headline_tr,
+                    score=assessment.score,
+                    error_message=err_msg,
+                    category=derived_category,
+                )
+            if not is_editorial and role == "PRIMARY_EDITOR":
+                err_msg = (
+                    "Recipient separation violation: PRIMARY_EDITOR cannot receive operational telemetry. "
+                    f"Operational notification '{derived_category.value}' is restricted to ADMIN."
+                )
+                logger.error("%s", err_msg)
+                return NotificationRecord(
+                    notification_id=notification_id,
+                    story_id=story_id,
+                    update_id=update_id,
+                    kind=assessment.kind,
+                    channel=channel_name,
+                    sent_at=current_now,
+                    status=DeliveryStatus.FAILED,
+                    message_text=message_text,
+                    headline_tr=assessment.headline_tr,
+                    score=assessment.score,
+                    error_message=err_msg,
+                    category=derived_category,
+                )
         else:
             recipients = self.settings.get_recipients_for_category(derived_category)
             if recipients:
@@ -303,6 +349,28 @@ class TelegramNotificationChannel(NotificationChannel):
         current_now = now or utc_now()
         if target_chat_id:
             chat_id = str(target_chat_id).strip()
+            role = self.settings.get_recipient_role(chat_id)
+            if role == "ADMIN" and not self.settings.legacy_editorial_fallback:
+                err_msg = (
+                    "Recipient separation violation: ADMIN is restricted to operational health reporting only. "
+                    "Editorial digest batch cannot be sent to ADMIN."
+                )
+                logger.error("%s", err_msg)
+                story_id = assessments[0].parent_story_id or assessments[0].article_ids[0][:8] if assessments else "DIGEST"
+                return NotificationRecord(
+                    notification_id=notification_id,
+                    story_id=story_id,
+                    update_id=None,
+                    kind=EditorialKind.NEW,
+                    channel="TELEGRAM_DIGEST",
+                    sent_at=current_now,
+                    status=DeliveryStatus.FAILED,
+                    message_text="",
+                    headline_tr=f"Editoryal Özet ({len(assessments)} Haber)",
+                    score=85,
+                    error_message=err_msg,
+                    category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                )
         else:
             recipients = self.settings.get_recipients_for_category(TelegramNotificationCategory.EDITORIAL_DIGEST)
             if recipients:
@@ -485,6 +553,58 @@ class TelegramNotificationChannel(NotificationChannel):
         is_one_shot = max_attempts == 1
         last_error: Optional[str] = None
         final_status: DeliveryStatus = DeliveryStatus.FAILED
+        recipient_role = self.settings.get_recipient_role(target_chat_id) or "AUTHORIZED_RECIPIENT"
+        delivery_id = f"DELIV-{notification_id}"
+
+        # Durable Pre-Send Delivery Claim:
+        # Atomically claim the delivery attempt in telegram_delivery_records before any external HTTP dispatch.
+        if self.repository is not None:
+            try:
+                claimed = self.repository.claim_telegram_delivery(
+                    delivery_id=delivery_id,
+                    message_key=notification_id,
+                    recipient_role=recipient_role,
+                    recipient_chat_id=target_chat_id,
+                    category=category,
+                    payload={"story_id": story_id, "update_id": update_id},
+                    max_attempts=max_attempts,
+                )
+            except Exception as exc:
+                err_msg = f"Delivery claim failed closed: repository error {self._sanitize(str(exc))}"
+                logger.error("%s", err_msg)
+                return NotificationRecord(
+                    notification_id=notification_id,
+                    story_id=story_id,
+                    update_id=update_id,
+                    kind=kind,
+                    channel=channel_name,
+                    sent_at=now,
+                    status=DeliveryStatus.FAILED,
+                    message_text=message_text,
+                    headline_tr=headline_tr,
+                    score=score,
+                    error_message=err_msg,
+                    category=category,
+                )
+
+            if not claimed:
+                err_msg = f"Delivery claim rejected: duplicate message or in-flight claim holds {notification_id}"
+                logger.warning("%s", err_msg)
+                existing = self.repository.get_telegram_delivery(target_chat_id, notification_id)
+                return NotificationRecord(
+                    notification_id=notification_id,
+                    story_id=story_id,
+                    update_id=update_id,
+                    kind=kind,
+                    channel=channel_name,
+                    sent_at=now,
+                    status=existing.status if existing else DeliveryStatus.FAILED,
+                    message_text=message_text,
+                    headline_tr=headline_tr,
+                    score=score,
+                    error_message=err_msg,
+                    category=category,
+                )
 
         with self._get_http_client() as client:
             for attempt in range(1, max_attempts + 1):
@@ -1042,6 +1162,14 @@ def deliver_one_shot_editorial_digest(
                 "masked_token": token_masked,
             }
         t_role = settings.get_recipient_role(t_chat) or "AUTHORIZED_RECIPIENT"
+        if (not dry_run and settings.telegram_delivery_enabled) and t_role == "ADMIN" and not settings.legacy_editorial_fallback:
+            return {
+                "status": "RECIPIENT_ROLE_VIOLATION",
+                "error": "Recipient separation violation: ADMIN is restricted to operational health reports only and cannot receive live editorial digests.",
+                "attempt_made": False,
+                "masked_chat_id": t_masked,
+                "masked_token": token_masked,
+            }
         target_recipients = [{
             "chat_id": t_chat,
             "role": t_role,
@@ -1084,6 +1212,14 @@ def deliver_one_shot_editorial_digest(
             if req_role == "ALL":
                 target_recipients = all_recs
             else:
+                if (not dry_run and settings.telegram_delivery_enabled) and req_role == "ADMIN" and not settings.legacy_editorial_fallback:
+                    return {
+                        "status": "RECIPIENT_ROLE_VIOLATION",
+                        "error": "Recipient separation violation: ADMIN is restricted to operational health reports only and cannot receive live editorial digests.",
+                        "attempt_made": False,
+                        "masked_chat_id": "<NOT_SET>",
+                        "masked_token": token_masked,
+                    }
                 target_recipients = [r for r in all_recs if r["role"] == req_role]
                 if not target_recipients:
                     return {
@@ -1419,6 +1555,64 @@ def deliver_one_shot_editorial_digest(
                 "is_ux_test": is_ux_test,
             })
             continue
+
+        # Durable Pre-Send Delivery Claim:
+        # Atomically acquire delivery claim before external HTTP call to guarantee no duplicate dispatches
+        # and prevent competing workers from sending the same logical message.
+        if repository is not None:
+            deliv_id = f"DELIV-{digest_hash[:8]}-{abs(hash(r_chat)) % 1000000:06d}"
+            try:
+                claimed = repository.claim_telegram_delivery(
+                    delivery_id=deliv_id,
+                    message_key=digest_hash,
+                    recipient_role=r_role,
+                    recipient_chat_id=r_chat,
+                    category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                    payload={
+                        "stable_digest_id": stable_digest_id,
+                        "is_ux_test": is_ux_test,
+                        "stories_count": len(assessments),
+                    },
+                    max_attempts=1,
+                )
+            except Exception as exc:
+                _record_public_result(r_role, r_masked, {
+                    "status": "REPOSITORY_ERROR",
+                    "error": f"Failed closed: repository claim error: {sanitize_telegram_text(str(exc), settings.telegram_bot_token)}",
+                    "digest_hash": digest_hash,
+                    "stable_digest_id": stable_digest_id,
+                    "attempt_made": False,
+                    "attempts_count": 0,
+                    "is_ux_test": is_ux_test,
+                })
+                continue
+
+            if not claimed:
+                existing_deliv = repository.get_telegram_delivery(r_chat, digest_hash)
+                deliv_st = existing_deliv.status.value if existing_deliv else "UNKNOWN"
+                if existing_deliv and existing_deliv.status in (DeliveryStatus.SENT, DeliveryStatus.DELIVERY_UNCERTAIN):
+                    _record_public_result(r_role, r_masked, {
+                        "status": "DUPLICATE_DELIVERY_PREVENTED",
+                        "error": f"Duplicate delivery prevented: prior durable repository delivery status is {deliv_st}.",
+                        "digest_hash": digest_hash,
+                        "stable_digest_id": stable_digest_id,
+                        "stories_count": len(assessments),
+                        "attempt_made": False,
+                        "attempts_count": 0,
+                        "is_ux_test": is_ux_test,
+                    })
+                else:
+                    _record_public_result(r_role, r_masked, {
+                        "status": "CLAIM_REJECTED",
+                        "error": f"Delivery claim rejected: an in-flight worker or prior attempt holds this message (status: {deliv_st}).",
+                        "digest_hash": digest_hash,
+                        "stable_digest_id": stable_digest_id,
+                        "stories_count": len(assessments),
+                        "attempt_made": False,
+                        "attempts_count": 0,
+                        "is_ux_test": is_ux_test,
+                    })
+                continue
 
         # Single-Shot Live Dispatch (EXACTLY ONE ATTEMPT, ZERO RETRIES)
         endpoint = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"

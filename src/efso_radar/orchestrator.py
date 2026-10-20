@@ -257,27 +257,27 @@ class RadarOrchestrator:
                 message=msg,
             )
 
-        if not dry_run:
-            self.repository.record_scheduled_execution_start(
-                run_id=active_run_id,
-                run_type="SCAN_ONLY" if scan_only else "CRON",
-                worker_id=worker,
-                started_at=run_now,
-            )
-            self.repository.save_recovery_state(
-                stage="RADAR_PIPELINE",
-                worker_id=worker,
-                state_payload={
-                    "stage": "INITIATED",
-                    "run_id": active_run_id,
-                    "worker_id": worker,
-                    "scan_only": scan_only,
-                    "dry_run": dry_run,
-                },
-                batch_id=active_run_id,
-            )
-
         try:
+            if not dry_run:
+                self.repository.record_scheduled_execution_start(
+                    run_id=active_run_id,
+                    run_type="SCAN_ONLY" if scan_only else "CRON",
+                    worker_id=worker,
+                    started_at=run_now,
+                )
+                self.repository.save_recovery_state(
+                    stage="RADAR_PIPELINE",
+                    worker_id=worker,
+                    state_payload={
+                        "stage": "INITIATED",
+                        "run_id": active_run_id,
+                        "worker_id": worker,
+                        "scan_only": scan_only,
+                        "dry_run": dry_run,
+                    },
+                    batch_id=active_run_id,
+                )
+
             # 2. Maintenance: Purge old processed records and expire stale backlog
             if not dry_run:
                 purged = self.repository.purge_expired_records(retention_days=35)
@@ -748,25 +748,35 @@ class RadarOrchestrator:
 
         except Exception as exc:
             if not dry_run:
-                self.repository.save_recovery_state(
-                    stage="RADAR_PIPELINE",
-                    worker_id=worker,
-                    state_payload={"stage": "FAILED", "run_id": active_run_id, "error": str(exc)},
-                    batch_id=active_run_id,
-                )
-                self.repository.record_scheduled_execution_finish(
-                    run_id=active_run_id,
-                    status="FAILED",
-                    articles_collected=len(articles) if "articles" in locals() else 0,
-                    candidates_evaluated=len(candidates) if "candidates" in locals() else 0,
-                    notifications_dispatched=notifications_dispatched if "notifications_dispatched" in locals() else 0,
-                    error_message=str(exc),
-                    finished_at=utc_now(),
-                )
+                try:
+                    self.repository.save_recovery_state(
+                        stage="RADAR_PIPELINE",
+                        worker_id=worker,
+                        state_payload={"stage": "FAILED", "run_id": active_run_id, "error": str(exc)},
+                        batch_id=active_run_id,
+                    )
+                except Exception as save_err:
+                    logger.warning("Failed recording failure recovery state: %s", save_err)
+
+                try:
+                    self.repository.record_scheduled_execution_finish(
+                        run_id=active_run_id,
+                        status="FAILED",
+                        articles_collected=len(articles) if "articles" in locals() else 0,
+                        candidates_evaluated=len(candidates) if "candidates" in locals() else 0,
+                        notifications_dispatched=notifications_dispatched if "notifications_dispatched" in locals() else 0,
+                        error_message=str(exc),
+                        finished_at=utc_now(),
+                    )
+                except Exception as finish_err:
+                    logger.warning("Failed recording execution finish status: %s", finish_err)
             raise
 
         finally:
             if not dry_run:
-                self.repository.release_run_lock(worker)
+                try:
+                    self.repository.release_run_lock(worker)
+                except Exception as release_err:
+                    logger.warning("Failed releasing run lock for worker %s: %s", worker, release_err)
 
 

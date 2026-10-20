@@ -613,5 +613,285 @@ class TestPhase5B3CCloudPersistenceIntegration(unittest.TestCase):
             self.assertIsInstance(orchestrator.repository, TursoStateRepository)
 
 
+    # --- Test 10: Durable Pre-Send Claim & Competing Worker Isolation ---
+    def test_10_durable_pre_send_claim_and_competing_worker_isolation(self):
+        """Atomically claim delivery before HTTP dispatch; competing workers cannot send same message."""
+        repo = self._create_turso_repo()
+        editor_chat = self.test_settings.telegram_primary_editor_chat_id
+        msg_key = "story_digest_hash_999"
+        deliv_id = "DELIV-claim-test-001"
+
+        # Worker 1 acquires pre-send claim
+        claimed_w1 = repo.claim_telegram_delivery(
+            delivery_id=deliv_id,
+            message_key=msg_key,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=editor_chat,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            payload={"test": 1},
+            max_attempts=1,
+        )
+        self.assertTrue(claimed_w1)
+
+        # Worker 2 attempts to claim the same logical message concurrently -> rejected!
+        claimed_w2 = repo.claim_telegram_delivery(
+            delivery_id="DELIV-claim-test-002",
+            message_key=msg_key,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=editor_chat,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            payload={"test": 2},
+            max_attempts=1,
+        )
+        self.assertFalse(claimed_w2)
+
+        # Worker 1 finishes dispatch and commits SENT status
+        sent_ok = repo.update_telegram_delivery_status(deliv_id, DeliveryStatus.SENT)
+        self.assertTrue(sent_ok)
+
+        # Once SENT, further claim attempts are permanently blocked
+        claimed_w3 = repo.claim_telegram_delivery(
+            delivery_id="DELIV-claim-test-003",
+            message_key=msg_key,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=editor_chat,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            payload={"test": 3},
+            max_attempts=1,
+        )
+        self.assertFalse(claimed_w3)
+
+    # --- Test 11: Crash Before and During Dispatch Resend Prevention ---
+    def test_11_crash_before_and_during_dispatch_resend_prevention(self):
+        """Crash before dispatch leaves durable claim; subsequent runner refuses blind resend."""
+        repo = self._create_turso_repo()
+        editor_chat = self.test_settings.telegram_primary_editor_chat_id
+
+        live_settings = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": True,
+            "telegram_bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+        })
+
+        http_calls = []
+
+        def mock_dispatch_handler(request: httpx.Request) -> httpx.Response:
+            http_calls.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 9901}})
+
+        transport = httpx.MockTransport(mock_dispatch_handler)
+
+        channel_1 = TelegramNotificationChannel(
+            settings=live_settings,
+            transport=transport,
+            repository=repo,
+        )
+
+        # Dispatch 1 succeeds
+        assessment = EditorialAssessment(
+            headline_tr="Başarılı Haber",
+            why_efso_tr="Test Haberi",
+            suggested_format=SuggestedFormat.POST,
+            category=StoryCategory.YERLI,
+            disposition=EditorialDisposition.DIGEST,
+            verification_status=VerificationStatus.OFFICIAL_CONFIRMATION,
+            confidence_score=0.95,
+            kind=EditorialKind.NEW,
+            score=92,
+            article_ids=["art_001"],
+        )
+
+        rec1 = channel_1.send(assessment=assessment, story_id="STORY-CRASH-001")
+        self.assertEqual(rec1.status, DeliveryStatus.SENT)
+        self.assertEqual(len(http_calls), 1)
+
+        # Runner 1 crashes. Runner 2 starts fresh with same repository.
+        # Runner 2 attempts to send the EXACT same notification_id -> pre-claim rejects before HTTP request!
+        channel_2 = TelegramNotificationChannel(
+            settings=live_settings,
+            transport=transport,
+            repository=repo,
+        )
+        rec2 = channel_2.send(assessment=assessment, story_id="STORY-CRASH-001", notification_id=rec1.notification_id)
+        self.assertIn(rec2.status, (DeliveryStatus.SENT, DeliveryStatus.FAILED))
+        # Total HTTP calls remains 1 (zero network request made by Runner 2)
+        self.assertEqual(len(http_calls), 1)
+
+        # Test fail-closed on repository claim error
+        broken_repo = MagicMock(spec=TursoStateRepository)
+        broken_repo.claim_telegram_delivery.side_effect = RuntimeError("Turso connection dropped!")
+        channel_broken = TelegramNotificationChannel(
+            settings=live_settings,
+            transport=transport,
+            repository=broken_repo,
+        )
+        rec_broken = channel_broken.send(assessment=assessment, story_id="STORY-CRASH-002")
+        self.assertEqual(rec_broken.status, DeliveryStatus.FAILED)
+        self.assertIn("failed closed", rec_broken.error_message or "")
+        # Still 1 call
+        self.assertEqual(len(http_calls), 1)
+
+    # --- Test 12: AI Budget Guard Fails Closed on Repository Errors ---
+    def test_12_ai_budget_guard_fails_closed_on_repository_error(self):
+        """ExperimentBudgetGuard never assumes 0 spend; repository read/write failures fail closed."""
+        broken_repo = MagicMock(spec=TursoStateRepository)
+        broken_repo.get_monthly_budget_summary.side_effect = ConnectionError("Cloud database unreachable!")
+        broken_repo.record_budget_usage.side_effect = ConnectionError("Cloud database unreachable!")
+
+        guard = ExperimentBudgetGuard(
+            ledger_path=self.tmp_path / "budget_fail_closed.json",
+            budget_ceiling_usd=0.05,
+            canary1_db_path=self.tmp_path / "c1.db",
+            canary2_db_path=self.tmp_path / "c2.db",
+            repository=broken_repo,
+        )
+
+        # 1. get_total_consumed_usd must raise ConnectionError, NOT swallow or return local total
+        with self.assertRaises(ConnectionError):
+            guard.get_total_consumed_usd()
+
+        # 2. reserve_batch must fail closed and halt before any dispatch
+        with self.assertRaises(ConnectionError):
+            guard.reserve_batch(
+                batch_hash="hash_fail_test",
+                candidate_ids=["c1"],
+                estimated_worst_cost_usd=0.001,
+            )
+
+        # 3. reconcile_batch must fail closed on write failure
+        with self.assertRaises(ConnectionError):
+            guard.reconcile_batch(
+                batch_hash="hash_fail_test",
+                actual_cost_usd=0.001,
+                input_tokens=100,
+                output_tokens=20,
+            )
+
+    # --- Test 13: Orchestrator Initialization Failure Releases Run Lock ---
+    def test_13_orchestrator_initialization_failure_releases_run_lock(self):
+        """If record_scheduled_execution_start fails, worker releases run lock in finally block."""
+        repo = self._create_turso_repo()
+        worker_id = "worker-lock-safety-001"
+        run_id = "run-fail-init-001"
+
+        # Mock record_scheduled_execution_start to raise an initialization error
+        with patch.object(repo, "record_scheduled_execution_start", side_effect=RuntimeError("Audit start error!")):
+            orchestrator = RadarOrchestrator(
+                settings=self.test_settings,
+                repository=repo,
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                orchestrator.run(dry_run=False, worker_id=worker_id, run_id=run_id)
+
+            self.assertIn("Audit start error!", str(ctx.exception))
+
+        # Crucial check: Lock MUST have been released by the finally block!
+        # Another worker must be able to acquire the lock immediately
+        next_worker_acquired = repo.acquire_run_lock("worker-next-002", timeout_minutes=15)
+        self.assertTrue(next_worker_acquired, "Lock was leaked by crashed worker!")
+        repo.release_run_lock("worker-next-002")
+
+    # --- Test 14: Recipient Separation and Live Dispatch Role Restrictions ---
+    def test_14_recipient_separation_live_dispatch_protection(self):
+        """ADMIN cannot receive live editorial bulletins; explicit overrides or ALL targeting fail closed."""
+        repo = self._create_turso_repo()
+        admin_chat = self.test_settings.telegram_chat_id
+        editor_chat = self.test_settings.telegram_primary_editor_chat_id
+
+        live_settings = self.test_settings.model_copy(update={
+            "telegram_delivery_enabled": True,
+            "telegram_bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            "legacy_editorial_fallback": False,
+        })
+
+        http_calls = []
+
+        def mock_dispatch(request: httpx.Request) -> httpx.Response:
+            http_calls.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 9911}})
+
+        transport = httpx.MockTransport(mock_dispatch)
+
+        channel = TelegramNotificationChannel(
+            settings=live_settings,
+            transport=transport,
+            repository=repo,
+        )
+
+        assessment = EditorialAssessment(
+            headline_tr="Editoryal Haber Bülteni",
+            why_efso_tr="Test",
+            suggested_format=SuggestedFormat.POST,
+            category=StoryCategory.YERLI,
+            disposition=EditorialDisposition.DIGEST,
+            verification_status=VerificationStatus.OFFICIAL_CONFIRMATION,
+            confidence_score=0.95,
+            kind=EditorialKind.NEW,
+            score=90,
+            article_ids=["art_002"],
+        )
+
+        # 1. Attempting explicit target_chat_id override targeting ADMIN for editorial alert fails closed
+        rec_admin_override = channel.send(
+            assessment=assessment,
+            story_id="STORY-ROLE-001",
+            target_chat_id=admin_chat,
+            dry_run=False,
+        )
+        self.assertEqual(rec_admin_override.status, DeliveryStatus.FAILED)
+        self.assertIn("Recipient separation violation", rec_admin_override.error_message or "")
+        self.assertEqual(len(http_calls), 0)
+
+        # 2. Attempting explicit target_chat_id override targeting ADMIN for digest batch fails closed
+        rec_batch_override = channel.send_digest_batch(
+            assessments=[assessment],
+            notification_id="BATCH-ROLE-001",
+            target_chat_id=admin_chat,
+            dry_run=False,
+        )
+        self.assertEqual(rec_batch_override.status, DeliveryStatus.FAILED)
+        self.assertIn("Recipient separation violation", rec_batch_override.error_message or "")
+        self.assertEqual(len(http_calls), 0)
+
+        # 3. One-shot editorial digest targeting ADMIN role fails closed in live dispatch
+        test_ledger_path = self.tmp_path / "ledger_role_test.json"
+        res_oneshot_admin = deliver_one_shot_editorial_digest(
+            settings=live_settings,
+            assessments=[assessment, assessment, assessment],
+            dry_run=False,
+            target_recipient_role="ADMIN",
+            repository=repo,
+            transport=transport,
+            ledger_path=test_ledger_path,
+        )
+        self.assertEqual(res_oneshot_admin.get("status"), "RECIPIENT_ROLE_VIOLATION")
+        self.assertEqual(len(http_calls), 0)
+
+        # 4. Attempting explicit target_chat_id override targeting PRIMARY_EDITOR for operational report fails closed
+        rec_op_override = channel.send(
+            assessment=assessment,
+            story_id="REPORT-001",
+            category=TelegramNotificationCategory.OPERATIONAL_HEALTH_REPORT,
+            target_chat_id=editor_chat,
+            dry_run=False,
+        )
+        self.assertEqual(rec_op_override.status, DeliveryStatus.FAILED)
+        self.assertIn("Recipient separation violation", rec_op_override.error_message or "")
+        self.assertEqual(len(http_calls), 0)
+
+        # 5. One-shot editorial digest without role target in live dispatch routes strictly to PRIMARY_EDITOR (not ADMIN)
+        res_oneshot_default = deliver_one_shot_editorial_digest(
+            settings=live_settings,
+            assessments=[assessment, assessment, assessment],
+            dry_run=False,
+            repository=repo,
+            transport=transport,
+            ledger_path=test_ledger_path,
+        )
+        self.assertEqual(res_oneshot_default.get("status"), "DELIVERY_SUCCESS")
+        # Assert only 1 HTTP call was made (to PRIMARY_EDITOR, NOT ADMIN)
+        self.assertEqual(len(http_calls), 1)
+        sent_body = json.loads(http_calls[0].content.decode("utf-8"))
+        self.assertEqual(sent_body.get("chat_id"), editor_chat)
+
 if __name__ == "__main__":
     unittest.main()

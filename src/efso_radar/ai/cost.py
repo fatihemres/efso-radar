@@ -442,12 +442,11 @@ class ExperimentBudgetGuard:
                 total += b.get("estimated_worst_case_usd", 0.0)
         if self.repository is not None:
             month = period_month or datetime.now(timezone.utc).strftime("%Y-%m")
-            try:
-                repo_sum = self.repository.get_monthly_budget_summary(month)
-                repo_cost = float(repo_sum.get("total_cost_usd", 0.0))
-                total = max(total, repo_cost)
-            except Exception:
-                pass
+            # Authoritative cloud repository read MUST fail closed on any error:
+            # Never silently ignore repository failures or assume 0 prior spend!
+            repo_sum = self.repository.get_monthly_budget_summary(month)
+            repo_cost = float(repo_sum.get("total_cost_usd", 0.0))
+            total = max(total, repo_cost)
         return round(total, 6)
 
     def get_remaining_allowance_usd(self) -> float:
