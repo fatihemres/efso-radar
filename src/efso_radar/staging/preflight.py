@@ -365,7 +365,7 @@ class CloudPreflightValidator:
             serialized = json.dumps(rows, sort_keys=True)
             return hashlib.md5(serialized.encode("utf-8")).hexdigest()
         except Exception as exc:
-            logger.warning("Could not compute schema fingerprint: %s", exc)
+            logger.warning("Could not compute schema fingerprint: %s", type(exc).__name__)
             return ""
 
     def validate(self) -> PreflightReport:
@@ -389,7 +389,7 @@ class CloudPreflightValidator:
             self._check_state_integrity(report)
 
         except Exception as exc:
-            report.errors.append(f"Preflight validation encountered unexpected error: {type(exc).__name__}: {exc}")
+            report.errors.append(f"Preflight validation encountered unexpected error: {type(exc).__name__}")
 
         # Post-validation fingerprint check
         report.schema_fingerprint_after = self._compute_schema_fingerprint()
@@ -419,7 +419,7 @@ class CloudPreflightValidator:
                     f"Schema version regression or outdated: found {ver}, expected >={CURRENT_SCHEMA_VERSION}"
                 )
         except Exception as exc:
-            report.errors.append(f"Failed to retrieve schema version: {exc}")
+            report.errors.append(f"Failed to retrieve schema version: {type(exc).__name__}")
 
     def _check_schema_structure(self, report: PreflightReport) -> None:
         # Retrieve all existing tables
@@ -462,7 +462,7 @@ class CloudPreflightValidator:
                                 f"Column type mismatch on {table_name}.{col_name}: expected {exp_type}, got {act_type}"
                             )
             except Exception as exc:
-                report.errors.append(f"Failed inspecting columns for table {table_name}: {exc}")
+                report.errors.append(f"Failed inspecting columns for table {table_name}: {type(exc).__name__}")
 
         # Check indexes
         for table_name, expected_indexes in SCHEMA_V6_INDEXES.items():
@@ -476,7 +476,7 @@ class CloudPreflightValidator:
                     if expected_idx not in actual_indexes:
                         report.missing_indexes.append(expected_idx)
             except Exception as exc:
-                report.errors.append(f"Failed inspecting indexes for table {table_name}: {exc}")
+                report.errors.append(f"Failed inspecting indexes for table {table_name}: {type(exc).__name__}")
 
         # Check named constraints
         for table_name, expected_constraints in SCHEMA_V6_CONSTRAINTS.items():
@@ -497,7 +497,7 @@ class CloudPreflightValidator:
                     if not (found_in_ddl or found_in_indexes):
                         report.missing_constraints.append(f"{table_name}.{expected_constraint}")
             except Exception as exc:
-                report.errors.append(f"Failed inspecting constraints for table {table_name}: {exc}")
+                report.errors.append(f"Failed inspecting constraints for table {table_name}: {type(exc).__name__}")
 
         # Verify critical uniqueness semantics (e.g. UNIQUE(recipient_chat_id, message_key)) strictly from
         # schema and index metadata. DDL text and constraint/index names are never used as proof: a real,
@@ -590,45 +590,72 @@ class CloudPreflightValidator:
             if not hasattr(self.repo, method_name) or not callable(getattr(self.repo, method_name)):
                 report.errors.append(f"Repository contract violation: missing required method '{method_name}'")
 
+    def _table_exists(self, table_name: str) -> bool:
+        rows = execute_read_query(
+            self.repo,
+            "SELECT name FROM sqlite_master WHERE type='table' AND name = ?",
+            [table_name],
+        )
+        return bool(rows)
+
     def _check_state_integrity(self, report: PreflightReport) -> None:
-        """Verify delivery and recovery state integrity without mutating any row."""
-        # 1. Delivery records status validity
+        """Verify delivery and recovery state integrity without mutating any row.
+
+        Diagnostics contain only safe categories and counts, never row values or raw exception text.
+        Genuinely missing tables are skipped (already reported by the structure check); any other
+        query failure is reported as an error so preflight fails closed.
+        """
         valid_statuses = {s.value for s in DeliveryStatus}
-        try:
+
+        def _guarded(table: str, label: str, fn) -> None:
+            try:
+                if not self._table_exists(table):
+                    return
+                fn()
+            except Exception as exc:
+                report.errors.append(
+                    f"State integrity check failed ({label}): query error {type(exc).__name__}"
+                )
+
+        # 1. Delivery records status validity
+        def _check_statuses() -> None:
             records = execute_read_query(
                 self.repo,
                 "SELECT DISTINCT status FROM telegram_delivery_records",
             )
-            for r in records:
-                st = r.get("status")
-                if st and st not in valid_statuses:
-                    report.integrity_issues.append(
-                        f"Invalid delivery status in telegram_delivery_records: '{st}'"
-                    )
-        except Exception:
-            # Table might be missing (already reported in structure check)
-            pass
+            invalid = sum(1 for r in records if r.get("status") not in valid_statuses)
+            if invalid:
+                report.integrity_issues.append(
+                    f"Invalid delivery status: found {invalid} distinct invalid value(s) in telegram_delivery_records"
+                )
+
+        _guarded("telegram_delivery_records", "delivery status", _check_statuses)
 
         # 2. Recovery state JSON validity
-        try:
+        def _check_recovery_json() -> None:
             states = execute_read_query(
                 self.repo,
-                "SELECT state_key, state_json FROM durable_recovery_state LIMIT 50",
+                "SELECT state_json FROM durable_recovery_state",
             )
+            corrupt = 0
             for r in states:
                 raw_json = r.get("state_json")
-                if raw_json:
-                    try:
-                        json.loads(raw_json)
-                    except Exception as json_err:
-                        report.integrity_issues.append(
-                            f"Corrupt recovery JSON in durable_recovery_state for key '{r.get('state_key')}': {json_err}"
-                        )
-        except Exception:
-            pass
+                if not isinstance(raw_json, str) or not raw_json.strip():
+                    corrupt += 1
+                    continue
+                try:
+                    json.loads(raw_json)
+                except (ValueError, TypeError):
+                    corrupt += 1
+            if corrupt:
+                report.integrity_issues.append(
+                    f"Corrupt recovery JSON: found {corrupt} record(s) in durable_recovery_state"
+                )
+
+        _guarded("durable_recovery_state", "recovery state JSON", _check_recovery_json)
 
         # 3. Duplicate claims check on telegram_delivery_records
-        try:
+        def _check_duplicates() -> None:
             duplicates = execute_read_query(
                 self.repo,
                 """
@@ -642,5 +669,5 @@ class CloudPreflightValidator:
                 report.integrity_issues.append(
                     f"Found {len(duplicates)} duplicate delivery identities violating uniqueness contract"
                 )
-        except Exception:
-            pass
+
+        _guarded("telegram_delivery_records", "duplicate delivery identities", _check_duplicates)
