@@ -14,7 +14,10 @@ Safety Invariants:
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import struct
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +26,7 @@ from pydantic import BaseModel, Field
 
 from efso_radar.domain import utc_now
 from efso_radar.repositories.base import StateRepository
+from efso_radar.repositories.migration_ledger import mask_text_chat_ids
 from efso_radar.repositories.schema import CURRENT_SCHEMA_VERSION
 from efso_radar.repositories.sqlite import SqliteStateRepository
 from efso_radar.staging.preflight import (
@@ -35,6 +39,69 @@ from efso_radar.staging.preflight import (
 logger = logging.getLogger("efso-radar.staging.cutover")
 
 
+class ContentHashError(Exception):
+    """Raised when table content cannot be losslessly serialized. Never carries record contents."""
+
+
+def _frame(tag: bytes, payload: bytes) -> bytes:
+    """Length-prefixed, type-tagged field so values can never bleed into each other."""
+    return tag + len(payload).to_bytes(8, "big") + payload
+
+
+def _serialize_value(val: Any) -> bytes:
+    """Type-preserving lossless encoding of a SQLite/libSQL value (NULL/INTEGER/REAL/TEXT/BLOB)."""
+    if val is None:
+        return _frame(b"N", b"")
+    if isinstance(val, bool):
+        return _frame(b"I", str(int(val)).encode("ascii"))
+    if isinstance(val, int):
+        return _frame(b"I", str(val).encode("ascii"))
+    if isinstance(val, float):
+        # IEEE-754 big-endian bits: exact, no rounding
+        return _frame(b"R", struct.pack(">d", val))
+    if isinstance(val, str):
+        try:
+            return _frame(b"T", val.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise ContentHashError("TEXT value is not valid UTF-8") from exc
+    if isinstance(val, (bytes, bytearray, memoryview)):
+        return _frame(b"B", bytes(val))
+    raise ContentHashError(f"Unsupported value type: {type(val).__name__}")
+
+
+def compute_table_content_hash(rows: list[dict[str, Any]], expected_cols: list[str]) -> str:
+    """Compute a deterministic, lossless SHA-256 hash of table records.
+
+    Guarantees:
+    - Type-preserving: NULL, INTEGER, REAL, TEXT and BLOB are all distinct (None != "__NULL__",
+      6 != "6", b"a" != "a").
+    - REAL values keep full IEEE-754 precision (no rounding).
+    - TEXT is hashed exactly as stored (no trimming, no JSON interpretation).
+    - Columns follow ``expected_cols`` order; every field and row is length-framed, so row and
+      column boundaries are unambiguous. Row order is the caller's ORDER BY primary key.
+    - Fails closed: a missing column or unsupported value raises ContentHashError (message never
+      contains record contents).
+
+    Limitation: ``rows`` is a fully materialized list (``execute_read_query`` does not stream), so
+    memory use is proportional to table size. Bounded-memory reconciliation is NOT implemented.
+    """
+    hasher = hashlib.sha256()
+    hasher.update(b"EFSO-CONTENT-HASH-V1")
+    hasher.update(len(expected_cols).to_bytes(4, "big"))
+    for col in expected_cols:
+        hasher.update(_frame(b"C", col.encode("utf-8")))
+    hasher.update(len(rows).to_bytes(8, "big"))
+    for row in rows:
+        hasher.update(b"R")
+        for col in expected_cols:
+            try:
+                val = row[col]
+            except (KeyError, IndexError, TypeError) as exc:
+                raise ContentHashError(f"Result row is missing expected column '{col}'") from exc
+            hasher.update(_serialize_value(val))
+    return hasher.hexdigest()
+
+
 class TableReconciliation(BaseModel):
     table_name: str
     source_count: int = 0
@@ -43,6 +110,10 @@ class TableReconciliation(BaseModel):
     source_sample_keys: list[str] = Field(default_factory=list)
     target_sample_keys: list[str] = Field(default_factory=list)
     keys_match: bool = False
+    content_matches: bool = True
+    source_content_hash: str = ""
+    target_content_hash: str = ""
+    mismatched_keys_sample: list[str] = Field(default_factory=list)
 
 
 class AbortReason(BaseModel):
@@ -66,6 +137,7 @@ class GoNoGoDecision(BaseModel):
         verdict = "GO (APPROVED FOR STAGING CUTOVER)" if self.can_proceed else "NO-GO (CUTOVER BLOCKED)"
         lines = [
             f"=== STAGING CUTOVER GO / NO-GO DECISION: [{verdict}] ===",
+            "NOTE: This evaluation represents offline planning evidence only and does NOT authorize live cutover.",
             f"Decided At: {self.decided_at.isoformat()}",
             f"1. Preflights Passed: {'YES' if self.all_preflights_passed else 'NO'}",
             f"2. Schema Compatible: {'YES' if self.schema_compatible else 'NO'}",
@@ -96,12 +168,34 @@ class StagingCutoverReport(BaseModel):
         return bool(self.table_reconciliations) and all(t.count_matches for t in self.table_reconciliations)
 
     @property
+    def all_keys_match(self) -> bool:
+        return bool(self.table_reconciliations) and all(t.keys_match for t in self.table_reconciliations)
+
+    @property
+    def all_contents_match(self) -> bool:
+        return bool(self.table_reconciliations) and all(t.content_matches for t in self.table_reconciliations)
+
+    @property
     def is_safe_to_cutover(self) -> bool:
-        return self.all_counts_match and len(self.abort_reasons) == 0
+        return (
+            self.all_counts_match
+            and self.all_keys_match
+            and self.all_contents_match
+            and len(self.abort_reasons) == 0
+        )
 
 
 class GoNoGoGate:
-    """Evaluates strict multi-factor prerequisites before authorizing staging transition."""
+    """Evaluates strict multi-factor prerequisites before authorizing staging transition.
+
+    CRITICAL SAFETY CONTRACT:
+    - Any reconciliation failure (count, full key set, content hash, or inspection error) MUST produce NO-GO.
+    - All abort reasons from the cutover report must be propagated into the decision.
+    - Never issue GO when the reconciler reports is_safe_to_cutover=False.
+    - Product Owner sign-off is mandatory and non-negotiable.
+    - An evaluation emitting can_proceed=True serves strictly as offline planning evidence,
+      never as automatic permission for live service transition.
+    """
 
     @staticmethod
     def evaluate(
@@ -118,17 +212,33 @@ class GoNoGoGate:
                 cutover_report.target_schema_version >= CURRENT_SCHEMA_VERSION
                 and cutover_report.source_schema_version >= CURRENT_SCHEMA_VERSION
             ),
-            data_reconciliation_passed=cutover_report.all_counts_match,
+            data_reconciliation_passed=cutover_report.is_safe_to_cutover,
             backup_verified=backup_verified,
             rollback_ready=rollback_ready,
             zero_cost_verified=zero_cost_verified,
             product_owner_signed_off=product_owner_signed_off,
         )
 
+        # 1. Target preflight validation check
         if not target_preflight.success:
             decision.abort_reasons.append(
                 AbortReason(code="ERR_PREFLIGHT_FAILED", message="Target preflight validation failed.")
             )
+            for err in target_preflight.errors:
+                decision.abort_reasons.append(
+                    AbortReason(code="ERR_PREFLIGHT_ERROR", message=mask_text_chat_ids(str(err)))
+                )
+            for mc in target_preflight.missing_constraints:
+                decision.abort_reasons.append(
+                    AbortReason(code="ERR_PREFLIGHT_CONSTRAINT", message=f"Missing constraint: {mc}")
+                )
+            for table_name, mismatches in target_preflight.type_mismatches.items():
+                for col, detail in mismatches.items():
+                    decision.abort_reasons.append(
+                        AbortReason(code="ERR_PREFLIGHT_TYPE", message=f"Type mismatch on {table_name}.{col}: {detail}")
+                    )
+
+        # 2. Schema compatibility check
         if not decision.schema_compatible:
             decision.abort_reasons.append(
                 AbortReason(
@@ -137,13 +247,30 @@ class GoNoGoGate:
                             f"target={cutover_report.target_schema_version}, expected>={CURRENT_SCHEMA_VERSION}.",
                 )
             )
+
+        # 3. Propagate ALL reconciler abort reasons (counts, full key set, content hashes, inspection errors)
+        for ar in cutover_report.abort_reasons:
+            if not any(existing.code == ar.code for existing in decision.abort_reasons):
+                decision.abort_reasons.append(ar)
+
         if not cutover_report.all_counts_match:
+            if not any(ar.code.startswith("ERR_COUNT_MISMATCH") or ar.code == "ERR_DATA_MISMATCH" for ar in decision.abort_reasons):
+                decision.abort_reasons.append(
+                    AbortReason(
+                        code="ERR_DATA_MISMATCH",
+                        message="Source and target record count reconciliation failed.",
+                    )
+                )
+
+        if not cutover_report.is_safe_to_cutover and not decision.abort_reasons:
             decision.abort_reasons.append(
                 AbortReason(
-                    code="ERR_DATA_MISMATCH",
-                    message="Source and target record count reconciliation failed.",
+                    code="ERR_RECONCILIATION_UNSAFE",
+                    message="Staging cutover reconciler determined target repository is unsafe for cutover.",
                 )
             )
+
+        # 4. Verified backup prerequisite
         if not backup_verified:
             decision.abort_reasons.append(
                 AbortReason(
@@ -151,6 +278,8 @@ class GoNoGoGate:
                     message="Prerequisite verified backup not present before cutover.",
                 )
             )
+
+        # 5. Rollback plan prerequisite
         if not rollback_ready:
             decision.abort_reasons.append(
                 AbortReason(
@@ -158,6 +287,8 @@ class GoNoGoGate:
                     message="Rollback plan or restore point is not ready.",
                 )
             )
+
+        # 6. Zero financial and token cost invariant
         if not zero_cost_verified:
             decision.abort_reasons.append(
                 AbortReason(
@@ -165,6 +296,8 @@ class GoNoGoGate:
                     message="Non-zero financial or token cost detected ($0.00 / 0 TRY invariant violated).",
                 )
             )
+
+        # 7. Explicit Product Owner sign-off
         if not product_owner_signed_off:
             decision.abort_reasons.append(
                 AbortReason(
@@ -177,6 +310,7 @@ class GoNoGoGate:
             decision.all_preflights_passed
             and decision.schema_compatible
             and decision.data_reconciliation_passed
+            and cutover_report.is_safe_to_cutover
             and decision.backup_verified
             and decision.rollback_ready
             and decision.zero_cost_verified
@@ -209,7 +343,7 @@ class StagingCutoverReconciler:
                     if db_path is not None:
                         resolved = Path(db_path).resolve()
                         prod_path = Path("data/radar.db").resolve()
-                        if resolved == prod_path:
+                        if resolved == prod_path or (resolved.name == "radar.db" and "data" in resolved.parts):
                             raise PermissionError(
                                 "Safety violation: StagingCutoverReconciler cannot operate on operational data/radar.db."
                             )
@@ -221,10 +355,16 @@ class StagingCutoverReconciler:
             target_type=type(self.target_repo).__name__,
         )
 
-        # 1. Version checks
+        # 1. Version checks (strictly via read-only execute_read_query to prevent creating missing SQLite files)
         try:
-            report.source_schema_version = self.source_repo.get_schema_version()
-            report.target_schema_version = self.target_repo.get_schema_version()
+            src_ver_rows = execute_read_query(self.source_repo, "SELECT MAX(version) AS ver FROM schema_migrations")
+            src_raw = src_ver_rows[0]["ver"] if src_ver_rows else None
+            report.source_schema_version = int(src_raw) if src_raw is not None else 0
+
+            tgt_ver_rows = execute_read_query(self.target_repo, "SELECT MAX(version) AS ver FROM schema_migrations")
+            tgt_raw = tgt_ver_rows[0]["ver"] if tgt_ver_rows else None
+            report.target_schema_version = int(tgt_raw) if tgt_raw is not None else 0
+
             if report.source_schema_version < CURRENT_SCHEMA_VERSION:
                 report.abort_reasons.append(
                     AbortReason(
@@ -241,10 +381,10 @@ class StagingCutoverReconciler:
                 )
         except Exception as exc:
             report.abort_reasons.append(
-                AbortReason(code="ERR_VERSION_CHECK_FAILED", message=f"Version check failed: {exc}")
+                AbortReason(code="ERR_VERSION_CHECK_FAILED", message=f"Version check failed: {type(exc).__name__}")
             )
 
-        # 2. Table-by-table record count & sample identity reconciliation
+        # 2. Table-by-table record count, complete primary key set, and content parity reconciliation
         for table_name, expected_cols in SCHEMA_V6_TABLES.items():
             pk_col = expected_cols[0]
             rec = TableReconciliation(table_name=table_name)
@@ -264,30 +404,65 @@ class StagingCutoverReconciler:
                         )
                     )
 
-                # Sample primary key parity check (up to 10 keys)
+                # Complete primary key set parity check (all keys, not only samples)
                 s_pk_rows = execute_read_query(
-                    self.source_repo, f"SELECT {pk_col} FROM {table_name} ORDER BY {pk_col} ASC LIMIT 10"
+                    self.source_repo, f"SELECT {pk_col} FROM {table_name} ORDER BY {pk_col} ASC"
                 )
                 t_pk_rows = execute_read_query(
-                    self.target_repo, f"SELECT {pk_col} FROM {table_name} ORDER BY {pk_col} ASC LIMIT 10"
+                    self.target_repo, f"SELECT {pk_col} FROM {table_name} ORDER BY {pk_col} ASC"
                 )
-                rec.source_sample_keys = [str(r.get(pk_col)) for r in s_pk_rows if r.get(pk_col)]
-                rec.target_sample_keys = [str(r.get(pk_col)) for r in t_pk_rows if r.get(pk_col)]
-                rec.keys_match = rec.source_sample_keys == rec.target_sample_keys
+                s_all_keys = [str(r.get(pk_col)) for r in s_pk_rows if r.get(pk_col) is not None]
+                t_all_keys = [str(r.get(pk_col)) for r in t_pk_rows if r.get(pk_col) is not None]
+                rec.source_sample_keys = [mask_text_chat_ids(k) for k in s_all_keys[:10]]
+                rec.target_sample_keys = [mask_text_chat_ids(k) for k in t_all_keys[:10]]
+                rec.keys_match = s_all_keys == t_all_keys
 
-                if not rec.keys_match and (rec.source_sample_keys or rec.target_sample_keys):
+                if not rec.keys_match and (s_all_keys or t_all_keys):
+                    diff_keys = list(set(s_all_keys) ^ set(t_all_keys))
+                    if not diff_keys and len(s_all_keys) == len(t_all_keys):
+                        for i, (sk, tk) in enumerate(zip(s_all_keys, t_all_keys)):
+                            if sk != tk:
+                                diff_keys.append(f"idx {i}: source={sk} vs target={tk}")
+                                break
+                    rec.mismatched_keys_sample = [mask_text_chat_ids(str(k)) for k in diff_keys[:5]]
                     report.abort_reasons.append(
                         AbortReason(
                             code=f"ERR_KEY_MISMATCH_{table_name.upper()}",
-                            message=f"Table '{table_name}' sample primary keys differ between source and target",
+                            message=f"Table '{table_name}' complete primary key set differs between source and target "
+                                    f"(mismatches sample: {rec.mismatched_keys_sample})",
+                        )
+                    )
+
+                # Content parity verification via deterministic SHA-256 hash
+                cols_sql = ", ".join(expected_cols)
+                s_rows = execute_read_query(
+                    self.source_repo, f"SELECT {cols_sql} FROM {table_name} ORDER BY {pk_col} ASC"
+                )
+                t_rows = execute_read_query(
+                    self.target_repo, f"SELECT {cols_sql} FROM {table_name} ORDER BY {pk_col} ASC"
+                )
+                rec.source_content_hash = compute_table_content_hash(s_rows, expected_cols)
+                rec.target_content_hash = compute_table_content_hash(t_rows, expected_cols)
+                rec.content_matches = rec.source_content_hash == rec.target_content_hash
+
+                if not rec.content_matches:
+                    report.abort_reasons.append(
+                        AbortReason(
+                            code=f"ERR_CONTENT_MISMATCH_{table_name.upper()}",
+                            message=f"Table '{table_name}' content hash mismatch: "
+                                    f"source={rec.source_content_hash[:8]}..., target={rec.target_content_hash[:8]}...",
                         )
                     )
 
             except Exception as exc:
+                rec.count_matches = False
+                rec.keys_match = False
+                rec.content_matches = False
+                # Only the exception class is reported: messages may embed record contents.
                 report.abort_reasons.append(
                     AbortReason(
                         code=f"ERR_TABLE_INSPECT_{table_name.upper()}",
-                        message=f"Failed reconciling table '{table_name}': {exc}",
+                        message=f"Failed reconciling table '{table_name}': {type(exc).__name__}",
                     )
                 )
 

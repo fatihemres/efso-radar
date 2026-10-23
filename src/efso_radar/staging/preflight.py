@@ -9,12 +9,15 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
+import sqlite3
 from pathlib import Path
 from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 from efso_radar.domain import DeliveryStatus
 from efso_radar.repositories.base import StateRepository
+from efso_radar.repositories.migration_ledger import mask_text_chat_ids
 from efso_radar.repositories.schema import CURRENT_SCHEMA_VERSION
 from efso_radar.repositories.sqlite import SqliteStateRepository
 from efso_radar.repositories.turso import TursoStateRepository
@@ -92,24 +95,156 @@ SCHEMA_V6_INDEXES: dict[str, list[str]] = {
     "scheduled_execution_history": ["idx_scheduled_execution_started"],
 }
 
-SCHEMA_V6_CONSTRAINTS: dict[str, list[str]] = {
-    "telegram_delivery_records": ["uq_recipient_message"],
+SCHEMA_V6_COLUMN_TYPES: dict[str, dict[str, str]] = {
+    "schema_migrations": {"version": "INTEGER", "applied_at": "TEXT", "description": "TEXT"},
+    "run_locks": {"lock_key": "TEXT", "worker_id": "TEXT", "acquired_at": "TEXT", "expires_at": "TEXT", "heartbeat_at": "TEXT"},
+    "processed_articles": {"article_id": "TEXT", "title": "TEXT", "source": "TEXT", "published_at": "TEXT", "processed_at": "TEXT"},
+    "stories": {"story_id": "TEXT", "headline_tr": "TEXT", "category": "TEXT", "first_seen_at": "TEXT", "last_updated_at": "TEXT", "article_ids_json": "TEXT", "update_count": "INTEGER", "is_active": "INTEGER"},
+    "story_updates": {"update_id": "TEXT", "story_id": "TEXT", "development_tr": "TEXT", "detected_at": "TEXT", "article_ids_json": "TEXT", "significance_score": "INTEGER"},
+    "notifications": {"notification_id": "TEXT", "story_id": "TEXT", "kind": "TEXT", "channel": "TEXT", "sent_at": "TEXT", "status": "TEXT", "message_text": "TEXT", "headline_tr": "TEXT", "score": "INTEGER"},
+    "editorial_assessments": {"assessment_id": "TEXT", "story_id": "TEXT", "kind": "TEXT", "score": "INTEGER", "headline_tr": "TEXT", "created_at": "TEXT"},
+    "owner_feedback": {"feedback_id": "TEXT", "rating": "TEXT", "notes": "TEXT", "created_at": "TEXT"},
+    "candidate_backlog": {"article_id": "TEXT", "url": "TEXT", "title": "TEXT", "source": "TEXT", "market": "TEXT", "snippet": "TEXT", "published_at": "TEXT", "discovered_at": "TEXT", "status": "TEXT", "priority_score": "REAL"},
+    "ai_usage_ledger": {"usage_id": "TEXT", "run_mode": "TEXT", "model_name": "TEXT", "batch_hash": "TEXT", "candidate_count": "INTEGER", "input_tokens": "INTEGER", "output_tokens": "INTEGER", "estimated_cost_usd": "REAL", "created_at": "TEXT"},
+    "telegram_delivery_records": {
+        "delivery_id": "TEXT", "message_key": "TEXT", "recipient_role": "TEXT", "recipient_chat_id": "TEXT",
+        "category": "TEXT", "status": "TEXT", "attempt_count": "INTEGER", "max_attempts": "INTEGER",
+        "payload_json": "TEXT", "created_at": "TEXT", "updated_at": "TEXT",
+    },
+    "durable_recovery_state": {"state_key": "TEXT", "stage": "TEXT", "worker_id": "TEXT", "state_json": "TEXT", "created_at": "TEXT", "updated_at": "TEXT"},
+    "admin_operational_reports": {"report_date": "TEXT", "dispatched_at": "TEXT", "worker_id": "TEXT", "status": "TEXT", "recipient_chat_id": "TEXT", "summary_json": "TEXT"},
+    "experiment_budget_history": {"record_id": "TEXT", "period_month": "TEXT", "run_id": "TEXT", "worker_id": "TEXT", "timestamp": "TEXT", "calls_count": "INTEGER", "prompt_tokens": "INTEGER", "completion_tokens": "INTEGER", "total_tokens": "INTEGER", "estimated_cost_usd": "REAL"},
+    "scheduled_execution_history": {"run_id": "TEXT", "run_type": "TEXT", "worker_id": "TEXT", "started_at": "TEXT", "status": "TEXT", "articles_collected": "INTEGER", "candidates_evaluated": "INTEGER", "notifications_dispatched": "INTEGER"},
+}
+
+SCHEMA_V6_CONSTRAINTS: dict[str, list[str]] = {}
+
+SCHEMA_V6_CRITICAL_UNIQUE_CONSTRAINTS: dict[str, list[set[str]]] = {
+    "telegram_delivery_records": [{"recipient_chat_id", "message_key"}],
 }
 
 
+def _types_are_compatible(actual: str, expected: str) -> bool:
+    """Check if actual SQL column type is compatible with expected type."""
+    act = actual.strip().upper()
+    exp = expected.strip().upper()
+    if exp == "TEXT":
+        return act in ("TEXT", "VARCHAR", "CHAR", "CLOB", "")
+    elif exp == "INTEGER":
+        return act in ("INTEGER", "INT", "TINYINT", "SMALLINT", "BIGINT")
+    elif exp == "REAL":
+        return act in ("REAL", "FLOAT", "DOUBLE", "NUMERIC")
+    return act == exp
+
+
+def validate_read_only_sql(sql: str) -> None:
+    """Validate that SQL string is strictly read-only and safe to execute.
+
+    Rejects:
+    - Empty queries
+    - Multiple statements (semicolon separation)
+    - Mutating PRAGMAs or PRAGMAs outside allowed read-only inspection set
+    - CTEs containing data-modifying statements (INSERT, UPDATE, DELETE, etc.)
+    - Any query containing mutating DML or DDL keywords anywhere in the statement
+    """
+    if not sql or not sql.strip():
+        raise ValueError("Preflight query safety violation: SQL query is empty.")
+
+    # Comments are never needed for introspection and can be used to hide payloads
+    # from naive scanners (e.g. a quote inside a comment desyncing literal stripping).
+    if "--" in sql or "/*" in sql or "*/" in sql:
+        raise ValueError("Preflight query safety violation: SQL comments are prohibited.")
+    cleaned = sql.strip()
+
+    # Reject multiple statements
+    if cleaned.endswith(";"):
+        cleaned = cleaned[:-1].strip()
+    if ";" in cleaned:
+        raise ValueError("Preflight query safety violation: multiple statements are prohibited.")
+
+    # Strip string literals to avoid false positives for keywords inside strings
+    no_strings = re.sub(r"'(''|[^'])*'", "'STRING'", cleaned)
+    no_strings = re.sub(r'"(""|[^"])*"', '"STRING"', no_strings)
+    upper = no_strings.upper()
+
+    # Check allowed starting verbs
+    if upper.startswith("PRAGMA"):
+        # Strict allowlist of exact read-only forms. Anything else (assignment, `name(value)`
+        # setter syntax such as `PRAGMA user_version(17)`, schema-qualified names) is rejected.
+        # Introspection pragmas that take an object name: PRAGMA name(identifier)
+        arg_pragmas = {"table_info", "table_xinfo", "index_list", "index_info", "index_xinfo", "foreign_key_list"}
+        # Introspection pragmas that must be bare (no argument, no assignment)
+        bare_pragmas = {"collation_list", "database_list", "compile_options", "user_version"}
+        m_arg = re.fullmatch(r"PRAGMA\s+([A-Z_]+)\s*\(\s*[A-Za-z_][A-Za-z0-9_]*\s*\)", upper, flags=re.IGNORECASE)
+        m_bare = re.fullmatch(r"PRAGMA\s+([A-Z_]+)", upper, flags=re.IGNORECASE)
+        if m_arg and m_arg.group(1).lower() in arg_pragmas:
+            return
+        if m_bare and m_bare.group(1).lower() in bare_pragmas:
+            return
+        raise ValueError(
+            f"Preflight query safety violation: PRAGMA is not an allowed read-only form: {sql[:40]}"
+        )
+
+    if not (upper.startswith("SELECT") or upper.startswith("WITH")):
+        raise ValueError(
+            f"Preflight query safety violation: query must start with SELECT, WITH, or allowed PRAGMA: {sql[:40]}"
+        )
+
+    # Strictly prohibit mutating verbs anywhere in the statement (e.g. in CTEs or subqueries)
+    prohibited_verbs = {
+        "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "REPLACE",
+        "ATTACH", "DETACH", "VACUUM", "REINDEX", "UPSERT", "SAVEPOINT",
+        "RELEASE", "GRANT", "REVOKE", "PRAGMA", "LOAD_EXTENSION", "BEGIN", "COMMIT",
+        "ROLLBACK", "ANALYZE",
+    }
+    words = set(re.findall(r"\b[A-Za-z_]+\b", upper))
+    found_prohibited = words.intersection(prohibited_verbs)
+    if found_prohibited:
+        raise ValueError(
+            f"Preflight query safety violation: query contains prohibited mutating keywords "
+            f"{sorted(found_prohibited)}: {sql[:50]}"
+        )
+
+
 def execute_read_query(repo: StateRepository, sql: str, params: Optional[list[Any]] = None) -> list[dict[str, Any]]:
-    """Execute a strictly read-only SQL query against SQLite or Turso repository."""
-    clean_sql = sql.strip().upper()
-    prohibited_verbs = ("INSERT ", "UPDATE ", "DELETE ", "DROP ", "ALTER ", "CREATE ", "ATTACH ", "DETACH ")
-    if any(clean_sql.startswith(verb) for verb in prohibited_verbs):
-        raise ValueError(f"Preflight query safety violation: query must be strictly read-only: {sql[:30]}")
+    """Execute a strictly read-only SQL query against SQLite or Turso repository.
+
+    Guarantees:
+    - Queries must pass strict read-only validation (no DML, no DDL, no CTE writes, no mutating PRAGMAs).
+    - Refuses execution against the operational database data/radar.db.
+    - Uses genuinely read-only file connections (?mode=ro) and PRAGMA query_only = ON when inspecting SQLite files.
+    - Never creates or initializes missing database files; fails closed if the file is missing, invalid, or inaccessible.
+    """
+    validate_read_only_sql(sql)
 
     if isinstance(repo, SqliteStateRepository):
-        with repo._connection() as conn:
+        db_path = getattr(repo, "db_path", None)
+        if db_path is None or not str(db_path).strip() or str(db_path).strip() == ":memory:":
+            raise FileNotFoundError(
+                "Preflight read-only query failed: SQLite repository does not have a valid existing database file path."
+            )
+        resolved = Path(db_path).resolve()
+        prod_path = Path("data/radar.db").resolve()
+        if resolved == prod_path or (resolved.name == "radar.db" and "data" in resolved.parts):
+            raise PermissionError(
+                "Safety violation: execute_read_query cannot execute against operational database data/radar.db."
+            )
+        if not resolved.exists() or not resolved.is_file():
+            raise FileNotFoundError(
+                f"Preflight read-only query failed: SQLite database file does not exist or is not a regular file: {resolved.name}"
+            )
+
+        uri_path = f"file:{resolved.as_posix()}?mode=ro"
+        conn = sqlite3.connect(uri_path, uri=True, timeout=15.0)
+        try:
+            conn.execute("PRAGMA query_only = ON;")
             cursor = conn.cursor()
             cursor.execute(sql, params or [])
             cols = [d[0] for d in cursor.description] if cursor.description else []
             return [dict(zip(cols, row)) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
     elif isinstance(repo, TursoStateRepository):
         res = repo.client.execute(sql, params or [])
         return res.fetchall()
@@ -118,7 +253,15 @@ def execute_read_query(repo: StateRepository, sql: str, params: Optional[list[An
 
 
 class PreflightReport(BaseModel):
-    """Structured report of cloud staging preflight validation."""
+    """Structured report of cloud staging preflight validation.
+
+    NOTE ON NON-MUTATING INVARIANT:
+    The schema fingerprint check computes an MD5 digest of all schema definitions
+    (tables, indexes, triggers, views) in sqlite_master before and after preflight.
+    This guarantees that database schema objects were strictly unmutated by the inspection.
+    Row content integrity and data preservation are separately verified via cryptographic
+    content hashing in the staging cutover reconciler.
+    """
     success: bool = False
     repository_type: str = ""
     schema_version: int = 0
@@ -129,6 +272,7 @@ class PreflightReport(BaseModel):
     constraints_checked: int = 0
     missing_tables: list[str] = Field(default_factory=list)
     missing_columns: dict[str, list[str]] = Field(default_factory=dict)
+    type_mismatches: dict[str, dict[str, str]] = Field(default_factory=dict)
     missing_indexes: list[str] = Field(default_factory=list)
     missing_constraints: list[str] = Field(default_factory=list)
     integrity_issues: list[str] = Field(default_factory=list)
@@ -151,7 +295,7 @@ class PreflightReport(BaseModel):
             f"=== CLOUD STAGING PREFLIGHT REPORT [{status_str}] ===",
             f"Repository Type: {self.repository_type}",
             f"Schema Version: {self.schema_version} (Expected: >={self.expected_schema_version})",
-            f"Non-Mutating Invariant Verified: {'YES' if self.is_non_mutating else 'NO'}",
+            f"Non-Mutating Schema Invariant Verified: {'YES' if self.is_non_mutating else 'NO'}",
             f"Checks: {self.tables_checked} tables, {self.columns_checked} columns, "
             f"{self.indexes_checked} indexes, {self.constraints_checked} constraints",
         ]
@@ -163,6 +307,11 @@ class PreflightReport(BaseModel):
             lines.append("Missing Columns:")
             for t, cols in self.missing_columns.items():
                 lines.append(f"  - {t}: {', '.join(cols)}")
+        if self.type_mismatches:
+            lines.append("Column Type Mismatches:")
+            for t, mismatches in self.type_mismatches.items():
+                for col, detail in mismatches.items():
+                    lines.append(f"  - {t}.{col}: {detail}")
         if self.missing_indexes:
             lines.append("Missing Indexes:")
             for idx in self.missing_indexes:
@@ -200,7 +349,7 @@ class CloudPreflightValidator:
             if db_path is not None:
                 resolved = Path(db_path).resolve()
                 prod_path = Path("data/radar.db").resolve()
-                if resolved == prod_path:
+                if resolved == prod_path or (resolved.name == "radar.db" and "data" in resolved.parts):
                     raise PermissionError(
                         "Safety violation: CloudPreflightValidator cannot be invoked directly on "
                         "operational database data/radar.db without explicit authorization."
@@ -250,6 +399,7 @@ class CloudPreflightValidator:
             len(report.errors) == 0
             and len(report.missing_tables) == 0
             and len(report.missing_columns) == 0
+            and len(report.type_mismatches) == 0
             and len(report.missing_indexes) == 0
             and len(report.missing_constraints) == 0
             and len(report.integrity_issues) == 0
@@ -261,7 +411,8 @@ class CloudPreflightValidator:
 
     def _check_schema_version(self, report: PreflightReport) -> None:
         try:
-            ver = self.repo.get_schema_version()
+            rows = execute_read_query(self.repo, "SELECT MAX(version) AS ver FROM schema_migrations")
+            ver = int(rows[0]["ver"]) if rows and rows[0].get("ver") is not None else 0
             report.schema_version = ver
             if ver < CURRENT_SCHEMA_VERSION:
                 report.errors.append(
@@ -287,14 +438,29 @@ class CloudPreflightValidator:
                 report.missing_tables.append(table_name)
                 continue
 
-            # Check columns via PRAGMA table_info
+            # Check columns and critical types via PRAGMA table_info
             try:
                 col_rows = execute_read_query(self.repo, f"PRAGMA table_info({table_name})")
-                actual_cols = {c["name"] for c in col_rows if c.get("name")}
-                missing_for_table = [col for col in expected_cols if col not in actual_cols]
+                actual_cols_map = {c["name"]: (c.get("type") or "") for c in col_rows if c.get("name")}
+                missing_for_table = [col for col in expected_cols if col not in actual_cols_map]
                 report.columns_checked += len(expected_cols)
                 if missing_for_table:
                     report.missing_columns[table_name] = missing_for_table
+
+                # Check critical column types
+                expected_type_map = SCHEMA_V6_COLUMN_TYPES.get(table_name, {})
+                for col_name, exp_type in expected_type_map.items():
+                    if col_name in actual_cols_map:
+                        act_type = actual_cols_map[col_name]
+                        if not _types_are_compatible(act_type, exp_type):
+                            if table_name not in report.type_mismatches:
+                                report.type_mismatches[table_name] = {}
+                            report.type_mismatches[table_name][col_name] = (
+                                f"Incompatible type: expected {exp_type}, got {act_type}"
+                            )
+                            report.errors.append(
+                                f"Column type mismatch on {table_name}.{col_name}: expected {exp_type}, got {act_type}"
+                            )
             except Exception as exc:
                 report.errors.append(f"Failed inspecting columns for table {table_name}: {exc}")
 
@@ -312,7 +478,7 @@ class CloudPreflightValidator:
             except Exception as exc:
                 report.errors.append(f"Failed inspecting indexes for table {table_name}: {exc}")
 
-        # Check constraints
+        # Check named constraints
         for table_name, expected_constraints in SCHEMA_V6_CONSTRAINTS.items():
             if table_name in report.missing_tables:
                 continue
@@ -332,6 +498,73 @@ class CloudPreflightValidator:
                         report.missing_constraints.append(f"{table_name}.{expected_constraint}")
             except Exception as exc:
                 report.errors.append(f"Failed inspecting constraints for table {table_name}: {exc}")
+
+        # Verify critical uniqueness semantics (e.g. UNIQUE(recipient_chat_id, message_key)) strictly from
+        # schema and index metadata. DDL text and constraint/index names are never used as proof: a real,
+        # non-partial UNIQUE index whose key columns are exactly the required set must exist, and every
+        # identity column in that set must enforce NOT NULL (since SQLite UNIQUE allows duplicate NULLs).
+        # Any missing/unsupported metadata fails closed.
+        for table_name, critical_unique_sets in SCHEMA_V6_CRITICAL_UNIQUE_CONSTRAINTS.items():
+            if table_name in report.missing_tables:
+                continue
+            cols_strs = [", ".join(sorted(s)) for s in critical_unique_sets]
+            try:
+                col_info_rows = execute_read_query(self.repo, f"PRAGMA table_info({table_name})")
+                if not col_info_rows:
+                    raise ValueError("table_info metadata returned no columns")
+                notnull_cols: set[str] = set()
+                for c_row in col_info_rows:
+                    if "name" not in c_row or "notnull" not in c_row or not c_row.get("name"):
+                        raise ValueError("table_info metadata is missing required fields")
+                    if int(c_row["notnull"]) == 1:
+                        notnull_cols.add(str(c_row["name"]))
+
+                idx_rows = execute_read_query(self.repo, f"PRAGMA index_list({table_name})")
+                unique_index_cols: list[frozenset[str]] = []
+                for idx in idx_rows:
+                    if "unique" not in idx or "partial" not in idx or not idx.get("name"):
+                        raise ValueError("index_list metadata is missing required fields")
+                    if int(idx["unique"]) != 1:
+                        continue
+                    if int(idx["partial"]) != 0:
+                        continue  # partial unique index does not enforce table-wide uniqueness
+                    info_rows = execute_read_query(self.repo, f"PRAGMA index_xinfo({idx['name']})")
+                    key_rows = []
+                    for r in info_rows:
+                        if "key" not in r or "name" not in r or "cid" not in r:
+                            raise ValueError("index_xinfo metadata is missing required fields")
+                        if int(r["key"]) == 1:
+                            key_rows.append(r)
+                    # Expression (cid -2) or rowid (cid -1) key parts have no real column name
+                    if not key_rows or any(r["name"] is None or int(r["cid"]) < 0 for r in key_rows):
+                        continue
+                    names = [r["name"] for r in key_rows]
+                    if len(set(names)) != len(names):
+                        continue
+                    unique_index_cols.append(frozenset(names))
+
+                for expected_cols_set, cols_str in zip(critical_unique_sets, cols_strs):
+                    report.constraints_checked += 1
+                    has_unique_index = frozenset(expected_cols_set) in unique_index_cols
+                    nullable_cols = sorted(col for col in expected_cols_set if col not in notnull_cols)
+                    if not has_unique_index or nullable_cols:
+                        report.missing_constraints.append(f"{table_name}.UNIQUE({cols_str})")
+                        if not has_unique_index:
+                            report.errors.append(
+                                f"Uniqueness constraint missing on {table_name} for ({cols_str})"
+                            )
+                        if nullable_cols:
+                            report.errors.append(
+                                f"Uniqueness identity columns on {table_name} must enforce NOT NULL: "
+                                f"{', '.join(nullable_cols)}"
+                            )
+            except Exception as exc:
+                # Only the exception class is reported; metadata failures must fail the preflight.
+                report.errors.append(
+                    f"Failed inspecting uniqueness semantics for table {table_name}: {type(exc).__name__}"
+                )
+                for cols_str in cols_strs:
+                    report.missing_constraints.append(f"{table_name}.UNIQUE({cols_str})")
 
     def _check_contract_capabilities(self, report: PreflightReport) -> None:
         """Verify repository contract capabilities required for cloud staging."""

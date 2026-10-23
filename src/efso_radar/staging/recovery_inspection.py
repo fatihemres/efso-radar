@@ -16,6 +16,7 @@ Safety Invariants:
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -28,6 +29,23 @@ from efso_radar.repositories.sqlite import SqliteStateRepository
 from efso_radar.staging.preflight import execute_read_query
 
 logger = logging.getLogger("efso-radar.staging.recovery_inspection")
+
+
+def sanitize_diagnostic_text(text: Optional[str]) -> str:
+    """Sanitize strings for logs, errors, and reports by redacting sensitive tokens and chat IDs."""
+    if not text:
+        return ""
+    val = str(text)
+    # Mask chat IDs
+    val = mask_text_chat_ids(val)
+    # Redact Telegram bot tokens (e.g. 123456789:ABCdefGhIjkLmNoPqRsTuVwXyZ)
+    val = re.sub(r"\b\d{8,12}:[A-Za-z0-9_-]{30,50}\b", "[REDACTED_BOT_TOKEN]", val)
+    val = re.sub(r"bot\d+:[A-Za-z0-9_-]+", "bot[REDACTED_BOT_TOKEN]", val)
+    # Redact bearer tokens
+    val = re.sub(r"Bearer\s+[A-Za-z0-9._-]+", "Bearer [REDACTED_TOKEN]", val, flags=re.IGNORECASE)
+    # Redact tokens/passwords in query params or connection strings
+    val = re.sub(r"(authToken|token|password|key|auth)=([^\s&]+)", r"\1=[REDACTED]", val, flags=re.IGNORECASE)
+    return val
 
 
 class UncertainDeliveryRecord(BaseModel):
@@ -85,10 +103,17 @@ class RecoveryCheckpointRecord(BaseModel):
     updated_at: str
 
 
+REQUIRED_RECOVERY_INSPECTIONS = 6
+
+
 class RecoveryInspectionReport(BaseModel):
     """Sanitized diagnostic report of recovery and delivery state inspection."""
     inspected_at: datetime = Field(default_factory=utc_now)
     repository_type: str = ""
+    is_inspection_complete: bool = False
+    inspections_attempted: int = 0
+    inspections_succeeded: int = 0
+    inspection_errors: list[str] = Field(default_factory=list)
     uncertain_deliveries: list[UncertainDeliveryRecord] = Field(default_factory=list)
     stuck_dispatching: list[StuckDispatchingRecord] = Field(default_factory=list)
     duplicate_identities: list[DuplicateIdentityRecord] = Field(default_factory=list)
@@ -98,8 +123,31 @@ class RecoveryInspectionReport(BaseModel):
     actionable_recommendations: list[str] = Field(default_factory=list)
 
     @property
-    def has_recovery_issues(self) -> bool:
+    def _all_required_inspections_succeeded(self) -> bool:
         return (
+            self.is_inspection_complete
+            and self.inspections_attempted >= REQUIRED_RECOVERY_INSPECTIONS
+            and self.inspections_succeeded == self.inspections_attempted
+            and len(self.inspection_errors) == 0
+        )
+
+    @property
+    def has_recovery_issues(self) -> bool:
+        """Returns True if any recovery anomalies exist OR if inspection failed / is incomplete / never executed."""
+        return (
+            not self._all_required_inspections_succeeded
+            or bool(self.uncertain_deliveries)
+            or bool(self.stuck_dispatching)
+            or bool(self.duplicate_identities)
+            or bool(self.expired_locks)
+            or bool(self.incomplete_executions)
+            or bool(self.recovery_checkpoints)
+        )
+
+    @property
+    def is_all_clear(self) -> bool:
+        """Strictly True ONLY if all required inspections succeeded with zero errors and zero issues."""
+        return self._all_required_inspections_succeeded and not (
             bool(self.uncertain_deliveries)
             or bool(self.stuck_dispatching)
             or bool(self.duplicate_identities)
@@ -109,11 +157,19 @@ class RecoveryInspectionReport(BaseModel):
         )
 
     def summary(self) -> str:
+        if not self._all_required_inspections_succeeded:
+            status_text = "INSPECTION FAILED / INCOMPLETE"
+        elif self.has_recovery_issues:
+            status_text = "ISSUES DETECTED"
+        else:
+            status_text = "ALL CLEAR"
+
         lines = [
             "=== DELIVERY RECOVERY & OPERATIONAL INSPECTION REPORT ===",
             f"Timestamp: {self.inspected_at.isoformat()}",
             f"Repository: {self.repository_type}",
-            f"Status: {'ISSUES DETECTED' if self.has_recovery_issues else 'ALL CLEAR'}",
+            f"Status: {status_text}",
+            f"Inspection Completion: {self.inspections_succeeded}/{self.inspections_attempted} succeeded",
             f"DELIVERY_UNCERTAIN Records: {len(self.uncertain_deliveries)}",
             f"Stuck DISPATCHING Claims: {len(self.stuck_dispatching)}",
             f"Duplicate Identity Keys: {len(self.duplicate_identities)}",
@@ -122,12 +178,17 @@ class RecoveryInspectionReport(BaseModel):
             f"Active Recovery Checkpoints: {len(self.recovery_checkpoints)}",
         ]
 
+        if self.inspection_errors:
+            lines.append("\n[!] Inspection Failures & Query Errors (Failed Closed):")
+            for err in self.inspection_errors:
+                lines.append(f"  - {err}")
+
         if self.uncertain_deliveries:
             lines.append("\n[!] DELIVERY_UNCERTAIN Deliveries (Requires Operator Investigation):")
             for u in self.uncertain_deliveries:
                 lines.append(
                     f"  - Delivery ID: {u.delivery_id} | Role: {u.recipient_role} | Chat: {u.masked_chat_id} | "
-                    f"Key: {u.message_key} | Attempts: {u.attempt_count} | Error: {mask_text_chat_ids(u.error_message or 'None')}"
+                    f"Key: {u.message_key} | Attempts: {u.attempt_count} | Error: {u.error_message or 'None'}"
                 )
 
         if self.stuck_dispatching:
@@ -157,7 +218,7 @@ class RecoveryInspectionReport(BaseModel):
             for e in self.incomplete_executions:
                 lines.append(
                     f"  - Run ID: {e.run_id} | Type: {e.run_type} | Status: {e.status} | Worker: {e.worker_id} | "
-                    f"Error: {mask_text_chat_ids(e.error_message or 'None')}"
+                    f"Error: {e.error_message or 'None'}"
                 )
 
         if self.recovery_checkpoints:
@@ -189,7 +250,7 @@ class DeliveryRecoveryInspector:
             if db_path is not None:
                 resolved = Path(db_path).resolve()
                 prod_path = Path("data/radar.db").resolve()
-                if resolved == prod_path:
+                if resolved == prod_path or (resolved.name == "radar.db" and "data" in resolved.parts):
                     raise PermissionError(
                         "Safety violation: DeliveryRecoveryInspector cannot be invoked directly on "
                         "operational database data/radar.db without explicit authorization."
@@ -201,6 +262,7 @@ class DeliveryRecoveryInspector:
         report = RecoveryInspectionReport(
             inspected_at=ref_now,
             repository_type=type(self.repo).__name__,
+            is_inspection_complete=False,
         )
 
         self._inspect_uncertain_deliveries(report)
@@ -209,11 +271,18 @@ class DeliveryRecoveryInspector:
         self._inspect_expired_locks(report, ref_now)
         self._inspect_incomplete_executions(report)
         self._inspect_recovery_checkpoints(report)
+
+        report.is_inspection_complete = (
+            report.inspections_attempted >= REQUIRED_RECOVERY_INSPECTIONS
+            and report.inspections_succeeded == report.inspections_attempted
+            and len(report.inspection_errors) == 0
+        )
         self._build_recommendations(report)
 
         return report
 
     def _inspect_uncertain_deliveries(self, report: RecoveryInspectionReport) -> None:
+        report.inspections_attempted += 1
         try:
             rows = execute_read_query(
                 self.repo,
@@ -229,23 +298,29 @@ class DeliveryRecoveryInspector:
             for r in rows:
                 report.uncertain_deliveries.append(
                     UncertainDeliveryRecord(
-                        delivery_id=str(r.get("delivery_id", "")),
-                        message_key=str(r.get("message_key", "")),
-                        recipient_role=str(r.get("recipient_role", "")),
+                        delivery_id=sanitize_diagnostic_text(str(r.get("delivery_id", ""))),
+                        message_key=sanitize_diagnostic_text(str(r.get("message_key", ""))),
+                        recipient_role=sanitize_diagnostic_text(str(r.get("recipient_role", ""))),
                         masked_chat_id=mask_chat_id(str(r.get("recipient_chat_id", ""))),
-                        category=str(r.get("category", "")),
+                        category=sanitize_diagnostic_text(str(r.get("category", ""))),
                         attempt_count=int(r.get("attempt_count", 0)),
                         created_at=str(r.get("created_at", "")),
                         updated_at=str(r.get("updated_at", "")),
-                        error_message=mask_text_chat_ids(r.get("error_message")),
+                        error_message=sanitize_diagnostic_text(r.get("error_message")),
                     )
                 )
+            report.inspections_succeeded += 1
         except Exception as exc:
-            logger.debug("Could not inspect uncertain deliveries: %s", exc)
+            report.is_inspection_complete = False
+            # Report only the safe exception category; raw exception text may embed database values or secrets.
+            err_category = type(exc).__name__
+            report.inspection_errors.append(f"Uncertain deliveries inspection failed: {err_category}")
+            logger.warning("Could not inspect uncertain deliveries: %s", err_category)
 
     def _inspect_stuck_dispatching(
         self, report: RecoveryInspectionReport, now: datetime, threshold_minutes: float
     ) -> None:
+        report.inspections_attempted += 1
         try:
             rows = execute_read_query(
                 self.repo,
@@ -271,20 +346,25 @@ class DeliveryRecoveryInspector:
                 if stuck_minutes >= threshold_minutes:
                     report.stuck_dispatching.append(
                         StuckDispatchingRecord(
-                            delivery_id=str(r.get("delivery_id", "")),
-                            message_key=str(r.get("message_key", "")),
-                            recipient_role=str(r.get("recipient_role", "")),
+                            delivery_id=sanitize_diagnostic_text(str(r.get("delivery_id", ""))),
+                            message_key=sanitize_diagnostic_text(str(r.get("message_key", ""))),
+                            recipient_role=sanitize_diagnostic_text(str(r.get("recipient_role", ""))),
                             masked_chat_id=mask_chat_id(str(r.get("recipient_chat_id", ""))),
-                            category=str(r.get("category", "")),
+                            category=sanitize_diagnostic_text(str(r.get("category", ""))),
                             created_at=str(r.get("created_at", "")),
                             updated_at=updated_str,
                             stuck_minutes=stuck_minutes,
                         )
                     )
+            report.inspections_succeeded += 1
         except Exception as exc:
-            logger.debug("Could not inspect stuck dispatching: %s", exc)
+            report.is_inspection_complete = False
+            err_category = type(exc).__name__
+            report.inspection_errors.append(f"Stuck dispatching inspection failed: {err_category}")
+            logger.warning("Could not inspect stuck dispatching: %s", err_category)
 
     def _inspect_duplicate_identities(self, report: RecoveryInspectionReport) -> None:
+        report.inspections_attempted += 1
         try:
             rows = execute_read_query(
                 self.repo,
@@ -299,22 +379,34 @@ class DeliveryRecoveryInspector:
                 report.duplicate_identities.append(
                     DuplicateIdentityRecord(
                         masked_chat_id=mask_chat_id(str(r.get("recipient_chat_id", ""))),
-                        message_key=str(r.get("message_key", "")),
+                        message_key=sanitize_diagnostic_text(str(r.get("message_key", ""))),
                         duplicate_count=int(r.get("cnt", 0)),
                     )
                 )
+            report.inspections_succeeded += 1
         except Exception as exc:
-            logger.debug("Could not inspect duplicate identities: %s", exc)
+            report.is_inspection_complete = False
+            err_category = type(exc).__name__
+            report.inspection_errors.append(f"Duplicate identities inspection failed: {err_category}")
+            logger.warning("Could not inspect duplicate identities: %s", err_category)
 
     def _inspect_expired_locks(self, report: RecoveryInspectionReport, now: datetime) -> None:
+        report.inspections_attempted += 1
         try:
             rows = execute_read_query(
                 self.repo,
                 "SELECT lock_key, worker_id, acquired_at, expires_at FROM run_locks",
             )
+            parse_errors: list[str] = []
             for r in rows:
-                expires_str = str(r.get("expires_at", ""))
+                lock_key_clean = sanitize_diagnostic_text(str(r.get("lock_key", "")))
+                worker_id_clean = sanitize_diagnostic_text(str(r.get("worker_id", "")))
+                acquired_clean = sanitize_diagnostic_text(str(r.get("acquired_at", "")))
+                raw_expires = r.get("expires_at")
+                expires_str = str(raw_expires).strip() if raw_expires is not None else ""
                 try:
+                    if not expires_str:
+                        raise ValueError("empty_lock_expiration_timestamp")
                     expires_dt = datetime.fromisoformat(expires_str)
                     if expires_dt.tzinfo is None:
                         expires_dt = expires_dt.replace(tzinfo=timezone.utc)
@@ -322,19 +414,36 @@ class DeliveryRecoveryInspector:
                         expired_min = (now - expires_dt).total_seconds() / 60.0
                         report.expired_locks.append(
                             ExpiredLockRecord(
-                                lock_key=str(r.get("lock_key", "")),
-                                worker_id=str(r.get("worker_id", "")),
-                                acquired_at=str(r.get("acquired_at", "")),
-                                expires_at=expires_str,
+                                lock_key=lock_key_clean,
+                                worker_id=worker_id_clean,
+                                acquired_at=acquired_clean,
+                                expires_at=sanitize_diagnostic_text(expires_str),
                                 expired_minutes_ago=expired_min,
                             )
                         )
-                except Exception:
-                    pass
+                except Exception as ts_exc:
+                    # Report only the safe error category (never echo the raw unparseable database value).
+                    reason_cat = "empty_timestamp" if not expires_str else f"invalid_iso_timestamp ({type(ts_exc).__name__})"
+                    sanitized_ts_err = sanitize_diagnostic_text(
+                        f"Invalid lock expiration timestamp for lock '{lock_key_clean}': {reason_cat}"
+                    )
+                    parse_errors.append(sanitized_ts_err)
+
+            if parse_errors:
+                report.is_inspection_complete = False
+                for err in parse_errors:
+                    report.inspection_errors.append(f"Expired locks inspection failed: {err}")
+                    logger.warning("Could not parse run_locks expiration timestamp: %s", err)
+            else:
+                report.inspections_succeeded += 1
         except Exception as exc:
-            logger.debug("Could not inspect run locks: %s", exc)
+            report.is_inspection_complete = False
+            err_category = type(exc).__name__
+            report.inspection_errors.append(f"Expired locks inspection failed: {err_category}")
+            logger.warning("Could not inspect run locks: %s", err_category)
 
     def _inspect_incomplete_executions(self, report: RecoveryInspectionReport) -> None:
+        report.inspections_attempted += 1
         try:
             rows = execute_read_query(
                 self.repo,
@@ -349,18 +458,23 @@ class DeliveryRecoveryInspector:
             for r in rows:
                 report.incomplete_executions.append(
                     IncompleteExecutionRecord(
-                        run_id=str(r.get("run_id", "")),
-                        run_type=str(r.get("run_type", "")),
-                        worker_id=str(r.get("worker_id", "")),
+                        run_id=sanitize_diagnostic_text(str(r.get("run_id", ""))),
+                        run_type=sanitize_diagnostic_text(str(r.get("run_type", ""))),
+                        worker_id=sanitize_diagnostic_text(str(r.get("worker_id", ""))),
                         started_at=str(r.get("started_at", "")),
-                        status=str(r.get("status", "")),
-                        error_message=mask_text_chat_ids(r.get("error_message")),
+                        status=sanitize_diagnostic_text(str(r.get("status", ""))),
+                        error_message=sanitize_diagnostic_text(r.get("error_message")),
                     )
                 )
+            report.inspections_succeeded += 1
         except Exception as exc:
-            logger.debug("Could not inspect execution history: %s", exc)
+            report.is_inspection_complete = False
+            err_category = type(exc).__name__
+            report.inspection_errors.append(f"Incomplete executions inspection failed: {err_category}")
+            logger.warning("Could not inspect execution history: %s", err_category)
 
     def _inspect_recovery_checkpoints(self, report: RecoveryInspectionReport) -> None:
+        report.inspections_attempted += 1
         try:
             rows = execute_read_query(
                 self.repo,
@@ -374,18 +488,27 @@ class DeliveryRecoveryInspector:
             for r in rows:
                 report.recovery_checkpoints.append(
                     RecoveryCheckpointRecord(
-                        state_key=str(r.get("state_key", "")),
-                        stage=str(r.get("stage", "")),
-                        worker_id=str(r.get("worker_id", "")),
-                        batch_id=r.get("batch_id"),
+                        state_key=sanitize_diagnostic_text(str(r.get("state_key", ""))),
+                        stage=sanitize_diagnostic_text(str(r.get("stage", ""))),
+                        worker_id=sanitize_diagnostic_text(str(r.get("worker_id", ""))),
+                        batch_id=sanitize_diagnostic_text(r.get("batch_id")),
                         created_at=str(r.get("created_at", "")),
                         updated_at=str(r.get("updated_at", "")),
                     )
                 )
+            report.inspections_succeeded += 1
         except Exception as exc:
-            logger.debug("Could not inspect recovery checkpoints: %s", exc)
+            report.is_inspection_complete = False
+            err_category = type(exc).__name__
+            report.inspection_errors.append(f"Recovery checkpoints inspection failed: {err_category}")
+            logger.warning("Could not inspect recovery checkpoints: %s", err_category)
 
     def _build_recommendations(self, report: RecoveryInspectionReport) -> None:
+        if report.inspection_errors or not report.is_inspection_complete:
+            report.actionable_recommendations.append(
+                f"Inspection encountered {len(report.inspection_errors)} error(s) and failed closed. "
+                "Resolve repository query/availability failures before relying on diagnostic status."
+            )
         if report.uncertain_deliveries:
             report.actionable_recommendations.append(
                 f"Verify external Telegram chat for {len(report.uncertain_deliveries)} DELIVERY_UNCERTAIN alerts. "
