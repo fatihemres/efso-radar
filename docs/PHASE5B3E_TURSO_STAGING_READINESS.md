@@ -1,12 +1,12 @@
 # Efso Radar — Phase 5B.3E: Turso Staging Integration & Safe Connection Readiness
 
-**Document Version:** 1.1.0  
-**Status:** Completed & Validated Offline Baseline (Phase 5B.3E Final Corrections)  
-**Security Classification:** Public Documentation (Zero Secrets / Zero Private Identifiers)  
-**Operating Budget:** STRICTLY 0 TRY / $0.00 ongoing spend  
-**Anchor Tag Baseline:** `v0.4.0`  
-**Git Baseline:** `8e61edfcc237672c39498e482f67ed6d98546699` (PR #9 merged)  
-**Target Feature Branch:** `feature/phase5b3e-turso-staging-readiness`  
+**Document Version:** 1.1.0
+**Status:** Completed & Validated Offline Baseline (Phase 5B.3E Final Corrections)
+**Security Classification:** Public Documentation (Zero Secrets / Zero Private Identifiers)
+**Operating Budget:** STRICTLY 0 TRY / $0.00 ongoing spend
+**Anchor Tag Baseline:** `v0.4.0`
+**Git Baseline:** `8e61edfcc237672c39498e482f67ed6d98546699` (PR #9 merged)
+**Target Feature Branch:** `feature/phase5b3e-turso-staging-readiness`
 
 ---
 
@@ -158,7 +158,7 @@ To prevent authentication tokens and database URLs from being persisted in clear
 
 ## 5. Explicit Operator Staging Activation Procedure
 
-This procedure governs the first future authorized connection to real Turso Cloud staging.  
+This procedure governs the first future authorized connection to real Turso Cloud staging.
 **DO NOT EXECUTE THESE STEPS WITHOUT EXPLICIT PRODUCT OWNER AUTHORIZATION.**
 
 ```mermaid
@@ -218,13 +218,15 @@ flowchart TD
   ```
 - Verify dry-run syntax strictly without network:
   ```powershell
-  python -m efso_radar.staging.connection --dry-run
+  $env:PYTHONPATH = "src"
+  .\.venv\Scripts\python.exe -m efso_radar.staging.connection --dry-run
   ```
 
 ### Step 5: Validate Connectivity in a Controlled Read-Only Session
 - Run the safe connection inspection tool with strictly read-only queries:
   ```powershell
-  python -m efso_radar.staging.connection --check
+  $env:PYTHONPATH = "src"
+  .\.venv\Scripts\python.exe -m efso_radar.staging.connection --check
   ```
 - **Expected Output:**
   ```text
@@ -244,14 +246,16 @@ flowchart TD
 - Update `$env:TURSO_AUTH_TOKEN` with the authorized write token.
 - Execute schema initialization:
   ```powershell
-  python -c "import os; from efso_radar.repositories.turso import TursoStateRepository; repo = TursoStateRepository(database_url=os.environ['TURSO_DATABASE_URL'], auth_token=os.environ['TURSO_AUTH_TOKEN'], init_schema=False); repo.initialize_schema(); print('Schema v6 successfully initialized.')"
+  $env:PYTHONPATH = "src"
+  .\.venv\Scripts\python.exe -c "import os; from efso_radar.repositories.turso import TursoStateRepository; repo = TursoStateRepository(database_url=os.environ['TURSO_DATABASE_URL'], auth_token=os.environ['TURSO_AUTH_TOKEN'], init_schema=False); repo.initialize_schema(); print('Schema v6 successfully initialized.')"
   ```
 
 ### Step 7: Run Non-Mutating Preflight After Initialization
 - Re-apply the scoped **READ-ONLY** token to `$env:TURSO_AUTH_TOKEN`.
 - Execute preflight validator:
   ```powershell
-  python -c "import os; from efso_radar.staging.preflight import CloudPreflightValidator; v = CloudPreflightValidator.create_for_turso(database_url=os.environ['TURSO_DATABASE_URL'], auth_token=os.environ['TURSO_AUTH_TOKEN']); r = v.validate(); assert r.success and r.is_non_mutating and r.schema_version == 6; print('Preflight PASSED (v6).')"
+  $env:PYTHONPATH = "src"
+  .\.venv\Scripts\python.exe -c "import os; from efso_radar.staging.preflight import CloudPreflightValidator; v = CloudPreflightValidator.create_for_turso(database_url=os.environ['TURSO_DATABASE_URL'], auth_token=os.environ['TURSO_AUTH_TOKEN']); r = v.validate(); assert r.success and r.is_non_mutating and r.schema_version == 6; print('Preflight PASSED (v6).')"
   ```
 - Confirm that all 15 tables, 11 indexes, and unique constraints pass.
 

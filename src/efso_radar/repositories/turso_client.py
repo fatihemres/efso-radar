@@ -41,6 +41,40 @@ def _format_http_status_error(status_code: int) -> str:
     return f"Turso API returned HTTP status {status_code} ({category})."
 
 
+SAFE_HRANA_ERROR_CATEGORIES: dict[str, str] = {
+    "SQLITE_ERROR": "Generic SQL execution failure",
+    "SQLITE_BUSY": "Database engine is busy or locked",
+    "SQLITE_LOCKED": "Database table is locked",
+    "SQLITE_NOMEM": "A malloc has failed",
+    "SQLITE_READONLY": "Attempt to write a readonly database",
+    "SQLITE_IOERR": "Disk I/O error occurred",
+    "SQLITE_CORRUPT": "Database disk image is malformed",
+    "SQLITE_NOTFOUND": "Unknown opcode or table not found",
+    "SQLITE_FULL": "Insertion failed because database is full",
+    "SQLITE_CANTOPEN": "Unable to open the database file",
+    "SQLITE_PROTOCOL": "Database lock protocol error",
+    "SQLITE_SCHEMA": "Database schema has changed",
+    "SQLITE_TOOBIG": "String or BLOB exceeds size limit",
+    "SQLITE_CONSTRAINT": "Abort due to constraint violation",
+    "SQLITE_MISMATCH": "Data type mismatch",
+    "SQLITE_MISUSE": "Library used incorrectly",
+    "SQLITE_AUTH": "Authorization denied",
+    "SQLITE_RANGE": "Column index out of range",
+    "SQLITE_NOTADB": "File is not a database",
+    "HRANA_ERROR": "Hrana protocol execution error",
+}
+
+
+def _sanitize_hrana_error(raw_code: Any) -> tuple[str, str]:
+    """Validate remote error code and return a safe (code, category) pair without untrusted messages."""
+    if isinstance(raw_code, str):
+        cleaned_code = raw_code.strip().upper()
+        if re.fullmatch(r"^[A-Z0-9_]{1,32}$", cleaned_code):
+            category = SAFE_HRANA_ERROR_CATEGORIES.get(cleaned_code, "Remote database statement execution failed")
+            return cleaned_code, category
+    return "UNKNOWN", "Remote database statement execution failed"
+
+
 def mask_turso_url(url: str) -> str:
     """Return a safely sanitized database URL for logging (no credentials, tokens, arbitrary paths, or query params).
 
@@ -357,11 +391,8 @@ class TursoHTTPClient:
             res_type = res.get("type")
             if res_type == "error":
                 err = res.get("error", {})
-                msg = str(err.get("message", "Unknown SQL error"))
-                if self.auth_token and self.auth_token in msg:
-                    msg = msg.replace(self.auth_token, "[REDACTED]")
-                code = err.get("code", "UNKNOWN")
-                raise TursoClientError(f"Turso statement {idx} error ({code}): {msg}")
+                valid_code, category = _sanitize_hrana_error(err.get("code"))
+                raise TursoClientError(f"Turso statement {idx} error ({valid_code}): {category}")
 
             response_data = res.get("response", {})
             exec_result = response_data.get("result", {})
@@ -419,14 +450,12 @@ class TursoHTTPClient:
 
         # Check for errors in user statements
         has_error = False
-        error_msg = ""
+        error_code = None
         for idx, res in enumerate(raw_results[1:]):
             if res.get("type") == "error":
                 has_error = True
                 err = res.get("error", {})
-                error_msg = str(err.get("message", "Unknown SQL error"))
-                if self.auth_token and self.auth_token in error_msg:
-                    error_msg = error_msg.replace(self.auth_token, "[REDACTED]")
+                error_code = err.get("code")
                 break
 
         if has_error:
@@ -437,8 +466,10 @@ class TursoHTTPClient:
                         json={"baton": baton, "requests": [{"type": "execute", "stmt": {"sql": "ROLLBACK"}}, {"type": "close"}]},
                     )
                 except Exception as rollback_exc:
-                    logger.warning("Turso transaction rollback failed: %s", rollback_exc)
-            raise TursoClientError(f"Turso transaction aborted due to statement error: {error_msg}")
+                    err_type = type(rollback_exc).__name__
+                    logger.warning("Turso transaction rollback failed (%s).", err_type)
+            valid_code, category = _sanitize_hrana_error(error_code)
+            raise TursoClientError(f"Turso transaction aborted due to statement error ({valid_code}): {category}")
 
         # Explicitly commit if all statements succeeded
         if baton:
@@ -461,10 +492,8 @@ class TursoHTTPClient:
             commit_results = commit_data.get("results", [])
             if commit_results and commit_results[0].get("type") == "error":
                 err = commit_results[0].get("error", {})
-                msg = str(err.get("message", "Unknown commit error"))
-                if self.auth_token and self.auth_token in msg:
-                    msg = msg.replace(self.auth_token, "[REDACTED]")
-                raise TursoClientError(f"Turso COMMIT failed: {msg}")
+                valid_code, category = _sanitize_hrana_error(err.get("code"))
+                raise TursoClientError(f"Turso COMMIT failed ({valid_code}): {category}")
 
         # Parse results for user statements (skipping BEGIN at index 0)
         parsed_results: list[TursoQueryResult] = []
