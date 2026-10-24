@@ -620,10 +620,10 @@ def demo() -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Efso Magazin news radar")
-    parser.add_argument("--scan-only", action="store_true", help="Execute decoupled RSS discovery and queue candidates without AI or notifications")
-    parser.add_argument("--dry-run", action="store_true", help="AI scan, print only, do not notify or change state")
-    parser.add_argument("--demo", action="store_true", help="Show a fake sample alert without network")
-    parser.add_argument("--legacy", action="store_true", help="Use legacy monolithic radar runner")
+    parser.add_argument("--scan-only", action="store_true", help="Execute decoupled RSS discovery and queue candidates without AI or notifications (zero-AI, zero-Telegram)")
+    parser.add_argument("--dry-run", action="store_true", help="Isolated DB execution (prints only, no state mutation or Telegram dispatch; NOTE: accesses live RSS feeds unless using --legacy)")
+    parser.add_argument("--demo", action="store_true", help="Show a fake sample alert without network (strictly offline)")
+    parser.add_argument("--legacy", action="store_true", help="Use legacy monolithic radar runner (restricted to --dry-run for offline fixture preview)")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.scan_only and args.legacy:

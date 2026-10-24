@@ -1,0 +1,73 @@
+name: "Efso Radar — Encrypted Backup (DESIGN ONLY)"
+
+# AUTOMATION READINESS CONTRACT:
+# Operational Schedule: 1 run per day: 02:15 Europe/Istanbul (UTC+3) (during quiet hours)
+# Corresponding UTC Cron: 15 23 * * * (previous calendar day in UTC)
+# NOTE: Active cron schedule is intentionally DISABLED during Phase 5B.3D offline readiness.
+# DESIGN ONLY: Live backup uploads and remote asset deletion are NOT IMPLEMENTED.
+# All operational databases and backup stores remain unmounted and isolated.
+
+on:
+  # schedule:
+  #   - cron: '15 23 * * *'
+  workflow_dispatch:
+    inputs:
+      timestamp:
+        description: "ISO-8601 UTC evaluation timestamp (default: representative eligible slot 23:15 UTC / 02:15 TSİ (önceki gün))"
+        required: false
+        default: "2026-10-23T23:15:00Z"
+      preview_mode:
+        description: "Run safe offline execution preview (zero network, synthetic data)"
+        required: true
+        default: "true"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: efso-radar-backup
+  cancel-in-progress: false
+
+jobs:
+  backup_preview:
+    name: "Offline Encrypted Backup Preview (DESIGN ONLY)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Execute Offline Backup Preview (Hermetic Synthetic Metadata Only)
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m efso_radar.workflow --task encrypted-backup --preview --timestamp "${{ inputs.timestamp || '2026-10-23T23:15:00Z' }}"
+
+# -----------------------------------------------------------------------------
+# FUTURE PRODUCTION TEMPLATE (DESIGN ONLY — NOT IMPLEMENTED)
+# -----------------------------------------------------------------------------
+#   backup_live:
+#     name: "Live Backup Snapshot (Not Implemented / Disabled)"
+#     if: false
+#     runs-on: ubuntu-latest
+#     timeout-minutes: 10
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: actions/setup-python@v5
+#         with:
+#           python-version: '3.11'
+#       - run: pip install -r requirements.txt
+#       - name: Snapshot & Upload (NOT IMPLEMENTED)
+#         run: echo "Live backup upload is not implemented in Phase 5B.3D" && exit 1
