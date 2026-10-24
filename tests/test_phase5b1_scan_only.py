@@ -418,6 +418,7 @@ class TestPhase5B1ScanOnlyPipeline(unittest.TestCase):
             database_url="libsql://efso-test.turso.io",
             auth_token="test-token",
             transport=turso_transport,
+            init_schema=True,
         )
 
         art1 = Article.create("Parite Test Haberi 1", "https://url.com/par1", "Milliyet", self.now)
