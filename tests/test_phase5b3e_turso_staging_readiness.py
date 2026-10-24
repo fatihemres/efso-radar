@@ -763,6 +763,222 @@ class TestTursoStagingReadiness(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 execute_read_query(sqlite_repo, "SELECT 1")
 
+    # -------------------------------------------------------------------------
+    # 10. PR #10 Final Hardening: Injected Client Safety & Hrana Error Redaction
+    # -------------------------------------------------------------------------
+
+    def test_23_writable_client_injection_on_readonly_repository_rejected(self) -> None:
+        """PR #10 Hardening 1: Injecting writable client into read-only repository is rejected without HTTP calls."""
+        writable_client = TursoHTTPClient(
+            database_url="libsql://staging-db.turso.io",
+            auth_token="test-token-12345",
+            transport=self.transport,
+            read_only=False,
+        )
+
+        self.recorded_requests.clear()
+
+        # 1. TursoReadOnlyStateRepository rejects writable client
+        with self.assertRaises(ValueError) as ctx1:
+            TursoReadOnlyStateRepository(
+                database_url="libsql://staging-db.turso.io",
+                client=writable_client,
+            )
+        self.assertIn("Security violation: cannot inject a writable TursoHTTPClient", str(ctx1.exception))
+
+        # 2. TursoStateRepository with read_only=True rejects writable client
+        with self.assertRaises(ValueError) as ctx2:
+            TursoStateRepository(
+                database_url="libsql://staging-db.turso.io",
+                client=writable_client,
+                read_only=True,
+            )
+        self.assertIn("Security violation: cannot inject a writable TursoHTTPClient", str(ctx2.exception))
+
+        # 3. Assert zero outbound HTTP requests were made during or after rejection
+        self.assertEqual(len(self.recorded_requests), 0)
+
+        # 4. Valid read-only client injection is preserved
+        readonly_client = TursoHTTPClient(
+            database_url="libsql://staging-db.turso.io",
+            auth_token="test-token-12345",
+            transport=self.transport,
+            read_only=True,
+        )
+        ro_repo = TursoReadOnlyStateRepository(
+            database_url="libsql://staging-db.turso.io",
+            client=readonly_client,
+        )
+        self.assertTrue(ro_repo.read_only)
+        self.assertTrue(ro_repo.client.read_only)
+
+        # 5. Valid mock client injection with read_only=True is preserved
+        mock_client = MagicMock(spec=TursoHTTPClient)
+        mock_client.read_only = True
+        mock_repo = TursoReadOnlyStateRepository(
+            database_url="libsql://staging-db.turso.io",
+            client=mock_client,
+        )
+        self.assertIs(mock_repo.client, mock_client)
+
+    def test_24_hrana_statement_error_redaction_with_synthetic_secrets(self) -> None:
+        """PR #10 Hardening 2a: Remote statement error message with synthetic secrets is completely redacted."""
+        secret_in_statement = "LEAKED_SECRET_STATEMENT_TOKEN_111222333"
+
+        class LeakyStatementTransport(httpx.BaseTransport):
+            def handle_request(self, request: httpx.Request) -> httpx.Response:
+                payload = {
+                    "baton": "test-baton",
+                    "results": [
+                        {
+                            "type": "error",
+                            "error": {
+                                "code": "SQLITE_ERROR",
+                                "message": f"Fatal table error: credentials {secret_in_statement} invalid",
+                            },
+                        },
+                        {"type": "ok", "response": {"type": "close"}},
+                    ],
+                }
+                return httpx.Response(status_code=200, json=payload, request=request)
+
+        client = TursoHTTPClient(
+            database_url="libsql://staging-db.turso.io",
+            auth_token="token",
+            transport=LeakyStatementTransport(),
+        )
+
+        with self.assertRaises(TursoClientError) as ctx:
+            client.execute("SELECT 1")
+
+        err_str = str(ctx.exception)
+        # Verify secret token is NOT leaked
+        self.assertNotIn(secret_in_statement, err_str)
+        # Verify safe category and code are reported
+        self.assertIn("SQLITE_ERROR", err_str)
+        self.assertIn("Generic SQL execution failure", err_str)
+
+    def test_25_hrana_transaction_failure_redaction_with_synthetic_secrets(self) -> None:
+        """PR #10 Hardening 2b: Remote transaction failure message with synthetic secrets is completely redacted."""
+        secret_in_tx = "LEAKED_SECRET_TX_TOKEN_444555666"
+
+        class LeakyTxTransport(httpx.BaseTransport):
+            def handle_request(self, request: httpx.Request) -> httpx.Response:
+                body = json.loads(request.content.decode("utf-8"))
+                reqs = body.get("requests", [])
+                if any(r.get("stmt", {}).get("sql") == "ROLLBACK" for r in reqs):
+                    return httpx.Response(status_code=200, json={"results": [{"type": "ok"}]}, request=request)
+
+                payload = {
+                    "baton": "tx-baton-123",
+                    "results": [
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                        {
+                            "type": "error",
+                            "error": {
+                                "code": "SQLITE_CONSTRAINT",
+                                "message": f"Foreign key error revealing secret {secret_in_tx}",
+                            },
+                        },
+                    ],
+                }
+                return httpx.Response(status_code=200, json=payload, request=request)
+
+        client = TursoHTTPClient(
+            database_url="libsql://staging-db.turso.io",
+            auth_token="token",
+            transport=LeakyTxTransport(),
+        )
+
+        with self.assertRaises(TursoClientError) as ctx:
+            client.execute_transaction([("SELECT 1", [])])
+
+        err_str = str(ctx.exception)
+        self.assertNotIn(secret_in_tx, err_str)
+        self.assertIn("SQLITE_CONSTRAINT", err_str)
+        self.assertIn("Abort due to constraint violation", err_str)
+
+    def test_26_hrana_commit_failure_redaction_with_synthetic_secrets(self) -> None:
+        """PR #10 Hardening 2c: Remote COMMIT failure message with synthetic secrets is completely redacted."""
+        secret_in_commit = "LEAKED_SECRET_COMMIT_TOKEN_777888999"
+
+        class LeakyCommitTransport(httpx.BaseTransport):
+            def handle_request(self, request: httpx.Request) -> httpx.Response:
+                body = json.loads(request.content.decode("utf-8"))
+                reqs = body.get("requests", [])
+                if any(r.get("stmt", {}).get("sql") == "COMMIT" for r in reqs):
+                    payload = {
+                        "baton": None,
+                        "results": [
+                            {
+                                "type": "error",
+                                "error": {
+                                    "code": "SQLITE_BUSY",
+                                    "message": f"Lock contention revealing secret {secret_in_commit}",
+                                },
+                            }
+                        ],
+                    }
+                    return httpx.Response(status_code=200, json=payload, request=request)
+
+                payload = {
+                    "baton": "commit-baton",
+                    "results": [
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                    ],
+                }
+                return httpx.Response(status_code=200, json=payload, request=request)
+
+        client = TursoHTTPClient(
+            database_url="libsql://staging-db.turso.io",
+            auth_token="token",
+            transport=LeakyCommitTransport(),
+        )
+
+        with self.assertRaises(TursoClientError) as ctx:
+            client.execute_transaction([("SELECT 1", [])])
+
+        err_str = str(ctx.exception)
+        self.assertNotIn(secret_in_commit, err_str)
+        self.assertIn("SQLITE_BUSY", err_str)
+        self.assertIn("Database engine is busy or locked", err_str)
+
+    def test_27_rollback_transport_exception_redacts_sensitive_data_from_logs(self) -> None:
+        """PR #10 Hardening 2d: Rollback transport exception with sensitive bearer token never leaks in logs."""
+        secret_in_rollback = "LEAKED_SECRET_ROLLBACK_BEARER_TOKEN_000111222"
+
+        class FailingRollbackTransport(httpx.BaseTransport):
+            def handle_request(self, request: httpx.Request) -> httpx.Response:
+                body = json.loads(request.content.decode("utf-8"))
+                reqs = body.get("requests", [])
+                if any(r.get("stmt", {}).get("sql") == "ROLLBACK" for r in reqs):
+                    raise httpx.ConnectError(f"Network error on Authorization: Bearer {secret_in_rollback}")
+
+                payload = {
+                    "baton": "rollback-baton",
+                    "results": [
+                        {"type": "ok"},
+                        {"type": "error", "error": {"code": "SQLITE_ERROR", "message": "fail"}},
+                    ],
+                }
+                return httpx.Response(status_code=200, json=payload, request=request)
+
+        client = TursoHTTPClient(
+            database_url="libsql://staging-db.turso.io",
+            auth_token="token",
+            transport=FailingRollbackTransport(),
+        )
+
+        with self.assertLogs("efso-radar.repository.turso_client", level="WARNING") as log_ctx:
+            with self.assertRaises(TursoClientError):
+                client.execute_transaction([("SELECT 1", [])])
+
+        # Verify no log message contains the secret
+        for log_msg in log_ctx.output:
+            self.assertNotIn(secret_in_rollback, log_msg)
+            self.assertIn("ConnectError", log_msg)
+
 
 if __name__ == "__main__":
     unittest.main()

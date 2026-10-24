@@ -64,6 +64,11 @@ class TursoStateRepository(StateRepository):
     ):
         self.read_only = bool(read_only)
         if client is not None:
+            if self.read_only and not getattr(client, "read_only", False):
+                raise ValueError(
+                    "Security violation: cannot inject a writable TursoHTTPClient "
+                    "into a read-only repository. Client must have read_only=True."
+                )
             self.client = client
         else:
             self.client = TursoHTTPClient(
