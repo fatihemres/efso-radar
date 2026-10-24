@@ -52,8 +52,9 @@ jobs:
       - name: Execute Offline Digest Preview (Hermetic Synthetic Data Only)
         env:
           PYTHONPATH: src
+          EFSO_PREVIEW_TIMESTAMP: "${{ inputs.timestamp || '2026-10-24T06:30:00Z' }}"
         run: |
-          python -m efso_radar.workflow --task editorial-digest --preview --timestamp "${{ inputs.timestamp || '2026-10-24T06:30:00Z' }}"
+          python -m efso_radar.workflow --task editorial-digest --preview --timestamp "$EFSO_PREVIEW_TIMESTAMP"
 
 # -----------------------------------------------------------------------------
 # FUTURE PRODUCTION TEMPLATE (DISABLED PENDING PRODUCT OWNER APPROVAL)

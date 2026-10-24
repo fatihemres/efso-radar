@@ -1,12 +1,12 @@
 # Efso Radar — Phase 5B.3D: Offline Workflow Orchestration & Automation Readiness
 
-**Document Version:** 1.0.0  
-**Status:** Completed & Validated Offline Baseline (Phase 5B.3D)  
-**Security Classification:** Public Documentation (Zero Secrets / Zero Private Identifiers)  
-**Operating Budget:** STRICTLY 0 TRY / $0.00 ongoing spending  
-**Anchor Tag Baseline:** `v0.4.0`  
-**Git Baseline:** `7c77fde59da100e333ebf8cbdc1d20d0ab12e8d7` (PR #1 through PR #8 merged)  
-**Target Feature Branch:** `feature/phase5b3d-offline-workflow-orchestration`  
+**Document Version:** 1.0.0
+**Status:** Completed & Validated Offline Baseline (Phase 5B.3D)
+**Security Classification:** Public Documentation (Zero Secrets / Zero Private Identifiers)
+**Operating Budget:** STRICTLY 0 TRY / $0.00 ongoing spending
+**Anchor Tag Baseline:** `v0.4.0`
+**Git Baseline:** `7c77fde59da100e333ebf8cbdc1d20d0ab12e8d7` (PR #1 through PR #8 merged)
+**Target Feature Branch:** `feature/phase5b3d-offline-workflow-orchestration`
 
 ---
 
@@ -67,25 +67,25 @@ flowchart TD
     Trigger["Injected UTC Timestamp (datetime)"] --> AwareCheck{"Is Timezone-Aware?"}
     AwareCheck -- No --> FailClosed["Fail-Closed (ValueError)"]
     AwareCheck -- Yes --> Convert["Convert to Europe/Istanbul (UTC+3)"]
-    
+
     Convert --> TaskType{"Workflow Task Type"}
-    
+
     TaskType -- SCAN_ONLY --> ScanSlot{"In [00:17..21:17] +45m Window?"}
     ScanSlot -- Yes --> ScanOK["SCAN_ONLY: Eligible (Zero Gemini / Zero Telegram)"]
     ScanSlot -- Early --> EarlyRet["EARLY_TRIGGER (Rejected)"]
     ScanSlot -- Late --> ExpireRet["WINDOW_EXPIRED (No Catch-up)"]
-    
+
     TaskType -- EDITORIAL_DIGEST --> QuietCheck{"In Quiet Hours (00:00-08:30 TSİ)?"}
     QuietCheck -- Yes --> QuietRet["QUIET_HOURS_BLOCKED (Deferred)"]
     QuietCheck -- No --> DigestSlot{"In [09:30, 15:30, 21:30] +45m Window?"}
     DigestSlot -- Yes --> DigestOK["EDITORIAL_DIGEST: Dispatches to PRIMARY_EDITOR only"]
     DigestSlot -- Early/Late --> WindowRet["EARLY_TRIGGER / WINDOW_EXPIRED"]
-    
+
     TaskType -- ADMIN_HEALTH_REPORT --> AdminCap{"Report Already Sent for Istanbul Date?"}
     AdminCap -- Yes --> AdminCapRet["ALREADY_DISPATCHED_TODAY (Blocked)"]
     AdminCap -- No --> AdminSlot{"In 22:00 +45m Window?"}
     AdminSlot -- Yes --> AdminOK["ADMIN_HEALTH_REPORT: Dispatches to ADMIN only"]
-    
+
     TaskType -- ENCRYPTED_BACKUP --> BackupSlot{"In 02:15 +45m Window?"}
     BackupSlot -- Yes --> BackupOK["ENCRYPTED_BACKUP: DESIGN ONLY (Zero Upload/Delete)"]
 ```
