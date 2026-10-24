@@ -1,0 +1,78 @@
+name: "Efso Radar — Editorial Digest (PRIMARY_EDITOR)"
+
+# AUTOMATION READINESS CONTRACT:
+# Operational Schedule: 3 runs per day: 09:30, 15:30, 21:30 Europe/Istanbul (UTC+3)
+# Corresponding UTC Cron: 30 6,12,18 * * *
+# NOTE: Active cron schedule is intentionally DISABLED during Phase 5B.3D offline readiness.
+# Recipient Invariant: Dispatches exclusively to PRIMARY_EDITOR. ADMIN never receives routine digests.
+# Live cloud activation requires separate, explicit Product Owner authorization.
+
+on:
+  # schedule:
+  #   - cron: '30 6,12,18 * * *'
+  workflow_dispatch:
+    inputs:
+      timestamp:
+        description: "ISO-8601 UTC evaluation timestamp (default: representative eligible slot 06:30 UTC / 09:30 TSİ)"
+        required: false
+        default: "2026-10-24T06:30:00Z"
+      preview_mode:
+        description: "Run safe offline execution preview (zero network, synthetic data)"
+        required: true
+        default: "true"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: efso-radar-digest
+  cancel-in-progress: false
+
+jobs:
+  digest_preview:
+    name: "Offline Editorial Digest Preview"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Execute Offline Digest Preview (Hermetic Synthetic Data Only)
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m efso_radar.workflow --task editorial-digest --preview --timestamp "${{ inputs.timestamp || '2026-10-24T06:30:00Z' }}"
+
+# -----------------------------------------------------------------------------
+# FUTURE PRODUCTION TEMPLATE (DISABLED PENDING PRODUCT OWNER APPROVAL)
+# -----------------------------------------------------------------------------
+#   digest_live:
+#     name: "Live Editorial Digest Dispatch (Disabled)"
+#     if: false
+#     runs-on: ubuntu-latest
+#     timeout-minutes: 10
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: actions/setup-python@v5
+#         with:
+#           python-version: '3.11'
+#       - run: pip install -r requirements.txt
+#       - name: Flush Due Digest
+#         env:
+#           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+#           TELEGRAM_PRIMARY_EDITOR_CHAT_ID: ${{ secrets.TELEGRAM_PRIMARY_EDITOR_CHAT_ID }}
+#           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+#           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+#         run: python -m efso_radar.workflow --task editorial-digest --live

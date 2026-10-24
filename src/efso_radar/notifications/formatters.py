@@ -587,3 +587,203 @@ def format_telegram_alert(assessment: EditorialAssessment) -> str:
 
     # 3. Verified Breaking / Routine Alert
     return format_telegram_breaking(assessment)
+
+
+
+def _is_valid_nonnegative_int(val: Any) -> bool:
+    """Check if value is a valid non-negative integer (not bool, not float, not string)."""
+    return isinstance(val, int) and not isinstance(val, bool) and val >= 0
+
+
+def _is_valid_positive_float(val: Any) -> bool:
+    """Check if value is a valid finite positive float/int (rejects bool, non-finite, <= 0)."""
+    if val is None or isinstance(val, bool):
+        return False
+    if not isinstance(val, (int, float)):
+        return False
+    import math
+    return math.isfinite(val) and val > 0.0
+
+
+def _is_valid_nonnegative_cost(val: Any) -> bool:
+    """Check if value is a valid finite non-negative float/int (rejects bool, non-finite, < 0)."""
+    if val is None or isinstance(val, bool):
+        return False
+    if not isinstance(val, (int, float)):
+        return False
+    import math
+    return math.isfinite(val) and val >= 0.0
+
+
+def format_telegram_admin_health_report(
+    metrics: dict[str, Any],
+    now: Optional[datetime] = None,
+) -> str:
+    """Format daily operational health report into Telegram HTML for the ADMIN recipient.
+
+    Strictly contains zero editorial gossip or article news items; reports operational
+    system metrics, scan reliability, delivery health, and zero-spend accounting.
+    Complies with docs/DAILY_ADMIN_HEALTH_REPORT_DESIGN.md.
+
+    Guarantees (Issue 1 Acceptance Fixes):
+    - Never derives delivery success percentage from error count alone.
+      When total attempts / successes are unavailable, reports error count with percentage UNKNOWN.
+    - Rejects negative, fractional, or inconsistent operational counters.
+    - Rejects rss_windows_success greater than rss_windows_total.
+    - Rejects non-finite USD costs or exchange rates (NaN, Infinity).
+    - Rejects negative costs; never interprets them as valid expenditure.
+    - Missing one member of a metric pair does not fabricate zero for that missing value.
+    - Preserves correct 0,00 TRY / $0.00 formatting for explicitly verified zero-cost fixtures.
+    - Handles None, zero denominators, malformed types, and HTML escaping safely.
+    """
+    e = html.escape
+    timestamp_str = format_turkey_timestamp(now, with_middle_dot=True)
+
+    # 1. System Status
+    status_raw = metrics.get("system_status") if isinstance(metrics, dict) else None
+    if status_raw is None or not isinstance(status_raw, str) or not status_raw.strip():
+        status = "BİLİNMİYOR (VERİ YOK)"
+        status_icon = "⚪"
+    else:
+        status = status_raw.strip()
+        status_icon = "🟢" if ("NORMAL" in status or "SAĞLIKLI" in status) else ("🟡" if "DEGRADE" in status else "🔴")
+
+    # 2. RSS Scan Windows
+    rss_success_raw = metrics.get("rss_windows_success") if isinstance(metrics, dict) else None
+    rss_total_raw = metrics.get("rss_windows_total") if isinstance(metrics, dict) else None
+    valid_rss_success = _is_valid_nonnegative_int(rss_success_raw)
+    valid_rss_total = _is_valid_nonnegative_int(rss_total_raw)
+
+    if not valid_rss_success or not valid_rss_total:
+        rss_line = "• Başarılı: <i>BİLİNMİYOR (Veri Kaydı Yok)</i>"
+    elif rss_success_raw > rss_total_raw:
+        rss_line = "• Başarılı: <i>BİLİNMİYOR (Tutarsız Veri: Başarılı > Toplam)</i>"
+    elif rss_total_raw == 0:
+        rss_line = "• Başarılı: 0 / 0 pencere (Tarama Penceresi Yok)"
+    else:
+        rss_pct = int((rss_success_raw / rss_total_raw) * 100)
+        rss_line = f"• Başarılı: {rss_success_raw} / {rss_total_raw} pencere (%{rss_pct})"
+
+    last_rss_raw = metrics.get("last_rss_success_ts") if isinstance(metrics, dict) else None
+    if last_rss_raw and isinstance(last_rss_raw, str) and last_rss_raw.strip():
+        last_rss_line = f"• Son Başarılı Tarama: {e(last_rss_raw.strip())}"
+    else:
+        last_rss_line = "• Son Başarılı Tarama: <i>BİLİNMİYOR</i>"
+
+    scanned_raw = metrics.get("total_articles_scanned") if isinstance(metrics, dict) else None
+    if _is_valid_nonnegative_int(scanned_raw):
+        scanned_line = f"• Toplam Taranan Makale: {scanned_raw}"
+    else:
+        scanned_line = "• Toplam Taranan Makale: <i>BİLİNMİYOR</i>"
+
+    # 3. Editorial Metrics
+    evaluated_raw = metrics.get("candidates_evaluated") if isinstance(metrics, dict) else None
+    if _is_valid_nonnegative_int(evaluated_raw):
+        evaluated_line = f"• Değerlendirilen / Havuzdaki Aday: {evaluated_raw}"
+    else:
+        evaluated_line = "• Değerlendirilen / Havuzdaki Aday: <i>BİLİNMİYOR</i>"
+
+    digests_sent_raw = metrics.get("editor_digests_sent") if isinstance(metrics, dict) else None
+    news_items_raw = metrics.get("editor_news_items") if isinstance(metrics, dict) else None
+    valid_digests = _is_valid_nonnegative_int(digests_sent_raw)
+    valid_items = _is_valid_nonnegative_int(news_items_raw)
+
+    if valid_digests and valid_items:
+        if digests_sent_raw > 0 or news_items_raw > 0:
+            editor_delivery_line = f"• PRIMARY_EDITOR Teslimatı: {digests_sent_raw} bülten ({news_items_raw} haber)"
+        else:
+            editor_delivery_line = "• PRIMARY_EDITOR Teslimatı: 0 bülten, 0 haber (sakin haber günü)"
+    elif valid_digests and not valid_items:
+        editor_delivery_line = f"• PRIMARY_EDITOR Teslimatı: {digests_sent_raw} bülten (Haber Sayısı Bilinmiyor)"
+    elif not valid_digests and valid_items:
+        editor_delivery_line = f"• PRIMARY_EDITOR Teslimatı: Bülten Sayısı Bilinmiyor ({news_items_raw} haber)"
+    else:
+        editor_delivery_line = "• PRIMARY_EDITOR Teslimatı: <i>BİLİNMİYOR (Veri Kaydı Yok)</i>"
+
+    # Delivery Success Rate: Never derive percentage from errors alone
+    delivery_errs_raw = metrics.get("delivery_errors") if isinstance(metrics, dict) else None
+    attempts_raw = metrics.get("delivery_attempts") if isinstance(metrics, dict) else None
+    successes_raw = metrics.get("delivery_successes") if isinstance(metrics, dict) else None
+
+    valid_errs = _is_valid_nonnegative_int(delivery_errs_raw)
+    valid_attempts = _is_valid_nonnegative_int(attempts_raw)
+    valid_successes = _is_valid_nonnegative_int(successes_raw)
+
+    if valid_errs:
+        if valid_attempts:
+            if attempts_raw == 0:
+                delivery_line = "• Teslimat Başarısı: 0 / 0 teslimat (Teslimat Denemesi Yok)"
+            elif valid_successes:
+                if successes_raw > attempts_raw:
+                    delivery_line = "• Teslimat Başarısı: <i>BİLİNMİYOR (Tutarsız Veri: Başarılı > Toplam)</i>"
+                else:
+                    succ_pct = int((successes_raw / attempts_raw) * 100)
+                    delivery_line = f"• Teslimat Başarısı: %{succ_pct} (Toplam: {attempts_raw}, Hata: {delivery_errs_raw})"
+            elif delivery_errs_raw > attempts_raw:
+                delivery_line = "• Teslimat Başarısı: <i>BİLİNMİYOR (Tutarsız Veri: Hata > Toplam)</i>"
+            else:
+                succ = attempts_raw - delivery_errs_raw
+                succ_pct = int((succ / attempts_raw) * 100)
+                delivery_line = f"• Teslimat Başarısı: %{succ_pct} (Toplam: {attempts_raw}, Hata: {delivery_errs_raw})"
+        else:
+            # Attempts unavailable: report error count and mark success percentage UNKNOWN
+            delivery_line = f"• Teslimat Başarısı: <i>BİLİNMİYOR</i> (Hata: {delivery_errs_raw})"
+    else:
+        delivery_line = "• Teslimat Başarısı: <i>BİLİNMİYOR (Veri Kaydı Yok)</i>"
+
+    # 4. Budget & Cost Accounting
+    gemini_calls_raw = metrics.get("gemini_calls") if isinstance(metrics, dict) else None
+    if _is_valid_nonnegative_int(gemini_calls_raw):
+        gemini_calls_str = str(gemini_calls_raw)
+    else:
+        gemini_calls_str = "<i>BİLİNMİYOR</i>"
+
+    cost_usd_raw = metrics.get("cost_usd") if isinstance(metrics, dict) else None
+    if not _is_valid_nonnegative_cost(cost_usd_raw):
+        cost_line = "• Dahili Hesaplanan Harcama: <i>BİLİNMİYOR (Harcama Kanıtı Yok)</i>"
+    else:
+        cost_usd = float(cost_usd_raw)
+        if cost_usd == 0.0:
+            cost_line = "• Dahili Hesaplanan Harcama: <b>0,00 TRY / $0.00</b>"
+        else:
+            rate_raw = metrics.get("usd_to_try_rate") if isinstance(metrics, dict) else None
+            if _is_valid_positive_float(rate_raw):
+                rate = float(rate_raw)
+                cost_try = cost_usd * rate
+                cost_try_str = f"{cost_try:.2f}".replace(".", ",")
+                cost_line = f"• Dahili Hesaplanan Harcama: <b>{cost_try_str} TRY / ${cost_usd:.2f}</b> (Kur: {rate:.2f})"
+            else:
+                cost_line = f"• Dahili Hesaplanan Harcama: <b>${cost_usd:.2f}</b> <i>(TRY Karşılığı Bilinmiyor — Kur Doğrulanmadı)</i>"
+
+    # 5. Operational Notes
+    notes_raw = metrics.get("operational_notes") if isinstance(metrics, dict) else None
+    if not notes_raw or not isinstance(notes_raw, list):
+        notes_html = "• <i>Kayıtlı operasyonel not bulunmuyor.</i>"
+    else:
+        valid_notes = [e(str(n).strip()) for n in notes_raw if n and str(n).strip()]
+        notes_html = "\n".join(f"• {n}" for n in valid_notes) if valid_notes else "• <i>Kayıtlı operasyonel not bulunmuyor.</i>"
+
+    return (
+        f"🩺 <b>EFSO RADAR · GÜNLÜK SAĞLIK RAPORU</b>\n"
+        f"📅 <b>{timestamp_str}</b>\n\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"{status_icon} <b>SİSTEM DURUMU: {e(status)}</b>\n"
+        f"━━━━━━━━━━━━━━\n\n"
+        f"📡 <b>RSS Taramaları:</b>\n"
+        f"{rss_line}\n"
+        f"{last_rss_line}\n"
+        f"{scanned_line}\n\n"
+        f"🎯 <b>Editoryal Süreç:</b>\n"
+        f"{evaluated_line}\n"
+        f"{editor_delivery_line}\n"
+        f"{delivery_line}\n"
+        f"<i>(Not: Sakin günlerde 0 bülten olağan editoryal filtreleme sonucudur.)</i>\n\n"
+        f"💰 <b>Bütçe & Harcama:</b>\n"
+        f"• Gemini Free-Tier Çağrısı: {gemini_calls_str}\n"
+        f"{cost_line}\n"
+        f"• Sağlayıcı Fatura Durumu: <i>Doğrulanmamış (Konsoldan teyit gerekir)</i>\n\n"
+        f"⚠️ <b>Operasyonel Notlar:</b>\n"
+        f"{notes_html}\n\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"🔒 <i>Bu rapor yalnızca sistem yöneticisine (ADMIN) iletilen operasyonel durum özetidir.</i>"
+    )
