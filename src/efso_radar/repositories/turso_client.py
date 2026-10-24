@@ -1,17 +1,21 @@
 """Official Turso (libSQL) HTTP Hrana v2 pipeline client.
 
 Implements parameter serialization, URL normalization, batched execution,
-and type mapping over Turso's /v2/pipeline endpoint.
+read-only query safety, and type mapping over Turso's /v2/pipeline endpoint.
 Requires zero C-extensions or external platform-dependent binaries.
 """
 from __future__ import annotations
 
 import base64
 import logging
+import re
 from typing import Any, Optional
+from urllib.parse import urlparse
 import httpx
 
 logger = logging.getLogger("efso-radar.repository.turso_client")
+
+ALLOWED_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
 
 
 class TursoClientError(Exception):
@@ -19,18 +23,186 @@ class TursoClientError(Exception):
     pass
 
 
-def normalize_turso_url(raw_url: str) -> str:
-    """Normalize libsql:// or https:// database URL to the /v2/pipeline endpoint."""
-    url = raw_url.strip()
-    if url.startswith("libsql://"):
-        url = "https://" + url[len("libsql://"):]
-    elif not url.startswith("http://") and not url.startswith("https://"):
-        url = "https://" + url
+def _format_http_status_error(status_code: int) -> str:
+    """Format safe HTTP status error without untrusted response body content."""
+    categories = {
+        400: "Bad Request",
+        401: "Unauthorized / Authentication Failed",
+        403: "Forbidden / Insufficient Permissions",
+        404: "Endpoint Not Found",
+        408: "Request Timeout",
+        429: "Rate Limit Exceeded",
+        500: "Internal Server Error",
+        502: "Bad Gateway",
+        503: "Service Unavailable",
+        504: "Gateway Timeout",
+    }
+    category = categories.get(status_code, "HTTP Error")
+    return f"Turso API returned HTTP status {status_code} ({category})."
 
-    url = url.rstrip("/")
-    if not url.endswith("/v2/pipeline"):
-        url += "/v2/pipeline"
-    return url
+
+def mask_turso_url(url: str) -> str:
+    """Return a safely sanitized database URL for logging (no credentials, tokens, arbitrary paths, or query params).
+
+    Guarantees:
+    - Never preserves secret-bearing arbitrary URL paths, query parameters, or userinfo.
+    - Discards malformed raw input and returns a safe fallback placeholder.
+    - Canonicalizes valid endpoints to scheme://hostname[:port]/v2/pipeline.
+    """
+    if not url or not isinstance(url, str) or not url.strip():
+        return "<EMPTY>"
+    raw = url.strip()
+    try:
+        # Strip userinfo before parsing
+        if "@" in raw:
+            scheme_part, rest = raw.split("://", 1) if "://" in raw else ("https", raw)
+            rest = rest.split("@", 1)[1]
+            raw = f"{scheme_part}://{rest}"
+
+        if "://" in raw:
+            scheme, remainder = raw.split("://", 1)
+            scheme = scheme.lower()
+        else:
+            scheme = "https"
+            remainder = raw
+
+        effective_scheme = "https" if scheme in ("libsql", "https") else ("http" if scheme == "http" else None)
+        if effective_scheme is None:
+            return "<unsupported_scheme_url>"
+
+        parsed = urlparse(f"{effective_scheme}://{remainder}")
+        host = (parsed.hostname or "").lower()
+        if not host:
+            return "<invalid_host_url>"
+
+        port_str = f":{parsed.port}" if parsed.port and parsed.port not in (80, 443) else ""
+        formatted_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+        return f"{effective_scheme}://{formatted_host}{port_str}/v2/pipeline"
+    except Exception:
+        return "<malformed_url>"
+
+
+def normalize_turso_url(raw_url: str, allow_localhost_http: bool = True) -> str:
+    """Normalize and strictly validate Turso database URL to the /v2/pipeline endpoint.
+
+    Guarantees:
+    - Rejects empty, whitespace, or malformed URLs.
+    - Strictly permits only 'libsql://', 'https://', and 'http://' (for exact loopback hosts only).
+    - Prohibits insecure remote 'http://' endpoints, regardless of parameters, substrings, or paths.
+    - Prohibits embedded username/password credentials in the URL.
+    - Normalizes 'libsql://' to 'https://' and appends '/v2/pipeline'.
+    """
+    if not raw_url or not isinstance(raw_url, str) or not raw_url.strip():
+        raise ValueError("Turso database URL cannot be empty.")
+
+    url = raw_url.strip()
+
+    # Reject embedded userinfo/passwords in URL to prevent credential leakage in logs
+    if "@" in url:
+        raise ValueError(
+            "Turso database URL must not contain embedded username or password credentials. "
+            "Supply authentication credentials exclusively via TURSO_AUTH_TOKEN."
+        )
+
+    if "://" in url:
+        scheme, remainder = url.split("://", 1)
+        scheme = scheme.lower()
+    else:
+        scheme = "https"
+        remainder = url
+
+    allowed_schemes = {"libsql", "https", "http"}
+    if scheme not in allowed_schemes:
+        raise ValueError(
+            f"Unsupported Turso URL scheme: '{scheme}'. "
+            f"Only 'libsql://' and 'https://' (or 'http://' for localhost) are supported."
+        )
+
+    effective_scheme = "https" if scheme == "libsql" else scheme
+    parsed = urlparse(f"{effective_scheme}://{remainder}")
+
+    if parsed.username or parsed.password:
+        raise ValueError(
+            "Turso database URL must not contain embedded username or password credentials. "
+            "Supply authentication credentials exclusively via TURSO_AUTH_TOKEN."
+        )
+
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        raise ValueError(f"Invalid Turso database URL: missing hostname in '{mask_turso_url(url)}'.")
+
+    if effective_scheme == "http":
+        if hostname not in ALLOWED_LOOPBACK_HOSTS:
+            raise ValueError(
+                f"Insecure unencrypted HTTP connection to remote Turso host '{hostname}' is prohibited. "
+                f"Use 'https://' or 'libsql://'."
+            )
+        if not allow_localhost_http:
+            raise ValueError("Plaintext HTTP connection to localhost is disabled.")
+
+    port_str = f":{parsed.port}" if parsed.port and parsed.port not in (80, 443) else ""
+    formatted_host = f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
+    return f"{effective_scheme}://{formatted_host}{port_str}/v2/pipeline"
+
+
+def validate_read_only_sql(sql: str) -> None:
+    """Strictly validate that an outbound SQL statement is read-only (SELECT, WITH, or allowed PRAGMA).
+
+    Raises ValueError if any DDL, DML, CTE writes, or mutating PRAGMAs are detected.
+    """
+    if not sql or not isinstance(sql, str) or not sql.strip():
+        raise ValueError("SQL query cannot be empty.")
+
+    cleaned = sql.strip()
+
+    # Reject SQL comments to prevent token-splitting evasion
+    if "--" in cleaned or "/*" in cleaned or "*/" in cleaned:
+        raise ValueError("Preflight query safety violation: SQL comments are prohibited in read-only queries.")
+
+    # Reject multiple statements
+    if cleaned.endswith(";"):
+        cleaned = cleaned[:-1].strip()
+    if ";" in cleaned:
+        raise ValueError("Preflight query safety violation: multiple statements are prohibited.")
+
+    # Strip string literals to avoid false positives for keywords inside strings
+    no_strings = re.sub(r"'(''|[^'])*'", "'STRING'", cleaned)
+    no_strings = re.sub(r'"(""|[^"])*"', '"STRING"', no_strings)
+    upper = no_strings.upper()
+
+    # Check allowed starting verbs
+    if upper.startswith("PRAGMA"):
+        arg_pragmas = {"table_info", "table_xinfo", "index_list", "index_info", "index_xinfo", "foreign_key_list"}
+        bare_pragmas = {"collation_list", "database_list", "compile_options", "user_version"}
+        m_arg = re.fullmatch(r"PRAGMA\s+([A-Z_]+)\s*\(\s*[A-Za-z_][A-Za-z0-9_]*\s*\)", upper, flags=re.IGNORECASE)
+        m_bare = re.fullmatch(r"PRAGMA\s+([A-Z_]+)", upper, flags=re.IGNORECASE)
+        if m_arg and m_arg.group(1).lower() in arg_pragmas:
+            return
+        if m_bare and m_bare.group(1).lower() in bare_pragmas:
+            return
+        raise ValueError(
+            f"Preflight query safety violation: PRAGMA is not an allowed read-only form: {sql[:40]}"
+        )
+
+    if not (upper.startswith("SELECT") or upper.startswith("WITH")):
+        raise ValueError(
+            f"Preflight query safety violation: query must start with SELECT, WITH, or allowed PRAGMA: {sql[:40]}"
+        )
+
+    # Strictly prohibit mutating verbs anywhere in the statement
+    prohibited_verbs = {
+        "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "REPLACE",
+        "ATTACH", "DETACH", "VACUUM", "REINDEX", "UPSERT", "SAVEPOINT",
+        "RELEASE", "GRANT", "REVOKE", "PRAGMA", "LOAD_EXTENSION", "BEGIN", "COMMIT",
+        "ROLLBACK", "ANALYZE",
+    }
+    words = set(re.findall(r"\b[A-Za-z_]+\b", upper))
+    found_prohibited = words.intersection(prohibited_verbs)
+    if found_prohibited:
+        raise ValueError(
+            f"Preflight query safety violation: query contains prohibited mutating keywords "
+            f"{sorted(found_prohibited)}: {sql[:50]}"
+        )
 
 
 def serialize_hrana_arg(val: Any) -> dict[str, Any]:
@@ -98,12 +270,27 @@ class TursoHTTPClient:
         auth_token: str = "",
         timeout_seconds: float = 15.0,
         transport: Optional[httpx.BaseTransport] = None,
+        read_only: bool = False,
     ):
-        self.pipeline_url = normalize_turso_url(database_url)
-        self.auth_token = auth_token
+        self.pipeline_url = normalize_turso_url(database_url, allow_localhost_http=True)
+        self.masked_url = mask_turso_url(self.pipeline_url)
+        self.auth_token = auth_token.strip() if auth_token else ""
+        if "\n" in self.auth_token or "\r" in self.auth_token:
+            raise ValueError("Turso auth token contains invalid newline characters.")
         self.timeout_seconds = timeout_seconds
         self.transport = transport
+        self.read_only = bool(read_only)
         self._client: Optional[httpx.Client] = None
+
+    def __repr__(self) -> str:
+        ro_flag = ", read_only=True" if self.read_only else ""
+        return f"TursoHTTPClient(pipeline_url='{self.masked_url}'{ro_flag})"
+
+    def __enter__(self) -> TursoHTTPClient:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
 
     def _get_client(self) -> httpx.Client:
         if self._client is None or self._client.is_closed:
@@ -123,15 +310,22 @@ class TursoHTTPClient:
         if self._client is not None and not self._client.is_closed:
             self._client.close()
 
+    def ping(self) -> bool:
+        """Execute non-mutating SELECT 1 to verify remote connectivity."""
+        res = self.execute("SELECT 1 AS ping")
+        row = res.fetchone()
+        return bool(row and row.get("ping") == 1)
+
     def execute_pipeline(
         self, statements: list[tuple[str, list[Any]]]
     ) -> list[TursoQueryResult]:
-        """
-        Execute multiple SQL statements with parameters in a single HTTP pipeline request.
-        Statements are tuples of (sql, args).
-        """
+        """Execute multiple SQL statements with parameters in a single HTTP pipeline request."""
         if not statements:
             return []
+
+        if self.read_only:
+            for sql, _ in statements:
+                validate_read_only_sql(sql)
 
         requests_payload: list[dict[str, Any]] = []
         for sql, args in statements:
@@ -147,12 +341,13 @@ class TursoHTTPClient:
         try:
             resp = client.post(self.pipeline_url, json={"requests": requests_payload})
         except httpx.HTTPError as exc:
-            raise TursoClientError(f"HTTP connection to Turso failed: {exc}") from exc
+            err_type = type(exc).__name__
+            if isinstance(exc, httpx.TimeoutException):
+                raise TursoClientError(f"HTTP connection to Turso timed out ({err_type}).") from None
+            raise TursoClientError(f"HTTP connection to Turso failed ({err_type}).") from None
 
         if resp.status_code != 200:
-            raise TursoClientError(
-                f"Turso API returned HTTP status {resp.status_code}: {resp.text[:300]}"
-            )
+            raise TursoClientError(_format_http_status_error(resp.status_code))
 
         data = resp.json()
         raw_results = data.get("results", [])
@@ -162,7 +357,9 @@ class TursoHTTPClient:
             res_type = res.get("type")
             if res_type == "error":
                 err = res.get("error", {})
-                msg = err.get("message", "Unknown SQL error")
+                msg = str(err.get("message", "Unknown SQL error"))
+                if self.auth_token and self.auth_token in msg:
+                    msg = msg.replace(self.auth_token, "[REDACTED]")
                 code = err.get("code", "UNKNOWN")
                 raise TursoClientError(f"Turso statement {idx} error ({code}): {msg}")
 
@@ -188,13 +385,12 @@ class TursoHTTPClient:
     def execute_transaction(
         self, statements: list[tuple[str, list[Any]]]
     ) -> list[TursoQueryResult]:
-        """
-        Execute multiple SQL statements atomically in an explicit transaction over /v2/pipeline.
-        Uses Hrana session baton to guarantee all statements succeed before committing,
-        or explicitly rolling back if any statement fails.
-        """
+        """Execute multiple SQL statements atomically in an explicit transaction over /v2/pipeline."""
         if not statements:
             return []
+
+        if self.read_only:
+            raise PermissionError("Transactions are prohibited on a read-only client.")
 
         requests_payload: list[dict[str, Any]] = [
             {"type": "execute", "stmt": {"sql": "BEGIN"}}
@@ -209,79 +405,66 @@ class TursoHTTPClient:
         try:
             resp = client.post(self.pipeline_url, json={"baton": None, "requests": requests_payload})
         except httpx.HTTPError as exc:
-            raise TursoClientError(f"HTTP connection to Turso failed during transaction execution: {exc}") from exc
+            err_type = type(exc).__name__
+            if isinstance(exc, httpx.TimeoutException):
+                raise TursoClientError(f"HTTP connection to Turso timed out during transaction ({err_type}).") from None
+            raise TursoClientError(f"HTTP connection to Turso failed during transaction ({err_type}).") from None
 
         if resp.status_code != 200:
-            raise TursoClientError(
-                f"Turso API returned HTTP status {resp.status_code}: {resp.text[:300]}"
-            )
+            raise TursoClientError(_format_http_status_error(resp.status_code))
 
         data = resp.json()
         baton = data.get("baton")
         raw_results = data.get("results", [])
 
-        # Check if any statement produced an error
-        failed_idx: Optional[int] = None
+        # Check for errors in user statements
+        has_error = False
         error_msg = ""
-        error_code = "UNKNOWN"
-
-        for idx, res in enumerate(raw_results):
+        for idx, res in enumerate(raw_results[1:]):
             if res.get("type") == "error":
-                failed_idx = idx - 1  # 0 is BEGIN
+                has_error = True
                 err = res.get("error", {})
-                error_msg = err.get("message", "Unknown SQL error")
-                error_code = err.get("code", "UNKNOWN")
+                error_msg = str(err.get("message", "Unknown SQL error"))
+                if self.auth_token and self.auth_token in error_msg:
+                    error_msg = error_msg.replace(self.auth_token, "[REDACTED]")
                 break
 
-        if failed_idx is not None:
-            # Transaction failed: explicitly rollback and close session
+        if has_error:
             if baton:
                 try:
                     client.post(
                         self.pipeline_url,
-                        json={
-                            "baton": baton,
-                            "requests": [
-                                {"type": "execute", "stmt": {"sql": "ROLLBACK"}},
-                                {"type": "close"},
-                            ],
-                        },
+                        json={"baton": baton, "requests": [{"type": "execute", "stmt": {"sql": "ROLLBACK"}}, {"type": "close"}]},
                     )
-                except Exception as rollback_err:
-                    logger.warning("Failed sending explicit rollback to Turso session: %s", rollback_err)
-            raise TursoClientError(
-                f"Turso transaction aborted due to error in statement {failed_idx} ({error_code}): {error_msg}"
-            )
+                except Exception as rollback_exc:
+                    logger.warning("Turso transaction rollback failed: %s", rollback_exc)
+            raise TursoClientError(f"Turso transaction aborted due to statement error: {error_msg}")
 
-        # All statements succeeded: commit and close session
+        # Explicitly commit if all statements succeeded
         if baton:
             try:
                 commit_resp = client.post(
                     self.pipeline_url,
-                    json={
-                        "baton": baton,
-                        "requests": [
-                            {"type": "execute", "stmt": {"sql": "COMMIT"}},
-                            {"type": "close"},
-                        ],
-                    },
+                    json={"baton": baton, "requests": [{"type": "execute", "stmt": {"sql": "COMMIT"}}, {"type": "close"}]},
                 )
             except httpx.HTTPError as exc:
+                err_type = type(exc).__name__
                 raise TursoClientError(
-                    f"Ambiguous transaction outcome: network error during Turso COMMIT ({exc}). "
+                    f"Ambiguous transaction outcome: network error during Turso COMMIT ({err_type}). "
                     "The transaction may or may not have committed."
-                ) from exc
+                ) from None
 
             if commit_resp.status_code != 200:
-                raise TursoClientError(
-                    f"Turso COMMIT returned HTTP status {commit_resp.status_code}: {commit_resp.text[:200]}"
-                )
+                raise TursoClientError(_format_http_status_error(commit_resp.status_code))
 
             commit_data = commit_resp.json()
             commit_results = commit_data.get("results", [])
             if commit_results and commit_results[0].get("type") == "error":
                 err = commit_results[0].get("error", {})
-                raise TursoClientError(f"Turso COMMIT failed: {err.get('message')}")
+                msg = str(err.get("message", "Unknown commit error"))
+                if self.auth_token and self.auth_token in msg:
+                    msg = msg.replace(self.auth_token, "[REDACTED]")
+                raise TursoClientError(f"Turso COMMIT failed: {msg}")
 
         # Parse results for user statements (skipping BEGIN at index 0)
         parsed_results: list[TursoQueryResult] = []
@@ -304,11 +487,15 @@ class TursoHTTPClient:
 
     def execute(self, sql: str, args: Optional[list[Any]] = None) -> TursoQueryResult:
         """Execute a single SQL statement."""
+        if self.read_only:
+            validate_read_only_sql(sql)
         results = self.execute_pipeline([(sql, args or [])])
         return results[0]
 
     def executescript(self, script: str) -> None:
         """Execute a multi-statement DDL script."""
+        if self.read_only:
+            raise PermissionError("Multi-statement script execution is prohibited on a read-only client.")
         statements = [s.strip() for s in script.split(";") if s.strip()]
         if not statements:
             return

@@ -173,6 +173,7 @@ class TestPhase5B3C2StagingPreflight(unittest.TestCase):
             database_url="libsql://synthetic-cloud.turso.io",
             auth_token="mock-token-12345",
             transport=self.turso_transport,
+            init_schema=True,
         )
 
                # Normalize synthetic migration metadata for exact parity tests.

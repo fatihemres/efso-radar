@@ -131,7 +131,8 @@ class TestCalibrationPhase3C(unittest.TestCase):
                 database_url="libsql://efso-calib.turso.io",
                 auth_token="test-token",
                 transport=transport,
-            )
+                init_schema=True,
+        )
             t_summary1 = import_calibration_feedback(turso_repo, csv_path=self.csv_path)
             self.assertEqual(t_summary1.repository_stored_count, 50)
             t_summary2 = import_calibration_feedback(turso_repo, csv_path=self.csv_path)

@@ -15,6 +15,10 @@ from efso_radar.staging.cutover import (
     GoNoGoGate,
     GoNoGoDecision,
 )
+from efso_radar.staging.connection import (
+    StagingConnectionReport,
+    check_staging_connection,
+)
 
 __all__ = [
     "CloudPreflightValidator",
@@ -25,4 +29,6 @@ __all__ = [
     "StagingCutoverReport",
     "GoNoGoGate",
     "GoNoGoDecision",
+    "StagingConnectionReport",
+    "check_staging_connection",
 ]
