@@ -795,8 +795,12 @@ class TestPhase5B3DFinalAcceptanceCorrections(unittest.TestCase):
             wf_path = Path(".github/workflows") / wf_file
             content = wf_path.read_text(encoding="utf-8")
             self.assertIn('default: "' + expected_ts + '"', content)
-            expected_flag = '--timestamp "${{ inputs.timestamp || \'' + expected_ts + '\' }}"'
-            self.assertIn(expected_flag, content)
+            expected_env = (
+                'EFSO_PREVIEW_TIMESTAMP: "' + "${{ inputs.timestamp || '" + expected_ts + "' }}" + '"'
+            )
+            self.assertIn(expected_env, content)
+            self.assertIn('--timestamp "$EFSO_PREVIEW_TIMESTAMP"', content)
+            self.assertNotIn('--timestamp "${{ inputs.timestamp', content)
             # Verify active crons are commented out
             self.assertNotIn("\n  schedule:", content)
             # Verify zero live secrets in preview job
