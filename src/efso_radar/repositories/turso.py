@@ -59,17 +59,55 @@ class TursoStateRepository(StateRepository):
         timeout_seconds: float = 15.0,
         transport: Optional[httpx.BaseTransport] = None,
         client: Optional[TursoHTTPClient] = None,
+        init_schema: bool = False,
+        read_only: bool = False,
     ):
-        self.client = client or TursoHTTPClient(
-            database_url=database_url,
-            auth_token=auth_token,
-            timeout_seconds=timeout_seconds,
-            transport=transport,
-        )
+        self.read_only = bool(read_only)
+        if client is not None:
+            self.client = client
+        else:
+            self.client = TursoHTTPClient(
+                database_url=database_url,
+                auth_token=auth_token,
+                timeout_seconds=timeout_seconds,
+                transport=transport,
+                read_only=self.read_only,
+            )
+        if init_schema and not self.read_only:
+            self._init_db()
+
+    def _assert_writable(self) -> None:
+        """Enforce read-only constraint for safe inspection and preflight."""
+        if getattr(self, "read_only", False):
+            raise PermissionError(
+                "TursoStateRepository is operating in read-only mode. Mutating operations are prohibited."
+            )
+
+    def initialize_schema(self) -> None:
+        """Explicitly initialize schema v6 tables and migrations (mutating operation)."""
+        self._assert_writable()
         self._init_db()
+
+    def close(self) -> None:
+        """Close underlying HTTP client."""
+        if hasattr(self, "client") and self.client is not None:
+            self.client.close()
+
+    def __enter__(self) -> TursoStateRepository:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
+    def __repr__(self) -> str:
+        mode_str = "READ_ONLY" if getattr(self, "read_only", False) else "WRITABLE"
+        client_repr = repr(self.client) if hasattr(self, "client") and self.client else "None"
+        return f"TursoStateRepository({client_repr}, mode={mode_str})"
 
     def _init_db(self) -> None:
         """Initialize Turso tables and migrations."""
+        if getattr(self, "read_only", False):
+            raise PermissionError("Cannot initialize database schema in read-only mode.")
         stmts: list[tuple[str, list[Any]]] = [
             (ddl.strip(), []) for ddl in get_all_init_statements() if ddl.strip()
         ]
@@ -103,6 +141,7 @@ class TursoStateRepository(StateRepository):
     def acquire_run_lock(
         self, worker_id: str, timeout_minutes: int = 15, now: Optional[datetime] = None
     ) -> bool:
+        self._assert_writable()
         ref_now = (now or utc_now()).astimezone(timezone.utc)
         now_iso = ref_now.isoformat()
         expires_at = (ref_now + timedelta(minutes=timeout_minutes)).isoformat()
@@ -123,6 +162,7 @@ class TursoStateRepository(StateRepository):
         return res.affected_row_count > 0
 
     def renew_run_lock(self, worker_id: str, extend_minutes: int = 15) -> bool:
+        self._assert_writable()
         now = utc_now()
         now_iso = now.isoformat()
         expires_at = (now + timedelta(minutes=extend_minutes)).isoformat()
@@ -137,6 +177,7 @@ class TursoStateRepository(StateRepository):
         return res.affected_row_count > 0
 
     def release_run_lock(self, worker_id: str) -> None:
+        self._assert_writable()
         self.client.execute(
             "DELETE FROM run_locks WHERE lock_key = 'radar_cron' AND worker_id = ?",
             [worker_id],
@@ -151,6 +192,7 @@ class TursoStateRepository(StateRepository):
         return res.fetchone() is not None
 
     def mark_articles_processed(self, articles: list[Article]) -> None:
+        self._assert_writable()
         if not articles:
             return
         now_iso = utc_now().isoformat()
@@ -177,6 +219,7 @@ class TursoStateRepository(StateRepository):
     # --- Candidate Backlog & Lifecycle Integrity ---
     def save_pending_candidates(self, candidates: list[Article]) -> None:
         """Persist fresh candidates into durable backlog in Turso."""
+        self._assert_writable()
         if not candidates:
             return
         now_iso = utc_now().isoformat()
@@ -247,6 +290,7 @@ class TursoStateRepository(StateRepository):
 
     def mark_candidates_evaluated(self, article_ids: list[str]) -> None:
         """Transition candidates in backlog to EVALUATED status."""
+        self._assert_writable()
         if not article_ids:
             return
         stmts: list[tuple[str, list[Any]]] = [
@@ -257,6 +301,7 @@ class TursoStateRepository(StateRepository):
 
     def expire_stale_backlog_candidates(self, max_age_hours: int = 24, now: Optional[datetime] = None) -> int:
         """Transition candidates older than max_age_hours to EXPIRED status, preserving legitimate UPDATEs."""
+        self._assert_writable()
         ref_now = now or utc_now()
         cutoff = (ref_now - timedelta(hours=max_age_hours)).isoformat()
         res = self.client.execute(
@@ -324,6 +369,7 @@ class TursoStateRepository(StateRepository):
         )
 
     def record_new_story(self, story: Story, assessment: EditorialAssessment) -> None:
+        self._assert_writable()
         now_iso = utc_now().isoformat()
         import uuid
         asm_id = f"ASM-{now_iso[:10]}-{uuid.uuid4().hex[:8]}"
@@ -372,6 +418,7 @@ class TursoStateRepository(StateRepository):
         self.client.execute_transaction(stmts)
 
     def record_story_update(self, update: StoryUpdate, assessment: EditorialAssessment) -> None:
+        self._assert_writable()
         now_iso = utc_now().isoformat()
         import uuid
         asm_id = f"ASM-{now_iso[:10]}-{uuid.uuid4().hex[:8]}"
@@ -425,6 +472,7 @@ class TursoStateRepository(StateRepository):
         self.client.execute_transaction(stmts)
 
     def record_editorial_assessment(self, assessment: EditorialAssessment, story_id: str) -> None:
+        self._assert_writable()
         import uuid
         now_iso = utc_now().isoformat()
         asm_id = f"ASM-{now_iso[:10]}-{uuid.uuid4().hex[:8]}"
@@ -491,6 +539,7 @@ class TursoStateRepository(StateRepository):
         worker_id: str,
         lease_seconds: int = 300,
     ) -> bool:
+        self._assert_writable()
         now = utc_now()
         now_iso = now.isoformat()
         lease_exp = (now + timedelta(seconds=lease_seconds)).isoformat()
@@ -548,6 +597,7 @@ class TursoStateRepository(StateRepository):
         return True
 
     def record_notification(self, record: NotificationRecord) -> None:
+        self._assert_writable()
         self.client.execute(
             """
             INSERT OR REPLACE INTO notifications
@@ -571,6 +621,7 @@ class TursoStateRepository(StateRepository):
         )
 
     def mark_notification_delivered(self, notification_id: str, delivered_at: datetime) -> None:
+        self._assert_writable()
         self.client.execute(
             """
             UPDATE notifications
@@ -587,6 +638,7 @@ class TursoStateRepository(StateRepository):
         error_message: str,
         status: DeliveryStatus = DeliveryStatus.FAILED,
     ) -> None:
+        self._assert_writable()
         self.client.execute(
             """
             UPDATE notifications
@@ -642,6 +694,7 @@ class TursoStateRepository(StateRepository):
     def expire_stale_held_notifications(
         self, max_age_hours: int, now: Optional[datetime] = None
     ) -> int:
+        self._assert_writable()
         ref_now = now or utc_now()
         cutoff = (ref_now - timedelta(hours=max_age_hours)).isoformat()
         res = self.client.execute(
@@ -655,6 +708,7 @@ class TursoStateRepository(StateRepository):
         return res.affected_row_count
 
     def recover_expired_dispatch_claims(self) -> int:
+        self._assert_writable()
         now_iso = utc_now().isoformat()
         res = self.client.execute(
             """
@@ -669,6 +723,7 @@ class TursoStateRepository(StateRepository):
 
     # --- Maintenance & Migrations ---
     def purge_expired_records(self, retention_days: int = 35) -> int:
+        self._assert_writable()
         cutoff = (utc_now() - timedelta(days=retention_days)).isoformat()
         res = self.client.execute(
             "DELETE FROM processed_articles WHERE processed_at < ?",
@@ -679,6 +734,7 @@ class TursoStateRepository(StateRepository):
     # --- Editorial Feedback & Calibration ---
     def record_owner_feedback(self, feedback: OwnerFeedback) -> None:
         """Store explicit owner editorial feedback in Turso."""
+        self._assert_writable()
         self.client.execute(
             """
             INSERT OR REPLACE INTO owner_feedback
@@ -697,6 +753,7 @@ class TursoStateRepository(StateRepository):
 
     def import_owner_feedback_batch(self, feedbacks: list[OwnerFeedback]) -> int:
         """Atomically and idempotently import a batch of owner feedback records into Turso."""
+        self._assert_writable()
         if not feedbacks:
             return 0
         sql = """
@@ -793,6 +850,7 @@ class TursoStateRepository(StateRepository):
     def mark_digest_notifications_dispatched(
         self, notification_ids: list[str], delivered_at: datetime
     ) -> int:
+        self._assert_writable()
         if not notification_ids:
             return 0
         delivered_iso = delivered_at.isoformat()
@@ -945,6 +1003,7 @@ class TursoStateRepository(StateRepository):
         response_json: Optional[str] = None,
         created_at: Optional[datetime] = None,
     ) -> None:
+        self._assert_writable()
         ts_iso = (created_at or utc_now()).isoformat()
         self.client.execute(
             """
@@ -1017,6 +1076,7 @@ class TursoStateRepository(StateRepository):
         max_attempts: int = 1,
     ) -> bool:
         """Atomically acquire a recipient-specific delivery claim before external HTTP dispatch."""
+        self._assert_writable()
         now_iso = utc_now().isoformat()
         res = self.client.execute(
             """
@@ -1084,6 +1144,7 @@ class TursoStateRepository(StateRepository):
         return res_exec.affected_row_count > 0
 
     def record_telegram_delivery(self, delivery: TelegramDeliveryRecord) -> None:
+        self._assert_writable()
         # 1. Fetch existing delivery record if any
         res = self.client.execute(
             """
@@ -1189,6 +1250,7 @@ class TursoStateRepository(StateRepository):
         error_message: Optional[str] = None,
         sent_at: Optional[datetime] = None,
     ) -> bool:
+        self._assert_writable()
         # Fetch existing status first
         res = self.client.execute(
             "SELECT status, sent_at FROM telegram_delivery_records WHERE delivery_id = ?",
@@ -1238,6 +1300,7 @@ class TursoStateRepository(StateRepository):
         - Neither caller-supplied live_mode=False nor operator_authorized=True may override this prohibition.
         - Offline reconciliation testing is isolated to explicitly owned synthetic SQLite fixtures or mock helpers.
         """
+        self._assert_writable()
         raise DeliveryStateError(
             "Reconciliation of DELIVERY_UNCERTAIN records on Turso-backed repositories is NOT IMPLEMENTED "
             "and is unconditionally disabled during Phase 5B.3B. Offline reconciliation is restricted "
@@ -1297,6 +1360,7 @@ class TursoStateRepository(StateRepository):
         batch_id: Optional[str] = None,
         last_processed_id: Optional[str] = None,
     ) -> None:
+        self._assert_writable()
         now_iso = utc_now().isoformat()
         state_key = f"{stage}::current"
         self.client.execute(
@@ -1351,6 +1415,7 @@ class TursoStateRepository(StateRepository):
         }
 
     def clear_recovery_state(self, stage: str) -> None:
+        self._assert_writable()
         state_key = f"{stage}::current"
         self.client.execute("DELETE FROM durable_recovery_state WHERE state_key = ?", [state_key])
 
@@ -1363,6 +1428,7 @@ class TursoStateRepository(StateRepository):
         recipient_chat_id: str,
         summary_payload: dict[str, Any],
     ) -> bool:
+        self._assert_writable()
         now_iso = utc_now().isoformat()
         res = self.client.execute(
             """
@@ -1402,6 +1468,7 @@ class TursoStateRepository(StateRepository):
         timestamp: Optional[datetime] = None,
         record_id: Optional[str] = None,
     ) -> bool:
+        self._assert_writable()
         clean_run = run_id.strip()
         rec_id = record_id or f"bud_{period_month}_{clean_run}"
         ts_iso = (timestamp or utc_now()).isoformat()
@@ -1522,6 +1589,7 @@ class TursoStateRepository(StateRepository):
         worker_id: str,
         started_at: Optional[datetime] = None,
     ) -> None:
+        self._assert_writable()
         start_iso = (started_at or utc_now()).isoformat()
         self.client.execute(
             """
@@ -1542,6 +1610,7 @@ class TursoStateRepository(StateRepository):
         error_message: Optional[str] = None,
         finished_at: Optional[datetime] = None,
     ) -> None:
+        self._assert_writable()
         fin_iso = (finished_at or utc_now()).isoformat()
         self.client.execute(
             """
@@ -1583,3 +1652,36 @@ class TursoStateRepository(StateRepository):
 
 
 
+
+
+class TursoReadOnlyStateRepository(TursoStateRepository):
+    """Turso-backed state repository for strictly non-mutating remote inspection.
+
+    Guarantees:
+    - Never executes schema initialization or migrations during construction.
+    - Zero outbound SQL requests are sent upon initialization.
+    - Strictly rejects any mutating DDL or DML operation with PermissionError.
+    - Safe for preflight validation, connection readiness checks, and recovery diagnostics.
+    """
+
+    def __init__(
+        self,
+        database_url: str,
+        auth_token: str = "",
+        timeout_seconds: float = 15.0,
+        transport: Optional[httpx.BaseTransport] = None,
+        client: Optional[TursoHTTPClient] = None,
+    ):
+        super().__init__(
+            database_url=database_url,
+            auth_token=auth_token,
+            timeout_seconds=timeout_seconds,
+            transport=transport,
+            client=client,
+            init_schema=False,
+            read_only=True,
+        )
+
+    def __repr__(self) -> str:
+        client_repr = repr(self.client) if hasattr(self, "client") and self.client else "None"
+        return f"TursoReadOnlyStateRepository({client_repr})"

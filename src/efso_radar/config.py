@@ -168,12 +168,8 @@ class Settings(BaseModel):
         """Return safely sanitized Turso database URL for logging without credentials."""
         if not self.turso_database_url:
             return "<NOT_SET>"
-        url = self.turso_database_url.strip()
-        if "@" in url:
-            prefix, rest = url.split("@", 1)
-            scheme = prefix.split("://")[0] if "://" in prefix else "libsql"
-            return f"{scheme}://***@{rest}"
-        return url
+        from efso_radar.repositories.turso_client import mask_turso_url
+        return mask_turso_url(self.turso_database_url)
 
     def get_masked_telegram_token(self) -> str:
         """Return safely masked Telegram token for logging/auditing without leaking secrets."""

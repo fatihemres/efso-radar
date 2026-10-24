@@ -20,7 +20,13 @@ from efso_radar.repositories.base import StateRepository
 from efso_radar.repositories.migration_ledger import mask_text_chat_ids
 from efso_radar.repositories.schema import CURRENT_SCHEMA_VERSION
 from efso_radar.repositories.sqlite import SqliteStateRepository
-from efso_radar.repositories.turso import TursoStateRepository
+import httpx
+from efso_radar.repositories.turso import TursoReadOnlyStateRepository, TursoStateRepository
+from efso_radar.repositories.turso_client import (
+    TursoClientError,
+    TursoHTTPClient,
+    validate_read_only_sql,
+)
 
 logger = logging.getLogger("efso-radar.staging.preflight")
 
@@ -137,74 +143,6 @@ def _types_are_compatible(actual: str, expected: str) -> bool:
     return act == exp
 
 
-def validate_read_only_sql(sql: str) -> None:
-    """Validate that SQL string is strictly read-only and safe to execute.
-
-    Rejects:
-    - Empty queries
-    - Multiple statements (semicolon separation)
-    - Mutating PRAGMAs or PRAGMAs outside allowed read-only inspection set
-    - CTEs containing data-modifying statements (INSERT, UPDATE, DELETE, etc.)
-    - Any query containing mutating DML or DDL keywords anywhere in the statement
-    """
-    if not sql or not sql.strip():
-        raise ValueError("Preflight query safety violation: SQL query is empty.")
-
-    # Comments are never needed for introspection and can be used to hide payloads
-    # from naive scanners (e.g. a quote inside a comment desyncing literal stripping).
-    if "--" in sql or "/*" in sql or "*/" in sql:
-        raise ValueError("Preflight query safety violation: SQL comments are prohibited.")
-    cleaned = sql.strip()
-
-    # Reject multiple statements
-    if cleaned.endswith(";"):
-        cleaned = cleaned[:-1].strip()
-    if ";" in cleaned:
-        raise ValueError("Preflight query safety violation: multiple statements are prohibited.")
-
-    # Strip string literals to avoid false positives for keywords inside strings
-    no_strings = re.sub(r"'(''|[^'])*'", "'STRING'", cleaned)
-    no_strings = re.sub(r'"(""|[^"])*"', '"STRING"', no_strings)
-    upper = no_strings.upper()
-
-    # Check allowed starting verbs
-    if upper.startswith("PRAGMA"):
-        # Strict allowlist of exact read-only forms. Anything else (assignment, `name(value)`
-        # setter syntax such as `PRAGMA user_version(17)`, schema-qualified names) is rejected.
-        # Introspection pragmas that take an object name: PRAGMA name(identifier)
-        arg_pragmas = {"table_info", "table_xinfo", "index_list", "index_info", "index_xinfo", "foreign_key_list"}
-        # Introspection pragmas that must be bare (no argument, no assignment)
-        bare_pragmas = {"collation_list", "database_list", "compile_options", "user_version"}
-        m_arg = re.fullmatch(r"PRAGMA\s+([A-Z_]+)\s*\(\s*[A-Za-z_][A-Za-z0-9_]*\s*\)", upper, flags=re.IGNORECASE)
-        m_bare = re.fullmatch(r"PRAGMA\s+([A-Z_]+)", upper, flags=re.IGNORECASE)
-        if m_arg and m_arg.group(1).lower() in arg_pragmas:
-            return
-        if m_bare and m_bare.group(1).lower() in bare_pragmas:
-            return
-        raise ValueError(
-            f"Preflight query safety violation: PRAGMA is not an allowed read-only form: {sql[:40]}"
-        )
-
-    if not (upper.startswith("SELECT") or upper.startswith("WITH")):
-        raise ValueError(
-            f"Preflight query safety violation: query must start with SELECT, WITH, or allowed PRAGMA: {sql[:40]}"
-        )
-
-    # Strictly prohibit mutating verbs anywhere in the statement (e.g. in CTEs or subqueries)
-    prohibited_verbs = {
-        "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "REPLACE",
-        "ATTACH", "DETACH", "VACUUM", "REINDEX", "UPSERT", "SAVEPOINT",
-        "RELEASE", "GRANT", "REVOKE", "PRAGMA", "LOAD_EXTENSION", "BEGIN", "COMMIT",
-        "ROLLBACK", "ANALYZE",
-    }
-    words = set(re.findall(r"\b[A-Za-z_]+\b", upper))
-    found_prohibited = words.intersection(prohibited_verbs)
-    if found_prohibited:
-        raise ValueError(
-            f"Preflight query safety violation: query contains prohibited mutating keywords "
-            f"{sorted(found_prohibited)}: {sql[:50]}"
-        )
-
 
 def execute_read_query(repo: StateRepository, sql: str, params: Optional[list[Any]] = None) -> list[dict[str, Any]]:
     """Execute a strictly read-only SQL query against SQLite or Turso repository.
@@ -247,6 +185,9 @@ def execute_read_query(repo: StateRepository, sql: str, params: Optional[list[An
 
     elif isinstance(repo, TursoStateRepository):
         res = repo.client.execute(sql, params or [])
+        return res.fetchall()
+    elif isinstance(repo, TursoHTTPClient):
+        res = repo.execute(sql, params or [])
         return res.fetchall()
     else:
         raise TypeError(f"Unsupported repository type for preflight inspection: {type(repo)}")
@@ -338,9 +279,32 @@ class PreflightReport(BaseModel):
 class CloudPreflightValidator:
     """Non-mutating preflight validation engine for cloud staging repositories."""
 
-    def __init__(self, repo: StateRepository, allow_operational_db: bool = False):
+    def __init__(self, repo: StateRepository | TursoHTTPClient, allow_operational_db: bool = False):
         self.repo = repo
         self._assert_isolation(allow_operational_db)
+
+    @classmethod
+    def create_for_turso(
+        cls,
+        database_url: str,
+        auth_token: str = "",
+        timeout_seconds: float = 15.0,
+        transport: Optional[httpx.BaseTransport] = None,
+    ) -> CloudPreflightValidator:
+        """Construct a preflight validator using a strictly read-only Turso repository.
+
+        Guarantees:
+        - Never executes schema initialization or migrations during construction.
+        - Zero outbound SQL requests are sent upon initialization.
+        - Safe for inspecting existing or uninitialized remote staging databases.
+        """
+        read_only_repo = TursoReadOnlyStateRepository(
+            database_url=database_url,
+            auth_token=auth_token,
+            timeout_seconds=timeout_seconds,
+            transport=transport,
+        )
+        return cls(repo=read_only_repo)
 
     def _assert_isolation(self, allow_operational_db: bool) -> None:
         """Ensure the validator fails closed if directed towards real production database."""
@@ -411,6 +375,12 @@ class CloudPreflightValidator:
 
     def _check_schema_version(self, report: PreflightReport) -> None:
         try:
+            if not self._table_exists("schema_migrations"):
+                report.schema_version = 0
+                report.errors.append(
+                    f"Schema migrations table missing: expected schema version >={CURRENT_SCHEMA_VERSION}, found uninitialized database"
+                )
+                return
             rows = execute_read_query(self.repo, "SELECT MAX(version) AS ver FROM schema_migrations")
             ver = int(rows[0]["ver"]) if rows and rows[0].get("ver") is not None else 0
             report.schema_version = ver

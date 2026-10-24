@@ -195,6 +195,7 @@ class TestTursoNotificationClaims(unittest.TestCase, NotificationClaimsContractM
             database_url="libsql://efso-test.turso.io",
             auth_token="mock-token-xyz",
             transport=self.mock_transport,
+            init_schema=True,
         )
 
     def tearDown(self):

@@ -204,6 +204,7 @@ class TestPhase5B3CCloudPersistenceIntegration(unittest.TestCase):
             database_url=self.test_settings.turso_database_url,
             auth_token=self.test_settings.turso_auth_token,
             transport=self.mock_transport,
+            init_schema=True,
         )
 
     # --- Test 1: Fail-Closed Storage Mode Configuration ---

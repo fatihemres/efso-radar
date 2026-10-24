@@ -1237,6 +1237,7 @@ class TestPhase5B3BCloudSafetyContracts(unittest.TestCase):
             database_url="libsql://mock.turso.io",
             auth_token="mock_token",
             client=mock_client,
+            init_schema=True,
         )
 
         # 1. Atomic acquire
