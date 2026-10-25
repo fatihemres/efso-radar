@@ -108,7 +108,8 @@ DISALLOWED_LIVE_FLAGS = frozenset({
 def validate_staging_destination(url: str) -> str:
     """Validate that the target URL matches the exact allowlisted staging destination.
 
-    Fails closed on any discrepancy, wildcard, alternative subdomain, IP address, or port.
+    Fails closed on any discrepancy, wildcard, alternative subdomain, IP address, port,
+    query string, fragment, or userinfo.
     Returns the canonicalized https:// pipeline URL on success.
     """
     if not isinstance(url, str) or not url.strip():
@@ -134,9 +135,27 @@ def validate_staging_destination(url: str) -> str:
             "Destination security violation: credentials embedded in destination URL are strictly prohibited."
         )
 
-    if parsed.port is not None and parsed.port not in (443, 80):
+    # Reject ANY explicit port (even 443 or 80)
+    if parsed.port is not None:
         raise PermissionError(
-            f"Destination security violation: non-standard port '{parsed.port}' disallowed."
+            f"Destination security violation: explicit port '{parsed.port}' is strictly disallowed."
+        )
+
+    # Reject query strings or fragments
+    if parsed.query:
+        raise PermissionError(
+            f"Destination security violation: query string '{parsed.query}' is strictly disallowed."
+        )
+    if parsed.fragment:
+        raise PermissionError(
+            f"Destination security violation: URL fragment '{parsed.fragment}' is strictly disallowed."
+        )
+
+    # Reject unexpected URL paths (allowed: empty, '/', or '/v2/pipeline')
+    norm_path = parsed.path.rstrip("/")
+    if norm_path not in ("", "/v2/pipeline"):
+        raise PermissionError(
+            f"Destination security violation: unexpected URL path '{parsed.path}' is disallowed."
         )
 
     return EXACT_STAGING_HTTPS_URL
@@ -146,14 +165,18 @@ def validate_staging_destination(url: str) -> str:
 # Manifest & Entity Models
 # =============================================================================
 
-@dataclass(frozen=True)
-class RegisteredEntity:
+class RegisteredEntity(BaseModel):
     """An individual synthetic entity registered in the per-run ownership manifest."""
+    model_config = {"extra": "forbid", "frozen": True}
+
     table: str
     pk_column: str
     pk_value: str
     cleanup_dependency_order: int
     expected_attributes: dict[str, Any]
+
+    def __getitem__(self, item: str) -> Any:
+        return getattr(self, item)
 
 
 class AuditOutcomeState(str, Enum):
@@ -161,6 +184,7 @@ class AuditOutcomeState(str, Enum):
     RESIDUAL = "RESIDUAL"
     UNKNOWN = "UNKNOWN"
     OWNERSHIP_MISMATCH_HALT = "OWNERSHIP_MISMATCH_HALT"
+    OFFLINE_VALIDATION_PASSED = "OFFLINE_VALIDATION_PASSED"
 
 
 class SessionStatus(str, Enum):
@@ -169,16 +193,73 @@ class SessionStatus(str, Enum):
     ABORTED = "ABORTED"
 
 
+def create_default_manifest_entities(run_id: str) -> list[RegisteredEntity]:
+    """Create the exact allowlisted 5-entry synthetic entity inventory for a given run ID."""
+    return [
+        RegisteredEntity(
+            table="processed_articles",
+            pk_column="article_id",
+            pk_value=f"synth_art_{run_id}_01",
+            cleanup_dependency_order=2,
+            expected_attributes={
+                "source": "staging_synth_test",
+                "title": f"SYNTH_ARTICLE_{run_id}_01",
+            },
+        ),
+        RegisteredEntity(
+            table="stories",
+            pk_column="story_id",
+            pk_value=f"synth_story_{run_id}_01",
+            cleanup_dependency_order=1,
+            expected_attributes={
+                "category": "synth_test",
+                "headline_tr": f"SYNTH_STORY_{run_id}_01",
+            },
+        ),
+        RegisteredEntity(
+            table="processed_articles",
+            pk_column="article_id",
+            pk_value=f"synth_art_{run_id}_02_rollback",
+            cleanup_dependency_order=2,
+            expected_attributes={
+                "source": "staging_synth_test",
+                "title": f"SYNTH_ARTICLE_{run_id}_02_ROLLBACK",
+            },
+        ),
+        RegisteredEntity(
+            table="run_locks",
+            pk_column="lock_key",
+            pk_value=f"synth_lock_{run_id}",
+            cleanup_dependency_order=1,
+            expected_attributes={
+                "worker_ids": [f"runner_alpha_{run_id}", f"runner_beta_{run_id}"],
+            },
+        ),
+        RegisteredEntity(
+            table="durable_recovery_state",
+            pk_column="state_key",
+            pk_value=f"synth_stage_{run_id}::current",
+            cleanup_dependency_order=1,
+            expected_attributes={
+                "stage": f"synth_stage_{run_id}",
+                "worker_id": f"synth_worker_{run_id}",
+            },
+        ),
+    ]
+
+
 class PerRunOwnershipManifest(BaseModel):
     """Crash-recoverable, allowlisted on-disk manifest tracking registered synthetic entities.
 
     Stores ONLY structural metadata and expected synthetic attributes.
     Zero tokens, credentials, database URLs, or private identifiers are permitted.
     """
+    model_config = {"extra": "forbid"}
+
     run_id: str
     created_at: str
     version: int = 1
-    registered_entities: list[dict[str, Any]]
+    registered_entities: list[RegisteredEntity]
 
     def save_atomic(self, directory: Optional[Path] = None) -> Path:
         """Atomically persist manifest to an ephemeral temporary directory with safe permissions."""
@@ -236,6 +317,17 @@ class PerRunOwnershipManifest(BaseModel):
         if path.is_symlink():
             raise PermissionError(f"Manifest security violation: symlinks are not permitted: {path}")
 
+        # Check POSIX file ownership
+        if hasattr(os, "geteuid") and sys.platform != "win32":
+            try:
+                st = path.stat()
+                if st.st_uid != os.geteuid():
+                    raise PermissionError(
+                        f"Manifest security violation: file owner UID {st.st_uid} does not match current UID {os.geteuid()}."
+                    )
+            except OSError:
+                pass
+
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -253,53 +345,109 @@ class PerRunOwnershipManifest(BaseModel):
             raise ValueError(f"Unsupported manifest version: {data.get('version')}")
 
         raw_entities = data.get("registered_entities")
-        if not isinstance(raw_entities, list) or len(raw_entities) == 0:
-            raise ValueError("Manifest must contain a non-empty registered_entities list.")
+        if not isinstance(raw_entities, list):
+            raise ValueError("Manifest registered_entities must be a list.")
 
-        # Validate each entity against strict allowlists and run-id derivation
-        for idx, ent in enumerate(raw_entities):
-            if not isinstance(ent, dict):
-                raise ValueError(f"Entity at index {idx} is not an object.")
+        # Require exact 5-entry inventory
+        if len(raw_entities) != 5:
+            raise ValueError(f"Manifest must contain exactly 5 registered entities, found {len(raw_entities)}.")
 
-            table = ent.get("table")
+        # Pydantic validation (enforces extra="forbid" on root and entities)
+        try:
+            manifest = cls.model_validate(data)
+        except Exception as exc:
+            raise ValueError(f"Manifest validation error: {exc}") from None
+
+        # Check for duplicate entity keys (table, pk_value)
+        seen_keys: set[tuple[str, str]] = set()
+        for ent in manifest.registered_entities:
+            key = (ent.table, ent.pk_value)
+            if key in seen_keys:
+                raise ValueError(f"Duplicate entity registration in manifest: {key}")
+            seen_keys.add(key)
+
+        # Validate exact 5 entities against strict allowlists, dependency ordering, and run_id derivation
+        expected_pk_inventory = {
+            ("processed_articles", f"synth_art_{run_id}_01"): 2,
+            ("processed_articles", f"synth_art_{run_id}_02_rollback"): 2,
+            ("stories", f"synth_story_{run_id}_01"): 1,
+            ("run_locks", f"synth_lock_{run_id}"): 1,
+            ("durable_recovery_state", f"synth_stage_{run_id}::current"): 1,
+        }
+
+        found_inventory: dict[tuple[str, str], int] = {}
+        for ent in manifest.registered_entities:
+            table = ent.table
             if table not in ALLOWED_TABLE_PK_MAP:
                 raise PermissionError(
                     f"Manifest contains unauthorized table '{table}'. Allowed: {sorted(ALLOWED_TABLE_PK_MAP.keys())}"
                 )
 
             expected_pk_col = ALLOWED_TABLE_PK_MAP[table]
-            actual_pk_col = ent.get("pk_column")
-            if actual_pk_col != expected_pk_col:
+            if ent.pk_column != expected_pk_col:
                 raise ValueError(
-                    f"Entity table '{table}' has unexpected pk_column '{actual_pk_col}', expected '{expected_pk_col}'."
+                    f"Entity table '{table}' has unexpected pk_column '{ent.pk_column}', expected '{expected_pk_col}'."
                 )
 
-            pk_value = ent.get("pk_value")
-            if not isinstance(pk_value, str) or not pk_value.strip():
-                raise ValueError(f"Entity table '{table}' missing valid pk_value.")
+            key = (table, ent.pk_value)
+            found_inventory[key] = ent.cleanup_dependency_order
 
-            # Validate synthetic key derivation from run_id
+            # Table-specific validations
             if table == "processed_articles":
-                if not pk_value.startswith(f"synth_art_{run_id}_"):
-                    raise ValueError(f"processed_articles PK '{pk_value}' not derived from run_id '{run_id}'.")
-            elif table == "stories":
-                if not pk_value.startswith(f"synth_story_{run_id}_"):
-                    raise ValueError(f"stories PK '{pk_value}' not derived from run_id '{run_id}'.")
-            elif table == "run_locks":
-                if pk_value != f"synth_lock_{run_id}":
-                    raise ValueError(f"run_locks PK '{pk_value}' does not match expected 'synth_lock_{run_id}'.")
-                if "radar_cron" in pk_value:
+                if not ent.pk_value.startswith(f"synth_art_{run_id}_"):
+                    raise ValueError(f"processed_articles PK '{ent.pk_value}' not derived from run_id '{run_id}'.")
+                if ent.cleanup_dependency_order != 2:
+                    raise ValueError(f"processed_articles must have cleanup_dependency_order=2, got {ent.cleanup_dependency_order}")
+                if "radar_cron" in ent.pk_value:
                     raise PermissionError("Critical safety violation: manifest cannot target 'radar_cron'.")
+                attrs = ent.expected_attributes
+                if attrs.get("source") != "staging_synth_test":
+                    raise ValueError(f"processed_articles entity missing expected source attribute: {attrs}")
+                title = attrs.get("title")
+                if not isinstance(title, str) or not title.startswith(f"SYNTH_ARTICLE_{run_id}"):
+                    raise ValueError(f"processed_articles title '{title}' does not match expected prefix for run {run_id}")
+
+            elif table == "stories":
+                if not ent.pk_value.startswith(f"synth_story_{run_id}_"):
+                    raise ValueError(f"stories PK '{ent.pk_value}' not derived from run_id '{run_id}'.")
+                if ent.cleanup_dependency_order != 1:
+                    raise ValueError(f"stories must have cleanup_dependency_order=1, got {ent.cleanup_dependency_order}")
+                attrs = ent.expected_attributes
+                if attrs.get("category") != "synth_test":
+                    raise ValueError(f"stories entity missing expected category attribute: {attrs}")
+                headline = attrs.get("headline_tr")
+                if not isinstance(headline, str) or headline != f"SYNTH_STORY_{run_id}_01":
+                    raise ValueError(f"stories headline_tr '{headline}' does not match expected for run {run_id}")
+
+            elif table == "run_locks":
+                if "radar_cron" in ent.pk_value:
+                    raise PermissionError("Critical safety violation: manifest cannot target 'radar_cron'.")
+                if ent.pk_value != f"synth_lock_{run_id}":
+                    raise ValueError(f"run_locks PK '{ent.pk_value}' does not match expected 'synth_lock_{run_id}'.")
+                if ent.cleanup_dependency_order != 1:
+                    raise ValueError(f"run_locks must have cleanup_dependency_order=1, got {ent.cleanup_dependency_order}")
+                attrs = ent.expected_attributes
+                workers = attrs.get("worker_ids")
+                if not isinstance(workers, list) or not any(w.startswith(f"runner_alpha_{run_id}") for w in workers):
+                    raise ValueError(f"run_locks entity missing expected worker_ids attribute: {attrs}")
+
             elif table == "durable_recovery_state":
                 expected_state_key = f"synth_stage_{run_id}::current"
-                if pk_value != expected_state_key:
-                    raise ValueError(f"durable_recovery_state PK '{pk_value}' does not match '{expected_state_key}'.")
+                if ent.pk_value != expected_state_key:
+                    raise ValueError(f"durable_recovery_state PK '{ent.pk_value}' does not match '{expected_state_key}'.")
+                if ent.cleanup_dependency_order != 1:
+                    raise ValueError(f"durable_recovery_state must have cleanup_dependency_order=1, got {ent.cleanup_dependency_order}")
+                attrs = ent.expected_attributes
+                if attrs.get("stage") != f"synth_stage_{run_id}" or attrs.get("worker_id") != f"synth_worker_{run_id}":
+                    raise ValueError(f"durable_recovery_state entity attributes do not match expected for run {run_id}")
 
-            expected_attrs = ent.get("expected_attributes")
-            if not isinstance(expected_attrs, dict):
-                raise ValueError(f"Entity table '{table}' expected_attributes must be a dictionary.")
+        if found_inventory != expected_pk_inventory:
+            raise ValueError(
+                f"Manifest entity inventory mismatch: expected {sorted(expected_pk_inventory.keys())}, "
+                f"got {sorted(found_inventory.keys())}"
+            )
 
-        return cls(**data)
+        return manifest
 
     def delete_if_clean(self, path: Path, audit_state: AuditOutcomeState) -> bool:
         """Unlink manifest file if and only if audit state is CLEAN. Retain otherwise."""
@@ -411,6 +559,7 @@ class HermeticStagingTransport(httpx.BaseTransport):
     Translates pipeline requests into SQLite transactions against an isolated temporary fixture.
     Supports failure injections (BEGIN errors, statement errors, COMMIT timeouts, network drops).
     """
+    is_hermetic: bool = True
 
     def __init__(
         self,
@@ -564,6 +713,71 @@ class HermeticStagingTransport(httpx.BaseTransport):
 
 
 # =============================================================================
+# Hermetic Transport Verification & Ambiguous Protocol Helpers
+# =============================================================================
+
+def is_hermetic_transport(transport: Any) -> bool:
+    """Recursively verify that transport is hermetic and incapable of real network IO."""
+    if transport is None:
+        return False
+    # Explicitly reject standard httpx network transports
+    if isinstance(transport, (httpx.HTTPTransport, httpx.AsyncHTTPTransport)):
+        return False
+    # If it's a BudgetTrackingTransport, check its inner transport
+    if isinstance(transport, BudgetTrackingTransport):
+        return is_hermetic_transport(transport.inner)
+    # Check if it is HermeticStagingTransport
+    if isinstance(transport, HermeticStagingTransport):
+        return True
+    # If a mock transport explicitly marks itself hermetic
+    if getattr(transport, "is_hermetic", False) is True:
+        return True
+    return False
+
+
+def reconcile_ambiguous_outcome(
+    client: TursoHTTPClient,
+    run_id: str,
+    *,
+    expected_article_id: Optional[str] = None,
+    expected_story_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Execute multi-record reconciliation queries following ambiguous transaction outcome.
+
+    Queries both processed_articles and stories.
+    Classifies outcome as COMMITTED_ORPHAN, NOT_COMMITTED, or PARTIAL_CORRUPTION_DETECTED.
+    Guarantees zero blind write retries.
+    """
+    art_id = expected_article_id or f"synth_art_{run_id}_01"
+    story_id = expected_story_id or f"synth_story_{run_id}_01"
+
+    r_art = client.execute("SELECT 1 AS f FROM processed_articles WHERE article_id = ?", [art_id])
+    r_story = client.execute("SELECT 1 AS f FROM stories WHERE story_id = ?", [story_id])
+
+    art_present = bool(r_art.fetchall())
+    story_present = bool(r_story.fetchall())
+
+    if art_present and story_present:
+        outcome = "COMMITTED_ORPHAN"
+    elif not art_present and not story_present:
+        outcome = "NOT_COMMITTED"
+    else:
+        raise RuntimeError(
+            f"PARTIAL_CORRUPTION_DETECTED: Atomicity violation during reconciliation. "
+            f"processed_articles={art_present}, stories={story_present}."
+        )
+
+    return {
+        "outcome": outcome,
+        "article_id": art_id,
+        "article_present": art_present,
+        "story_id": story_id,
+        "story_present": story_present,
+        "blind_retries": 0,
+    }
+
+
+# =============================================================================
 # Hermetic Session Runner Engine
 # =============================================================================
 
@@ -582,13 +796,42 @@ class StagingSessionRunner:
         simulate_ownership_mismatch: bool = False,
         simulate_rollback_persisted: bool = False,
         simulate_audit_failure: bool = False,
+        simulate_ambiguous_contradictory: bool = False,
+        simulate_ambiguous_inspection_failure: bool = False,
     ):
+        # 1. Strict destination URL validation
         self.destination_url = validate_staging_destination(destination_url)
+
+        # 2. Strict Hermetic transport boundary enforcement
+        if client is None:
+            raise PermissionError("Client cannot be None.")
+
+        transport = getattr(client, "transport", None)
+        if transport is None or not is_hermetic_transport(transport):
+            raise PermissionError(
+                "Hermetic security boundary violation: client must use an approved HermeticStagingTransport. "
+                "Live network transports and unverified clients are strictly prohibited."
+            )
+
+        # 3. Endpoint alignment verification
+        expected_pipeline_url = f"{self.destination_url}/v2/pipeline"
+        client_pipeline = getattr(client, "pipeline_url", None)
+        if client_pipeline != expected_pipeline_url:
+            raise PermissionError(
+                f"Client endpoint mismatch: client pipeline_url '{client_pipeline}' "
+                f"does not match session destination '{expected_pipeline_url}'."
+            )
+
+        if getattr(client, "read_only", False):
+            raise ValueError("StagingSessionRunner requires a read-write client for test execution.")
+
         self.client = client
         self.manifest_dir = manifest_dir
         self.simulate_ownership_mismatch = simulate_ownership_mismatch
         self.simulate_rollback_persisted = simulate_rollback_persisted
         self.simulate_audit_failure = simulate_audit_failure
+        self.simulate_ambiguous_contradictory = simulate_ambiguous_contradictory
+        self.simulate_ambiguous_inspection_failure = simulate_ambiguous_inspection_failure
 
         self.run_id = f"run_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{uuid_hex(12)}"
         self.manifest: Optional[PerRunOwnershipManifest] = None
@@ -599,6 +842,7 @@ class StagingSessionRunner:
         self.stages: list[StageResult] = []
         self.errors: list[str] = []
         self.warnings: list[str] = []
+        self.halt_before_cleanup = False
         self.audit_state = AuditOutcomeState.UNKNOWN
         self.session_status = SessionStatus.FAILED
 
@@ -633,57 +877,7 @@ class StagingSessionRunner:
 
     def _create_and_persist_manifest(self) -> None:
         """Register the 5 synthetic entities ahead of dispatch and persist to disk."""
-        entities = [
-            {
-                "table": "processed_articles",
-                "pk_column": "article_id",
-                "pk_value": f"synth_art_{self.run_id}_01",
-                "cleanup_dependency_order": 2,
-                "expected_attributes": {
-                    "source": "staging_synth_test",
-                    "title_prefix": f"SYNTH_ARTICLE_{self.run_id}_01",
-                },
-            },
-            {
-                "table": "stories",
-                "pk_column": "story_id",
-                "pk_value": f"synth_story_{self.run_id}_01",
-                "cleanup_dependency_order": 1,
-                "expected_attributes": {
-                    "category": "synth_test",
-                    "headline_prefix": f"SYNTH_STORY_{self.run_id}_01",
-                },
-            },
-            {
-                "table": "processed_articles",
-                "pk_column": "article_id",
-                "pk_value": f"synth_art_{self.run_id}_02_rollback",
-                "cleanup_dependency_order": 2,
-                "expected_attributes": {
-                    "source": "staging_synth_test",
-                    "title_prefix": f"SYNTH_ARTICLE_{self.run_id}_02_ROLLBACK",
-                },
-            },
-            {
-                "table": "run_locks",
-                "pk_column": "lock_key",
-                "pk_value": f"synth_lock_{self.run_id}",
-                "cleanup_dependency_order": 1,
-                "expected_attributes": {
-                    "worker_prefix": f"runner_alpha_{self.run_id}",
-                },
-            },
-            {
-                "table": "durable_recovery_state",
-                "pk_column": "state_key",
-                "pk_value": f"synth_stage_{self.run_id}::current",
-                "cleanup_dependency_order": 1,
-                "expected_attributes": {
-                    "worker_prefix": f"synth_worker_{self.run_id}",
-                },
-            },
-        ]
-
+        entities = create_default_manifest_entities(self.run_id)
         self.manifest = PerRunOwnershipManifest(
             run_id=self.run_id,
             created_at=datetime.now(timezone.utc).isoformat(),
@@ -1079,22 +1273,32 @@ class StagingSessionRunner:
         ))
 
     def _run_live_07(self) -> None:
-        """LIVE-07: Ambiguous Outcome Comprehensive Protocol (2 calls)."""
+        """LIVE-07: Ambiguous Outcome Protocol & Multi-Record Reconciliation (2 calls)."""
         start = time.perf_counter()
         req_start = self.http_requests_total
 
-        art_id = f"synth_art_{self.run_id}_01"
-        story_id = f"synth_story_{self.run_id}_01"
+        if self.simulate_ambiguous_inspection_failure:
+            self.halt_before_cleanup = True
+            self.audit_state = AuditOutcomeState.UNKNOWN
+            raise TursoClientError("Reconciliation query failed: simulated transport error during inspection.")
 
-        # Protocol verification: queries both processed_articles and stories (2 calls)
-        r_art = self._execute("SELECT 1 AS f FROM processed_articles WHERE article_id = ?", [art_id])
-        r_story = self._execute("SELECT 1 AS f FROM stories WHERE story_id = ?", [story_id])
+        if self.simulate_ambiguous_contradictory:
+            # Query an invalid story ID to deterministically simulate contradictory outcome (art=True, story=False)
+            story_lookup = f"synth_story_nonexistent_{self.run_id}"
+        else:
+            story_lookup = f"synth_story_{self.run_id}_01"
 
-        art_present = bool(r_art.fetchall())
-        story_present = bool(r_story.fetchall())
-
-        if not (art_present and story_present):
-            raise RuntimeError("LIVE-07 protocol error: Expected records not found during reconciliation.")
+        try:
+            rec = reconcile_ambiguous_outcome(
+                self.client,
+                self.run_id,
+                expected_story_id=story_lookup,
+            )
+        except RuntimeError as exc:
+            if "PARTIAL_CORRUPTION_DETECTED" in str(exc):
+                self.halt_before_cleanup = True
+                self.audit_state = AuditOutcomeState.UNKNOWN
+            raise
 
         duration = time.perf_counter() - start
         self.stages.append(StageResult(
@@ -1103,10 +1307,15 @@ class StagingSessionRunner:
             success=True,
             http_requests_used=self.http_requests_total - req_start,
             duration_seconds=duration,
+            details=rec,
         ))
 
     def _run_live_08(self) -> None:
         """LIVE-08: Pre-Deletion Ownership Verification, Parameterized Conditional Deletion & Three-State Audit."""
+        # If execution was halted due to critical atomicity corruption or ambiguous failure, do not delete
+        if self.halt_before_cleanup or self.audit_state == AuditOutcomeState.OWNERSHIP_MISMATCH_HALT:
+            return
+
         start = time.perf_counter()
         req_start = self.http_requests_total
         assert self.manifest is not None
@@ -1114,13 +1323,13 @@ class StagingSessionRunner:
         # ---------------------------------------------------------------------
         # Step 8a: Pre-Deletion Ownership Verification (5 calls)
         # ---------------------------------------------------------------------
-        verified_entities: list[dict[str, Any]] = []
+        verified_entities: list[RegisteredEntity] = []
 
         for ent in self.manifest.registered_entities:
-            tbl = ent["table"]
-            pk_col = ent["pk_column"]
-            pk_val = ent["pk_value"]
-            expected = ent["expected_attributes"]
+            tbl = ent.table
+            pk_col = ent.pk_column
+            pk_val = ent.pk_value
+            expected = ent.expected_attributes
 
             res = self._execute(f"SELECT * FROM {tbl} WHERE {pk_col} = ?", [pk_val])
             rows = res.fetchall()
@@ -1136,22 +1345,23 @@ class StagingSessionRunner:
                 self.audit_state = AuditOutcomeState.OWNERSHIP_MISMATCH_HALT
                 raise PermissionError("OWNERSHIP_MISMATCH_HALT: Row attributes do not match expected synthetic markers.")
 
-            # Verify synthetic markers
+            # Verify exact synthetic markers
             if tbl == "processed_articles":
-                if row.get("source") != expected.get("source") or not str(row.get("title", "")).startswith(expected.get("title_prefix", "")):
+                if row.get("source") != expected.get("source") or row.get("title") != expected.get("title"):
                     self.audit_state = AuditOutcomeState.OWNERSHIP_MISMATCH_HALT
                     raise PermissionError(f"OWNERSHIP_MISMATCH_HALT on {tbl}.{pk_val}")
             elif tbl == "stories":
-                if row.get("category") != expected.get("category") or not str(row.get("headline_tr", "")).startswith(expected.get("headline_prefix", "")):
+                if row.get("category") != expected.get("category") or row.get("headline_tr") != expected.get("headline_tr"):
                     self.audit_state = AuditOutcomeState.OWNERSHIP_MISMATCH_HALT
                     raise PermissionError(f"OWNERSHIP_MISMATCH_HALT on {tbl}.{pk_val}")
             elif tbl == "run_locks":
                 wid = str(row.get("worker_id", ""))
-                if not (wid.startswith(f"runner_alpha_{self.run_id}") or wid.startswith(f"runner_beta_{self.run_id}")):
+                allowed_workers = set(expected.get("worker_ids", [f"runner_alpha_{self.run_id}", f"runner_beta_{self.run_id}"]))
+                if wid not in allowed_workers:
                     self.audit_state = AuditOutcomeState.OWNERSHIP_MISMATCH_HALT
                     raise PermissionError(f"OWNERSHIP_MISMATCH_HALT on {tbl}.{pk_val}")
             elif tbl == "durable_recovery_state":
-                if not str(row.get("worker_id", "")).startswith(f"synth_worker_{self.run_id}"):
+                if row.get("stage") != expected.get("stage") or row.get("worker_id") != expected.get("worker_id"):
                     self.audit_state = AuditOutcomeState.OWNERSHIP_MISMATCH_HALT
                     raise PermissionError(f"OWNERSHIP_MISMATCH_HALT on {tbl}.{pk_val}")
 
@@ -1161,20 +1371,20 @@ class StagingSessionRunner:
         # Step 8b: Parameterized Conditional Deletion (PK + Attributes) (4-5 calls)
         # ---------------------------------------------------------------------
         # Sort in cleanup dependency order (higher order first)
-        verified_entities.sort(key=lambda e: e.get("cleanup_dependency_order", 1), reverse=True)
+        verified_entities.sort(key=lambda e: e.cleanup_dependency_order, reverse=True)
 
         for ent in verified_entities:
-            tbl = ent["table"]
-            pk_col = ent["pk_column"]
-            pk_val = ent["pk_value"]
-            expected = ent["expected_attributes"]
+            tbl = ent.table
+            pk_col = ent.pk_column
+            pk_val = ent.pk_value
+            expected = ent.expected_attributes
 
             if tbl == "processed_articles":
-                del_sql = "DELETE FROM processed_articles WHERE article_id = ? AND source = ? AND title LIKE ?"
-                del_params = [pk_val, expected["source"], f"{expected['title_prefix']}%"]
+                del_sql = "DELETE FROM processed_articles WHERE article_id = ? AND source = ? AND title = ?"
+                del_params = [pk_val, expected["source"], expected["title"]]
             elif tbl == "stories":
-                del_sql = "DELETE FROM stories WHERE story_id = ? AND category = ? AND headline_tr LIKE ?"
-                del_params = [pk_val, expected["category"], f"{expected['headline_prefix']}%"]
+                del_sql = "DELETE FROM stories WHERE story_id = ? AND category = ? AND headline_tr = ?"
+                del_params = [pk_val, expected["category"], expected["headline_tr"]]
             elif tbl == "run_locks":
                 del_sql = "DELETE FROM run_locks WHERE lock_key = ? AND (worker_id = ? OR worker_id = ?)"
                 del_params = [pk_val, f"runner_alpha_{self.run_id}", f"runner_beta_{self.run_id}"]
@@ -1201,9 +1411,9 @@ class StagingSessionRunner:
 
         any_residual = False
         for ent in self.manifest.registered_entities:
-            tbl = ent["table"]
-            pk_col = ent["pk_column"]
-            pk_val = ent["pk_value"]
+            tbl = ent.table
+            pk_col = ent.pk_column
+            pk_val = ent.pk_value
             audit_res = self._execute(f"SELECT COUNT(*) AS cnt FROM {tbl} WHERE {pk_col} = ?", [pk_val])
             rows = audit_res.fetchall()
             count = int(rows[0].get("cnt", 0)) if rows else 0
@@ -1243,8 +1453,8 @@ class ManifestRecoveryReport(BaseModel):
 def recover_manifest_offline(manifest_path: Path) -> ManifestRecoveryReport:
     """Offline validation and simulated cleanup audit for a persisted manifest file.
 
-    Strictly validates schema, allowlisted tables, and synthetic key derivation.
-    Demonstrates offline cleanup simulation and manifest preservation on failure.
+    Strictly validates schema, allowlisted tables, synthetic key derivation, and ownership attributes.
+    Demonstrates offline schema validation without modifying or deleting the manifest.
     Does NOT connect to cloud or perform unauthorized deletion.
     """
     manifest = PerRunOwnershipManifest.load_and_validate(manifest_path)
@@ -1255,20 +1465,21 @@ def recover_manifest_offline(manifest_path: Path) -> ManifestRecoveryReport:
         conn.execute(stmt)
     conn.commit()
 
-    # Simulate checking records
+    # Simulate checking records against isolated fixture
     any_residual = False
     for ent in manifest.registered_entities:
-        tbl = ent["table"]
-        pk_col = ent["pk_column"]
-        pk_val = ent["pk_value"]
+        tbl = ent.table
+        pk_col = ent.pk_column
+        pk_val = ent.pk_value
         cur = conn.cursor()
         cur.execute(f"SELECT COUNT(*) FROM {tbl} WHERE {pk_col} = ?", [pk_val])
         row = cur.fetchone()
         if row and row[0] > 0:
             any_residual = True
 
-    audit_state = AuditOutcomeState.RESIDUAL if any_residual else AuditOutcomeState.CLEAN
-    manifest_unlinked = manifest.delete_if_clean(manifest_path, audit_state)
+    # Offline recovery NEVER destroys or unlinks the manifest file!
+    # Verified remote clean state can only be confirmed by an independently authorized live run.
+    audit_state = AuditOutcomeState.OFFLINE_VALIDATION_PASSED
 
     return ManifestRecoveryReport(
         manifest_path=str(manifest_path),
@@ -1276,8 +1487,11 @@ def recover_manifest_offline(manifest_path: Path) -> ManifestRecoveryReport:
         valid_schema=True,
         entities_count=len(manifest.registered_entities),
         audit_state=audit_state,
-        manifest_preserved=not manifest_unlinked,
-        summary_message=f"Offline manifest validation succeeded for run {manifest.run_id} ({audit_state.value}).",
+        manifest_preserved=True,
+        summary_message=(
+            f"Offline manifest validation succeeded for run {manifest.run_id} ({audit_state.value}). "
+            f"Remote staging cleanup requires live verification; manifest preserved on disk."
+        ),
     )
 
 
@@ -1337,7 +1551,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             m_path = Path(args.recover_manifest)
             rep = recover_manifest_offline(m_path)
             sys.stdout.write(f"{rep.summary_message}\n")
-            return 0 if rep.audit_state == AuditOutcomeState.CLEAN else 1
+            return 0 if rep.audit_state in (AuditOutcomeState.CLEAN, AuditOutcomeState.OFFLINE_VALIDATION_PASSED) else 1
         except Exception as exc:
             sys.stderr.write(f"Manifest recovery validation failed: {type(exc).__name__}: {exc}\n")
             return 1
