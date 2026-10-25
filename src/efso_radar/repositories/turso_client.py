@@ -23,6 +23,11 @@ class TursoClientError(Exception):
     pass
 
 
+class TursoAmbiguousTransactionError(TursoClientError):
+    """Raised when a Turso multi-statement transaction commit outcome is ambiguous (UNKNOWN)."""
+    pass
+
+
 def _format_http_status_error(status_code: int) -> str:
     """Format safe HTTP status error without untrusted response body content."""
     categories = {
@@ -554,7 +559,7 @@ class TursoHTTPClient:
             )
         except httpx.HTTPError as exc:
             err_type = type(exc).__name__
-            raise TursoClientError(
+            raise TursoAmbiguousTransactionError(
                 f"Ambiguous transaction outcome (UNKNOWN): network error during Turso COMMIT ({err_type}). "
                 "The transaction may or may not have committed."
             ) from None
@@ -565,7 +570,7 @@ class TursoHTTPClient:
                     f"Ambiguous transaction outcome (UNKNOWN): Turso COMMIT returned HTTP status {commit_resp.status_code}. "
                     "The transaction may or may not have committed."
                 )
-            raise TursoClientError(
+            raise TursoAmbiguousTransactionError(
                 f"Ambiguous transaction outcome (UNKNOWN): Turso COMMIT returned unexpected HTTP status {commit_resp.status_code}. "
                 "The transaction may or may not have committed."
             )
@@ -574,27 +579,27 @@ class TursoHTTPClient:
             commit_data = commit_resp.json()
         except Exception as exc:
             err_type = type(exc).__name__
-            raise TursoClientError(
+            raise TursoAmbiguousTransactionError(
                 f"Ambiguous transaction outcome (UNKNOWN): malformed JSON in Turso COMMIT response ({err_type}). "
                 "The transaction may or may not have committed."
             ) from None
 
         if not isinstance(commit_data, dict):
-            raise TursoClientError(
+            raise TursoAmbiguousTransactionError(
                 "Ambiguous transaction outcome (UNKNOWN): Turso COMMIT response is not an object. "
                 "The transaction may or may not have committed."
             )
 
         commit_results = commit_data.get("results")
         if not isinstance(commit_results, list) or len(commit_results) == 0:
-            raise TursoClientError(
+            raise TursoAmbiguousTransactionError(
                 "Ambiguous transaction outcome (UNKNOWN): missing or truncated result list in Turso COMMIT response. "
                 "The transaction may or may not have committed."
             )
 
         commit_first = commit_results[0]
         if not isinstance(commit_first, dict):
-            raise TursoClientError(
+            raise TursoAmbiguousTransactionError(
                 "Ambiguous transaction outcome (UNKNOWN): invalid result format in Turso COMMIT response. "
                 "The transaction may or may not have committed."
             )
@@ -605,7 +610,7 @@ class TursoHTTPClient:
             valid_code, category = _sanitize_hrana_error(err.get("code") if isinstance(err, dict) else None)
             raise TursoClientError(f"Turso COMMIT failed ({valid_code}): {category}")
         elif commit_type != "ok":
-            raise TursoClientError(
+            raise TursoAmbiguousTransactionError(
                 "Ambiguous transaction outcome (UNKNOWN): unexpected result type in Turso COMMIT response. "
                 "The transaction may or may not have committed."
             )
@@ -617,7 +622,7 @@ class TursoHTTPClient:
             or commit_resp_data.get("type") != "execute"
             or not isinstance(commit_resp_data.get("result"), dict)
         ):
-            raise TursoClientError(
+            raise TursoAmbiguousTransactionError(
                 "Ambiguous transaction outcome (UNKNOWN): missing or malformed execution result in Turso COMMIT response. "
                 "The transaction may or may not have committed."
             )
