@@ -484,12 +484,12 @@ class TursoHTTPClient:
                     )
                 except Exception:
                     pass
-            raise TursoClientError(f"Turso transaction response malformed: unexpected BEGIN response type '{begin_res.get('type')}'.")
+            raise TursoClientError("Turso transaction response malformed: unexpected BEGIN response type.")
 
         # Validate and check for errors in user statements (index 1 onwards)
         has_error = False
         error_code = None
-        unexpected_type = None
+        has_unexpected_type = False
         malformed_structure = False
 
         for idx, res in enumerate(raw_results[1:]):
@@ -505,7 +505,7 @@ class TursoHTTPClient:
                 break
             elif res_type != "ok":
                 has_error = True
-                unexpected_type = res_type
+                has_unexpected_type = True
                 break
             response_data = res.get("response")
             if not isinstance(response_data, dict) or not isinstance(response_data.get("result"), dict):
@@ -528,7 +528,7 @@ class TursoHTTPClient:
                 raise TursoClientError(f"Turso transaction aborted due to statement error ({valid_code}): {category}")
             if malformed_structure:
                 raise TursoClientError("Turso transaction response malformed: statement result item is missing or invalid.")
-            raise TursoClientError(f"Turso transaction aborted due to unexpected statement response type '{unexpected_type}'.")
+            raise TursoClientError("Turso transaction aborted due to unexpected statement response type.")
 
         # All results so far are "ok", check if result list is truncated
         if len(raw_results) < len(requests_payload):
@@ -606,7 +606,19 @@ class TursoHTTPClient:
             raise TursoClientError(f"Turso COMMIT failed ({valid_code}): {category}")
         elif commit_type != "ok":
             raise TursoClientError(
-                f"Ambiguous transaction outcome (UNKNOWN): unexpected result type '{commit_type}' in Turso COMMIT response. "
+                "Ambiguous transaction outcome (UNKNOWN): unexpected result type in Turso COMMIT response. "
+                "The transaction may or may not have committed."
+            )
+
+        # Validate complete expected successful COMMIT response structure
+        commit_resp_data = commit_first.get("response")
+        if (
+            not isinstance(commit_resp_data, dict)
+            or commit_resp_data.get("type") != "execute"
+            or not isinstance(commit_resp_data.get("result"), dict)
+        ):
+            raise TursoClientError(
+                "Ambiguous transaction outcome (UNKNOWN): missing or malformed execution result in Turso COMMIT response. "
                 "The transaction may or may not have committed."
             )
 
