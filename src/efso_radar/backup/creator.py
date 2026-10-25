@@ -173,59 +173,57 @@ def create_consistent_sqlite_snapshot(source_db_path: Path) -> tuple[bytes, int,
     except Exception as exc:
         raise BackupCreationError(f"Failed to open source database for backup: {exc}") from exc
 
-    with tempfile.TemporaryDirectory(prefix="efso_snap_") as tmp_dir:
-        snap_path = Path(tmp_dir) / "snapshot.db"
-        try:
-            target_conn = sqlite3.connect(snap_path)
-            # Atomic online backup across all pages
-            source_conn.backup(target_conn)
-            source_conn.close()
+    with contextlib.closing(source_conn):
+        with tempfile.TemporaryDirectory(prefix="efso_snap_") as tmp_dir:
+            snap_path = Path(tmp_dir) / "snapshot.db"
+            try:
+                with contextlib.closing(sqlite3.connect(snap_path)) as target_conn:
+                    # Atomic online backup across all pages
+                    source_conn.backup(target_conn)
 
-            # Verify integrity of the snapshot
-            cursor = target_conn.cursor()
-            cursor.execute("PRAGMA integrity_check;")
-            check_row = cursor.fetchone()
-            if not check_row or check_row[0] != "ok":
-                raise BackupCreationError(f"Snapshot failed SQLite integrity check: {check_row}")
+                    # Verify integrity of the snapshot
+                    cursor = target_conn.cursor()
+                    cursor.execute("PRAGMA integrity_check;")
+                    check_row = cursor.fetchone()
+                    if not check_row or check_row[0] != "ok":
+                        raise BackupCreationError(f"Snapshot failed SQLite integrity check: {check_row}")
 
-            # Check essential tables exist
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-            tables = {row[0] for row in cursor.fetchall()}
-            missing_tables = [t for t in ESSENTIAL_TABLES if t not in tables]
-            if missing_tables:
-                raise BackupCreationError(f"Database snapshot is missing essential tables: {missing_tables}")
+                    # Check essential tables exist
+                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+                    tables = {row[0] for row in cursor.fetchall()}
+                    missing_tables = [t for t in ESSENTIAL_TABLES if t not in tables]
+                    if missing_tables:
+                        raise BackupCreationError(f"Database snapshot is missing essential tables: {missing_tables}")
 
-            # Read true schema version from schema_migrations
-            cursor.execute("SELECT MAX(version) FROM schema_migrations;")
-            ver_row = cursor.fetchone()
-            if not ver_row or ver_row[0] is None:
-                raise BackupCreationError("schema_migrations table has no recorded migrations")
-            actual_schema_version = int(ver_row[0])
+                    # Read true schema version from schema_migrations
+                    cursor.execute("SELECT MAX(version) FROM schema_migrations;")
+                    ver_row = cursor.fetchone()
+                    if not ver_row or ver_row[0] is None:
+                        raise BackupCreationError("schema_migrations table has no recorded migrations")
+                    actual_schema_version = int(ver_row[0])
 
-            # Strip active run locks so restored instances do not inherit deadlocks
-            if "run_locks" in tables:
-                cursor.execute("DELETE FROM run_locks;")
-                target_conn.commit()
+                    # Strip active run locks so restored instances do not inherit deadlocks
+                    if "run_locks" in tables:
+                        cursor.execute("DELETE FROM run_locks;")
+                        target_conn.commit()
 
-            # Switch journal mode in the snapshot to DELETE so it has zero WAL dependency
-            target_conn.execute("PRAGMA journal_mode = DELETE;")
-            target_conn.commit()
+                    # Switch journal mode in the snapshot to DELETE so it has zero WAL dependency
+                    target_conn.execute("PRAGMA journal_mode = DELETE;")
+                    target_conn.commit()
 
-            # Collect row counts from snapshot
-            row_counts: dict[str, int] = {}
-            for table in tables:
-                if not table.startswith("sqlite_"):
-                    cursor.execute(f"SELECT COUNT(*) FROM {table};")
-                    row_counts[table] = int(cursor.fetchone()[0])
+                    # Collect row counts from snapshot
+                    row_counts: dict[str, int] = {}
+                    for table in tables:
+                        if not table.startswith("sqlite_"):
+                            cursor.execute(f"SELECT COUNT(*) FROM {table};")
+                            row_counts[table] = int(cursor.fetchone()[0])
 
-            target_conn.close()
-
-            raw_db_bytes = snap_path.read_bytes()
-            return raw_db_bytes, actual_schema_version, row_counts
-        except BackupCreationError:
-            raise
-        except Exception as exc:
-            raise BackupCreationError(f"Unexpected error during SQLite snapshotting: {exc}") from exc
+                raw_db_bytes = snap_path.read_bytes()
+                return raw_db_bytes, actual_schema_version, row_counts
+            except BackupCreationError:
+                raise
+            except Exception as exc:
+                raise BackupCreationError(f"Unexpected error during SQLite snapshotting: {exc}") from exc
 
 
 def validate_delivery_ledger_structure(data: dict[str, Any], ledger_name: str) -> None:

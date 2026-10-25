@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Optional
 from pydantic import BaseModel, Field
@@ -173,15 +174,12 @@ def execute_read_query(repo: StateRepository, sql: str, params: Optional[list[An
             )
 
         uri_path = f"file:{resolved.as_posix()}?mode=ro"
-        conn = sqlite3.connect(uri_path, uri=True, timeout=15.0)
-        try:
+        with closing(sqlite3.connect(uri_path, uri=True, timeout=15.0)) as conn:
             conn.execute("PRAGMA query_only = ON;")
             cursor = conn.cursor()
             cursor.execute(sql, params or [])
             cols = [d[0] for d in cursor.description] if cursor.description else []
             return [dict(zip(cols, row)) for row in cursor.fetchall()]
-        finally:
-            conn.close()
 
     elif isinstance(repo, TursoStateRepository):
         res = repo.client.execute(sql, params or [])

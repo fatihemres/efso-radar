@@ -444,18 +444,28 @@ class TursoHTTPClient:
         if resp.status_code != 200:
             raise TursoClientError(_format_http_status_error(resp.status_code))
 
-        data = resp.json()
+        try:
+            data = resp.json()
+        except Exception as exc:
+            err_type = type(exc).__name__
+            raise TursoClientError(f"Turso transaction response malformed: invalid JSON payload ({err_type}).") from None
+
+        if not isinstance(data, dict):
+            raise TursoClientError("Turso transaction response malformed: response root is not an object.")
+
         baton = data.get("baton")
-        raw_results = data.get("results", [])
+        raw_results = data.get("results")
 
-        if not raw_results:
-            raise TursoClientError("Turso transaction response malformed: empty results received.")
+        if not isinstance(raw_results, list) or len(raw_results) == 0:
+            raise TursoClientError("Turso transaction response malformed: missing result list.")
 
-        # Check for error on BEGIN (index 0)
+        # Validate BEGIN (index 0)
         begin_res = raw_results[0]
+        if not isinstance(begin_res, dict):
+            raise TursoClientError("Turso transaction response malformed: invalid BEGIN result format.")
         if begin_res.get("type") == "error":
             err = begin_res.get("error", {})
-            valid_code, category = _sanitize_hrana_error(err.get("code"))
+            valid_code, category = _sanitize_hrana_error(err.get("code") if isinstance(err, dict) else None)
             if baton:
                 try:
                     client.post(
@@ -465,15 +475,42 @@ class TursoHTTPClient:
                 except Exception:
                     pass
             raise TursoClientError(f"Turso transaction BEGIN failed ({valid_code}): {category}")
+        elif begin_res.get("type") != "ok":
+            if baton:
+                try:
+                    client.post(
+                        self.pipeline_url,
+                        json={"baton": baton, "requests": [{"type": "close"}]},
+                    )
+                except Exception:
+                    pass
+            raise TursoClientError(f"Turso transaction response malformed: unexpected BEGIN response type '{begin_res.get('type')}'.")
 
-        # Check for errors in user statements (index 1 onwards)
+        # Validate and check for errors in user statements (index 1 onwards)
         has_error = False
         error_code = None
+        unexpected_type = None
+        malformed_structure = False
+
         for idx, res in enumerate(raw_results[1:]):
-            if res.get("type") == "error":
+            if not isinstance(res, dict):
+                has_error = True
+                malformed_structure = True
+                break
+            res_type = res.get("type")
+            if res_type == "error":
                 has_error = True
                 err = res.get("error", {})
-                error_code = err.get("code")
+                error_code = err.get("code") if isinstance(err, dict) else None
+                break
+            elif res_type != "ok":
+                has_error = True
+                unexpected_type = res_type
+                break
+            response_data = res.get("response")
+            if not isinstance(response_data, dict) or not isinstance(response_data.get("result"), dict):
+                has_error = True
+                malformed_structure = True
                 break
 
         if has_error:
@@ -486,8 +523,24 @@ class TursoHTTPClient:
                 except Exception as rollback_exc:
                     err_type = type(rollback_exc).__name__
                     logger.warning("Turso transaction rollback failed (%s).", err_type)
-            valid_code, category = _sanitize_hrana_error(error_code)
-            raise TursoClientError(f"Turso transaction aborted due to statement error ({valid_code}): {category}")
+            if error_code is not None:
+                valid_code, category = _sanitize_hrana_error(error_code)
+                raise TursoClientError(f"Turso transaction aborted due to statement error ({valid_code}): {category}")
+            if malformed_structure:
+                raise TursoClientError("Turso transaction response malformed: statement result item is missing or invalid.")
+            raise TursoClientError(f"Turso transaction aborted due to unexpected statement response type '{unexpected_type}'.")
+
+        # All results so far are "ok", check if result list is truncated
+        if len(raw_results) < len(requests_payload):
+            if baton:
+                try:
+                    client.post(
+                        self.pipeline_url,
+                        json={"baton": baton, "requests": [{"type": "execute", "stmt": {"sql": "ROLLBACK"}}, {"type": "close"}]},
+                    )
+                except Exception:
+                    pass
+            raise TursoClientError("Turso transaction response malformed: truncated result list.")
 
         # Enforce that session baton exists for multi-statement transaction
         if not baton:
@@ -502,27 +555,60 @@ class TursoHTTPClient:
         except httpx.HTTPError as exc:
             err_type = type(exc).__name__
             raise TursoClientError(
-                f"Ambiguous transaction outcome: network error during Turso COMMIT ({err_type}). "
+                f"Ambiguous transaction outcome (UNKNOWN): network error during Turso COMMIT ({err_type}). "
                 "The transaction may or may not have committed."
             ) from None
 
         if commit_resp.status_code != 200:
             if commit_resp.status_code in (500, 502, 503, 504):
                 raise TursoClientError(
-                    f"Ambiguous transaction outcome: Turso COMMIT returned HTTP status {commit_resp.status_code}. "
+                    f"Ambiguous transaction outcome (UNKNOWN): Turso COMMIT returned HTTP status {commit_resp.status_code}. "
                     "The transaction may or may not have committed."
                 )
-            raise TursoClientError(_format_http_status_error(commit_resp.status_code))
+            raise TursoClientError(
+                f"Ambiguous transaction outcome (UNKNOWN): Turso COMMIT returned unexpected HTTP status {commit_resp.status_code}. "
+                "The transaction may or may not have committed."
+            )
 
-        commit_data = commit_resp.json()
-        commit_results = commit_data.get("results", [])
-        if not commit_results:
-            raise TursoClientError("Turso COMMIT response malformed: missing execution result.")
+        try:
+            commit_data = commit_resp.json()
+        except Exception as exc:
+            err_type = type(exc).__name__
+            raise TursoClientError(
+                f"Ambiguous transaction outcome (UNKNOWN): malformed JSON in Turso COMMIT response ({err_type}). "
+                "The transaction may or may not have committed."
+            ) from None
 
-        if commit_results[0].get("type") == "error":
-            err = commit_results[0].get("error", {})
-            valid_code, category = _sanitize_hrana_error(err.get("code"))
+        if not isinstance(commit_data, dict):
+            raise TursoClientError(
+                "Ambiguous transaction outcome (UNKNOWN): Turso COMMIT response is not an object. "
+                "The transaction may or may not have committed."
+            )
+
+        commit_results = commit_data.get("results")
+        if not isinstance(commit_results, list) or len(commit_results) == 0:
+            raise TursoClientError(
+                "Ambiguous transaction outcome (UNKNOWN): missing or truncated result list in Turso COMMIT response. "
+                "The transaction may or may not have committed."
+            )
+
+        commit_first = commit_results[0]
+        if not isinstance(commit_first, dict):
+            raise TursoClientError(
+                "Ambiguous transaction outcome (UNKNOWN): invalid result format in Turso COMMIT response. "
+                "The transaction may or may not have committed."
+            )
+
+        commit_type = commit_first.get("type")
+        if commit_type == "error":
+            err = commit_first.get("error", {})
+            valid_code, category = _sanitize_hrana_error(err.get("code") if isinstance(err, dict) else None)
             raise TursoClientError(f"Turso COMMIT failed ({valid_code}): {category}")
+        elif commit_type != "ok":
+            raise TursoClientError(
+                f"Ambiguous transaction outcome (UNKNOWN): unexpected result type '{commit_type}' in Turso COMMIT response. "
+                "The transaction may or may not have committed."
+            )
 
         # Parse results for user statements (skipping BEGIN at index 0)
         parsed_results: list[TursoQueryResult] = []

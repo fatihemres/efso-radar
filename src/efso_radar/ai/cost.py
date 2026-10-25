@@ -42,6 +42,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NamedTuple, Optional, Sequence
@@ -368,11 +369,10 @@ class ExperimentBudgetGuard:
         if not db_path.exists():
             return 0, 0, 0.0
         try:
-            conn = sqlite3.connect(db_path)
-            c = conn.cursor()
-            c.execute("SELECT input_tokens, output_tokens, estimated_cost_usd FROM ai_usage_ledger")
-            rows = c.fetchall()
-            conn.close()
+            with closing(sqlite3.connect(db_path)) as conn:
+                c = conn.cursor()
+                c.execute("SELECT input_tokens, output_tokens, estimated_cost_usd FROM ai_usage_ledger")
+                rows = c.fetchall()
             in_tok = sum(r[0] for r in rows)
             out_tok = sum(r[1] for r in rows)
             cost = sum(r[2] for r in rows)

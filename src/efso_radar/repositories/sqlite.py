@@ -9,7 +9,7 @@ import json
 import logging
 import sqlite3
 import tempfile
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Generator, Optional
@@ -124,20 +124,23 @@ class SqliteStateRepository(StateRepository):
         return cls(resolved, _internal_fixture_token=_FIXTURE_OWNERSHIP_TOKEN)
 
     def close(self) -> None:
-        """Cleanly close and checkpoint repository resources before disposal.
+        """Close repository-owned resources.
 
-        On Windows, truncating the WAL journal and closing any open handles prevents
-        WinError 32 PermissionError when deleting temporary fixture directories.
+        CRITICAL BOUNDARY CONTRACT:
+        - This method manages internal repository resources only. It cannot and does NOT close
+          independently opened sqlite3.Connection objects created outside this repository.
+        - Callers, diagnostic tools, and test fixtures holding independent connections to this
+          database MUST explicitly close them (e.g. via contextlib.closing) before attempting
+          storage disposal.
+        - Avoids unnecessary WAL checkpointing on operational databases: WAL truncation is
+          performed only on explicitly owned synthetic fixtures in temporary storage.
         """
-        if self.db_path.exists():
+        if getattr(self, "_is_owned_synthetic_fixture", False) and self.db_path.exists():
             try:
-                conn = sqlite3.connect(self.db_path, timeout=5.0)
-                try:
+                with closing(sqlite3.connect(self.db_path, timeout=5.0)) as conn:
                     conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-                finally:
-                    conn.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Synthetic fixture WAL checkpoint on close: %s", exc)
 
     def __enter__(self) -> SqliteStateRepository:
         return self
@@ -147,16 +150,14 @@ class SqliteStateRepository(StateRepository):
 
     @contextmanager
     def _connection(self) -> Generator[sqlite3.Connection, None, None]:
-        conn = sqlite3.connect(self.db_path, timeout=15.0)
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        with closing(sqlite3.connect(self.db_path, timeout=15.0)) as conn:
+            conn.row_factory = sqlite3.Row
+            try:
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
     def _init_db(self) -> None:
         """Create tables, indexes, and run migrations."""

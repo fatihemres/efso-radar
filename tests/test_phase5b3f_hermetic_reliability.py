@@ -17,7 +17,11 @@ import json
 import logging
 import sqlite3
 import tempfile
+from contextlib import closing
+import platform
+import threading
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -85,6 +89,11 @@ class StatefulMockHranaTransport(httpx.BaseTransport):
         status_on_commit: Optional[int] = None,
         omit_baton_on_begin: bool = False,
         fail_on_rollback_exc: Optional[Exception] = None,
+        raw_content_on_pipeline: Optional[bytes] = None,
+        override_pipeline_results: Optional[list[Any]] = None,
+        raw_content_on_commit: Optional[bytes] = None,
+        override_commit_results: Optional[list[Any]] = None,
+        truncate_pipeline_results_count: Optional[int] = None,
     ):
         self.conn = conn
         self.fail_on_begin = fail_on_begin
@@ -97,6 +106,11 @@ class StatefulMockHranaTransport(httpx.BaseTransport):
         self.status_on_commit = status_on_commit
         self.omit_baton_on_begin = omit_baton_on_begin
         self.fail_on_rollback_exc = fail_on_rollback_exc
+        self.raw_content_on_pipeline = raw_content_on_pipeline
+        self.override_pipeline_results = override_pipeline_results
+        self.raw_content_on_commit = raw_content_on_commit
+        self.override_commit_results = override_commit_results
+        self.truncate_pipeline_results_count = truncate_pipeline_results_count
 
         self.session_counter = 0
         self.active_batons: set[str] = set()
@@ -133,6 +147,21 @@ class StatefulMockHranaTransport(httpx.BaseTransport):
                 raise httpx.ConnectError("Simulated network connection reset during COMMIT")
             if self.status_on_commit is not None:
                 return httpx.Response(self.status_on_commit, json={"message": "Gateway error"}, request=request)
+            if self.raw_content_on_commit is not None:
+                return httpx.Response(200, content=self.raw_content_on_commit, request=request)
+            if self.override_commit_results is not None:
+                return httpx.Response(200, json={"baton": in_baton, "results": self.override_commit_results}, request=request)
+
+        # Initial pipeline overrides
+        has_rollback = any(
+            req.get("type") == "execute" and req.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK"
+            for req in requests_list
+        )
+        if not has_commit and not has_rollback:
+            if self.raw_content_on_pipeline is not None:
+                return httpx.Response(200, content=self.raw_content_on_pipeline, request=request)
+            if self.override_pipeline_results is not None:
+                return httpx.Response(200, json={"baton": "mock-baton-pipeline", "results": self.override_pipeline_results}, request=request)
 
         # Check for simulated failure on ROLLBACK
         has_rollback = any(
@@ -268,6 +297,9 @@ class StatefulMockHranaTransport(httpx.BaseTransport):
                     self.active_batons.remove(in_baton)
                 out_baton = None
                 results.append({"type": "ok", "response": {"type": "close"}})
+
+        if not has_commit and self.truncate_pipeline_results_count is not None:
+            results = results[:self.truncate_pipeline_results_count]
 
         return httpx.Response(
             200,
@@ -508,6 +540,142 @@ class TestHranaTransactionReliability(unittest.TestCase):
         for msg in log_ctx.output:
             self.assertNotIn(secret_rollback_token, msg)
             self.assertIn("ConnectError", msg)
+    def test_08a_hrana_malformed_json_on_pipeline_aborts_transaction(self):
+        """Hermetic Hrana: malformed non-JSON payload on pipeline response aborts transaction."""
+        transport = StatefulMockHranaTransport(
+            self.backend_conn,
+            raw_content_on_pipeline=b"<html>Bad Gateway</html>",
+        )
+        client = TursoHTTPClient("libsql://staging-cloud.turso.io", "mock-token", transport=transport)
+        statements = [
+            ("INSERT INTO processed_articles (article_id, canonical_url, title, source, published_at, processed_at) VALUES (?, ?, ?, ?, ?, ?)",
+             ["art-m1", "https://news.test/m1", "M1", "Src1", "2026-10-25T10:00:00Z", "2026-10-25T10:00:00Z"]),
+        ]
+        with self.assertRaises(TursoClientError) as ctx:
+            client.execute_transaction(statements)
+        self.assertIn("Turso transaction response malformed", str(ctx.exception))
+        self.assertIn("invalid JSON payload", str(ctx.exception))
+
+    def test_08b_hrana_missing_or_empty_pipeline_results_aborts_transaction(self):
+        """Hermetic Hrana: empty results array on pipeline response aborts transaction."""
+        transport = StatefulMockHranaTransport(
+            self.backend_conn,
+            override_pipeline_results=[],
+        )
+        client = TursoHTTPClient("libsql://staging-cloud.turso.io", "mock-token", transport=transport)
+        statements = [
+            ("INSERT INTO processed_articles (article_id, canonical_url, title, source, published_at, processed_at) VALUES (?, ?, ?, ?, ?, ?)",
+             ["art-m2", "https://news.test/m2", "M2", "Src1", "2026-10-25T10:00:00Z", "2026-10-25T10:00:00Z"]),
+        ]
+        with self.assertRaises(TursoClientError) as ctx:
+            client.execute_transaction(statements)
+        self.assertIn("Turso transaction response malformed", str(ctx.exception))
+        self.assertIn("missing result list", str(ctx.exception))
+
+    def test_08c_hrana_unexpected_begin_response_type_aborts_transaction(self):
+        """Hermetic Hrana: unexpected response type for BEGIN aborts transaction without commit."""
+        transport = StatefulMockHranaTransport(
+            self.backend_conn,
+            override_pipeline_results=[{"type": "unexpected_stream_frame"}],
+        )
+        client = TursoHTTPClient("libsql://staging-cloud.turso.io", "mock-token", transport=transport)
+        statements = [
+            ("INSERT INTO processed_articles (article_id, canonical_url, title, source, published_at, processed_at) VALUES (?, ?, ?, ?, ?, ?)",
+             ["art-m3", "https://news.test/m3", "M3", "Src1", "2026-10-25T10:00:00Z", "2026-10-25T10:00:00Z"]),
+        ]
+        with self.assertRaises(TursoClientError) as ctx:
+            client.execute_transaction(statements)
+        self.assertIn("Turso transaction response malformed", str(ctx.exception))
+        self.assertIn("unexpected BEGIN response type", str(ctx.exception))
+
+    def test_08d_hrana_unexpected_statement_response_type_aborts_and_rolls_back(self):
+        """Hermetic Hrana: unexpected response type for user statement rolls back and aborts."""
+        transport = StatefulMockHranaTransport(
+            self.backend_conn,
+            override_pipeline_results=[
+                {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                {"type": "strange_event_type"},
+            ],
+        )
+        client = TursoHTTPClient("libsql://staging-cloud.turso.io", "mock-token", transport=transport)
+        statements = [
+            ("INSERT INTO processed_articles (article_id, canonical_url, title, source, published_at, processed_at) VALUES (?, ?, ?, ?, ?, ?)",
+             ["art-m4", "https://news.test/m4", "M4", "Src1", "2026-10-25T10:00:00Z", "2026-10-25T10:00:00Z"]),
+        ]
+        with self.assertRaises(TursoClientError) as ctx:
+            client.execute_transaction(statements)
+        self.assertIn("Turso transaction aborted due to unexpected statement response type", str(ctx.exception))
+
+    def test_08e_hrana_truncated_pipeline_results_aborts_and_rolls_back(self):
+        """Hermetic Hrana: truncated pipeline result list triggers rollback and aborts."""
+        transport = StatefulMockHranaTransport(
+            self.backend_conn,
+            truncate_pipeline_results_count=1,
+        )
+        client = TursoHTTPClient("libsql://staging-cloud.turso.io", "mock-token", transport=transport)
+        statements = [
+            ("INSERT INTO processed_articles (article_id, canonical_url, title, source, published_at, processed_at) VALUES (?, ?, ?, ?, ?, ?)",
+             ["art-m5", "https://news.test/m5", "M5", "Src1", "2026-10-25T10:00:00Z", "2026-10-25T10:00:00Z"]),
+        ]
+        with self.assertRaises(TursoClientError) as ctx:
+            client.execute_transaction(statements)
+        self.assertIn("Turso transaction response malformed", str(ctx.exception))
+        self.assertIn("truncated result list", str(ctx.exception))
+
+    def test_08f_commit_malformed_json_reports_ambiguous_outcome(self):
+        """Hermetic Hrana: malformed JSON response during COMMIT raises ambiguous outcome (UNKNOWN)."""
+        transport = StatefulMockHranaTransport(
+            self.backend_conn,
+            raw_content_on_commit=b"NOT_VALID_JSON{[[",
+        )
+        client = TursoHTTPClient("libsql://staging-cloud.turso.io", "mock-token", transport=transport)
+        statements = [
+            ("INSERT INTO processed_articles (article_id, canonical_url, title, source, published_at, processed_at) VALUES (?, ?, ?, ?, ?, ?)",
+             ["art-m6", "https://news.test/m6", "M6", "Src1", "2026-10-25T10:00:00Z", "2026-10-25T10:00:00Z"]),
+        ]
+        with self.assertRaises(TursoClientError) as ctx:
+            client.execute_transaction(statements)
+        err_msg = str(ctx.exception)
+        self.assertIn("Ambiguous transaction outcome", err_msg)
+        self.assertIn("malformed JSON in Turso COMMIT response", err_msg)
+        self.assertIn("may or may not have committed", err_msg)
+
+    def test_08g_commit_missing_results_reports_ambiguous_outcome(self):
+        """Hermetic Hrana: missing results in COMMIT response raises ambiguous outcome (UNKNOWN)."""
+        transport = StatefulMockHranaTransport(
+            self.backend_conn,
+            override_commit_results=[],
+        )
+        client = TursoHTTPClient("libsql://staging-cloud.turso.io", "mock-token", transport=transport)
+        statements = [
+            ("INSERT INTO processed_articles (article_id, canonical_url, title, source, published_at, processed_at) VALUES (?, ?, ?, ?, ?, ?)",
+             ["art-m7", "https://news.test/m7", "M7", "Src1", "2026-10-25T10:00:00Z", "2026-10-25T10:00:00Z"]),
+        ]
+        with self.assertRaises(TursoClientError) as ctx:
+            client.execute_transaction(statements)
+        err_msg = str(ctx.exception)
+        self.assertIn("Ambiguous transaction outcome", err_msg)
+        self.assertIn("missing or truncated result list in Turso COMMIT response", err_msg)
+        self.assertIn("may or may not have committed", err_msg)
+
+    def test_08h_commit_unexpected_result_type_reports_ambiguous_outcome(self):
+        """Hermetic Hrana: unexpected result type in COMMIT response raises ambiguous outcome (UNKNOWN)."""
+        transport = StatefulMockHranaTransport(
+            self.backend_conn,
+            override_commit_results=[{"type": "strange_commit_type"}],
+        )
+        client = TursoHTTPClient("libsql://staging-cloud.turso.io", "mock-token", transport=transport)
+        statements = [
+            ("INSERT INTO processed_articles (article_id, canonical_url, title, source, published_at, processed_at) VALUES (?, ?, ?, ?, ?, ?)",
+             ["art-m8", "https://news.test/m8", "M8", "Src1", "2026-10-25T10:00:00Z", "2026-10-25T10:00:00Z"]),
+        ]
+        with self.assertRaises(TursoClientError) as ctx:
+            client.execute_transaction(statements)
+        err_msg = str(ctx.exception)
+        self.assertIn("Ambiguous transaction outcome", err_msg)
+        self.assertIn("unexpected result type 'strange_commit_type' in Turso COMMIT response", err_msg)
+        self.assertIn("may or may not have committed", err_msg)
+
 
 
 # =============================================================================
@@ -608,6 +776,80 @@ class TestMultiWorkerLeaseContention(unittest.TestCase):
         ) as runner3_repo:
             # Runner 3 cannot acquire
             self.assertFalse(runner3_repo.acquire_run_lock("runner_gamma", timeout_minutes=15, now=t0))
+
+    def test_12b_simultaneous_concurrent_worker_contention_with_barrier(self):
+        """Multi-worker contention: 2 workers simultaneously contending via barrier produce exactly 1 winner and safe recovery."""
+        backend_conn1 = sqlite3.connect(self.backend_db, check_same_thread=False, timeout=15.0)
+        backend_conn1.isolation_level = None
+        backend_conn1.row_factory = sqlite3.Row
+        transport1 = StatefulMockHranaTransport(backend_conn1)
+        worker_alpha_repo = TursoStateRepository("libsql://staging-cloud.turso.io", "token_a", transport=transport1, init_schema=False)
+
+        backend_conn2 = sqlite3.connect(self.backend_db, check_same_thread=False, timeout=15.0)
+        backend_conn2.isolation_level = None
+        backend_conn2.row_factory = sqlite3.Row
+        transport2 = StatefulMockHranaTransport(backend_conn2)
+        worker_beta_repo = TursoStateRepository("libsql://staging-cloud.turso.io", "token_b", transport=transport2, init_schema=False)
+
+        try:
+            barrier = threading.Barrier(2)
+            results: dict[str, bool] = {}
+            exceptions: dict[str, Exception] = {}
+            t0 = datetime(2026, 10, 25, 12, 0, 0, tzinfo=timezone.utc)
+
+            def worker_task(worker_id: str, repo: TursoStateRepository) -> None:
+                try:
+                    barrier.wait(timeout=5.0)
+                    acquired = repo.acquire_run_lock(worker_id, timeout_minutes=10, now=t0)
+                    results[worker_id] = acquired
+                except Exception as exc:
+                    exceptions[worker_id] = exc
+
+            th_alpha = threading.Thread(target=worker_task, args=("runner_alpha", worker_alpha_repo))
+            th_beta = threading.Thread(target=worker_task, args=("runner_beta", worker_beta_repo))
+
+            th_alpha.start()
+            th_beta.start()
+            th_alpha.join(timeout=10.0)
+            th_beta.join(timeout=10.0)
+
+            self.assertEqual(exceptions, {}, f"Worker threads encountered unexpected exceptions: {exceptions}")
+            self.assertEqual(len(results), 2, "Both workers must report acquisition results")
+
+            # Assert exactly one winner and one loser
+            alpha_success = results.get("runner_alpha", False)
+            beta_success = results.get("runner_beta", False)
+            self.assertEqual(int(alpha_success) + int(beta_success), 1, "Exactly one worker must acquire the lock")
+
+            winner = "runner_alpha" if alpha_success else "runner_beta"
+            loser = "runner_beta" if alpha_success else "runner_alpha"
+            loser_repo = worker_beta_repo if alpha_success else worker_alpha_repo
+
+            # Assert winner is reflected in backend database
+            cur = self.backend_conn.cursor()
+            cur.execute("SELECT worker_id FROM run_locks WHERE lock_key = 'radar_cron'")
+            row = cur.fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["worker_id"], winner)
+
+            # Assert loser cannot renew or release winner's lock
+            self.assertFalse(loser_repo.renew_run_lock(loser, extend_minutes=10))
+
+            # Advance clock past lease expiration: safe recovery
+            t_expired = t0 + timedelta(minutes=11)
+            loser_acquired = loser_repo.acquire_run_lock(loser, timeout_minutes=10, now=t_expired)
+            self.assertTrue(loser_acquired, f"Loser {loser} must safely take over expired lease at t0 + 11 mins")
+
+            # Verify database now records loser as new owner
+            cur.execute("SELECT worker_id FROM run_locks WHERE lock_key = 'radar_cron'")
+            new_row = cur.fetchone()
+            self.assertEqual(new_row["worker_id"], loser)
+        finally:
+            worker_alpha_repo.close()
+            worker_beta_repo.close()
+            backend_conn1.close()
+            backend_conn2.close()
+
 
 
 # =============================================================================
@@ -1163,6 +1405,56 @@ class TestWindowsSQLiteCleanupRegression(unittest.TestCase):
             cleanup_succeeded = False
 
         self.assertTrue(cleanup_succeeded, "Temporary directory cleanup raised PermissionError despite repo.close()")
+
+    def test_23a_sqlite_close_does_not_checkpoint_unowned_operational_databases(self):
+        """Windows Cleanup: calling close() on a standard repository does NOT execute WAL checkpointing."""
+        tmp_dir = tempfile.TemporaryDirectory()
+        tmp_path = Path(tmp_dir.name)
+        db_path = tmp_path / "op_sim.db"
+
+        # Standard repository instance: _is_owned_synthetic_fixture is False
+        repo = SqliteStateRepository(db_path)
+        self.assertFalse(repo._is_owned_synthetic_fixture)
+
+        # Mock sqlite3.connect to verify that close() does not open connections to operational DB
+        with patch("efso_radar.repositories.sqlite.sqlite3.connect") as mock_connect:
+            repo.close()
+            mock_connect.assert_not_called()
+
+        tmp_dir.cleanup()
+
+    def test_23b_external_connection_lifecycle_must_be_explicitly_closed_for_windows_cleanup(self):
+        """Windows Cleanup: unclosed external SQLite connections prevent directory cleanup; explicit closing() fixes it."""
+        tmp_dir = tempfile.TemporaryDirectory()
+        tmp_path = Path(tmp_dir.name)
+        db_path = tmp_path / "external_leak_test.db"
+
+        # Create an owned synthetic fixture
+        repo = SqliteStateRepository.create_owned_synthetic_fixture(db_path)
+        self.assertTrue(repo._is_owned_synthetic_fixture)
+
+        # 1. An external tool or test opens an independent connection without contextlib.closing
+        external_conn = sqlite3.connect(db_path)
+        external_conn.execute("SELECT 1;")
+
+        # 2. repo.close() only closes repo-owned resources; it CANNOT close external connections
+        repo.close()
+
+        # 3. On Windows, an unclosed connection locks the file, causing PermissionError on directory cleanup
+        if platform.system() == "Windows":
+            with self.assertRaises(PermissionError):
+                tmp_dir.cleanup()
+
+        # 4. Cleanup errors must never be silently concealed: verify that explicit closing releases the handle
+        external_conn.close()
+
+        # 5. Now verify clean lifecycle pattern using contextlib.closing
+        with closing(sqlite3.connect(db_path)) as properly_managed_conn:
+            properly_managed_conn.execute("SELECT 1;")
+
+        # Properly managed connection is closed on exit; cleanup must succeed without errors
+        tmp_dir.cleanup()
+
 
     def test_24_context_manager_lifecycle_closes_cleanly(self):
         """Windows Cleanup: using SqliteStateRepository as a context manager auto-closes on scope exit."""
