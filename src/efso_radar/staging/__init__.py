@@ -17,22 +17,26 @@ from efso_radar.staging.cutover import (
     GoNoGoGate,
     GoNoGoDecision,
 )
-from efso_radar.staging.runner import (
-    AuditOutcomeState,
-    SessionStatus,
-    StagingSessionRunner,
-    StagingRunnerReport,
-    PerRunOwnershipManifest,
-    validate_staging_destination,
-    EXACT_STAGING_DESTINATION,
-    EXACT_STAGING_HOSTNAME,
-    recover_manifest_offline,
-)
 
 if TYPE_CHECKING:
     from efso_radar.staging.connection import (
         StagingConnectionReport,
         check_staging_connection,
+    )
+    from efso_radar.staging.runner import (
+        AuditOutcomeState,
+        SessionStatus,
+        StagingSessionRunner,
+        StagingRunnerReport,
+        PerRunOwnershipManifest,
+        RegisteredEntity,
+        create_default_manifest_entities,
+        is_hermetic_transport,
+        reconcile_ambiguous_outcome,
+        validate_staging_destination,
+        EXACT_STAGING_DESTINATION,
+        EXACT_STAGING_HOSTNAME,
+        recover_manifest_offline,
     )
 
 __all__ = [
@@ -49,6 +53,10 @@ __all__ = [
     "StagingSessionRunner",
     "StagingRunnerReport",
     "PerRunOwnershipManifest",
+    "RegisteredEntity",
+    "create_default_manifest_entities",
+    "is_hermetic_transport",
+    "reconcile_ambiguous_outcome",
     "validate_staging_destination",
     "EXACT_STAGING_DESTINATION",
     "EXACT_STAGING_HOSTNAME",
@@ -57,9 +65,30 @@ __all__ = [
     "check_staging_connection",
 ]
 
+_RUNNER_EXPORTS = frozenset({
+    "AuditOutcomeState",
+    "SessionStatus",
+    "StagingSessionRunner",
+    "StagingRunnerReport",
+    "PerRunOwnershipManifest",
+    "RegisteredEntity",
+    "create_default_manifest_entities",
+    "is_hermetic_transport",
+    "reconcile_ambiguous_outcome",
+    "validate_staging_destination",
+    "EXACT_STAGING_DESTINATION",
+    "EXACT_STAGING_HOSTNAME",
+    "recover_manifest_offline",
+})
+
+_CONNECTION_EXPORTS = frozenset({
+    "StagingConnectionReport",
+    "check_staging_connection",
+})
+
 
 def __getattr__(name: str) -> Any:
-    if name in ("StagingConnectionReport", "check_staging_connection"):
+    if name in _CONNECTION_EXPORTS:
         from efso_radar.staging.connection import (
             StagingConnectionReport,
             check_staging_connection,
@@ -69,4 +98,7 @@ def __getattr__(name: str) -> Any:
             "check_staging_connection": check_staging_connection,
         }
         return mapping[name]
+    if name in _RUNNER_EXPORTS:
+        import efso_radar.staging.runner as runner_mod
+        return getattr(runner_mod, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
