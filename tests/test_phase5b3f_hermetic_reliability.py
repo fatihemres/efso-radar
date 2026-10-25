@@ -673,7 +673,123 @@ class TestHranaTransactionReliability(unittest.TestCase):
             client.execute_transaction(statements)
         err_msg = str(ctx.exception)
         self.assertIn("Ambiguous transaction outcome", err_msg)
-        self.assertIn("unexpected result type 'strange_commit_type' in Turso COMMIT response", err_msg)
+        self.assertIn("unexpected result type in Turso COMMIT response", err_msg)
+        self.assertNotIn("strange_commit_type", err_msg)
+        self.assertIn("may or may not have committed", err_msg)
+
+    def test_08i_untrusted_response_types_never_leak_secrets(self):
+        """Hermetic Hrana: arbitrary server-supplied response types never leak into errors or logs."""
+        secret_begin_type = "LEAKED_HRANA_SECRET_BEGIN_TYPE_12345"
+        secret_stmt_type = "LEAKED_HRANA_SECRET_STMT_TYPE_67890"
+        secret_commit_type = "LEAKED_HRANA_SECRET_COMMIT_TYPE_ABCDE"
+
+        statements = [
+            ("INSERT INTO processed_articles (article_id, canonical_url, title, source, published_at, processed_at) VALUES (?, ?, ?, ?, ?, ?)",
+             ["art-leak", "https://news.test/l", "Leak", "Src1", "2026-10-25T10:00:00Z", "2026-10-25T10:00:00Z"]),
+        ]
+
+        class MemoryLogHandler(logging.Handler):
+            def __init__(self):
+                super().__init__()
+                self.records: list[str] = []
+
+            def emit(self, record: logging.LogRecord) -> None:
+                self.records.append(self.format(record))
+
+        log_handler = MemoryLogHandler()
+        target_logger = logging.getLogger("efso-radar")
+        target_logger.addHandler(log_handler)
+
+        try:
+            # Case 1: Malformed BEGIN response type
+            t1 = StatefulMockHranaTransport(self.backend_conn, override_pipeline_results=[{"type": secret_begin_type}])
+            c1 = TursoHTTPClient("libsql://staging-cloud.turso.io", "mock-token", transport=t1)
+            with self.assertRaises(TursoClientError) as ctx1:
+                c1.execute_transaction(statements)
+            self.assertIn("unexpected BEGIN response type", str(ctx1.exception))
+            self.assertNotIn(secret_begin_type, str(ctx1.exception))
+
+            # Case 2: Malformed statement response type
+            t2 = StatefulMockHranaTransport(
+                self.backend_conn,
+                override_pipeline_results=[
+                    {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                    {"type": secret_stmt_type},
+                ],
+            )
+            c2 = TursoHTTPClient("libsql://staging-cloud.turso.io", "mock-token", transport=t2)
+            with self.assertRaises(TursoClientError) as ctx2:
+                c2.execute_transaction(statements)
+            self.assertIn("unexpected statement response type", str(ctx2.exception))
+            self.assertNotIn(secret_stmt_type, str(ctx2.exception))
+
+            # Case 3: Malformed COMMIT response type
+            t3 = StatefulMockHranaTransport(self.backend_conn, override_commit_results=[{"type": secret_commit_type}])
+            c3 = TursoHTTPClient("libsql://staging-cloud.turso.io", "mock-token", transport=t3)
+            with self.assertRaises(TursoClientError) as ctx3:
+                c3.execute_transaction(statements)
+            self.assertIn("unexpected result type in Turso COMMIT response", str(ctx3.exception))
+            self.assertNotIn(secret_commit_type, str(ctx3.exception))
+        finally:
+            target_logger.removeHandler(log_handler)
+
+        all_logs = " ".join(log_handler.records)
+        self.assertNotIn(secret_begin_type, all_logs)
+        self.assertNotIn(secret_stmt_type, all_logs)
+        self.assertNotIn(secret_commit_type, all_logs)
+
+    def test_08j_commit_missing_execute_response_structure_reports_ambiguous_outcome(self):
+        """Hermetic Hrana: HTTP 200 with {'results': [{'type': 'ok'}]} lacking execution payload raises ambiguous outcome."""
+        transport = StatefulMockHranaTransport(
+            self.backend_conn,
+            override_commit_results=[{"type": "ok"}],
+        )
+        client = TursoHTTPClient("libsql://staging-cloud.turso.io", "mock-token", transport=transport)
+        statements = [
+            ("INSERT INTO processed_articles (article_id, canonical_url, title, source, published_at, processed_at) VALUES (?, ?, ?, ?, ?, ?)",
+             ["art-m10", "https://news.test/m10", "M10", "Src1", "2026-10-25T10:00:00Z", "2026-10-25T10:00:00Z"]),
+        ]
+        with self.assertRaises(TursoClientError) as ctx:
+            client.execute_transaction(statements)
+        err_msg = str(ctx.exception)
+        self.assertIn("Ambiguous transaction outcome", err_msg)
+        self.assertIn("missing or malformed execution result in Turso COMMIT response", err_msg)
+        self.assertIn("may or may not have committed", err_msg)
+
+    def test_08k_commit_malformed_execute_result_reports_ambiguous_outcome(self):
+        """Hermetic Hrana: COMMIT response with malformed response/result dictionary raises ambiguous outcome."""
+        transport = StatefulMockHranaTransport(
+            self.backend_conn,
+            override_commit_results=[{"type": "ok", "response": {"type": "execute"}}],
+        )
+        client = TursoHTTPClient("libsql://staging-cloud.turso.io", "mock-token", transport=transport)
+        statements = [
+            ("INSERT INTO processed_articles (article_id, canonical_url, title, source, published_at, processed_at) VALUES (?, ?, ?, ?, ?, ?)",
+             ["art-m11", "https://news.test/m11", "M11", "Src1", "2026-10-25T10:00:00Z", "2026-10-25T10:00:00Z"]),
+        ]
+        with self.assertRaises(TursoClientError) as ctx:
+            client.execute_transaction(statements)
+        err_msg = str(ctx.exception)
+        self.assertIn("Ambiguous transaction outcome", err_msg)
+        self.assertIn("missing or malformed execution result in Turso COMMIT response", err_msg)
+        self.assertIn("may or may not have committed", err_msg)
+
+    def test_08l_commit_wrong_response_type_reports_ambiguous_outcome(self):
+        """Hermetic Hrana: COMMIT response with non-execute response frame raises ambiguous outcome."""
+        transport = StatefulMockHranaTransport(
+            self.backend_conn,
+            override_commit_results=[{"type": "ok", "response": {"type": "something_else", "result": {}}}],
+        )
+        client = TursoHTTPClient("libsql://staging-cloud.turso.io", "mock-token", transport=transport)
+        statements = [
+            ("INSERT INTO processed_articles (article_id, canonical_url, title, source, published_at, processed_at) VALUES (?, ?, ?, ?, ?, ?)",
+             ["art-m12", "https://news.test/m12", "M12", "Src1", "2026-10-25T10:00:00Z", "2026-10-25T10:00:00Z"]),
+        ]
+        with self.assertRaises(TursoClientError) as ctx:
+            client.execute_transaction(statements)
+        err_msg = str(ctx.exception)
+        self.assertIn("Ambiguous transaction outcome", err_msg)
+        self.assertIn("missing or malformed execution result in Turso COMMIT response", err_msg)
         self.assertIn("may or may not have committed", err_msg)
 
 
