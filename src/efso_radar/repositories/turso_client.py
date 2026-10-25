@@ -566,7 +566,7 @@ class TursoHTTPClient:
 
         if commit_resp.status_code != 200:
             if commit_resp.status_code in (500, 502, 503, 504):
-                raise TursoClientError(
+                raise TursoAmbiguousTransactionError(
                     f"Ambiguous transaction outcome (UNKNOWN): Turso COMMIT returned HTTP status {commit_resp.status_code}. "
                     "The transaction may or may not have committed."
                 )
