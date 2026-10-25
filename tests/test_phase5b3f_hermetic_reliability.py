@@ -1221,14 +1221,13 @@ class TestWindowsSQLiteCleanupRegression(unittest.TestCase):
         remote_remaining_rows = res.fetchone()["cnt"]
         self.assertEqual(remote_remaining_rows, 0, "Remote staging cleanup failed: synthetic records remain!")
 
-        # 2. Simulate local temporary SQLite fixture with an intentionally held lock to test error diagnosis
+        # 2. Simulate local temporary SQLite fixture cleanup diagnostics
         local_db = tmp_path / "local_fixture.db"
         local_conn = sqlite3.connect(local_db)
         local_conn.execute("CREATE TABLE dummy (x INT);")
 
         def dispose_fixtures_with_diagnostics():
             try:
-                # If local_conn was not closed, Windows raises PermissionError on cleanup
                 tmp_dir.cleanup()
             except PermissionError as perm_err:
                 # Diagnostics must report remote cleanup succeeded and isolate local Windows error
@@ -1237,16 +1236,22 @@ class TestWindowsSQLiteCleanupRegression(unittest.TestCase):
                     f"but local temporary SQLite cleanup failed due to Windows file locking: {perm_err}"
                 ) from perm_err
 
-        # Assert that the diagnostic distinction is cleanly made
-        with self.assertRaises(RuntimeError) as ctx:
-            dispose_fixtures_with_diagnostics()
+        # Simulate Windows file locking PermissionError deterministically across all OS environments (Windows, Linux, macOS)
+        from unittest.mock import patch
+        with patch.object(
+            tmp_dir,
+            "cleanup",
+            side_effect=PermissionError("[WinError 32] The process cannot access the file because it is being used by another process"),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                dispose_fixtures_with_diagnostics()
 
         err_msg = str(ctx.exception)
         self.assertIn("LOCAL_WINDOWS_CLEANUP_FAILURE", err_msg)
         self.assertIn("Remote staging cleanup succeeded (0 remaining rows)", err_msg)
         self.assertIn("Windows file locking", err_msg)
 
-        # Now cleanly close connection and cleanup for real
+        # Cleanly close connection and cleanup for real
         local_conn.close()
         turso_repo.close()
         backend_conn.close()
