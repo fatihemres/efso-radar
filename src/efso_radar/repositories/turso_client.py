@@ -448,7 +448,25 @@ class TursoHTTPClient:
         baton = data.get("baton")
         raw_results = data.get("results", [])
 
-        # Check for errors in user statements
+        if not raw_results:
+            raise TursoClientError("Turso transaction response malformed: empty results received.")
+
+        # Check for error on BEGIN (index 0)
+        begin_res = raw_results[0]
+        if begin_res.get("type") == "error":
+            err = begin_res.get("error", {})
+            valid_code, category = _sanitize_hrana_error(err.get("code"))
+            if baton:
+                try:
+                    client.post(
+                        self.pipeline_url,
+                        json={"baton": baton, "requests": [{"type": "close"}]},
+                    )
+                except Exception:
+                    pass
+            raise TursoClientError(f"Turso transaction BEGIN failed ({valid_code}): {category}")
+
+        # Check for errors in user statements (index 1 onwards)
         has_error = False
         error_code = None
         for idx, res in enumerate(raw_results[1:]):
@@ -471,29 +489,40 @@ class TursoHTTPClient:
             valid_code, category = _sanitize_hrana_error(error_code)
             raise TursoClientError(f"Turso transaction aborted due to statement error ({valid_code}): {category}")
 
+        # Enforce that session baton exists for multi-statement transaction
+        if not baton:
+            raise TursoClientError("Turso transaction protocol error: server did not return a session baton for transaction.")
+
         # Explicitly commit if all statements succeeded
-        if baton:
-            try:
-                commit_resp = client.post(
-                    self.pipeline_url,
-                    json={"baton": baton, "requests": [{"type": "execute", "stmt": {"sql": "COMMIT"}}, {"type": "close"}]},
-                )
-            except httpx.HTTPError as exc:
-                err_type = type(exc).__name__
+        try:
+            commit_resp = client.post(
+                self.pipeline_url,
+                json={"baton": baton, "requests": [{"type": "execute", "stmt": {"sql": "COMMIT"}}, {"type": "close"}]},
+            )
+        except httpx.HTTPError as exc:
+            err_type = type(exc).__name__
+            raise TursoClientError(
+                f"Ambiguous transaction outcome: network error during Turso COMMIT ({err_type}). "
+                "The transaction may or may not have committed."
+            ) from None
+
+        if commit_resp.status_code != 200:
+            if commit_resp.status_code in (500, 502, 503, 504):
                 raise TursoClientError(
-                    f"Ambiguous transaction outcome: network error during Turso COMMIT ({err_type}). "
+                    f"Ambiguous transaction outcome: Turso COMMIT returned HTTP status {commit_resp.status_code}. "
                     "The transaction may or may not have committed."
-                ) from None
+                )
+            raise TursoClientError(_format_http_status_error(commit_resp.status_code))
 
-            if commit_resp.status_code != 200:
-                raise TursoClientError(_format_http_status_error(commit_resp.status_code))
+        commit_data = commit_resp.json()
+        commit_results = commit_data.get("results", [])
+        if not commit_results:
+            raise TursoClientError("Turso COMMIT response malformed: missing execution result.")
 
-            commit_data = commit_resp.json()
-            commit_results = commit_data.get("results", [])
-            if commit_results and commit_results[0].get("type") == "error":
-                err = commit_results[0].get("error", {})
-                valid_code, category = _sanitize_hrana_error(err.get("code"))
-                raise TursoClientError(f"Turso COMMIT failed ({valid_code}): {category}")
+        if commit_results[0].get("type") == "error":
+            err = commit_results[0].get("error", {})
+            valid_code, category = _sanitize_hrana_error(err.get("code"))
+            raise TursoClientError(f"Turso COMMIT failed ({valid_code}): {category}")
 
         # Parse results for user statements (skipping BEGIN at index 0)
         parsed_results: list[TursoQueryResult] = []

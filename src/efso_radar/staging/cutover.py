@@ -433,16 +433,19 @@ class StagingCutoverReconciler:
                         )
                     )
 
-                # Content parity verification via deterministic SHA-256 hash
-                cols_sql = ", ".join(expected_cols)
+                # Content parity verification via deterministic SHA-256 hash.
+                # For schema_migrations, applied_at and description differ by backend/time.
+                # Reconcile applied version set, preserving strict full-column content hashes for all business tables.
+                hash_cols = ["version"] if table_name == "schema_migrations" else expected_cols
+                cols_sql = ", ".join(hash_cols)
                 s_rows = execute_read_query(
                     self.source_repo, f"SELECT {cols_sql} FROM {table_name} ORDER BY {pk_col} ASC"
                 )
                 t_rows = execute_read_query(
                     self.target_repo, f"SELECT {cols_sql} FROM {table_name} ORDER BY {pk_col} ASC"
                 )
-                rec.source_content_hash = compute_table_content_hash(s_rows, expected_cols)
-                rec.target_content_hash = compute_table_content_hash(t_rows, expected_cols)
+                rec.source_content_hash = compute_table_content_hash(s_rows, hash_cols)
+                rec.target_content_hash = compute_table_content_hash(t_rows, hash_cols)
                 rec.content_matches = rec.source_content_hash == rec.target_content_hash
 
                 if not rec.content_matches:

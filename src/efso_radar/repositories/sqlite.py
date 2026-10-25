@@ -123,6 +123,28 @@ class SqliteStateRepository(StateRepository):
 
         return cls(resolved, _internal_fixture_token=_FIXTURE_OWNERSHIP_TOKEN)
 
+    def close(self) -> None:
+        """Cleanly close and checkpoint repository resources before disposal.
+
+        On Windows, truncating the WAL journal and closing any open handles prevents
+        WinError 32 PermissionError when deleting temporary fixture directories.
+        """
+        if self.db_path.exists():
+            try:
+                conn = sqlite3.connect(self.db_path, timeout=5.0)
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+
+    def __enter__(self) -> SqliteStateRepository:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
     @contextmanager
     def _connection(self) -> Generator[sqlite3.Connection, None, None]:
         conn = sqlite3.connect(self.db_path, timeout=15.0)
@@ -288,7 +310,7 @@ class SqliteStateRepository(StateRepository):
 
     def get_pending_candidates(self, max_age_hours: int = 24, now: Optional[datetime] = None) -> list[Article]:
         """Retrieve unexpired candidates from backlog that are still awaiting evaluation.
-        
+
         Preserves candidates within max_age_hours, plus any genuine UPDATE candidates regardless of age.
         """
         ref_now = now or utc_now()
