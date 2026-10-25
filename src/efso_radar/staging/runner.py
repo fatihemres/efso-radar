@@ -38,6 +38,7 @@ from pydantic import BaseModel, Field
 from efso_radar.repositories.schema import CURRENT_SCHEMA_VERSION, get_all_init_statements
 from efso_radar.repositories.turso import TursoReadOnlyStateRepository
 from efso_radar.repositories.turso_client import (
+    TursoAmbiguousTransactionError,
     TursoClientError,
     TursoHTTPClient,
     deserialize_hrana_value,
@@ -358,6 +359,12 @@ class PerRunOwnershipManifest(BaseModel):
         except Exception as exc:
             raise ValueError(f"Manifest validation error: {exc}") from None
 
+        # Build canonical expected reference inventory for this run_id
+        canonical_entities = create_default_manifest_entities(run_id)
+        canonical_map: dict[tuple[str, str], RegisteredEntity] = {
+            (e.table, e.pk_value): e for e in canonical_entities
+        }
+
         # Check for duplicate entity keys (table, pk_value)
         seen_keys: set[tuple[str, str]] = set()
         for ent in manifest.registered_entities:
@@ -366,86 +373,77 @@ class PerRunOwnershipManifest(BaseModel):
                 raise ValueError(f"Duplicate entity registration in manifest: {key}")
             seen_keys.add(key)
 
-        # Validate exact 5 entities against strict allowlists, dependency ordering, and run_id derivation
-        expected_pk_inventory = {
-            ("processed_articles", f"synth_art_{run_id}_01"): 2,
-            ("processed_articles", f"synth_art_{run_id}_02_rollback"): 2,
-            ("stories", f"synth_story_{run_id}_01"): 1,
-            ("run_locks", f"synth_lock_{run_id}"): 1,
-            ("durable_recovery_state", f"synth_stage_{run_id}::current"): 1,
-        }
+            # Specific check for forbidden target radar_cron
+            if "radar_cron" in ent.pk_value:
+                raise PermissionError("Critical safety violation: manifest cannot target 'radar_cron'.")
 
-        found_inventory: dict[tuple[str, str], int] = {}
-        for ent in manifest.registered_entities:
-            table = ent.table
-            if table not in ALLOWED_TABLE_PK_MAP:
+            # Check unauthorized tables
+            if ent.table not in ALLOWED_TABLE_PK_MAP:
                 raise PermissionError(
-                    f"Manifest contains unauthorized table '{table}'. Allowed: {sorted(ALLOWED_TABLE_PK_MAP.keys())}"
+                    f"Manifest contains unauthorized table '{ent.table}'. Allowed: {sorted(ALLOWED_TABLE_PK_MAP.keys())}"
                 )
 
-            expected_pk_col = ALLOWED_TABLE_PK_MAP[table]
-            if ent.pk_column != expected_pk_col:
-                raise ValueError(
-                    f"Entity table '{table}' has unexpected pk_column '{ent.pk_column}', expected '{expected_pk_col}'."
-                )
-
-            key = (table, ent.pk_value)
-            found_inventory[key] = ent.cleanup_dependency_order
-
-            # Table-specific validations
-            if table == "processed_articles":
+            # Check key derivation from run_id
+            if ent.table == "processed_articles":
                 if not ent.pk_value.startswith(f"synth_art_{run_id}_"):
                     raise ValueError(f"processed_articles PK '{ent.pk_value}' not derived from run_id '{run_id}'.")
-                if ent.cleanup_dependency_order != 2:
-                    raise ValueError(f"processed_articles must have cleanup_dependency_order=2, got {ent.cleanup_dependency_order}")
-                if "radar_cron" in ent.pk_value:
-                    raise PermissionError("Critical safety violation: manifest cannot target 'radar_cron'.")
-                attrs = ent.expected_attributes
-                if attrs.get("source") != "staging_synth_test":
-                    raise ValueError(f"processed_articles entity missing expected source attribute: {attrs}")
-                title = attrs.get("title")
-                if not isinstance(title, str) or not title.startswith(f"SYNTH_ARTICLE_{run_id}"):
-                    raise ValueError(f"processed_articles title '{title}' does not match expected prefix for run {run_id}")
-
-            elif table == "stories":
+            elif ent.table == "stories":
                 if not ent.pk_value.startswith(f"synth_story_{run_id}_"):
                     raise ValueError(f"stories PK '{ent.pk_value}' not derived from run_id '{run_id}'.")
-                if ent.cleanup_dependency_order != 1:
-                    raise ValueError(f"stories must have cleanup_dependency_order=1, got {ent.cleanup_dependency_order}")
-                attrs = ent.expected_attributes
-                if attrs.get("category") != "synth_test":
-                    raise ValueError(f"stories entity missing expected category attribute: {attrs}")
-                headline = attrs.get("headline_tr")
-                if not isinstance(headline, str) or headline != f"SYNTH_STORY_{run_id}_01":
-                    raise ValueError(f"stories headline_tr '{headline}' does not match expected for run {run_id}")
-
-            elif table == "run_locks":
-                if "radar_cron" in ent.pk_value:
-                    raise PermissionError("Critical safety violation: manifest cannot target 'radar_cron'.")
+            elif ent.table == "run_locks":
                 if ent.pk_value != f"synth_lock_{run_id}":
                     raise ValueError(f"run_locks PK '{ent.pk_value}' does not match expected 'synth_lock_{run_id}'.")
-                if ent.cleanup_dependency_order != 1:
-                    raise ValueError(f"run_locks must have cleanup_dependency_order=1, got {ent.cleanup_dependency_order}")
-                attrs = ent.expected_attributes
-                workers = attrs.get("worker_ids")
-                if not isinstance(workers, list) or not any(w.startswith(f"runner_alpha_{run_id}") for w in workers):
-                    raise ValueError(f"run_locks entity missing expected worker_ids attribute: {attrs}")
-
-            elif table == "durable_recovery_state":
+            elif ent.table == "durable_recovery_state":
                 expected_state_key = f"synth_stage_{run_id}::current"
                 if ent.pk_value != expected_state_key:
                     raise ValueError(f"durable_recovery_state PK '{ent.pk_value}' does not match '{expected_state_key}'.")
-                if ent.cleanup_dependency_order != 1:
-                    raise ValueError(f"durable_recovery_state must have cleanup_dependency_order=1, got {ent.cleanup_dependency_order}")
-                attrs = ent.expected_attributes
-                if attrs.get("stage") != f"synth_stage_{run_id}" or attrs.get("worker_id") != f"synth_worker_{run_id}":
-                    raise ValueError(f"durable_recovery_state entity attributes do not match expected for run {run_id}")
 
-        if found_inventory != expected_pk_inventory:
-            raise ValueError(
-                f"Manifest entity inventory mismatch: expected {sorted(expected_pk_inventory.keys())}, "
-                f"got {sorted(found_inventory.keys())}"
-            )
+            # Must match an entity in canonical_map
+            if key not in canonical_map:
+                raise ValueError(
+                    f"Manifest entity inventory mismatch: unexpected entity registration {key}. "
+                    f"Expected canonical keys: {sorted(canonical_map.keys())}"
+                )
+
+            canonical_ent = canonical_map[key]
+
+            # Exact pk_column check
+            if ent.pk_column != canonical_ent.pk_column:
+                raise ValueError(
+                    f"Entity table '{ent.table}' has unexpected pk_column '{ent.pk_column}', "
+                    f"expected '{canonical_ent.pk_column}'."
+                )
+
+            # Exact cleanup_dependency_order check
+            if ent.cleanup_dependency_order != canonical_ent.cleanup_dependency_order:
+                raise ValueError(
+                    f"Entity {key} has unexpected cleanup_dependency_order {ent.cleanup_dependency_order}, "
+                    f"expected cleanup_dependency_order={canonical_ent.cleanup_dependency_order}."
+                )
+
+            # Exact expected_attributes check against canonical entity
+            expected_attrs = canonical_ent.expected_attributes
+            actual_attrs = ent.expected_attributes
+
+            extra_attrs = set(actual_attrs) - set(expected_attrs)
+            if extra_attrs:
+                raise ValueError(f"Entity {key} has arbitrary extra ownership attributes: {sorted(extra_attrs)}.")
+
+            missing_attrs = set(expected_attrs) - set(actual_attrs)
+            if missing_attrs:
+                raise ValueError(f"Entity {key} is missing expected ownership attributes: {sorted(missing_attrs)}.")
+
+            for attr_k, exp_val in expected_attrs.items():
+                act_val = actual_attrs[attr_k]
+                if act_val != exp_val:
+                    raise ValueError(
+                        f"Entity {key} attribute '{attr_k}' mismatch: expected {exp_val!r}, got {act_val!r}."
+                    )
+
+        # Confirm all canonical entities are present
+        missing_canonical = set(canonical_map.keys()) - seen_keys
+        if missing_canonical:
+            raise ValueError(f"Manifest missing canonical entities: {sorted(missing_canonical)}.")
 
         return manifest
 
@@ -559,7 +557,6 @@ class HermeticStagingTransport(httpx.BaseTransport):
     Translates pipeline requests into SQLite transactions against an isolated temporary fixture.
     Supports failure injections (BEGIN errors, statement errors, COMMIT timeouts, network drops).
     """
-    is_hermetic: bool = True
 
     def __init__(
         self,
@@ -717,20 +714,93 @@ class HermeticStagingTransport(httpx.BaseTransport):
 # =============================================================================
 
 def is_hermetic_transport(transport: Any) -> bool:
-    """Recursively verify that transport is hermetic and incapable of real network IO."""
+    """Verify that transport is an approved concrete hermetic transport and incapable of real network IO."""
     if transport is None:
         return False
     # Explicitly reject standard httpx network transports
     if isinstance(transport, (httpx.HTTPTransport, httpx.AsyncHTTPTransport)):
         return False
-    # If it's a BudgetTrackingTransport, check its inner transport
-    if isinstance(transport, BudgetTrackingTransport):
+    # Only exact concrete BudgetTrackingTransport or HermeticStagingTransport are accepted (no subclasses)
+    if type(transport) is BudgetTrackingTransport:
         return is_hermetic_transport(transport.inner)
-    # Check if it is HermeticStagingTransport
-    if isinstance(transport, HermeticStagingTransport):
+    if type(transport) is HermeticStagingTransport:
+        conn = getattr(transport, "conn", None)
+        if not isinstance(conn, sqlite3.Connection):
+            return False
+        try:
+            cur = conn.cursor()
+            cur.execute("PRAGMA database_list;")
+            db_list = cur.fetchall()
+            for row in db_list:
+                db_file = row[2] if len(row) > 2 else ""
+                if db_file and db_file != "" and not str(db_file).startswith(":memory:"):
+                    return False
+        except Exception:
+            return False
         return True
-    # If a mock transport explicitly marks itself hermetic
-    if getattr(transport, "is_hermetic", False) is True:
+    return False
+
+
+def verify_hermetic_session_transport(transport: Any) -> None:
+    """Strictly verify concrete hermetic transport chain and in-memory SQLite backing for session execution.
+
+    Full session execution strictly requires BudgetTrackingTransport wrapping HermeticStagingTransport.
+    Rejects:
+    - Bare transports (cannot bypass request ceiling)
+    - Duck-typed objects (e.g. is_hermetic=True)
+    - Custom subclasses of BudgetTrackingTransport or HermeticStagingTransport
+    - Unknown wrappers or real-network-capable transports
+    - File-backed SQLite connections or attached file-backed databases
+    """
+    if transport is None:
+        raise PermissionError("Hermetic security boundary violation: client transport cannot be None.")
+
+    # Must be exact concrete BudgetTrackingTransport (reject bare transports and custom subclasses)
+    if type(transport) is not BudgetTrackingTransport:
+        raise PermissionError(
+            f"Hermetic security boundary violation: expected concrete BudgetTrackingTransport, got {type(transport).__name__}."
+        )
+
+    # Inner transport must be exact concrete HermeticStagingTransport (reject duck typing and custom subclasses)
+    inner = transport.inner
+    if type(inner) is not HermeticStagingTransport:
+        raise PermissionError(
+            f"Hermetic security boundary violation: expected inner concrete HermeticStagingTransport, got {type(inner).__name__}."
+        )
+
+    # Backing SQLite connection check
+    conn = getattr(inner, "conn", None)
+    if not isinstance(conn, sqlite3.Connection):
+        raise PermissionError("Hermetic security boundary violation: transport must be backed by a valid sqlite3.Connection.")
+
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA database_list;")
+        db_list = cur.fetchall()
+    except Exception as exc:
+        raise PermissionError(f"Failed to inspect SQLite database list: {exc}")
+
+    for row in db_list:
+        db_file = row[2] if len(row) > 2 else ""
+        if db_file and db_file != "" and not str(db_file).startswith(":memory:"):
+            raise PermissionError(
+                f"Hermetic security boundary violation: SQLite connection is backed by or has attached file '{db_file}'. "
+                "Only pure in-memory SQLite connections (:memory:) are permitted."
+            )
+
+
+def is_ambiguous_transaction_error(exc: BaseException) -> bool:
+    """Classify whether an exception represents an ambiguous transaction outcome (UNKNOWN).
+
+    Ambiguous outcomes include network drops, timeouts, gateway errors during COMMIT,
+    or unconfirmed batons where transaction state cannot be definitively known without reconciliation.
+    Deterministic errors like constraint violations or invalid syntax return False.
+    """
+    if isinstance(exc, TursoAmbiguousTransactionError):
+        return True
+    if isinstance(exc, TursoClientError) and "Ambiguous transaction outcome (UNKNOWN)" in str(exc):
+        return True
+    if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)):
         return True
     return False
 
@@ -807,11 +877,7 @@ class StagingSessionRunner:
             raise PermissionError("Client cannot be None.")
 
         transport = getattr(client, "transport", None)
-        if transport is None or not is_hermetic_transport(transport):
-            raise PermissionError(
-                "Hermetic security boundary violation: client must use an approved HermeticStagingTransport. "
-                "Live network transports and unverified clients are strictly prohibited."
-            )
+        verify_hermetic_session_transport(transport)
 
         # 3. Endpoint alignment verification
         expected_pipeline_url = f"{self.destination_url}/v2/pipeline"
@@ -904,6 +970,9 @@ class StagingSessionRunner:
 
         except Exception as exc:
             self.errors.append(f"Execution suspended in testing phase: {type(exc).__name__}: {exc}")
+            if is_ambiguous_transaction_error(exc):
+                self.audit_state = AuditOutcomeState.UNKNOWN
+                self.halt_before_cleanup = True
         finally:
             # Phase 3: Exact-Match Cleanup & Three-State Audit (LIVE-08)
             bt = self.budget_transport
@@ -1076,12 +1145,14 @@ class StagingSessionRunner:
                 ],
             ),
             (
+                # Duplicate primary key insertion on art_id_rollback deterministically triggers SQLITE_CONSTRAINT
+                # using a primary key that is ALREADY registered in the ownership manifest.
                 "INSERT INTO processed_articles (article_id, canonical_url, title, source, published_at, processed_at) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 [
-                    f"synth_art_invalid_{self.run_id}",
-                    "https://example.com/invalid",
-                    None,  # Violates NOT NULL title
+                    art_id_rollback,
+                    f"https://example.com/synth/{self.run_id}/02_duplicate",
+                    f"SYNTH_ARTICLE_{self.run_id}_02_ROLLBACK",
                     "staging_synth_test",
                     "2026-10-25T15:00:00Z",
                     "2026-10-25T15:00:00Z",
@@ -1299,6 +1370,10 @@ class StagingSessionRunner:
                 self.halt_before_cleanup = True
                 self.audit_state = AuditOutcomeState.UNKNOWN
             raise
+        except Exception as exc:
+            self.halt_before_cleanup = True
+            self.audit_state = AuditOutcomeState.UNKNOWN
+            raise
 
         duration = time.perf_counter() - start
         self.stages.append(StageResult(
@@ -1312,7 +1387,7 @@ class StagingSessionRunner:
 
     def _run_live_08(self) -> None:
         """LIVE-08: Pre-Deletion Ownership Verification, Parameterized Conditional Deletion & Three-State Audit."""
-        # If execution was halted due to critical atomicity corruption or ambiguous failure, do not delete
+        # If execution was halted due to critical atomicity corruption, ownership mismatch, or ambiguous failure, do not delete
         if self.halt_before_cleanup or self.audit_state == AuditOutcomeState.OWNERSHIP_MISMATCH_HALT:
             return
 

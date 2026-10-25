@@ -38,7 +38,11 @@ from unittest.mock import patch, MagicMock
 import httpx
 
 from efso_radar.repositories.schema import get_all_init_statements
-from efso_radar.repositories.turso_client import TursoClientError, TursoHTTPClient
+from efso_radar.repositories.turso_client import (
+    TursoAmbiguousTransactionError,
+    TursoClientError,
+    TursoHTTPClient,
+)
 from efso_radar.staging.runner import (
     AuditOutcomeState,
     BudgetTrackingTransport,
@@ -53,11 +57,13 @@ from efso_radar.staging.runner import (
     StagingSessionRunner,
     TEST_CUTOFF_REQUESTS,
     create_default_manifest_entities,
+    is_ambiguous_transaction_error,
     is_hermetic_transport,
     main,
     reconcile_ambiguous_outcome,
     recover_manifest_offline,
     validate_staging_destination,
+    verify_hermetic_session_transport,
 )
 
 
@@ -559,7 +565,7 @@ class TestHermeticSessionRunner(unittest.TestCase):
         mismatched_client = TursoHTTPClient(
             database_url="https://other-staging-db.turso.io",
             auth_token="token",
-            transport=self.raw_transport,
+            transport=self.budget_transport,
         )
         with self.assertRaises(PermissionError) as ctx:
             StagingSessionRunner(client=mismatched_client)
@@ -571,7 +577,7 @@ class TestHermeticSessionRunner(unittest.TestCase):
         ro_client = TursoHTTPClient(
             database_url=EXACT_STAGING_DESTINATION,
             auth_token="token",
-            transport=self.raw_transport,
+            transport=self.budget_transport,
             read_only=True,
         )
         with self.assertRaises(ValueError) as ctx:
@@ -877,6 +883,367 @@ class TestOfflineCLIAndSafety(unittest.TestCase):
         self.assertEqual(result.returncode, 0, f"CLI exited with {result.returncode}: {result.stderr}")
         self.assertIn("Efso Radar Hermetic Staging Runner Foundation", result.stdout)
         self.assertEqual(result.stderr, "")
+
+
+
+
+# =============================================================================
+# PR #16 Final Safety Corrections Tests
+# =============================================================================
+
+class TestVerifiedHermeticTransportChain(unittest.TestCase):
+    """Adversarial tests for strictly verified hermetic transport chain (Requirement 1)."""
+
+    def setUp(self):
+        self.conn = create_schema_v6_conn()
+        self.raw_transport = HermeticStagingTransport(self.conn)
+        self.budget_transport = BudgetTrackingTransport(self.raw_transport)
+        self.temp_dir = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+        self.conn.close()
+
+    def test_duck_typed_is_hermetic_rejected(self):
+        """Objects claiming is_hermetic=True without concrete approved class must be rejected."""
+        class DuckHermeticTransport(httpx.BaseTransport):
+            is_hermetic: bool = True
+            def handle_request(self, request):
+                return httpx.Response(200, json={}, request=request)
+
+        duck = DuckHermeticTransport()
+        self.assertFalse(is_hermetic_transport(duck))
+
+        with self.assertRaises(PermissionError) as ctx:
+            verify_hermetic_session_transport(duck)
+        self.assertIn("Hermetic security boundary violation", str(ctx.exception))
+
+        # Wrapped in budget transport
+        duck_budget = BudgetTrackingTransport(duck)  # type: ignore[arg-type]
+        self.assertFalse(is_hermetic_transport(duck_budget))
+
+        with self.assertRaises(PermissionError) as ctx:
+            verify_hermetic_session_transport(duck_budget)
+        self.assertIn("Hermetic security boundary violation", str(ctx.exception))
+
+    def test_bare_hermetic_transport_rejected(self):
+        """Bare HermeticStagingTransport cannot bypass request ceiling; must be rejected."""
+        with self.assertRaises(PermissionError) as ctx:
+            verify_hermetic_session_transport(self.raw_transport)
+        self.assertIn("expected concrete BudgetTrackingTransport", str(ctx.exception))
+
+        client = TursoHTTPClient(
+            database_url=EXACT_STAGING_DESTINATION,
+            auth_token="token",
+            transport=self.raw_transport,
+        )
+        with self.assertRaises(PermissionError) as ctx:
+            StagingSessionRunner(client=client)
+        self.assertIn("expected concrete BudgetTrackingTransport", str(ctx.exception))
+        client.close()
+
+    def test_custom_subclasses_rejected(self):
+        """Custom subclasses that could override network or budgeting behavior must be rejected."""
+        class SubBudgetTracking(BudgetTrackingTransport):
+            pass
+
+        class SubHermeticStaging(HermeticStagingTransport):
+            pass
+
+        sub_budget = SubBudgetTracking(self.raw_transport)
+        with self.assertRaises(PermissionError) as ctx:
+            verify_hermetic_session_transport(sub_budget)
+        self.assertIn("expected concrete BudgetTrackingTransport", str(ctx.exception))
+
+        sub_raw = SubHermeticStaging(self.conn)
+        budget_wrapping_sub_raw = BudgetTrackingTransport(sub_raw)
+        with self.assertRaises(PermissionError) as ctx:
+            verify_hermetic_session_transport(budget_wrapping_sub_raw)
+        self.assertIn("expected inner concrete HermeticStagingTransport", str(ctx.exception))
+
+    def test_file_backed_sqlite_connection_rejected(self):
+        """Transport backed by a file-backed SQLite database is not hermetic and must be rejected."""
+        db_path = Path(self.temp_dir.name) / "file_backed.db"
+        file_conn = sqlite3.connect(str(db_path))
+        file_raw = HermeticStagingTransport(file_conn)
+        file_budget = BudgetTrackingTransport(file_raw)
+
+        client = TursoHTTPClient(
+            database_url=EXACT_STAGING_DESTINATION,
+            auth_token="token",
+            transport=file_budget,
+        )
+
+        with self.assertRaises(PermissionError) as ctx:
+            StagingSessionRunner(client=client)
+        self.assertIn("SQLite connection is backed by or has attached file", str(ctx.exception))
+
+        client.close()
+        file_conn.close()
+
+    def test_attached_file_sqlite_connection_rejected(self):
+        """Transport backed by an in-memory SQLite database with an attached file must be rejected."""
+        mem_conn = sqlite3.connect(":memory:")
+        attached_path = (Path(self.temp_dir.name) / "attached.db").resolve()
+        safe_path_str = str(attached_path).replace("\\", "/")
+        mem_conn.execute(f"ATTACH DATABASE '{safe_path_str}' AS attached_db;")
+
+        attached_raw = HermeticStagingTransport(mem_conn)
+        attached_budget = BudgetTrackingTransport(attached_raw)
+
+        client = TursoHTTPClient(
+            database_url=EXACT_STAGING_DESTINATION,
+            auth_token="token",
+            transport=attached_budget,
+        )
+
+        with self.assertRaises(PermissionError) as ctx:
+            StagingSessionRunner(client=client)
+        self.assertIn("SQLite connection is backed by or has attached file", str(ctx.exception))
+
+        client.close()
+        mem_conn.close()
+
+    def test_zero_sql_executed_on_transport_rejection(self):
+        """Verify zero SQL statements executed when transport chain verification fails."""
+        file_path = Path(self.temp_dir.name) / "zero_exec.db"
+        file_conn = sqlite3.connect(str(file_path))
+        raw = HermeticStagingTransport(file_conn)
+        budget = BudgetTrackingTransport(raw)
+        client = TursoHTTPClient(
+            database_url=EXACT_STAGING_DESTINATION,
+            auth_token="token",
+            transport=budget,
+        )
+
+        with self.assertRaises(PermissionError):
+            StagingSessionRunner(client=client)
+
+        # Confirm zero application schema tables or synthetic records created in the file
+        cur = file_conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = cur.fetchall()
+        self.assertEqual(tables, [])
+
+        client.close()
+        file_conn.close()
+
+
+class TestPreserveUnknownAfterAmbiguousTransactions(unittest.TestCase):
+    """Regression tests for preserving UNKNOWN audit state and manifest on ambiguous outcomes (Requirement 2)."""
+
+    def setUp(self):
+        self.conn = create_schema_v6_conn()
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.manifest_dir = Path(self.temp_dir.name)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+        self.conn.close()
+
+    def test_live_02_commit_timeout_preserves_unknown_and_manifest(self):
+        """Injected COMMIT timeout in LIVE-02 stops writes, preserves UNKNOWN state, and skips cleanup."""
+        timeout_raw = HermeticStagingTransport(self.conn, fail_on_commit_timeout=True)
+        timeout_budget = BudgetTrackingTransport(timeout_raw)
+        client = TursoHTTPClient(
+            database_url=EXACT_STAGING_DESTINATION,
+            auth_token="token",
+            transport=timeout_budget,
+        )
+
+        runner = StagingSessionRunner(
+            client=client,
+            destination_url=EXACT_STAGING_DESTINATION,
+            manifest_dir=self.manifest_dir,
+        )
+        report = runner.run()
+
+        # 1. Status is FAILED
+        self.assertEqual(report.status, SessionStatus.FAILED)
+        # 2. Audit outcome state is strictly UNKNOWN (not CLEAN)
+        self.assertEqual(report.audit_state, AuditOutcomeState.UNKNOWN)
+        # 3. Manifest is preserved on disk
+        self.assertTrue(report.manifest_preserved)
+        self.assertTrue(Path(report.manifest_path).exists())
+        # 4. Zero cleanup reserve used and zero cleanup stage executed
+        self.assertEqual(report.cleanup_reserve_used, 0)
+        self.assertFalse(any(s.stage_id == "LIVE-08" for s in report.stages))
+        # 5. Error recorded mentions Ambiguous transaction outcome
+        self.assertTrue(any("Ambiguous transaction outcome" in err for err in report.errors))
+
+    def test_live_07_reconciliation_query_failure_preserves_unknown(self):
+        """Simulated transport failure during LIVE-07 reconciliation keeps UNKNOWN and preserves manifest."""
+        raw = HermeticStagingTransport(self.conn)
+        budget = BudgetTrackingTransport(raw)
+        client = TursoHTTPClient(
+            database_url=EXACT_STAGING_DESTINATION,
+            auth_token="token",
+            transport=budget,
+        )
+
+        runner = StagingSessionRunner(
+            client=client,
+            destination_url=EXACT_STAGING_DESTINATION,
+            manifest_dir=self.manifest_dir,
+            simulate_ambiguous_inspection_failure=True,
+        )
+        report = runner.run()
+
+        self.assertEqual(report.status, SessionStatus.FAILED)
+        self.assertEqual(report.audit_state, AuditOutcomeState.UNKNOWN)
+        self.assertTrue(report.manifest_preserved)
+        self.assertTrue(Path(report.manifest_path).exists())
+        self.assertFalse(any(s.stage_id == "LIVE-08" for s in report.stages))
+
+    def test_typed_ambiguous_error_classification(self):
+        """TursoAmbiguousTransactionError is typed subclass and properly classified."""
+        self.assertTrue(issubclass(TursoAmbiguousTransactionError, TursoClientError))
+
+        amb_err = TursoAmbiguousTransactionError("Ambiguous transaction outcome (UNKNOWN): timeout during COMMIT")
+        self.assertTrue(is_ambiguous_transaction_error(amb_err))
+
+        legacy_amb_err = TursoClientError("Ambiguous transaction outcome (UNKNOWN): network error during Turso COMMIT")
+        self.assertTrue(is_ambiguous_transaction_error(legacy_amb_err))
+
+        timeout_err = httpx.TimeoutException("Connection timed out")
+        self.assertTrue(is_ambiguous_transaction_error(timeout_err))
+
+        # Clear deterministic errors return False
+        constraint_err = TursoClientError("Turso transaction aborted due to statement error (SQLITE_CONSTRAINT): Abort")
+        self.assertFalse(is_ambiguous_transaction_error(constraint_err))
+
+        syntax_err = TursoClientError("Turso transaction aborted due to statement error (SQLITE_ERROR): syntax error")
+        self.assertFalse(is_ambiguous_transaction_error(syntax_err))
+
+
+class TestEliminateUnregisteredTentativeRecords(unittest.TestCase):
+    """Test verification that LIVE-03 statement error touches zero unregistered primary keys (Requirement 3)."""
+
+    def setUp(self):
+        self.conn = create_schema_v6_conn()
+        self.raw_transport = HermeticStagingTransport(self.conn)
+        self.budget_transport = BudgetTrackingTransport(self.raw_transport)
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.manifest_dir = Path(self.temp_dir.name)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+        self.conn.close()
+
+    def test_live_03_zero_unregistered_keys(self):
+        """Prove that LIVE-03 only targets registered primary key synth_art_{run_id}_02_rollback."""
+        client = TursoHTTPClient(
+            database_url=EXACT_STAGING_DESTINATION,
+            auth_token="token",
+            transport=self.budget_transport,
+        )
+        runner = StagingSessionRunner(
+            client=client,
+            destination_url=EXACT_STAGING_DESTINATION,
+            manifest_dir=self.manifest_dir,
+        )
+        # Register manifest ahead of execution
+        runner._create_and_persist_manifest()
+        manifest_pks = {e.pk_value for e in runner.manifest.registered_entities}
+
+        art_id_rollback = f"synth_art_{runner.run_id}_02_rollback"
+        # Verify that art_id_rollback is in the manifest
+        self.assertIn(art_id_rollback, manifest_pks)
+
+        # Run LIVE-01, LIVE-02, LIVE-03
+        runner._run_live_01()
+        runner._run_live_02()
+        runner._run_live_03()
+
+        # Query all articles in the database; should contain only LIVE-02 article, NOT any invalid/unregistered key
+        cur = self.conn.cursor()
+        cur.execute("SELECT article_id FROM processed_articles;")
+        articles = [r[0] for r in cur.fetchall()]
+        for art in articles:
+            self.assertIn(art, manifest_pks)
+            self.assertFalse(art.startswith("synth_art_invalid_"))
+
+
+class TestEnforceExactManifestOwnershipAttributes(unittest.TestCase):
+    """Adversarial tests for strictly validating exact canonical manifest ownership attributes (Requirement 4)."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.manifest_dir = Path(self.temp_dir.name)
+        self.run_id = "run_20261025T150000Z_abcdef123456"
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _write_manifest(self, entities_data: list[dict]) -> Path:
+        path = self.manifest_dir / f"efso_radar_staging_manifest_{self.run_id}.json"
+        path.write_text(json.dumps({
+            "run_id": self.run_id,
+            "created_at": "2026-10-25T15:00:00Z",
+            "version": 1,
+            "registered_entities": entities_data,
+        }), encoding="utf-8")
+        return path
+
+    def test_adversarial_tampered_article_title_rejected(self):
+        """Manifest with modified article title must be rejected."""
+        entities = [e.model_dump() for e in create_default_manifest_entities(self.run_id)]
+        entities[0]["expected_attributes"]["title"] = "SYNTH_ARTICLE_TAMPERED"
+        path = self._write_manifest(entities)
+
+        with self.assertRaises(ValueError) as ctx:
+            PerRunOwnershipManifest.load_and_validate(path)
+        self.assertIn("attribute 'title' mismatch", str(ctx.exception))
+
+    def test_adversarial_tampered_story_headline_rejected(self):
+        """Manifest with modified story headline must be rejected."""
+        entities = [e.model_dump() for e in create_default_manifest_entities(self.run_id)]
+        entities[1]["expected_attributes"]["headline_tr"] = "SYNTH_STORY_TAMPERED"
+        path = self._write_manifest(entities)
+
+        with self.assertRaises(ValueError) as ctx:
+            PerRunOwnershipManifest.load_and_validate(path)
+        self.assertIn("attribute 'headline_tr' mismatch", str(ctx.exception))
+
+    def test_adversarial_extra_attributes_rejected(self):
+        """Manifest entity with arbitrary extra ownership attributes must be rejected."""
+        entities = [e.model_dump() for e in create_default_manifest_entities(self.run_id)]
+        entities[0]["expected_attributes"]["extra_unauthorized_marker"] = "exploit"
+        path = self._write_manifest(entities)
+
+        with self.assertRaises(ValueError) as ctx:
+            PerRunOwnershipManifest.load_and_validate(path)
+        self.assertIn("arbitrary extra ownership attributes", str(ctx.exception))
+
+    def test_adversarial_missing_worker_ids_rejected(self):
+        """Manifest entity for run_locks missing worker_ids must be rejected."""
+        entities = [e.model_dump() for e in create_default_manifest_entities(self.run_id)]
+        entities[3]["expected_attributes"] = {}
+        path = self._write_manifest(entities)
+
+        with self.assertRaises(ValueError) as ctx:
+            PerRunOwnershipManifest.load_and_validate(path)
+        self.assertIn("missing expected ownership attributes", str(ctx.exception))
+
+    def test_adversarial_unexpected_worker_ids_rejected(self):
+        """Manifest entity for run_locks with altered worker_ids must be rejected."""
+        entities = [e.model_dump() for e in create_default_manifest_entities(self.run_id)]
+        entities[3]["expected_attributes"]["worker_ids"] = ["unauthorized_worker_beta"]
+        path = self._write_manifest(entities)
+
+        with self.assertRaises(ValueError) as ctx:
+            PerRunOwnershipManifest.load_and_validate(path)
+        self.assertIn("attribute 'worker_ids' mismatch", str(ctx.exception))
+
+    def test_adversarial_tampered_recovery_stage_rejected(self):
+        """Manifest entity for durable_recovery_state with tampered stage must be rejected."""
+        entities = [e.model_dump() for e in create_default_manifest_entities(self.run_id)]
+        entities[4]["expected_attributes"]["stage"] = "injected_stage"
+        path = self._write_manifest(entities)
+
+        with self.assertRaises(ValueError) as ctx:
+            PerRunOwnershipManifest.load_and_validate(path)
+        self.assertIn("attribute 'stage' mismatch", str(ctx.exception))
 
 
 if __name__ == "__main__":
