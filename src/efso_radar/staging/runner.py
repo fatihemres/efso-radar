@@ -872,9 +872,22 @@ class StagingSessionRunner:
         # 1. Strict destination URL validation
         self.destination_url = validate_staging_destination(destination_url)
 
-        # 2. Strict Hermetic transport boundary enforcement
+        # 2. Strict Hermetic client and transport boundary enforcement
         if client is None:
             raise PermissionError("Client cannot be None.")
+
+        # Require a fresh, exact concrete TursoHTTPClient instance (reject subclasses, mocks, or fakes)
+        if type(client) is not TursoHTTPClient:
+            raise PermissionError(
+                f"Hermetic security boundary violation: client must be an exact concrete TursoHTTPClient, got {type(client).__name__}."
+            )
+
+        # Require a fresh TursoHTTPClient instance with no previously initialized or cached internal HTTP client
+        if getattr(client, "_client", None) is not None:
+            raise PermissionError(
+                "Hermetic security boundary violation: client has an already initialized internal HTTP client (_client is not None). "
+                "StagingSessionRunner requires a fresh, uninitialized TursoHTTPClient to prevent stale cached transports."
+            )
 
         transport = getattr(client, "transport", None)
         verify_hermetic_session_transport(transport)
@@ -929,12 +942,26 @@ class StagingSessionRunner:
         return bt.cleanup_request_count if bt else 0
 
     def _execute(self, sql: str, params: Optional[list[Any]] = None) -> Any:
+        cached = getattr(self.client, "_client", None)
+        if cached is not None:
+            cached_transport = getattr(cached, "_transport", None)
+            if cached_transport is not None and cached_transport is not self.client.transport:
+                raise PermissionError(
+                    "Hermetic security boundary violation: cached HTTP client transport differs from configured transport."
+                )
         upper = sql.strip().upper()
         if any(upper.startswith(v) for v in ("INSERT", "UPDATE", "DELETE")):
             self.total_mutating_operations += 1
         return self.client.execute(sql, params)
 
     def _execute_transaction(self, statements: list[tuple[str, list[Any]]]) -> list[Any]:
+        cached = getattr(self.client, "_client", None)
+        if cached is not None:
+            cached_transport = getattr(cached, "_transport", None)
+            if cached_transport is not None and cached_transport is not self.client.transport:
+                raise PermissionError(
+                    "Hermetic security boundary violation: cached HTTP client transport differs from configured transport."
+                )
         upper_stmts = [s[0].strip().upper() for s in statements]
         for us in upper_stmts:
             if any(us.startswith(v) for v in ("INSERT", "UPDATE", "DELETE")):
@@ -953,6 +980,12 @@ class StagingSessionRunner:
 
     def run(self) -> StagingRunnerReport:
         """Execute full hermetic dry-run session across stages LIVE-01 through LIVE-08."""
+        # Reject previously initialized client before dispatching SQL or mutating state
+        if getattr(self.client, "_client", None) is not None:
+            raise PermissionError(
+                "Hermetic security boundary violation: client has an already initialized internal HTTP client before dispatch."
+            )
+
         manifest_unlinked = False
 
         try:

@@ -1246,5 +1246,174 @@ class TestEnforceExactManifestOwnershipAttributes(unittest.TestCase):
         self.assertIn("attribute 'stage' mismatch", str(ctx.exception))
 
 
+
+class TestRejectUnsafeOrCachedClients(unittest.TestCase):
+    """Regression tests verifying rejection of unsafe, subclassed, or cached HTTP clients (Requirement 1)."""
+
+    def setUp(self):
+        self.conn = create_schema_v6_conn()
+        self.raw_transport = HermeticStagingTransport(self.conn)
+        self.budget_transport = BudgetTrackingTransport(self.raw_transport)
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.manifest_dir = Path(self.temp_dir.name)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+        self.conn.close()
+
+    def test_runner_rejects_subclass_of_turso_http_client(self):
+        """Runner requires exact TursoHTTPClient concrete instance; custom subclasses are rejected."""
+        class SubTursoHTTPClient(TursoHTTPClient):
+            pass
+
+        sub_client = SubTursoHTTPClient(
+            database_url=EXACT_STAGING_DESTINATION,
+            auth_token="token",
+            transport=self.budget_transport,
+        )
+        with self.assertRaises(PermissionError) as ctx:
+            StagingSessionRunner(client=sub_client)
+        self.assertIn("client must be an exact concrete TursoHTTPClient", str(ctx.exception))
+        sub_client.close()
+
+    def test_runner_rejects_previously_initialized_internal_client(self):
+        """A client that already initialized its internal _client must be rejected immediately."""
+        client = TursoHTTPClient(
+            database_url=EXACT_STAGING_DESTINATION,
+            auth_token="token",
+            transport=self.budget_transport,
+        )
+        # Initialize internal cached _client
+        _ = client._get_client()
+        self.assertIsNotNone(client._client)
+
+        with self.assertRaises(PermissionError) as ctx:
+            StagingSessionRunner(client=client)
+        self.assertIn("already initialized internal HTTP client", str(ctx.exception))
+        client.close()
+
+    def test_runner_rejects_cached_transport_mismatch_with_zero_mutations(self):
+        """If a cached HTTP client holds an unsafe transport, runner rejects it with zero mutations."""
+        unsafe_transport = httpx.HTTPTransport()
+        client = TursoHTTPClient(
+            database_url=EXACT_STAGING_DESTINATION,
+            auth_token="token",
+            transport=unsafe_transport,
+        )
+        # Initialize client so _client holds unsafe_transport
+        _ = client._get_client()
+        # Attempt to bypass by setting client.transport to verified budget_transport
+        client.transport = self.budget_transport
+
+        with self.assertRaises(PermissionError) as ctx:
+            StagingSessionRunner(
+                client=client,
+                destination_url=EXACT_STAGING_DESTINATION,
+                manifest_dir=self.manifest_dir,
+            )
+        self.assertIn("already initialized internal HTTP client", str(ctx.exception))
+
+        # Assert zero synthetic mutations and zero tables modified
+        cur = self.conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM processed_articles;")
+        self.assertEqual(cur.fetchone()[0], 0)
+        cur.execute("SELECT COUNT(*) FROM stories;")
+        self.assertEqual(cur.fetchone()[0], 0)
+        cur.execute("SELECT COUNT(*) FROM run_locks;")
+        self.assertEqual(cur.fetchone()[0], 0)
+        cur.execute("SELECT COUNT(*) FROM durable_recovery_state;")
+        self.assertEqual(cur.fetchone()[0], 0)
+        client.close()
+
+    def test_runner_run_rejects_client_initialized_before_dispatch(self):
+        """Even if initialized between __init__ and run(), runner rejects before dispatching SQL."""
+        client = TursoHTTPClient(
+            database_url=EXACT_STAGING_DESTINATION,
+            auth_token="token",
+            transport=self.budget_transport,
+        )
+        runner = StagingSessionRunner(
+            client=client,
+            destination_url=EXACT_STAGING_DESTINATION,
+            manifest_dir=self.manifest_dir,
+        )
+        # Now initialize internal _client before calling run()
+        _ = client._get_client()
+
+        with self.assertRaises(PermissionError) as ctx:
+            runner.run()
+        self.assertIn("already initialized internal HTTP client before dispatch", str(ctx.exception))
+        client.close()
+
+
+class TestConsistentTypedAmbiguousCommitErrors(unittest.TestCase):
+    """Focused tests for HTTP 500, 502, 503, 504 COMMIT failures (Requirement 2)."""
+
+    def setUp(self):
+        self.conn = create_schema_v6_conn()
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.manifest_dir = Path(self.temp_dir.name)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+        self.conn.close()
+
+    def test_execute_transaction_raises_typed_ambiguous_on_http_server_errors(self):
+        """execute_transaction() must raise TursoAmbiguousTransactionError on HTTP 500, 502, 503, and 504."""
+        for status_code in (500, 502, 503, 504):
+            with self.subTest(status_code=status_code):
+                raw = HermeticStagingTransport(self.conn, fail_on_commit_status=status_code)
+                budget = BudgetTrackingTransport(raw)
+                client = TursoHTTPClient(
+                    database_url=EXACT_STAGING_DESTINATION,
+                    auth_token="token",
+                    transport=budget,
+                )
+                stmts = [
+                    (
+                        "INSERT INTO processed_articles (article_id, canonical_url, title, source, published_at, processed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        [f"art_{status_code}", f"https://example.com/{status_code}", "Title", "src", "2026-10-25T15:00:00Z", "2026-10-25T15:00:00Z"],
+                    ),
+                ]
+                with self.assertRaises(TursoAmbiguousTransactionError) as ctx:
+                    client.execute_transaction(stmts)
+
+                self.assertIn(f"HTTP status {status_code}", str(ctx.exception))
+                self.assertIn("Ambiguous transaction outcome (UNKNOWN)", str(ctx.exception))
+                self.assertIn("The transaction may or may not have committed", str(ctx.exception))
+                client.close()
+
+    def test_full_session_preserves_unknown_on_http_server_errors_zero_blind_retries(self):
+        """In full session LIVE-02, HTTP 500/502/503/504 preserves UNKNOWN, skips cleanup, zero blind retries."""
+        for status_code in (500, 502, 503, 504):
+            with self.subTest(status_code=status_code):
+                raw = HermeticStagingTransport(self.conn, fail_on_commit_status=status_code)
+                budget = BudgetTrackingTransport(raw)
+                client = TursoHTTPClient(
+                    database_url=EXACT_STAGING_DESTINATION,
+                    auth_token="token",
+                    transport=budget,
+                )
+                runner = StagingSessionRunner(
+                    client=client,
+                    destination_url=EXACT_STAGING_DESTINATION,
+                    manifest_dir=self.manifest_dir,
+                )
+                report = runner.run()
+
+                # 1. Status is FAILED
+                self.assertEqual(report.status, SessionStatus.FAILED)
+                # 2. Audit outcome state strictly UNKNOWN
+                self.assertEqual(report.audit_state, AuditOutcomeState.UNKNOWN)
+                # 3. Manifest preserved
+                self.assertTrue(report.manifest_preserved)
+                self.assertTrue(Path(report.manifest_path).exists())
+                # 4. Zero cleanup reserve used and LIVE-08 cleanup skipped
+                self.assertEqual(report.cleanup_reserve_used, 0)
+                self.assertFalse(any(s.stage_id == "LIVE-08" for s in report.stages))
+                # 5. Correct error message recorded
+                self.assertTrue(any(f"HTTP status {status_code}" in err for err in report.errors))
+
+
 if __name__ == "__main__":
     unittest.main()
