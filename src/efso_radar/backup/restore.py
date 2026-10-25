@@ -15,6 +15,7 @@ import logging
 import os
 import shutil
 import sqlite3
+from contextlib import closing
 import tarfile
 import tempfile
 import time
@@ -756,17 +757,16 @@ def verify_quiescence(operational_data_dir: Path) -> None:
         return
 
     try:
-        conn = sqlite3.connect(f"file:{live_db}?mode=ro", uri=True, timeout=5.0)
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='run_locks';")
-        if cursor.fetchone():
-            cursor.execute("SELECT COUNT(*) FROM run_locks;")
-            active_locks = cursor.fetchone()[0]
-            if active_locks > 0:
-                raise RestoreVerificationError(
-                    f"Quiescence check failed: {active_locks} active worker run locks detected in database"
-                )
-        conn.close()
+        with closing(sqlite3.connect(f"file:{live_db}?mode=ro", uri=True, timeout=5.0)) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='run_locks';")
+            if cursor.fetchone():
+                cursor.execute("SELECT COUNT(*) FROM run_locks;")
+                active_locks = cursor.fetchone()[0]
+                if active_locks > 0:
+                    raise RestoreVerificationError(
+                        f"Quiescence check failed: {active_locks} active worker run locks detected in database"
+                    )
     except sqlite3.OperationalError as exc:
         raise RestoreVerificationError(f"Cannot verify database quiescence: {exc}") from exc
 
@@ -931,11 +931,10 @@ def simulate_offline_cutover_in_test_workspace(
         internal_temp = tempfile.TemporaryDirectory(prefix="efso_sim_cutover_")
         safe_workspace = Path(internal_temp.name).resolve()
         # Initialize synthetic live baseline in internally owned temp directory
-        conn = sqlite3.connect(safe_workspace / "radar.db")
-        conn.execute("CREATE TABLE stories (id TEXT);")
-        conn.execute("INSERT INTO stories VALUES ('internal_story');")
-        conn.commit()
-        conn.close()
+        with closing(sqlite3.connect(safe_workspace / "radar.db")) as conn:
+            conn.execute("CREATE TABLE stories (id TEXT);")
+            conn.execute("INSERT INTO stories VALUES ('internal_story');")
+            conn.commit()
         (safe_workspace / "telegram_digest_delivery_ledger.json").write_text("{}", encoding="utf-8")
         (safe_workspace / "experiment_budget_ledger.json").write_text("{}", encoding="utf-8")
     else:
@@ -967,15 +966,8 @@ def simulate_offline_cutover_in_test_workspace(
 
         if live_db.exists():
             try:
-                live_conn = sqlite3.connect(f"file:{live_db}?mode=ro", uri=True, timeout=10.0)
-                bak_conn = sqlite3.connect(bak_db)
-                live_conn.backup(bak_conn)
-                live_conn.close()
-                bak_conn.close()
-                del live_conn
-                del bak_conn
-                import gc
-                gc.collect()
+                with closing(sqlite3.connect(f"file:{live_db}?mode=ro", uri=True, timeout=10.0)) as live_conn,                      closing(sqlite3.connect(bak_db)) as bak_conn:
+                    live_conn.backup(bak_conn)
                 journal.db_backed_up = True
             except Exception as exc:
                 journal.phase = "FAILED"
@@ -1036,11 +1028,10 @@ def simulate_offline_cutover_in_test_workspace(
                 raise RuntimeError("Injected fault at step 4: Smoke test failure")
 
             # Step 3: Post-cutover smoke test
-            conn = sqlite3.connect(f"file:{live_db}?mode=ro", uri=True)
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM stories;")
-            cursor.fetchone()
-            conn.close()
+            with closing(sqlite3.connect(f"file:{live_db}?mode=ro", uri=True)) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM stories;")
+                cursor.fetchone()
 
             journal.phase = "COMPLETED"
             journal.step_history.append("Smoke test passed successfully")
