@@ -3,7 +3,7 @@
 @efsomagazin için yerli ve global popüler kültür gündemini takip eden, Google News RSS üzerinden haberleri toplayan, kural tabanlı ve yapay zekâ destekli editoryal ön eleme sunan ve **yalnızca seçici ve doğrulanabilir gelişmeleri** Telegram üzerinden bildiren editoryal radar sistemi.
 
 > **ÖNEMLİ GÜVENLİK VE MİMARİ BİLGİLENDİRMESİ:**
-> - **Herkese Açık Kod / Public Depo (Lisans Belirlenmedi):** Bu depo GitHub üzerinde genel erişime açıktır (`fatihemres/efso-radar`). Hiçbir özel anahtar, bot token'ı veya özel chat ID depoda yer almaz.
+> - **Herkese Açık Kod / Public Depo (Tüm Hakları Saklıdır):** Bu depo GitHub üzerinde genel erişime açıktır (`fatihemres/efso-radar`). Hiçbir özel anahtar, bot token'ı veya özel chat ID depoda yer almaz.
 > - **Üretim Otomasyonu Kapalıdır:** GitHub Actions zamanlanmış cron iş akışları güvenlik nedeniyle **tamamen devre dışıdır**. Arka planda çalışan canlı veya gözetimsiz bir üretim servisi bulunmamaktadır.
 > - **Git Commit ile Durum Saklanmaz:** Sistem durumu Git commitleri ile depoya yazılmaz. Durum yönetimi Schema v6 (15 tablo) ile yerel SQLite ve Turso libSQL bulut veritabanı altyapısıyla sağlanır.
 > - **Varsayılan Güvenlik Korumaları:** Yapay zekâ değerlendirmesi (`AI_EVALUATION_ENABLED=False`) ve Telegram bildirim iletimi (`TELEGRAM_DELIVERY_ENABLED=False`) varsayılan olarak **kapalıdır**.
@@ -11,7 +11,7 @@
 > - **Instagram Entegrasyonu:** Instagram otomatik paylaşımı kesinlikle kapalıdır; sistem yalnızca Telegram üzerinden editöre taslak öneri sunar.
 > - **Üretim Aktivasyonu:** Canlı sistem geçişi ve zamanlanmış iş akışlarının etkinleştirilmesi Ürün Sahibi'nin (Product Owner) ayrı ve açık onayına tabidir.
 
-\n> **Lisans notu:** Bu depo herkese açıktır ancak henüz bir yeniden kullanım/dağıtım lisansı seçilmemiştir. Public GitHub görünürlüğü tek başına açık kaynak lisansı anlamına gelmez. Kodun lisanslanması ve RSS/haber içeriğinin kullanım hakları [lisans incelemesi](https://github.com/fatihemres/efso-radar/issues/17) altında değerlendirilmektedir.\n
+\n> **Lisans notu:** Bu deponun sahibine ait özgün çalışmalar için tüm haklar saklıdır ve yeniden kullanım izni verilmemektedir. Ayrıntılar için [LICENSE](LICENSE) dosyasına bakın. Üçüncü taraf haber verileri ve bağımlılıkların hakları ayrıca saklıdır.\n
 ---
 
 ## 👥 Alıcı Politikası (Recipient Policy)
