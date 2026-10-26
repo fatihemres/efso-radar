@@ -23,6 +23,18 @@
 - **Independent review correction (2026-10-26):** Review of all 63 non-test Python files identified four Gemini SDK dispatch locations, including previously unguarded `src/radar.py:judge` and a bypass via injected `mock_client` in the shadow evaluator. Scoped commits [`462b9956`](https://github.com/fatihemres/efso-radar/commit/462b9956e3be6ea81e8ec1583274c7d5f5b8465f) and [`27723b0a`](https://github.com/fatihemres/efso-radar/commit/27723b0a72599aa2b63ba5c273b990a23e98ec9d) close both routes, move historical pilot live-denial before local file/ledger access, reject NaN/infinite monetary budgets, and explicitly scope mocks to hermetic tests. They do not authorize live operations.
 - **Post-review code CI:** [run 40321496127](https://github.com/fatihemres/efso-radar/actions/runs/40321496127) on commit `27723b0a72599aa2b63ba5c273b990a23e98ec9d` **PASSED** on Linux Python **3.11 and 3.12**: **561 passed, 14 skipped, 163 subtests passed per job**, confirmed independently from raw job logs. No independent local Windows or provider test. Any subsequent doc/test commit needs its own CI evidence. The PR remains DRAFT / UNMERGED pending the Product Owner.
 
+## Latest checked implementation and live read-only evidence — 2026-10-26
+
+| What | Exact evidence / environment | Result and boundary |
+| --- | --- | --- |
+| PR #27 initial LIVE-01 read-only operator | Merged `32c0e3bfdf10ffa4f267b51440bbdc9e455d3d16`; [CI #40337613519](https://github.com/fatihemres/efso-radar/actions/runs/40337613519) | Hosted Linux 3.11/3.12 + Windows 3.12 PASS; mock-only tests. |
+| PR #28 one-query sanitized diagnostic | Merged `6dc438547417384f73c0358022130f93a8320145`; [main CI #40358925571](https://github.com/fatihemres/efso-radar/actions/runs/40358925571) | Each matrix job: **571 passed / 14 skipped / 176 subtests passed**; Ruff PASS, Linux pip check/pip-audit clean. |
+| PO Windows Python 3.12 focused tests | Owner-provided PowerShell at `C:\Dev\EfsoRadar`, `PYTHONPATH=src`, `venv\Scripts\python.exe -m pytest tests/test_phase5b3g_c_live01_readonly.py -q` | At integrated `main` `6dc4385`: **10 passed, 10 subtests passed in 0.88s**. Owner-provided log, not assistant local execution. |
+| First authorized remote staging LIVE-01 | Owner-provided console output, read-only Turso token; old CLI then new CLI at `6dc4385`. [Issue #13 comment](https://github.com/fatihemres/efso-radar/issues/13#issuecomment-6421424925) | **PASS** (both); latest **47/60 reads**, schema v6, **15 expected tables**, **129 expected columns**, **five synthetic-key collisions absent**; **no write operations** by read-only client/transport design. Not a claim that the complete remote database content was audited. |
+| Credential invalidation | Owner's direct statement after PASS: clicked **Invalidate All Tokens** | Treat as reported revocation of database/group credentials, **not independently verified**; no SQL data deletion implied, other legacy token consumers may require reissuing. Do not request tokens/chat secrets. |
+
+**Remaining gaps:** Block Writes ON not freshly observed after LIVE-01; there is no saved write-session ownership manifest from LIVE-01; no LIVE-02 through LIVE-08 remote mutations, ownership-checked cleanup or remote recovery proof. The original 8-step staging runner remains **hermetic-only**. Existing PR #26, an offline deadline candidate, is **draft/unmerged** and was last CI-verified against an older `main` base. These gaps cannot be waived by a remote read-only PASS. No provider-specific absolute $0 billing guarantee was verified.
+
 ## Reproducible offline commands
 
 Windows PowerShell from `C:\Dev\EfsoRadar`:

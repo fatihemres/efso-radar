@@ -19,5 +19,13 @@
 | ERD-013 | **OPEN / REQUIRES PO CHOICE** | Reconcile historical `v0.4.0` anchor versus actual package `__version__ = "2.0.0"`, release/tag policy and public release intent. No release has been authorized here. | [Phase 4 closure](docs/PHASE4_CLOSURE.md), [package metadata](src/efso_radar/__init__.py) |
 | ERD-014 | **OPEN / RIGHTS AUDIT** | Complete third-party material/provenance review; decide whether public repository visibility meets owner intention. | [Issue #17](https://github.com/fatihemres/efso-radar/issues/17) |
 
+## Subsequent decision/evidence addendum — 2026-10-26
+
+**Earlier ERD-006, ERD-007 and ERD-012 reflect the governance snapshot preceding the later, explicit scoped LIVE-01 approvals.** Their broader prohibitions remain in force except for that completed one-off read-only operation.
+
+- **ERD-015 — PO APPROVED / READ-ONLY OPERATION EXECUTED:** The PO separately authorized a Turso staging-only, **read-only LIVE-01** session. The owner reported two PASS executions, latest on `main` SHA `6dc4385`: 47 requests, schema v6, 15 tables, 129 expected columns, five run-specific synthetic-key absence queries. [Detailed evidence](https://github.com/fatihemres/efso-radar/issues/13#issuecomment-6421424925). This did not create persistent test records or authorize live writes, subsequent remote sessions, production, cron, Gemini, RSS, Telegram or backup.
+- **ERD-016 — PO ACTION OBSERVED BY REPORT / CREDENTIALS INVALIDATED:** The PO reported clicking Turso **Invalidate All Tokens** after the LIVE-01 PASS. This is a completed credential-revocation action per owner report, not independent platform verification or a DB schema/data change. Any future connection requires newly scoped authorization and a new credential; no existing service needs to be re-enabled implicitly. The database's Block Writes ON setting was not reverified following this action.
+- **ERD-012 REMAINS OPEN:** Remaining LIVE-02 through LIVE-08 actual remote mutations and corresponding write-unblock/cleanup are **NOT AUTHORIZED**. Separate code integration, independent verification and explicit PO operational go/no-go gates remain mandatory. [Issue #13](https://github.com/fatihemres/efso-radar/issues/13).
+
 ## How to record changes
 New consequential decision: next `ERD-###`, date if known, explicit PO quote or linked issue/PR, authority/status, rationale, affected documents. Never promote an AI suggestion or an issue into PO approval; never backdate or erase superseded decisions. Proposed ideas belong in [Idea Register](docs/IDEA_REGISTER.md) until approved.
