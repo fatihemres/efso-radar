@@ -17,7 +17,8 @@
 
 - Candidate branch `fix/issue-21-zero-spend-gates-20261026` attempts hard-blocking of real Gemini calls in the editorial engine, shadow evaluator and historical Phase 4D helper until separately approved provider billing safeguards exist. Existing offline cached results and synthetic mocks are deliberately distinct.
 - Operational AI monetary defaults are zero; `Settings.from_env` rejects positive historical budget overrides, while explicit positive values remain available only to legacy hermetic price-estimation tests. This is not provider Free Tier verification or permission to activate services.
-- Added negative tests for defaults, zero/negative validation, positive environment rejection, production engine no-dispatch and real shadow client no-dispatch. **Tests have not been locally run by ChatGPT**; CI outcome at final PR HEAD must be independently checked before a VERIFIED label.
+- Added negative tests for defaults, zero/negative validation, positive environment rejection, production engine no-dispatch and real shadow client no-dispatch. Historical mock-only calibration budget tests explicitly use old numeric ceilings so they still test the cost calculator without permitting real dispatch. **Tests have not been locally run by ChatGPT**.
+- Initial CI at `fbaf7a7` ([run 40311808779](https://github.com/fatihemres/efso-radar/actions/runs/40311808779)) **FAILED**: 4 pre-existing tests assumed positive defaults or the missing-key diagnostic. The candidate patch addresses those specific regressions; rerun CI and inspect exact logs before any VERIFIED classification.
 
 ## Reproducible offline commands
 

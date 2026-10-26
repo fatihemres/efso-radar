@@ -1308,13 +1308,6 @@ class BlindShadowEvaluationRunner:
         import os
         from efso_radar.ai.calibration import HybridNotificationPlanner
 
-        # Offline/synthetic mocks remain possible; real API dispatch is not approved.
-        if not dry_run and mock_client is None:
-            try:
-                require_verified_free_tier()
-            except RuntimeError as exc:
-                raise AIEvaluationError(str(exc)) from exc
-
         clean_model, pricing = resolve_model_pricing(self.settings.gemini_model)
         key = api_key or self.settings.gemini_api_key or os.getenv("GEMINI_API_KEY", "")
         if not key and not dry_run and mock_client is None:
@@ -1322,6 +1315,14 @@ class BlindShadowEvaluationRunner:
                 "GEMINI_API_KEY is required for live shadow evaluation. "
                 "Live API inference must be explicitly authorized with an API key."
             )
+
+        # Offline/synthetic mocks remain possible; real API dispatch is not approved.
+        # Keep the missing-key diagnostic above, but deny all real-provider dispatch.
+        if not dry_run and mock_client is None:
+            try:
+                require_verified_free_tier()
+            except RuntimeError as exc:
+                raise AIEvaluationError(str(exc)) from exc
 
         client = None
         if not dry_run:
