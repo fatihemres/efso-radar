@@ -94,6 +94,53 @@ class TestLive01HermeticPreflight(unittest.TestCase):
         self.assertEqual(guard.sent, 0)
         self.assertEqual(called, [])
 
+    def test_probe_failure_reports_safe_http_status_without_retries(self):
+        for status in (400, 401, 403, 404, 408, 429, 500, 502, 503, 504):
+            with self.subTest(status=status):
+                sent = []
+                def respond(req):
+                    sent.append(req)
+                    return httpx.Response(
+                        status,
+                        json={"error": "secret-NEVER-PRINT-TOKEN-or-backend-response"},
+                        request=req,
+                    )
+                report = execute_live01_readonly(
+                    "mock-secret-token", inner_transport=httpx.MockTransport(respond)
+                )
+                self.assertFalse(report.passed)
+                self.assertEqual(report.stage, "CONNECTIVITY")
+                self.assertEqual(report.failure_category, f"HTTP_{status}")
+                self.assertEqual(report.request_count, 1)
+                self.assertEqual(report.collision_checks, 0)
+                self.assertEqual(len(sent), 1)
+                self.assertNotIn("secret", report.summary().lower())
+                self.assertNotIn("backend", report.summary().lower())
+
+    def test_probe_hrana_denied_stops_after_one_query(self):
+        sent = []
+        def respond(req):
+            sent.append(req)
+            return httpx.Response(
+                200,
+                json={"results": [
+                    {"type": "error", "error": {
+                        "code": "SQLITE_AUTH",
+                        "message": "untrusted-secret-response-body",
+                    }},
+                    {"type": "ok"},
+                ]},
+                request=req,
+            )
+        report = execute_live01_readonly(
+            "mock-secret", inner_transport=httpx.MockTransport(respond)
+        )
+        self.assertFalse(report.passed)
+        self.assertEqual(report.failure_category, "REMOTE_QUERY_ERROR")
+        self.assertEqual(report.request_count, 1)
+        self.assertEqual(len(sent), 1)
+        self.assertNotIn("untrusted", report.summary())
+
     def test_request_ceiling_is_hard_even_for_selects(self):
         seen = []
         guard = Live01ReadOnlyTransport(

@@ -19,7 +19,7 @@ from typing import Callable, Optional
 import httpx
 
 from efso_radar.repositories.turso import TursoReadOnlyStateRepository
-from efso_radar.repositories.turso_client import TursoHTTPClient, validate_read_only_sql
+from efso_radar.repositories.turso_client import TursoClientError, TursoHTTPClient, validate_read_only_sql
 from efso_radar.staging.preflight import CloudPreflightValidator
 from efso_radar.staging.runner import (
     EXACT_STAGING_DESTINATION,
@@ -108,6 +108,25 @@ class Live01Report:
         )
 
 
+def classify_connectivity_failure(exc: Exception) -> str:
+    """Return strictly fixed, safe labels; never echo response bodies, tokens or URL."""
+    if isinstance(exc, TursoClientError):
+        # The shared client already sanitizes HTTP status and Hrana error categories.
+        # Deliberately avoid printing raw exception text despite that guarantee.
+        reason = str(exc)
+        for status in (400, 401, 403, 404, 408, 429, 500, 502, 503, 504):
+            if f"HTTP status {status} " in reason:
+                return f"HTTP_{status}"
+        if "timed out" in reason:
+            return "HTTP_TIMEOUT"
+        if "HTTP connection to Turso failed" in reason:
+            return "HTTP_TRANSPORT"
+        return "REMOTE_QUERY_ERROR"
+    if isinstance(exc, (PermissionError, ValueError)):
+        return "READ_ONLY_GUARD"
+    return "CONNECTIVITY_ERROR"
+
+
 def execute_live01_readonly(
     auth_token: str,
     *,
@@ -135,10 +154,15 @@ def execute_live01_readonly(
         timeout_seconds=PER_REQUEST_TIMEOUT_SECONDS,
         transport=transport,
     )
-    stage = "PREFLIGHT"
+    stage = "CONNECTIVITY"
     schema_version = tables_checked = columns_checked = collision_checks = 0
     failure = ""
     try:
+        # One explicit read-only probe; do not proceed with 41+ queries on bad auth.
+        probe = client.execute("SELECT 1 AS live01_probe").fetchone()
+        if not probe or probe.get("live01_probe") != 1:
+            raise TursoClientError("LIVE01_PROBE_UNEXPECTED_RESULT")
+        stage = "PREFLIGHT"
         repository = TursoReadOnlyStateRepository(database_url=endpoint, client=client)
         preflight = CloudPreflightValidator(repo=repository).validate()
         schema_version = preflight.schema_version
@@ -173,8 +197,12 @@ def execute_live01_readonly(
                     failure = "SYNTHETIC_KEY_COLLISION"
                     break
     except Exception as exc:
-        # No raw exception values: HTTP clients/validation errors may contain sensitive data.
-        failure = "READ_ERROR_" + type(exc).__name__
+        # Deliberately no exception messages, response bodies or token details.
+        failure = (
+            classify_connectivity_failure(exc)
+            if stage == "CONNECTIVITY"
+            else "READ_ERROR_" + type(exc).__name__
+        )
     finally:
         client.close()
 
