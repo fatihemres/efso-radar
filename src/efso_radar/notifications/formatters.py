@@ -13,7 +13,7 @@ import hashlib
 import html
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from difflib import SequenceMatcher
 from efso_radar.deduplication.engine import (

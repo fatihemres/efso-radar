@@ -255,7 +255,7 @@ def judge(candidates: list[dict[str, Any]], state: dict[str, Any], now: datetime
     api_key = os.getenv("GEMINI_API_KEY", "")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is missing")
-    from google import genai  # noqa: lazy import supports no-dependency demo
+    from google import genai  # lazy import supports no-dependency demo
     from google.genai import types
     client = genai.Client(api_key=api_key)
     resp = client.models.generate_content(
