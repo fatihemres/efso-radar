@@ -1,5 +1,40 @@
 # Efso Radar — Mimari ve Tasarım Dokümantasyonu (Faz 1 & Faz 1.1)
 
+## Güncel mimari harita (26 Ekim 2026, main: d1660653)
+
+Bu bölüm güncel dizin yapısına dayanan **üst düzey bir haritadır**; aşağıdaki erken Faz 1/2 anlatımı tarihsel tasarım bağlamı olarak korunmuştur. Ayrıntılı ve sonraki faza özgü kayıtları yeniden kopyalamak yerine onlara bağlantı verir.
+
+```text
+RSS / Google News / çoklu yayıncı adaptörleri (sources/)
+            |
+      kaynak doğrulama ve deduplication/
+            |
+          domain.py + ai/ değerlendirme sözleşmeleri
+            |
+           orchestrator.py
+            |
+ StateRepository (repositories/base.py)
+     +-------------------------+
+     | SQLite/WAL              | Turso/libSQL Hrana v2 |
+     | repositories/sqlite.py  | repositories/turso.py |
+     +-------------------------+
+            |
+ notifications/ (PRIMARY_EDITOR editoryal, ADMIN yalnız sağlık)
+            |
+          Telegram (gerçek gönderim KAPALI)
+
+workflow/  -> çevrimdışı zamanlama/iş akışı önizlemesi
+backup/    -> AES-256-GCM yedek, doğrulanmış geri yükleme sözleşmeleri
+staging/   -> Turso bağlantı/preflight, kurtarma, offline hermetic runner
+```
+
+**Sınırlar:** `src/radar.py` CLI girişidir; `config.py` güvenlik/bütçe/çalışma ayarları, `domain.py` olay ve editoryal veri modelleri, `repositories/schema.py` Schema v6 (15 tablo) temelidir. Bulut staging için kodun mevcut olması canlı cloud validation'ın veya üretim aktivasyonunun tamamlandığını göstermez. Önce hermetik test, sonra bağımsız PO gate esastır.
+
+**Derin teknik kayıtlar:** [Cloud Safety](PHASE5B3_CLOUD_SAFETY_ARCHITECTURE.md), [persistence parity](PHASE5B3C_CLOUD_PERSISTENCE_INTEGRATION.md), [offline orchestration](PHASE5B3D_OFFLINE_WORKFLOW_ORCHESTRATION.md), [Turso readiness](PHASE5B3E_TURSO_STAGING_READINESS.md), [hermetic reliability](PHASE5B3F_HERMETIC_RELIABILITY_VALIDATION.md), [live staging plan (authorization NOT granted)](PHASE5B3G_LIVE_STAGING_RELIABILITY_PLAN.md), [encrypted backup](PHASE5B2_BACKUP_ARCHITECTURE.md), [roadmap](../ROADMAP.md). Yaşam döngüsü ve sınırlar için [Engineering Governance](ENGINEERING_GOVERNANCE.md).
+
+---
+
+
 ## 1. Genel Bakış ve Modül Sınırları
 
 Efso Radar, katmanlı ve pragmatik bir **Clean / Ports & Adapters** mimarisine sahiptir. Temel iş mantığı harici altyapılardan (veritabanı sürücüsü, bulut sağlayıcısı, bildirim kanalı) tamamen soyutlanmıştır.

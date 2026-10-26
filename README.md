@@ -91,3 +91,22 @@ GitHub kanonik proje kaydıdır; ChatGPT Project karar alma/çalışma alanıdı
 - [Kontrollü Turso staging test planı — Phase 5B.3G](docs/PHASE5B3G_LIVE_STAGING_RELIABILITY_PLAN.md)
 
 Önemli: Dokümandaki planlar veya geçmiş canlı pilotlar, bugün Turso erişimi, üretim/cron etkinleştirmesi, Gemini/Telegram çağrısı ya da release izni vermez. Bunlar ayrı ve açık PO onayına bağlıdır. GitHub PR/CI kanıtları ile tarihlendirilmiş durum kayıtlarını birbirinden ayırın.
+
+---
+
+## 💻 Geliştirici kurulumu ve güvenli test
+
+Desteklenen CI Python sürümleri: **3.11 ve 3.12**. Aşağıdaki komutlar Windows PowerShell içindir; geliştirme ortamı `C:\Dev\EfsoRadar` olarak bilinir ancak kişisel yolun değişebilir.
+
+```powershell
+git clone https://github.com/fatihemres/efso-radar.git
+cd efso-radar
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+$env:PYTHONPATH = 'src'
+.\.venv\Scripts\python.exe -m pytest tests -v
+```
+
+Geliştirme ortamında `python -m efso_radar.workflow --verify-schedule` ve `python -W error -m efso_radar.staging.runner --help` yalnızca komut/sözleşme denetimi içindir. **Dikkat:** README'deki bazı `--dry-run` komutları bile RSS veya Gemini ağına erişebilir. Harici bağlantı ve API çağrıları mevcut işletim kısıtları uyarınca ayrı PO izni gerektirir. Testler için hermetik fikstür ve mock HTTP kullanın. Gerçek `.env`, `data/` ve kurtarma manifestlerini okumayın/değiştirmeyin.
+
+**Proje dizinleri:** `src/efso_radar/` uygulama modülleri; `src/radar.py` CLI; `tests/` otomatik testler; `scripts/` yardımcı komutlar (çalıştırmadan önce yan etkilerini inceleyin); `.github/workflows/` CI ve kapalı üretim şablonları; `docs/` mimari ve faz kanıtları; `data/` operasyonel/deneysel kayıt alanı (korunan içerik). İlgili yönetim ve teknik kaynak bağlantıları yukarıdaki bölümde.

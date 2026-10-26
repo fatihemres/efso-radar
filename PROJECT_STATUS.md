@@ -27,3 +27,7 @@ GitHub Actions run [40211637125](https://github.com/fatihemres/efso-radar/action
 5. **Local state:** User/agent reports indicate local `main` clean after branch housekeeping. This was not directly inspected from the user's Windows filesystem; any new untracked worktrees must be checked at task start.
 
 Other records: [ROADMAP](ROADMAP.md), [DECISIONS](DECISIONS.md), [engineering workflow](docs/ENGINEERING_GOVERNANCE.md).
+
+## Governance documentation pending integration
+- [Draft PR #20](https://github.com/fatihemres/efso-radar/pull/20) establishes canonical management documents. As of this snapshot, it is a **documentation candidate** rather than merged `main` content; independent reviewer and PO merge gate remain open.
+- Existing `main` ruleset [Protect main](https://github.com/fatihemres/efso-radar/rules/25393440) is active and requires a PR, linear history and strict Python 3.11/3.12 checks (reviewer approval count set to 0). This is observed GitHub configuration, not approval to merge.
