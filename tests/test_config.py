@@ -36,9 +36,15 @@ class TestConfig(unittest.TestCase):
 
     def test_from_env_refuses_positive_budget_without_touching_dotenv(self):
         with patch.object(Path, "exists", return_value=False):
-            with patch.dict(os.environ, {"MAX_MONTHLY_AI_COST_USD": "1.20"}, clear=True):
-                with self.assertRaisesRegex(ValueError, "Positive AI monetary budgets"):
-                    Settings.from_env()
+            for key, old_value in (
+                ("MAX_ESTIMATED_RUN_COST_USD", "0.05"),
+                ("MAX_MONTHLY_AI_COST_USD", "1.20"),
+                ("MAX_SHADOW_EVAL_BUDGET_USD", "0.05"),
+            ):
+                with self.subTest(legacy_budget=key):
+                    with patch.dict(os.environ, {key: old_value, "AI_EVALUATION_ENABLED": "true"}, clear=True):
+                        with self.assertRaisesRegex(ValueError, "Positive AI monetary budgets"):
+                            Settings.from_env()
             with patch.dict(os.environ, {}, clear=True):
                 s = Settings.from_env()
                 self.assertEqual(s.max_monthly_ai_cost_usd, 0.0)

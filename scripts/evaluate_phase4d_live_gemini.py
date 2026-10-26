@@ -202,8 +202,8 @@ def run_phase4d_evaluation(live: bool = False) -> dict[str, Any]:
         raise RuntimeError("GEMINI_API_KEY is missing or invalid! Halting execution.")
     logger.info("Preflight 4.1 Passed: GEMINI_API_KEY presence verified (Value masked).")
 
-    # Verify billing status: Ensure no paid billing credentials or services configured
-    logger.info("Preflight 4.2 Passed: System operating under free-tier / tariff-equivalent shadow accounting.")
+    # This historical diagnostic does NOT verify provider billing status.
+    logger.info("Preflight 4.2: Tariff-equivalent estimate only; provider Free Tier/billing unverified.")
 
     # Ledger verification
     budget_guard = ExperimentBudgetGuard(
