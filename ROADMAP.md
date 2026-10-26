@@ -14,9 +14,15 @@
 | Phase 5B.3F | Hermetic reliability/concurrency and recovery validation | [PR #12](https://github.com/fatihemres/efso-radar/pull/12), [Issue #11](https://github.com/fatihemres/efso-radar/issues/11) | **INTEGRATED / OFFLINE VERIFIED** |
 | Phase 5B.3G-A | Controlled live staging *specification*, without live execution | [PR #14](https://github.com/fatihemres/efso-radar/pull/14) | **INTEGRATED (DESIGN)** |
 | Phase 5B.3G-B | Hermetic eight-step mock staging runner, strict safety barriers | [PR #16](https://github.com/fatihemres/efso-radar/pull/16) | **INTEGRATED / OFFLINE VERIFIED** |
-| Phase 5B.3G-C | Conditional real Turso staging reliability session, exactly scoped and audited | [Issue #13](https://github.com/fatihemres/efso-radar/issues/13), [plan](docs/PHASE5B3G_LIVE_STAGING_RELIABILITY_PLAN.md) | **PLANNED / NOT AUTHORIZED** |
+| Phase 5B.3G-C | Conditional real Turso staging reliability session, exactly scoped and audited | [Issue #13](https://github.com/fatihemres/efso-radar/issues/13), [LIVE-01 evidence](https://github.com/fatihemres/efso-radar/issues/13#issuecomment-6421424925), [plan](docs/PHASE5B3G_LIVE_STAGING_RELIABILITY_PLAN.md) | **READ-ONLY LIVE-01 OPERATOR PASS / WRITE PHASES NOT AUTHORIZED** |
 | Follow-on cloud cutover & unattended operations | Cloud parity, backups, zero-cost controls, human editorial recipient tests, PO release decision | Existing Phase 5 architecture; future issue required | **DISCOVERY / NOT AUTHORIZED** |
 | Rights and distribution | Review third-party origins and decide visibility/distribution | [Issue #17](https://github.com/fatihemres/efso-radar/issues/17) | **IN PROGRESS (AUDIT)** |
+
+## 2026-10-26 LIVE-01 milestone checkpoint
+
+Read-only schema/integrity preflight passed on the owner-operated staging connection, with **15 expected tables, 129 expected columns and five ephemeral synthetic-key collision checks**. This is a **verified read-only substep**, not closure of G-C and not an approval to unblock writes. Afterward the owner invalidated all database tokens; any future authenticated session needs freshly scoped credentials and a new approval for its exact operation.
+
+**Remaining dependency:** [Draft PR #26](https://github.com/fatihemres/efso-radar/pull/26) has an offline transport deadline guard, but the G-B eight-step runner is **not connected to real Turso**. A future live-capable implementation needs separate code review and hard gates for manifest pre-registration/retention, write-unblock window, bounded requests/session time, ambiguous COMMIT = UNKNOWN, ownership-checked cleanup and manual Block Writes restoration. The earlier LIVE-01 check's ephemeral run IDs/keys **must not** be reused or mistaken for a persisted run manifest.
 
 ## Current dependency gate: Phase 5B.3G-C
 1. Reconcile [Phase 5B.3G plan v2.2.0](docs/PHASE5B3G_LIVE_STAGING_RELIABILITY_PLAN.md) with actual [offline runner](src/efso_radar/staging/runner.py), including any divergences introduced by later PR #16 fixes. This is a *review task*, not an instruction to run it live.
