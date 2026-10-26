@@ -74,17 +74,28 @@ class TestSealedHermeticOperator(unittest.TestCase):
             "2026-10-25T15:00:00Z",
         ]
 
-    def _assert_no_new_requests(self, action):
+    def _assert_no_new_requests(self, action, *, reason="OFFLINE_SEALED_GATE_"):
         count = self.budget.request_count
         with patch.object(
             self.transport, "handle_request", wraps=self.transport.handle_request
         ) as spy:
-            with self.assertRaises(PermissionError):
+            with self.assertRaisesRegex(PermissionError, reason):
                 action()
             self.assertEqual(spy.call_count, 0)
         self.assertEqual(self.budget.request_count, count)
         self.assertTrue(self.runner.halt_before_cleanup)
         self.assertEqual(self.runner.audit_state, AuditOutcomeState.UNKNOWN)
+
+    def _assert_isolated_private_guard_denial(self, action, reason):
+        # Test-only fixture reset. Never resume a real operator after denial:
+        # public API irreversible stop is exercised in its dedicated tests.
+        # Without this, multiple invalid subcases only exercise the first
+        # guard failure and falsely appear to cover other input types.
+        self.assertTrue(self.runner._preflight_attempted)
+        self.assertIsNotNone(self.runner._seal)
+        self.runner.halt_before_cleanup = False
+        self.runner._preflight_accepted = True
+        self._assert_no_new_requests(action, reason=reason)
 
     def test_nominal_eight_stages_all_run_and_clean_without_network(self):
         with patch.object(
@@ -214,8 +225,9 @@ class TestSealedHermeticOperator(unittest.TestCase):
         ]
         for sql, params in statements:
             with self.subTest(sql=sql):
-                self._assert_no_new_requests(
-                    lambda sql=sql, params=params: self.runner._guard_mutation(sql, params)
+                self._assert_isolated_private_guard_denial(
+                    lambda sql=sql, params=params: self.runner._guard_mutation(sql, params),
+                    "SQL_NOT_ALLOWLISTED",
                 )
 
     def test_unregistered_synthetic_primary_key_rejected(self):
@@ -234,8 +246,9 @@ class TestSealedHermeticOperator(unittest.TestCase):
         self._prepared()
         for params in (None, [], self._article_params()[:-1], tuple(self._article_params())):
             with self.subTest(params_type=type(params).__name__):
-                self._assert_no_new_requests(
-                    lambda params=params: self.runner._guard_mutation(_INSERT_ARTICLE, params)
+                self._assert_isolated_private_guard_denial(
+                    lambda params=params: self.runner._guard_mutation(_INSERT_ARTICLE, params),
+                    "PARAMETERS_INVALID",
                 )
 
     def test_non_scalar_parameters_fail_closed_with_unknown(self):
@@ -244,8 +257,9 @@ class TestSealedHermeticOperator(unittest.TestCase):
             with self.subTest(type=type(bad).__name__):
                 params = self._article_params()
                 params[1] = bad
-                self._assert_no_new_requests(
-                    lambda params=params: self.runner._guard_mutation(_INSERT_ARTICLE, params)
+                self._assert_isolated_private_guard_denial(
+                    lambda params=params: self.runner._guard_mutation(_INSERT_ARTICLE, params),
+                    "PARAMETERS_INVALID",
                 )
 
     def test_ambiguous_reconciliation_preserves_manifest(self):
@@ -290,8 +304,9 @@ class TestSealedHermeticOperator(unittest.TestCase):
         )
         for sql, args in invalid:
             with self.subTest(sql=sql):
-                self._assert_no_new_requests(
-                    lambda sql=sql, args=args: self.runner._guard_read(sql, args)
+                self._assert_isolated_private_guard_denial(
+                    lambda sql=sql, args=args: self.runner._guard_read(sql, args),
+                    "READ_NOT_ALLOWLISTED",
                 )
 
     def test_article_pk_url_pair_and_all_timestamp_fields_bound(self):
@@ -308,8 +323,9 @@ class TestSealedHermeticOperator(unittest.TestCase):
         examples.append(huge)
         for args in examples:
             with self.subTest(args=args[1]):
-                self._assert_no_new_requests(
-                    lambda args=args: self.runner._guard_mutation(_INSERT_ARTICLE, args)
+                self._assert_isolated_private_guard_denial(
+                    lambda args=args: self.runner._guard_mutation(_INSERT_ARTICLE, args),
+                    "PARAMETERS_INVALID" if len(args[1]) > 512 else "OWNERSHIP_MISMATCH",
                 )
 
     def test_story_dates_counts_and_payload_bound(self):
@@ -329,8 +345,9 @@ class TestSealedHermeticOperator(unittest.TestCase):
             with self.subTest(index=index):
                 args = original[:]
                 args[index] = bad
-                self._assert_no_new_requests(
-                    lambda args=args: self.runner._guard_mutation(_INSERT_STORY, args)
+                self._assert_isolated_private_guard_denial(
+                    lambda args=args: self.runner._guard_mutation(_INSERT_STORY, args),
+                    "OWNERSHIP_MISMATCH",
                 )
 
     def test_lock_cas_and_recovery_timestamps_and_payload_bound(self):
@@ -342,8 +359,9 @@ class TestSealedHermeticOperator(unittest.TestCase):
             "2026-10-25T15:00:00Z",
         ]
         lock_args[3] = "2099-01-01T00:00:00Z"
-        self._assert_no_new_requests(
-            lambda: self.runner._execute(_INSERT_LOCK, lock_args)
+        self._assert_isolated_private_guard_denial(
+            lambda: self.runner._execute(_INSERT_LOCK, lock_args),
+            "OWNERSHIP_MISMATCH",
         )
         recovery_args = [
             f"synth_stage_{run_id}::current",
@@ -351,8 +369,9 @@ class TestSealedHermeticOperator(unittest.TestCase):
             json.dumps({"cursor": 1000}),
             "2026-10-25T15:00:00Z", "2026-10-25T15:00:00Z",
         ]
-        self._assert_no_new_requests(
-            lambda: self.runner._execute(_INSERT_RECOVERY, recovery_args)
+        self._assert_isolated_private_guard_denial(
+            lambda: self.runner._execute(_INSERT_RECOVERY, recovery_args),
+            "OWNERSHIP_MISMATCH",
         )
 
     def test_halted_session_rejects_later_valid_reads_and_writes(self):
