@@ -107,6 +107,8 @@ class TestSealedHermeticOperator(unittest.TestCase):
         self.assertEqual(self.budget.request_count, 0)
 
     def test_unlisted_sql_and_read_only_table_mutations_denied(self):
+        # Exercise every invalid template through the pure pre-dispatch guard.
+        # Public _execute permanently halts on the first denial (tested below).
         self._prepared()
         statements = [
             ("DELETE FROM notifications WHERE id = ?", ["synthetic"]),
@@ -117,7 +119,7 @@ class TestSealedHermeticOperator(unittest.TestCase):
         for sql, params in statements:
             with self.subTest(sql=sql):
                 self._assert_no_new_requests(
-                    lambda sql=sql, params=params: self.runner._execute(sql, params)
+                    lambda sql=sql, params=params: self.runner._guard_mutation(sql, params)
                 )
 
     def test_unregistered_synthetic_primary_key_rejected(self):
@@ -137,7 +139,7 @@ class TestSealedHermeticOperator(unittest.TestCase):
         for params in (None, [], self._article_params()[:-1], tuple(self._article_params())):
             with self.subTest(params_type=type(params).__name__):
                 self._assert_no_new_requests(
-                    lambda params=params: self.runner._execute(_INSERT_ARTICLE, params)
+                    lambda params=params: self.runner._guard_mutation(_INSERT_ARTICLE, params)
                 )
 
     def test_non_scalar_parameters_fail_closed_with_unknown(self):
@@ -147,7 +149,7 @@ class TestSealedHermeticOperator(unittest.TestCase):
                 params = self._article_params()
                 params[1] = bad
                 self._assert_no_new_requests(
-                    lambda params=params: self.runner._execute(_INSERT_ARTICLE, params)
+                    lambda params=params: self.runner._guard_mutation(_INSERT_ARTICLE, params)
                 )
 
     def test_ambiguous_reconciliation_preserves_manifest(self):
@@ -193,7 +195,7 @@ class TestSealedHermeticOperator(unittest.TestCase):
         for sql, args in invalid:
             with self.subTest(sql=sql):
                 self._assert_no_new_requests(
-                    lambda sql=sql, args=args: self.runner._execute(sql, args)
+                    lambda sql=sql, args=args: self.runner._guard_read(sql, args)
                 )
 
     def test_article_pk_url_pair_and_all_timestamp_fields_bound(self):
@@ -211,7 +213,7 @@ class TestSealedHermeticOperator(unittest.TestCase):
         for args in examples:
             with self.subTest(args=args[1]):
                 self._assert_no_new_requests(
-                    lambda args=args: self.runner._execute(_INSERT_ARTICLE, args)
+                    lambda args=args: self.runner._guard_mutation(_INSERT_ARTICLE, args)
                 )
 
     def test_story_dates_counts_and_payload_bound(self):
@@ -232,7 +234,7 @@ class TestSealedHermeticOperator(unittest.TestCase):
                 args = original[:]
                 args[index] = bad
                 self._assert_no_new_requests(
-                    lambda args=args: self.runner._execute(_INSERT_STORY, args)
+                    lambda args=args: self.runner._guard_mutation(_INSERT_STORY, args)
                 )
 
     def test_lock_cas_and_recovery_timestamps_and_payload_bound(self):
