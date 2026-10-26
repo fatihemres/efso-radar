@@ -37,6 +37,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
 
+      - name: Update vulnerable runner build tooling
+        run: python -m pip install setuptools==84.2.1
+
       - name: Verify installed dependency graph
         run: python -m pip check
 
