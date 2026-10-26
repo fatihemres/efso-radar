@@ -111,7 +111,13 @@ class SealedHermeticStagingRunner(StagingSessionRunner):
         # Reject custom objects, nested values and unhashable payloads before
         # checking synthetic marker allowlists; malformed arguments must never
         # bypass the UNKNOWN/preserve-manifest failure path.
-        if any(type(value) not in (str, int, float, bool) for value in params):
+        if any(
+            type(value) not in (str, int, float, bool)
+            or (type(value) is str and len(value) > 512)
+            for value in params
+        ):
+            self._deny("PARAMETERS_INVALID")
+        if type(params[0]) is not str:
             self._deny("PARAMETERS_INVALID")
 
         assert params is not None
@@ -132,17 +138,18 @@ class SealedHermeticStagingRunner(StagingSessionRunner):
             self._deny("MANIFEST_INVALID")
 
         expected = entity.expected_attributes
+        stamp = "2026-10-25T15:00:00Z"
         if table == "processed_articles":
             if operation == "insert":
-                correct_url = {
-                    f"https://example.com/synth/{self.run_id}/01",
-                    f"https://example.com/synth/{self.run_id}/02",
-                    f"https://example.com/synth/{self.run_id}/02_duplicate",
-                }
+                # Pair each canonical key with only its matching synthetic URL.
+                suffix = "/01" if target == f"synth_art_{self.run_id}_01" else "/02"
+                allowed_urls = {f"https://example.com/synth/{self.run_id}{suffix}"}
+                if suffix == "/02":
+                    allowed_urls.add(f"https://example.com/synth/{self.run_id}/02_duplicate")
                 if (
-                    params[1] not in correct_url
-                    or params[2] != expected["title"]
-                    or params[3] != expected["source"]
+                    params[1] not in allowed_urls
+                    or params[2:4] != [expected["title"], expected["source"]]
+                    or params[4:] != [stamp, stamp]
                 ):
                     self._deny("OWNERSHIP_MISMATCH")
             elif params[1:] != [expected["source"], expected["title"]]:
@@ -154,9 +161,12 @@ class SealedHermeticStagingRunner(StagingSessionRunner):
                 except (ValueError, TypeError):
                     self._deny("OWNERSHIP_MISMATCH")
                 if (
-                    params[1] != expected["headline_tr"]
-                    or params[2] != expected["category"]
+                    params[1:3] != [expected["headline_tr"], expected["category"]]
+                    or params[3:5] != [stamp, stamp]
                     or article_ids != [f"synth_art_{self.run_id}_01"]
+                    or type(params[6]) is not int
+                    or type(params[7]) is not int
+                    or params[6:] != [1, 1]
                 ):
                     self._deny("OWNERSHIP_MISMATCH")
             elif params[1:] != [expected["category"], expected["headline_tr"]]:
@@ -164,22 +174,86 @@ class SealedHermeticStagingRunner(StagingSessionRunner):
         elif table == "run_locks":
             workers = expected["worker_ids"]
             if operation == "insert":
-                if params[1] not in workers:
+                accepted = (
+                    [workers[0], stamp, "2026-10-25T15:05:00Z", stamp],
+                    [workers[1], stamp, "2026-10-25T15:05:00Z", stamp],
+                    [
+                        workers[1],
+                        "2026-10-25T15:06:00Z",
+                        "2026-10-25T15:11:00Z",
+                        "2026-10-25T15:06:00Z",
+                    ],
+                )
+                if params[1:] not in accepted:
                     self._deny("OWNERSHIP_MISMATCH")
             elif params[1:] != workers:
                 self._deny("OWNERSHIP_MISMATCH")
         elif table == "durable_recovery_state":
             if operation == "insert":
-                if params[1:3] != [expected["stage"], expected["worker_id"]]:
+                if (
+                    params[1:3] != [expected["stage"], expected["worker_id"]]
+                    or params[3] != json.dumps({"cursor": 100})
+                    or params[4:] != [stamp, stamp]
+                ):
                     self._deny("OWNERSHIP_MISMATCH")
             elif params[1:] != [expected["stage"], expected["worker_id"]]:
                 self._deny("OWNERSHIP_MISMATCH")
 
+    def _guard_read(self, sql: str, params: list[Any] | None) -> None:
+        """Accept only known single-PK reads against this run's five identities.
+
+        The parent preflight validator reads schema through its own hermetic
+        read-only client. These are only the runner's direct stage reads.
+        """
+        if (
+            type(params) is not list
+            or len(params) != 1
+            or type(params[0]) is not str
+            or self._seal is None
+        ):
+            self._deny("READ_NOT_ALLOWLISTED")
+        assert params is not None
+        entity = next(
+            (
+                e for e in create_default_manifest_entities(self.run_id)
+                if e.pk_value == params[0]
+            ),
+            None,
+        )
+        if entity is None:
+            self._deny("READ_NOT_ALLOWLISTED")
+        table, pk = entity.table, entity.pk_column
+        approved = {
+            f"SELECT 1 AS found FROM {table} WHERE {pk} = ?",
+            f"SELECT * FROM {table} WHERE {pk} = ?",
+            f"SELECT COUNT(*) AS cnt FROM {table} WHERE {pk} = ?",
+        }
+        specific = {
+            "processed_articles": (
+                f"SELECT title, source FROM {table} WHERE {pk} = ?",
+                f"SELECT article_id FROM {table} WHERE {pk} = ?",
+            ),
+            "stories": (f"SELECT headline_tr, category FROM {table} WHERE {pk} = ?",),
+            "run_locks": (f"SELECT worker_id FROM {table} WHERE {pk} = ?",),
+            "durable_recovery_state": (
+                f"SELECT state_json FROM {table} WHERE {pk} = ?",
+            ),
+        }
+        approved.update(specific[table])
+        if _norm(sql) not in approved:
+            self._deny("READ_NOT_ALLOWLISTED")
+        try:
+            self._seal.require_registered_identity(table, pk, entity.pk_value)
+        except (PermissionError, ValueError, OSError):
+            self._deny("MANIFEST_INVALID")
+
     def _execute(self, sql: str, params: list[Any] | None = None) -> Any:
         if not isinstance(sql, str):
             self._deny("SQL_NOT_ALLOWLISTED")
+        if len(sql) > 1024:
+            self._deny("SQL_NOT_ALLOWLISTED")
         if _norm(sql).upper().startswith("SELECT "):
-            # Reads remain confined to the parent's in-memory HTTP mock.
+            self._guard_read(sql, params)
             return super()._execute(sql, params)
         self._guard_mutation(sql, params)
         return super()._execute(sql, params)
