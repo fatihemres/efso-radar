@@ -134,7 +134,9 @@ class SealedHermeticStagingRunner(StagingSessionRunner):
             self._seal.require_registered_identity(
                 entity.table, entity.pk_column, entity.pk_value
             )
-        except (PermissionError, ValueError, OSError):
+        except Exception:
+            # Unexpected validation errors also fail closed, without leaking
+            # any raw manifest or filesystem data into a session report.
             self._deny("MANIFEST_INVALID")
 
         expected = entity.expected_attributes
@@ -244,10 +246,14 @@ class SealedHermeticStagingRunner(StagingSessionRunner):
             self._deny("READ_NOT_ALLOWLISTED")
         try:
             self._seal.require_registered_identity(table, pk, entity.pk_value)
-        except (PermissionError, ValueError, OSError):
+        except Exception:
+            # Unexpected validation errors also fail closed, without leaking
+            # any raw manifest or filesystem data into a session report.
             self._deny("MANIFEST_INVALID")
 
     def _execute(self, sql: str, params: list[Any] | None = None) -> Any:
+        if self.halt_before_cleanup:
+            self._deny("SESSION_HALTED")
         if not isinstance(sql, str):
             self._deny("SQL_NOT_ALLOWLISTED")
         if len(sql) > 1024:
@@ -259,6 +265,8 @@ class SealedHermeticStagingRunner(StagingSessionRunner):
         return super()._execute(sql, params)
 
     def _execute_transaction(self, statements: list[tuple[str, list[Any]]]) -> list[Any]:
+        if self.halt_before_cleanup:
+            self._deny("SESSION_HALTED")
         if not isinstance(statements, list) or not statements:
             self._deny("TRANSACTION_INVALID")
         # Validate ALL proposed statements before dispatching a transaction.
