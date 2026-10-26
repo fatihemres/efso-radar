@@ -5,7 +5,7 @@
 ## Current evidence
 - Historical Phase 4 closure and later ADRs reference stable anchor `v0.4.0` (see [Phase 4 closure](PHASE4_CLOSURE.md)).
 - The actual Python package at `src/efso_radar/__init__.py` currently reports `__version__ = "2.0.0"`.
-- GitHub Releases API returned an empty list during this review. Tag history was not independently enumerated. These facts **do not establish a new stable release**.
+- GitHub Releases API returned an empty list during this review. GitHub Git refs independently confirmed **existing annotated tag `v0.4.0`**; its tag-object SHA is `4c76da9759b82ce71d706523bcd30177fe729ff1`. The existence of this historical tag does not resolve the newer package `2.0.0` discrepancy or constitute authorization to publish another release.
 - A public repository containing owner-owned proprietary code is not automatically open-source. [LICENSE](../LICENSE); third-party audit [#17](https://github.com/fatihemres/efso-radar/issues/17).
 
 ## Working policy until PO resolves numbering

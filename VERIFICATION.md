@@ -4,6 +4,9 @@
 
 ## Current independently checked evidence
 
+| Governance documentation PR #20 | [CI 40296162208](https://github.com/fatihemres/efso-radar/actions/runs/40296162208), branch HEAD `f6486b1670598d691e834f854925fcf0ee950763` **before subsequent documentation amendments** | Python 3.11 and 3.12 CI successful at this exact SHA. Any later documentation commit needs a fresh run; this is not evidence for that later SHA. |
+
+
 | What | Evidence / environment | Result and precise scope |
 | --- | --- | --- |
 | Phase 5B.3G-B offline runner / Turso hardening | [PR #16](https://github.com/fatihemres/efso-radar/pull/16), final feature HEAD `674894bd4550452f5e452fcd07b9023906a2e2de`, [Actions run 40211637125](https://github.com/fatihemres/efso-radar/actions/runs/40211637125) | **CI successful** for Python **3.11** and **3.12** on Linux. GitHub PR merged via rebase; `main` integration commit `9a9ee4a9af35b2a027238da3fca6ffc0e445c9cd`. |
@@ -37,7 +40,7 @@ CI source: [.github/workflows/ci.yml](.github/workflows/ci.yml); currently `ubun
 
 1. Real Turso transaction/write/cleanup session not run under Phase 5B.3G; Block Writes remains ON. No cloud call authorized.
 2. Local Windows run of latest `main` test matrix not independently captured in this task.
-3. No configured CodeQL/secret scanning results or branch-rule specifics independently verified; branch `main` is marked protected by GitHub API but protection detail endpoint was unavailable (403).
+3. **Branch ruleset verified:** active ruleset [Protect main](https://github.com/fatihemres/efso-radar/rules/25393440) enforces PR workflow, linear history, no deletion/force updates and strict checks `test (3.11)` / `test (3.12)`. It requires **0 approving reviews** at GitHub policy level; PO permission remains mandatory by governance. Standalone CodeQL/secret scan results are **not** established. The older branch-protection endpoint (different from rulesets) returned 403.
 4. Python package `__version__=2.0.0` versus historical `v0.4.0` requires PO release/version decision.
 5. Full end-to-end autonomous system operation, safety under provider quotas, and user/editor live acceptance are NOT proven by offline CI.
 
