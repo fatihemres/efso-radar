@@ -44,6 +44,7 @@ from efso_radar.ai.cost import (
     estimate_call_cost,
     estimate_tokens_from_text,
     extract_provider_token_usage,
+    require_verified_free_tier,
 )
 from efso_radar.ai.prompts import build_diagnostic_editorial_prompt
 from efso_radar.ai.schemas import DiagnosticArticleDecision, DiagnosticEvaluationBatch
@@ -320,6 +321,9 @@ def run_phase4d_evaluation(live: bool = False) -> dict[str, Any]:
         actual_cost_usd = estimate_call_cost(MODEL_NAME, actual_in_tokens, actual_out_tokens)
         logger.info("[DRY-RUN] Simulated evaluation completed. Theoretical cost: $%.6f", actual_cost_usd)
     else:
+        # The historical Phase 4D live pilot does not grant current API permission.
+        # Stop before budget ledger writes or network client construction.
+        require_verified_free_tier()
         logger.info("Executing REAL Gemini API call for model '%s'...", MODEL_NAME)
         # Reserve batch first in budget ledger
         budget_guard.reserve_batch(

@@ -34,6 +34,7 @@ from efso_radar.ai.cost import (
     ExperimentBudgetGuard,
     extract_provider_token_usage,
     resolve_model_pricing,
+    require_verified_free_tier,
 )
 from efso_radar.ai.prompts import build_diagnostic_editorial_prompt, build_editorial_prompt
 from efso_radar.ai.schemas import (
@@ -1306,6 +1307,13 @@ class BlindShadowEvaluationRunner:
         """
         import os
         from efso_radar.ai.calibration import HybridNotificationPlanner
+
+        # Offline/synthetic mocks remain possible; real API dispatch is not approved.
+        if not dry_run and mock_client is None:
+            try:
+                require_verified_free_tier()
+            except RuntimeError as exc:
+                raise AIEvaluationError(str(exc)) from exc
 
         clean_model, pricing = resolve_model_pricing(self.settings.gemini_model)
         key = api_key or self.settings.gemini_api_key or os.getenv("GEMINI_API_KEY", "")
