@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -100,6 +101,56 @@ class TestOfflineManifestSeal(unittest.TestCase):
                 OfflineManifestSeal.from_persisted(unrelated_file, RUN_ID)
         with self.assertRaises(ManifestSealViolation):
             OfflineManifestSeal.from_persisted(self.path, "run_wrong")
+
+    def test_rejects_canonical_file_outside_configured_temp_root_before_read(self):
+        # The file is valid and named correctly, but it is not under the
+        # (mock) OS temp root. No operational file is ever accessed.
+        approved_temp = self.root / "approved"
+        approved_temp.mkdir()
+        with patch(
+            "efso_radar.staging.manifest_seal.tempfile.gettempdir",
+            return_value=str(approved_temp),
+        ):
+            with patch.object(
+                Path,
+                "read_bytes",
+                side_effect=AssertionError("Must not read outside temporary root"),
+            ):
+                with self.assertRaisesRegex(
+                    ManifestSealViolation, "temporary directory"
+                ):
+                    OfflineManifestSeal.from_persisted(self.path, RUN_ID)
+
+    def test_rejects_manifest_via_directory_symlink_escape(self):
+        approved_temp = self.root / "approved"
+        outside = self.root / "outside"
+        approved_temp.mkdir()
+        outside.mkdir()
+        external = self.manifest.save_atomic(outside)
+        link = approved_temp / "link"
+        try:
+            link.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("Directory symlinks unsupported by this Windows host")
+        with patch(
+            "efso_radar.staging.manifest_seal.tempfile.gettempdir",
+            return_value=str(approved_temp),
+        ):
+            with self.assertRaisesRegex(
+                ManifestSealViolation, "temporary directory"
+            ):
+                OfflineManifestSeal.from_persisted(link / external.name, RUN_ID)
+
+    def test_rejects_hardlinked_manifest(self):
+        directory = self.root / "hardlink"
+        directory.mkdir()
+        linked = directory / self.path.name
+        try:
+            os.link(self.path, linked)
+        except OSError:
+            self.skipTest("Hardlinks unsupported by this filesystem")
+        with self.assertRaisesRegex(ManifestSealViolation, "Linked manifest"):
+            OfflineManifestSeal.from_persisted(linked, RUN_ID)
 
     def test_rejects_oversized_manifest_without_inspecting_contents(self):
         seal = OfflineManifestSeal.from_persisted(self.path, RUN_ID)
