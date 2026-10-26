@@ -133,6 +133,7 @@ class SealedHermeticStagingRunner(StagingSessionRunner):
         # Preserve possible residual rows; never silently run cleanup after a
         # write firewall or seal failure.
         self.halt_before_cleanup = True
+        self._preflight_accepted = False
         self.audit_state = AuditOutcomeState.UNKNOWN
         raise PermissionError(f"OFFLINE_SEALED_GATE_{code}: mutation refused")
 
