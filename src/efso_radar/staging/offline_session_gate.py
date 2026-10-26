@@ -94,7 +94,10 @@ class OfflineSessionGate:
     def _ensure_active(self, *allowed: MockPhase) -> None:
         if self._phase == MockPhase.HALTED:
             self._deny("ALREADY_HALTED")
-        now = self._read_clock()
+        try:
+            now = self._read_clock()
+        except Exception:
+            self._deny("TIME_OR_CLOCK_INVALID")
         if now < self._last_clock or now - self._started >= MAX_ELAPSED_SECONDS:
             self._deny("TIME_OR_CLOCK_INVALID")
         self._last_clock = now
