@@ -61,16 +61,17 @@ class Settings(BaseModel):
         default="DEFER_TO_NEXT_DIGEST"
     )
 
-    # Low-Cost Architecture, API Budgets & Safety Circuit-Breakers
+    # Strict $0 defaults. Explicit positive estimates remain usable in hermetic
+    # historical tests, never as authorization for operational paid usage.
     # Live AI processing is disabled by default until separately authorized by the Product Owner
     ai_evaluation_enabled: bool = Field(default=False)
     min_discovery_priority_for_ai: float = Field(default=5.5, ge=0.0, le=20.0)
     ai_batch_size: int = Field(default=10, ge=1, le=60)
     max_output_tokens: int = Field(default=3200, ge=500, le=8192)
-    max_estimated_run_cost_usd: float = Field(default=0.05, ge=0.001)
-    max_monthly_ai_cost_usd: float = Field(default=1.20, ge=0.01)
+    max_estimated_run_cost_usd: float = Field(default=0.0, ge=0.0)
+    max_monthly_ai_cost_usd: float = Field(default=0.0, ge=0.0)
     max_monthly_ai_calls: int = Field(default=300, ge=1)
-    max_shadow_eval_budget_usd: float = Field(default=0.05, ge=0.001, le=0.50)
+    max_shadow_eval_budget_usd: float = Field(default=0.0, ge=0.0, le=0.50)
     usd_to_try_rate: float = Field(default=36.0, ge=1.0)
     enable_search_grounding: bool = Field(default=False)  # Disabled to prevent extra costs
     http_timeout_seconds: float = Field(default=18.0, ge=2.0, le=120.0)
@@ -308,7 +309,7 @@ class Settings(BaseModel):
         if primary_editor_id and not primary_editor_id.startswith("-") and primary_editor_id not in allowed_list:
             allowed_list.append(primary_editor_id)
 
-        return cls(
+        settings = cls(
             gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
@@ -346,14 +347,20 @@ class Settings(BaseModel):
             min_discovery_priority_for_ai=float(os.getenv("MIN_DISCOVERY_PRIORITY_FOR_AI", "5.5")),
             ai_batch_size=int(os.getenv("AI_BATCH_SIZE", "10")),
             max_output_tokens=int(os.getenv("MAX_OUTPUT_TOKENS", "3200")),
-            max_estimated_run_cost_usd=float(os.getenv("MAX_ESTIMATED_RUN_COST_USD", "0.05")),
-            max_monthly_ai_cost_usd=float(os.getenv("MAX_MONTHLY_AI_COST_USD", "1.20")),
+            max_estimated_run_cost_usd=float(os.getenv("MAX_ESTIMATED_RUN_COST_USD", "0.00")),
+            max_monthly_ai_cost_usd=float(os.getenv("MAX_MONTHLY_AI_COST_USD", "0.00")),
             max_monthly_ai_calls=int(os.getenv("MAX_MONTHLY_AI_CALLS", "300")),
-            max_shadow_eval_budget_usd=float(os.getenv("MAX_SHADOW_EVAL_BUDGET_USD", "0.05")),
+            max_shadow_eval_budget_usd=float(os.getenv("MAX_SHADOW_EVAL_BUDGET_USD", "0.00")),
             usd_to_try_rate=float(os.getenv("USD_TO_TRY_RATE", "36.0")),
             enable_search_grounding=os.getenv("ENABLE_SEARCH_GROUNDING", "false").lower() in ("true", "1"),
             http_timeout_seconds=float(os.getenv("HTTP_TIMEOUT_SECONDS", "18.0")),
         )
+        # Reject historical positive spending allowances from operational config.
+        if any(getattr(settings, key) > 0 for key in (
+            "max_estimated_run_cost_usd", "max_monthly_ai_cost_usd", "max_shadow_eval_budget_usd"
+        )):
+            raise ValueError("Positive AI monetary budgets are forbidden by the $0 / 0 TRY operating policy.")
+        return settings
 
 
 def get_istanbul_timezone() -> timezone:

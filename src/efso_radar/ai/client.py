@@ -22,6 +22,7 @@ from efso_radar.ai.cost import (
     estimate_call_cost,
     estimate_tokens_from_text,
     extract_provider_token_usage,
+    require_verified_free_tier,
 )
 from efso_radar.ai.prompts import build_diagnostic_editorial_prompt, build_editorial_prompt
 from efso_radar.ai.schemas import (
@@ -170,6 +171,14 @@ class GeminiEditorialEngine(AIEditorialEngine):
                 logger.info("Reusing cached Gemini response for batch_hash=%s (0 API tokens billed)", batch_hash)
                 batch = EditorialDecisionBatch.model_validate_json(cached_raw)
                 return self._validate_and_transform_picks(batch.picks, candidates, recent_stories)
+
+        # No live inference until the provider's zero-billing tier is independently
+        # verified; cached batches remain eligible for offline reuse.
+        if self.client is not None:
+            try:
+                require_verified_free_tier()
+            except RuntimeError as exc:
+                raise AIEvaluationError(str(exc)) from exc
 
         prompt_text = build_editorial_prompt(candidates, recent_stories, now)
 
