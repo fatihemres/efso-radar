@@ -34,6 +34,7 @@ from efso_radar.ai.cost import (
     ExperimentBudgetGuard,
     extract_provider_token_usage,
     resolve_model_pricing,
+    require_verified_free_tier,
 )
 from efso_radar.ai.prompts import build_diagnostic_editorial_prompt, build_editorial_prompt
 from efso_radar.ai.schemas import (
@@ -1314,6 +1315,15 @@ class BlindShadowEvaluationRunner:
                 "GEMINI_API_KEY is required for live shadow evaluation. "
                 "Live API inference must be explicitly authorized with an API key."
             )
+
+        # Fail closed for every non-dry-run call, including injected clients.
+        # Hermetic mock tests patch this guard explicitly; mock_client itself
+        # is not proof that a real network request cannot be made.
+        if not dry_run:
+            try:
+                require_verified_free_tier()
+            except RuntimeError as exc:
+                raise AIEvaluationError(str(exc)) from exc
 
         client = None
         if not dry_run:
