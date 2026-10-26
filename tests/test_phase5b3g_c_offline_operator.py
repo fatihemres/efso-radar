@@ -1,0 +1,210 @@
+"""Hermetic proof for the standalone, non-live G-C sealed operator candidate."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import sqlite3
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import httpx
+
+from efso_radar.repositories.schema import get_all_init_statements
+from efso_radar.repositories.turso_client import TursoHTTPClient
+from efso_radar.staging.offline_operator import (
+    SealedHermeticStagingRunner,
+    _INSERT_ARTICLE,
+    _INSERT_STORY,
+)
+from efso_radar.staging.runner import (
+    AuditOutcomeState,
+    BudgetTrackingTransport,
+    EXACT_STAGING_DESTINATION,
+    HermeticStagingTransport,
+    SessionStatus,
+)
+
+
+class TestSealedHermeticOperator(unittest.TestCase):
+    def setUp(self):
+        self.db = sqlite3.connect(":memory:")
+        self.addCleanup(self.db.close)
+        for sql in get_all_init_statements():
+            self.db.execute(sql)
+        self.db.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at, description) "
+            "VALUES (6, '2026-10-26T16:00:00Z', 'Schema v6')"
+        )
+        self.db.commit()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.transport = HermeticStagingTransport(self.db)
+        self.budget = BudgetTrackingTransport(self.transport)
+        self.client = TursoHTTPClient(
+            database_url=EXACT_STAGING_DESTINATION,
+            auth_token="synthetic-offline-only",
+            transport=self.budget,
+        )
+        self.addCleanup(self.client.close)
+        self.runner = SealedHermeticStagingRunner(
+            client=self.client,
+            destination_url=EXACT_STAGING_DESTINATION,
+            manifest_dir=Path(self.temp.name),
+        )
+
+    def _prepared(self):
+        self.runner._create_and_persist_manifest()
+        self.runner._run_live_01()
+        self.assertTrue(self.runner._preflight_accepted)
+        self.assertIsNotNone(self.runner._seal)
+
+    def _article_params(self):
+        run_id = self.runner.run_id
+        return [
+            f"synth_art_{run_id}_01",
+            f"https://example.com/synth/{run_id}/01",
+            f"SYNTH_ARTICLE_{run_id}_01",
+            "staging_synth_test",
+            "2026-10-25T15:00:00Z",
+            "2026-10-25T15:00:00Z",
+        ]
+
+    def _assert_no_new_requests(self, action):
+        count = self.budget.request_count
+        with patch.object(
+            self.transport, "handle_request", wraps=self.transport.handle_request
+        ) as spy:
+            with self.assertRaises(PermissionError):
+                action()
+            self.assertEqual(spy.call_count, 0)
+        self.assertEqual(self.budget.request_count, count)
+        self.assertTrue(self.runner.halt_before_cleanup)
+        self.assertEqual(self.runner.audit_state, AuditOutcomeState.UNKNOWN)
+
+    def test_nominal_eight_stages_all_run_and_clean_without_network(self):
+        with patch.object(
+            httpx.HTTPTransport, "handle_request",
+            side_effect=AssertionError("Real HTTP prohibited"),
+        ):
+            report = self.runner.run()
+        self.assertEqual(report.status, SessionStatus.PASSED, report.errors)
+        self.assertEqual(report.audit_state, AuditOutcomeState.CLEAN)
+        self.assertEqual(len(report.stages), 8)
+        self.assertEqual(report.http_requests_total, 78)
+        self.assertLess(report.http_requests_total, 100)
+        self.assertFalse(report.manifest_preserved)
+        self.assertFalse(Path(report.manifest_path).exists())
+        for table in ("processed_articles", "stories", "run_locks", "durable_recovery_state"):
+            self.assertEqual(self.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0)
+
+    def test_preflight_is_mandatory_for_mutations(self):
+        self._assert_no_new_requests(
+            lambda: self.runner._execute(_INSERT_ARTICLE, self._article_params())
+        )
+        self.assertEqual(self.budget.request_count, 0)
+
+    def test_unlisted_sql_and_read_only_table_mutations_denied(self):
+        self._prepared()
+        statements = [
+            ("DELETE FROM notifications WHERE id = ?", ["synthetic"]),
+            ("DROP TABLE stories", []),
+            ("UPDATE stories SET is_active = 0", []),
+            (_INSERT_ARTICLE + "; DROP TABLE stories", self._article_params()),
+        ]
+        for sql, params in statements:
+            with self.subTest(sql=sql):
+                self._assert_no_new_requests(
+                    lambda sql=sql, params=params: self.runner._execute(sql, params)
+                )
+
+    def test_unregistered_synthetic_primary_key_rejected(self):
+        self._prepared()
+        params = self._article_params()
+        params[0] += "_forged"
+        self._assert_no_new_requests(lambda: self.runner._execute(_INSERT_ARTICLE, params))
+
+    def test_marker_mismatch_rejected_without_dispatch(self):
+        self._prepared()
+        params = self._article_params()
+        params[3] = "real_source"
+        self._assert_no_new_requests(lambda: self.runner._execute(_INSERT_ARTICLE, params))
+
+    def test_missing_or_invalid_parameters_rejected(self):
+        self._prepared()
+        for params in (None, [], self._article_params()[:-1], tuple(self._article_params())):
+            with self.subTest(params_type=type(params).__name__):
+                self._assert_no_new_requests(
+                    lambda params=params: self.runner._execute(_INSERT_ARTICLE, params)
+                )
+
+    def test_whole_transaction_validated_before_any_dispatch(self):
+        self._prepared()
+        run_id = self.runner.run_id
+        article = (_INSERT_ARTICLE, self._article_params())
+        story = (
+            _INSERT_STORY,
+            [
+                f"synth_story_{run_id}_01",
+                f"SYNTH_STORY_{run_id}_01",
+                "other_category",   # tampered second statement
+                "2026-10-25T15:00:00Z",
+                "2026-10-25T15:00:00Z",
+                json.dumps([f"synth_art_{run_id}_01"]),
+                1, 1,
+            ],
+        )
+        self._assert_no_new_requests(
+            lambda: self.runner._execute_transaction([article, story])
+        )
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM processed_articles").fetchone()[0], 0)
+
+    def test_manifest_tampering_after_preflight_retains_file_and_refuses_cleanup(self):
+        original = self.runner._run_live_02
+
+        def corrupt_then_dispatch():
+            path = self.runner.manifest_path
+            assert path is not None
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data["created_at"] = "2099-12-31T00:00:00Z"
+            path.write_text(json.dumps(data), encoding="utf-8")
+            return original()
+
+        with patch.object(self.runner, "_run_live_02", side_effect=corrupt_then_dispatch):
+            report = self.runner.run()
+        self.assertEqual(report.status, SessionStatus.FAILED)
+        self.assertEqual(report.audit_state, AuditOutcomeState.UNKNOWN)
+        self.assertTrue(report.manifest_preserved)
+        self.assertTrue(Path(report.manifest_path).exists())
+        self.assertIn("MANIFEST_INVALID", " ".join(report.errors))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM processed_articles").fetchone()[0], 0)
+        self.assertEqual([s.stage_id for s in report.stages], ["LIVE-01"])
+
+    def test_manifest_missing_after_preflight_fails_closed(self):
+        self._prepared()
+        assert self.runner.manifest_path is not None
+        self.runner.manifest_path.unlink()
+        self._assert_no_new_requests(
+            lambda: self.runner._execute(_INSERT_ARTICLE, self._article_params())
+        )
+
+    def test_live_http_transport_still_rejected_without_dispatch(self):
+        network_transport = httpx.HTTPTransport(retries=0)
+        live = TursoHTTPClient(
+            database_url=EXACT_STAGING_DESTINATION,
+            auth_token="not-a-real-secret",
+            transport=network_transport,
+        )
+        try:
+            with patch.object(
+                network_transport, "handle_request",
+                side_effect=AssertionError("network access forbidden"),
+            ):
+                with self.assertRaises(PermissionError):
+                    SealedHermeticStagingRunner(client=live)
+        finally:
+            live.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
