@@ -1,0 +1,44 @@
+# Efso Radar — Verification Ledger
+
+**Checkpoint:** 2026-10-26. This ledger separates direct GitHub CI evidence, agent-reported local runs, historical pilot acceptance and missing validations. **No tests were run by ChatGPT against a local clone for this documentation task.** Evidence is not a release certificate.
+
+## Current independently checked evidence
+
+| What | Evidence / environment | Result and precise scope |
+| --- | --- | --- |
+| Phase 5B.3G-B offline runner / Turso hardening | [PR #16](https://github.com/fatihemres/efso-radar/pull/16), final feature HEAD `674894bd4550452f5e452fcd07b9023906a2e2de`, [Actions run 40211637125](https://github.com/fatihemres/efso-radar/actions/runs/40211637125) | **CI successful** for Python **3.11** and **3.12** on Linux. GitHub PR merged via rebase; `main` integration commit `9a9ee4a9af35b2a027238da3fca6ffc0e445c9cd`. |
+| Offline test suite | Antigravity completion report for PR #16; reported `python -m pytest tests` | **568 passed / 154 subtests reported** by coding agent; not reproduced on Windows by this reviewer. Run link is the independently checked CI confirmation, not independent reproduction of local output. |
+| Previous reliability foundation | [PR #12](https://github.com/fatihemres/efso-radar/pull/12), [Phase 5B.3F record](docs/PHASE5B3F_HERMETIC_RELIABILITY_VALIDATION.md) | Integrated hermetic transaction, concurrency, parity and crash recovery tests; historical test totals are per milestone and must not be added together. |
+| Prior manual editorial pilot | [Phase 4 closure](docs/PHASE4_CLOSURE.md) | **Historical claimed acceptance**, including narrowly scoped RSS/Gemini/Telegram tests. Not authorization for present live operations or proof of current unattended reliability. |
+| Repository governance PR | This documentation-only branch | Markdown files and links require review; the PR must separately pass CI and PO review. No new runtime test result is claimed here. |
+
+## Reproducible offline commands
+
+Windows PowerShell from `C:\Dev\EfsoRadar`:
+
+```powershell
+git status --short
+$env:PYTHONPATH = 'src'
+python -m pytest tests -v
+python -W error -m efso_radar.staging.runner --help
+```
+
+CI source: [.github/workflows/ci.yml](.github/workflows/ci.yml); currently `ubuntu-latest`, Python 3.11 and 3.12, requirements from `requirements-dev.txt`, `python -m pytest tests -v`. No separate lint, typecheck, coverage, CodeQL, Windows Actions matrix or release pipeline was found in the inspected repository tree. Do not claim these checks exist or pass.
+
+## Release and validation gates
+
+- **IMPLEMENTED:** Code committed to a task branch. **VERIFIED:** tests/review with identifiable SHA and environment. **INTEGRATED:** merged on `main`. **ACCEPTED:** explicit PO acceptance. **LIVE:** separate operational authorization and observed evidence. Different gates.
+- For implementation PRs: record focused tests, full suite, OS/versions, outcomes, CI links, security gates, rollback and reviewer decision.
+- For runtime-critical changes: negative/adversarial cases (ambiguous COMMIT, ownership mismatch, no blind retry, cleanup budget, token masking, readonly firewall, deterministic idempotency). Count synthetic rows separately from mutating SQL operations.
+- Before any future live staging: independently reconcile observed remote schema, permissions, cleanup and final locks **only after specific PO authorization**.
+- For public-distribution/release: third-party provenance [#17](https://github.com/fatihemres/efso-radar/issues/17), version reconciliation and separate release approval.
+
+## Open verification gaps
+
+1. Real Turso transaction/write/cleanup session not run under Phase 5B.3G; Block Writes remains ON. No cloud call authorized.
+2. Local Windows run of latest `main` test matrix not independently captured in this task.
+3. No configured CodeQL/secret scanning results or branch-rule specifics independently verified; branch `main` is marked protected by GitHub API but protection detail endpoint was unavailable (403).
+4. Python package `__version__=2.0.0` versus historical `v0.4.0` requires PO release/version decision.
+5. Full end-to-end autonomous system operation, safety under provider quotas, and user/editor live acceptance are NOT proven by offline CI.
+
+Append significant verified evidence with date, commit, command, environment, outcome and evidence URL. Avoid per-PR report file sprawl.
