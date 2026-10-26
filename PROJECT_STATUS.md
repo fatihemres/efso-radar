@@ -22,9 +22,10 @@ GitHub Actions run [40211637125](https://github.com/fatihemres/efso-radar/action
 ## Immediate risks / decision gates
 1. **Live staging:** Block Writes ON, revoked credentials; real reads/writes and connection attempts prohibited without new PO authorization; $0 spend ceiling. Remote availability/state not independently rechecked now.
 2. **Historical document drift:** Phase 4 dual-editorial-recipient wording and old $1.20 budget contradict subsequent PO policy. [DECISIONS](DECISIONS.md) establishes current priority; do not rewrite historical reports.
-3. **Rights:** Public repo is proprietary for original material, but third-party audit [#17](https://github.com/fatihemres/efso-radar/issues/17) unfinished.
-4. **Release numbering:** 2.0.0 in Python metadata vs v0.4.0 historical document anchor; no stable release assumed.
-5. **Local state:** User/agent reports indicate local `main` clean after branch housekeeping. This was not directly inspected from the user's Windows filesystem; any new untracked worktrees must be checked at task start.
+3. **Runtime budget drift:** Despite the PO-approved $0.00 / 0 TRY spending policy, the current `.env.example` and `config.py` retain positive historical monetary defaults (`1.20` monthly / `0.05` per-run and shadow-evaluation) with positive lower validators. AI evaluation is disabled by default; this is a **configuration/policy discrepancy, not evidence of charges**. Follow-up [Issue #21](https://github.com/fatihemres/efso-radar/issues/21) is OPEN and requires a separately authorized implementation PR before any live activation.
+4. **Rights:** Public repo is proprietary for original material, but third-party audit [#17](https://github.com/fatihemres/efso-radar/issues/17) unfinished.
+5. **Release numbering:** 2.0.0 in Python metadata vs v0.4.0 historical document anchor; no stable release assumed.
+6. **Local state:** User/agent reports indicate local `main` clean after branch housekeeping. This was not directly inspected from the user's Windows filesystem; any new untracked worktrees must be checked at task start.
 
 Other records: [ROADMAP](ROADMAP.md), [DECISIONS](DECISIONS.md), [engineering workflow](docs/ENGINEERING_GOVERNANCE.md).
 
