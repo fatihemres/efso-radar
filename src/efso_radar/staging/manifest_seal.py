@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import tempfile
 from pathlib import Path
 
 from efso_radar.staging.runner import PerRunOwnershipManifest
@@ -34,7 +35,24 @@ def _load_snapshot(path: Path, expected_run_id: str) -> tuple[PerRunOwnershipMan
     ):
         raise ManifestSealViolation("Canonical per-run staging manifest is missing or unsafe.")
     try:
-        if path.stat().st_size > MAX_MANIFEST_BYTES:
+        # A matching filename alone does not make an arbitrary repository or
+        # operational-data path safe to read. Resolve directory ancestors
+        # before touching file contents and require the system temp root.
+        temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+        manifest_parent = path.parent.resolve(strict=True)
+        if manifest_parent == temp_root:
+            pass
+        else:
+            try:
+                manifest_parent.relative_to(temp_root)
+            except ValueError:
+                raise ManifestSealViolation(
+                    "Manifest must reside inside the OS temporary directory."
+                ) from None
+        stat = path.stat()
+        if stat.st_nlink != 1:
+            raise ManifestSealViolation("Linked manifest files are not permitted.")
+        if stat.st_size > MAX_MANIFEST_BYTES:
             raise ManifestSealViolation("Manifest exceeds offline safety size limit.")
         before = path.read_bytes()
         if not before or len(before) > MAX_MANIFEST_BYTES:
