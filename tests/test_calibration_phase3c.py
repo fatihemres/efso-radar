@@ -369,7 +369,8 @@ class TestCalibrationPhase3C(unittest.TestCase):
     def test_shadow_gemini_evaluation_design_is_within_budget_and_requires_approval(self):
         """Shadow evaluation design computes token/cost estimates without making live API calls."""
         items = load_and_verify_calibration_csv(self.csv_path)
-        design = design_shadow_gemini_evaluation(items)
+        # Historical price-model acceptance test, not a live operating budget.
+        design = design_shadow_gemini_evaluation(items, settings=Settings(max_shadow_eval_budget_usd=0.05))
         self.assertEqual(design.total_candidates, 50)
         self.assertGreater(design.estimated_input_tokens, 1000)
         self.assertLess(design.estimated_single_pass_cost_usd, 0.01)
@@ -556,6 +557,7 @@ class TestCalibrationPhase3C(unittest.TestCase):
             est_run_cost_usd=0.001,
             current_monthly_cost_usd=0.10,
             current_monthly_calls=50,
+            max_run_cost_usd=0.05,  # Historical numerical guard fixture, not operational allowance
             max_monthly_cost_usd=1.20,
             max_monthly_calls=300,
         )
@@ -566,6 +568,7 @@ class TestCalibrationPhase3C(unittest.TestCase):
             est_run_cost_usd=0.001,
             current_monthly_cost_usd=0.10,
             current_monthly_calls=300,
+            max_run_cost_usd=0.05,  # Historical numerical guard fixture, not operational allowance
             max_monthly_cost_usd=1.20,
             max_monthly_calls=300,
         )
@@ -576,6 +579,7 @@ class TestCalibrationPhase3C(unittest.TestCase):
             est_run_cost_usd=0.001,
             current_monthly_cost_usd=1.1995,
             current_monthly_calls=100,
+            max_run_cost_usd=0.05,  # Historical numerical guard fixture, not operational allowance
             max_monthly_cost_usd=1.20,
             max_monthly_calls=300,
         )

@@ -172,6 +172,11 @@ class GeminiEditorialEngine(AIEditorialEngine):
                 batch = EditorialDecisionBatch.model_validate_json(cached_raw)
                 return self._validate_and_transform_picks(batch.picks, candidates, recent_stories)
 
+        # Missing credentials may yield an offline empty result without any API call.
+        if not self.client:
+            logger.warning("No GEMINI_API_KEY configured. Returning empty editorial picks.")
+            return []
+
         # No live inference until the provider's zero-billing tier is independently
         # verified; cached batches remain eligible for offline reuse.
         if self.client is not None:
@@ -213,10 +218,6 @@ class GeminiEditorialEngine(AIEditorialEngine):
             msg = f"Estimated AI cost (${est_cost:.4f}) exceeds configured per-run budget (${self.settings.max_estimated_run_cost_usd:.4f})."
             logger.error(msg)
             raise AIEvaluationError(msg)
-
-        if not self.client:
-            logger.warning("No GEMINI_API_KEY configured. Returning empty editorial picks.")
-            return []
 
         import uuid
         usage_id = f"AI-{now.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
