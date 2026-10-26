@@ -98,15 +98,15 @@ class TestOfflineSessionGate(unittest.TestCase):
                 gate = OfflineSessionGate(
                     expected_manifest_sha256=DIGEST, clock=lambda: 0.0
                 )
+                values = dict(
+                    manifest_sha256=DIGEST, schema_version=6,
+                    tables_checked=15, columns_checked=129,
+                    collision_checks=5, simulated_block_writes_on=True,
+                    request_count=47,
+                )
+                values.update(params)
                 with self.assertRaises(MockGateDenied):
-                    gate.record_simulated_preflight(
-                        **dict(
-                            manifest_sha256=DIGEST, schema_version=6,
-                            tables_checked=15, columns_checked=129,
-                            collision_checks=5, simulated_block_writes_on=True,
-                            request_count=47, **{},
-                        ) | params
-                    )
+                    gate.record_simulated_preflight(**values)
                 self.assertEqual(gate.snapshot().phase, MockPhase.HALTED)
 
     def test_write_requires_mock_window_and_correct_next_stage(self):
@@ -224,7 +224,7 @@ class TestOfflineSessionGate(unittest.TestCase):
         self.start()
         self.assert_halt(
             lambda: self.gate.record_simulated_stage(
-                stage="LIVE-02", manifest_sha256=DIGEST, request_count=80
+                stage="LIVE-02", manifest_sha256=DIGEST, request_count=33
             ), "CLEANUP_RESERVE"
         )
         self.gate.record_simulated_lockdown(
@@ -259,6 +259,30 @@ class TestOfflineSessionGate(unittest.TestCase):
                 stage="LIVE-02", manifest_sha256=DIGEST, request_count=4
             ), "TIME_OR_CLOCK_INVALID"
         )
+
+    def test_decreasing_and_nonfinite_clock_fail_closed(self):
+        self.start()
+        for tick in (99.0, math.nan):
+            with self.subTest(tick=tick):
+                gate_clock = [100.0]
+                gate = OfflineSessionGate(
+                    expected_manifest_sha256=DIGEST, clock=lambda: gate_clock[0]
+                )
+                gate.record_simulated_preflight(
+                    manifest_sha256=DIGEST, schema_version=6,
+                    tables_checked=15, columns_checked=129,
+                    collision_checks=5, simulated_block_writes_on=True,
+                    request_count=47
+                )
+                gate.record_simulated_human_window(marker="MOCK_ONLY")
+                gate_clock[0] = tick
+                with self.assertRaisesRegex(
+                    MockGateDenied, "TIME_OR_CLOCK_INVALID"
+                ):
+                    gate.record_simulated_stage(
+                        stage="LIVE-02", manifest_sha256=DIGEST, request_count=4
+                    )
+                self.assertEqual(gate.snapshot().phase, MockPhase.HALTED)
 
     def test_invalid_initial_digest_or_clock_never_start(self):
         for bad in ("", "not-a-hash", "A" * 64):
