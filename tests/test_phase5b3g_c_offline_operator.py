@@ -138,6 +138,44 @@ class TestSealedHermeticOperator(unittest.TestCase):
                     lambda params=params: self.runner._execute(_INSERT_ARTICLE, params)
                 )
 
+    def test_non_scalar_parameters_fail_closed_with_unknown(self):
+        self._prepared()
+        for bad in ([], {"unexpected": "nested"}, None, object()):
+            with self.subTest(type=type(bad).__name__):
+                params = self._article_params()
+                params[1] = bad
+                self._assert_no_new_requests(
+                    lambda params=params: self.runner._execute(_INSERT_ARTICLE, params)
+                )
+
+    def test_ambiguous_reconciliation_preserves_manifest(self):
+        other = SealedHermeticStagingRunner(
+            client=self.client,
+            destination_url=EXACT_STAGING_DESTINATION,
+            manifest_dir=Path(self.temp.name),
+            simulate_ambiguous_inspection_failure=True,
+        )
+        report = other.run()
+        self.assertEqual(report.status, SessionStatus.FAILED)
+        self.assertEqual(report.audit_state, AuditOutcomeState.UNKNOWN)
+        self.assertTrue(report.manifest_preserved)
+        self.assertTrue(Path(report.manifest_path).exists())
+        self.assertTrue(other.halt_before_cleanup)
+        self.assertEqual(len([s for s in report.stages if s.stage_id == "LIVE-08"]), 0)
+
+    def test_ownership_mismatch_aborts_cleanup_preserving_manifest(self):
+        other = SealedHermeticStagingRunner(
+            client=self.client,
+            destination_url=EXACT_STAGING_DESTINATION,
+            manifest_dir=Path(self.temp.name),
+            simulate_ownership_mismatch=True,
+        )
+        report = other.run()
+        self.assertEqual(report.status, SessionStatus.FAILED)
+        self.assertEqual(report.audit_state, AuditOutcomeState.OWNERSHIP_MISMATCH_HALT)
+        self.assertTrue(report.manifest_preserved)
+        self.assertTrue(Path(report.manifest_path).exists())
+
     def test_whole_transaction_validated_before_any_dispatch(self):
         self._prepared()
         run_id = self.runner.run_id
