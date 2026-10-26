@@ -16,6 +16,8 @@ from efso_radar.staging.offline_operator import (
     SealedHermeticStagingRunner,
     _INSERT_ARTICLE,
     _INSERT_STORY,
+    _INSERT_LOCK,
+    _INSERT_RECOVERY,
 )
 from efso_radar.staging.runner import (
     AuditOutcomeState,
@@ -175,6 +177,85 @@ class TestSealedHermeticOperator(unittest.TestCase):
         self.assertEqual(report.audit_state, AuditOutcomeState.OWNERSHIP_MISMATCH_HALT)
         self.assertTrue(report.manifest_preserved)
         self.assertTrue(Path(report.manifest_path).exists())
+
+    def test_only_registered_run_scoped_read_templates_are_accepted(self):
+        self._prepared()
+        run_id = self.runner.run_id
+        invalid = (
+            ("SELECT * FROM notifications WHERE id = ?", ["private"]),
+            ("SELECT * FROM stories WHERE story_id = ?", ["another-run"]),
+            ("SELECT 1 AS found FROM stories WHERE story_id = ? AND 1 = 1",
+             [f"synth_story_{run_id}_01"]),
+            ("SELECT 1; DELETE FROM stories", [f"synth_story_{run_id}_01"]),
+            ("SELECT * FROM sqlite_master", []),
+            ("SELECT 1 AS found FROM processed_articles WHERE article_id = ?", None),
+        )
+        for sql, args in invalid:
+            with self.subTest(sql=sql):
+                self._assert_no_new_requests(
+                    lambda sql=sql, args=args: self.runner._execute(sql, args)
+                )
+
+    def test_article_pk_url_pair_and_all_timestamp_fields_bound(self):
+        self._prepared()
+        examples = []
+        crossed = self._article_params()
+        crossed[1] = f"https://example.com/synth/{self.runner.run_id}/02"
+        examples.append(crossed)
+        changed_stamp = self._article_params()
+        changed_stamp[5] = "2099-01-01T00:00:00Z"
+        examples.append(changed_stamp)
+        huge = self._article_params()
+        huge[1] = "x" * 1000
+        examples.append(huge)
+        for args in examples:
+            with self.subTest(args=args[1]):
+                self._assert_no_new_requests(
+                    lambda args=args: self.runner._execute(_INSERT_ARTICLE, args)
+                )
+
+    def test_story_dates_counts_and_payload_bound(self):
+        self._prepared()
+        run_id = self.runner.run_id
+        original = [
+            f"synth_story_{run_id}_01",
+            f"SYNTH_STORY_{run_id}_01",
+            "synth_test",
+            "2026-10-25T15:00:00Z",
+            "2026-10-25T15:00:00Z",
+            json.dumps([f"synth_art_{run_id}_01"]),
+            1, 1,
+        ]
+        for index, bad in ((3, "2099-01-01T00:00:00Z"), (6, 999),
+                           (7, True), (5, json.dumps(["wrong-article"]))):
+            with self.subTest(index=index):
+                args = original[:]
+                args[index] = bad
+                self._assert_no_new_requests(
+                    lambda args=args: self.runner._execute(_INSERT_STORY, args)
+                )
+
+    def test_lock_cas_and_recovery_timestamps_and_payload_bound(self):
+        self._prepared()
+        run_id = self.runner.run_id
+        lock_args = [
+            f"synth_lock_{run_id}", f"runner_alpha_{run_id}",
+            "2026-10-25T15:00:00Z", "2026-10-25T15:05:00Z",
+            "2026-10-25T15:00:00Z",
+        ]
+        lock_args[3] = "2099-01-01T00:00:00Z"
+        self._assert_no_new_requests(
+            lambda: self.runner._execute(_INSERT_LOCK, lock_args)
+        )
+        recovery_args = [
+            f"synth_stage_{run_id}::current",
+            f"synth_stage_{run_id}", f"synth_worker_{run_id}",
+            json.dumps({"cursor": 1000}),
+            "2026-10-25T15:00:00Z", "2026-10-25T15:00:00Z",
+        ]
+        self._assert_no_new_requests(
+            lambda: self.runner._execute(_INSERT_RECOVERY, recovery_args)
+        )
 
     def test_whole_transaction_validated_before_any_dispatch(self):
         self._prepared()
