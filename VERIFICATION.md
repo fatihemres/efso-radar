@@ -4,11 +4,9 @@
 
 ## Current independently checked evidence
 
-| Governance documentation PR #20 | [CI 40296162208](https://github.com/fatihemres/efso-radar/actions/runs/40296162208), branch HEAD `f6486b1670598d691e834f854925fcf0ee950763` **before subsequent documentation amendments** | Python 3.11 and 3.12 CI successful at this exact SHA. Any later documentation commit needs a fresh run; this is not evidence for that later SHA. |
-
-
 | What | Evidence / environment | Result and precise scope |
 | --- | --- | --- |
+| Governance documentation PR #20 | [CI 40296162208](https://github.com/fatihemres/efso-radar/actions/runs/40296162208), branch HEAD `f6486b1670598d691e834f854925fcf0ee950763` **before subsequent documentation amendments** | Python 3.11 and 3.12 CI successful at this exact SHA. Any later documentation commit needs a fresh run; this is not evidence for that later SHA. |
 | Phase 5B.3G-B offline runner / Turso hardening | [PR #16](https://github.com/fatihemres/efso-radar/pull/16), final feature HEAD `674894bd4550452f5e452fcd07b9023906a2e2de`, [Actions run 40211637125](https://github.com/fatihemres/efso-radar/actions/runs/40211637125) | **CI successful** for Python **3.11** and **3.12** on Linux. GitHub PR merged via rebase; `main` integration commit `9a9ee4a9af35b2a027238da3fca6ffc0e445c9cd`. |
 | Offline test suite | Antigravity completion report for PR #16; reported `python -m pytest tests` | **568 passed / 154 subtests reported** by coding agent; not reproduced on Windows by this reviewer. Run link is the independently checked CI confirmation, not independent reproduction of local output. |
 | Previous reliability foundation | [PR #12](https://github.com/fatihemres/efso-radar/pull/12), [Phase 5B.3F record](docs/PHASE5B3F_HERMETIC_RELIABILITY_VALIDATION.md) | Integrated hermetic transaction, concurrency, parity and crash recovery tests; historical test totals are per milestone and must not be added together. |
