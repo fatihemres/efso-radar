@@ -68,10 +68,10 @@ class Settings(BaseModel):
     min_discovery_priority_for_ai: float = Field(default=5.5, ge=0.0, le=20.0)
     ai_batch_size: int = Field(default=10, ge=1, le=60)
     max_output_tokens: int = Field(default=3200, ge=500, le=8192)
-    max_estimated_run_cost_usd: float = Field(default=0.0, ge=0.0)
-    max_monthly_ai_cost_usd: float = Field(default=0.0, ge=0.0)
+    max_estimated_run_cost_usd: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
+    max_monthly_ai_cost_usd: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
     max_monthly_ai_calls: int = Field(default=300, ge=1)
-    max_shadow_eval_budget_usd: float = Field(default=0.0, ge=0.0, le=0.50)
+    max_shadow_eval_budget_usd: float = Field(default=0.0, ge=0.0, allow_inf_nan=False, le=0.50)
     usd_to_try_rate: float = Field(default=36.0, ge=1.0)
     enable_search_grounding: bool = Field(default=False)  # Disabled to prevent extra costs
     http_timeout_seconds: float = Field(default=18.0, ge=2.0, le=120.0)

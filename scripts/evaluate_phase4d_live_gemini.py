@@ -121,6 +121,9 @@ def build_domain_articles(raw_articles: list[dict[str, Any]], trial_timestamp: s
 
 def run_phase4d_evaluation(live: bool = False) -> dict[str, Any]:
     """Execute Phase 4D live or simulated Gemini evaluation."""
+    # Fail before private evidence reads, ledger initialization or any other side effect.
+    if live:
+        require_verified_free_tier()
     logger.info("=== Phase 4D: Starting Supervised Live RSS-to-Gemini Evaluation ===")
 
     # 0. Safety Enforcement: Force TELEGRAM_DELIVERY_ENABLED to false

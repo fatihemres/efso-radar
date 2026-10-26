@@ -8,6 +8,7 @@ import csv
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -598,6 +599,7 @@ class TestCalibrationPhase3C(unittest.TestCase):
                 runner.run_live_gemini_evaluation(items, api_key="", dry_run=False)
             self.assertIn("GEMINI_API_KEY is required", str(ctx.exception))
 
+    @patch("efso_radar.ai.phase3c2b_eval.require_verified_free_tier", new=lambda: None)
     def test_phase3c2c_live_shadow_evaluation_mock_client_and_resume_and_confusion_matrix(self):
         """run_live_gemini_evaluation with mock_client enforces per-batch output tokens, records ledger, and resumes."""
         from unittest.mock import MagicMock

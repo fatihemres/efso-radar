@@ -124,6 +124,16 @@ class TestAIComponents(unittest.TestCase):
             engine.evaluate([art], [], self.now)
         engine.client.models.generate_content.assert_not_called()
 
+    @patch("efso_radar.ai.phase3c2b_eval.require_verified_free_tier", new=lambda: None)
+    def test_injected_shadow_client_cannot_bypass_verification_gate(self):
+        from efso_radar.ai.phase3c2b_eval import BlindShadowEvaluationRunner
+        runner = BlindShadowEvaluationRunner(settings=Settings())
+        injected_client = MagicMock()
+        art = Article.create("Synthetic article", "https://example.com/injected", "Source", self.now)
+        with self.assertRaisesRegex(AIEvaluationError, "free-tier/no-billing"):
+            runner.run_live_gemini_evaluation([art], dry_run=False, mock_client=injected_client)
+        injected_client.models.generate_content.assert_not_called()
+
     def test_unverified_shadow_runner_refuses_real_client(self):
         from efso_radar.ai.phase3c2b_eval import BlindShadowEvaluationRunner
         runner = BlindShadowEvaluationRunner(settings=Settings(gemini_api_key="synthetic-key"))
@@ -300,6 +310,7 @@ class TestAIComponents(unittest.TestCase):
         if hasattr(config_passed, "thinking_config") and config_passed.thinking_config is not None:
             self.assertEqual(str(config_passed.thinking_config.thinking_level).upper(), "THINKINGLEVEL.MINIMAL")
 
+    @patch("efso_radar.ai.phase3c2b_eval.require_verified_free_tier", new=lambda: None)
     def test_sdk_level_request_controls_and_thinking_config(self):
         """Verifies explicit SDK request controls: attempts=1, automatic_function_calling disabled, and thinking_level='minimal'."""
         from efso_radar.ai.phase3c2b_eval import BlindShadowEvaluationRunner
