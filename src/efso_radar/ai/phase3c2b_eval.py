@@ -1316,9 +1316,10 @@ class BlindShadowEvaluationRunner:
                 "Live API inference must be explicitly authorized with an API key."
             )
 
-        # Offline/synthetic mocks remain possible; real API dispatch is not approved.
-        # Keep the missing-key diagnostic above, but deny all real-provider dispatch.
-        if not dry_run and mock_client is None:
+        # Fail closed for every non-dry-run call, including injected clients.
+        # Hermetic mock tests patch this guard explicitly; mock_client itself
+        # is not proof that a real network request cannot be made.
+        if not dry_run:
             try:
                 require_verified_free_tier()
             except RuntimeError as exc:

@@ -17,7 +17,7 @@ from efso_radar.ai.calibration import (
     DEFAULT_FILLED_CALIBRATION_CSV,
     load_and_verify_calibration_csv,
 )
-from efso_radar.ai.cost import ExperimentBudgetGuard
+from efso_radar.ai.cost import ExperimentBudgetGuard, require_verified_free_tier
 from efso_radar.ai.phase3c2b_eval import BlindShadowEvaluationRunner
 from efso_radar.config import Settings
 from efso_radar.repositories.sqlite import SqliteStateRepository
@@ -26,6 +26,8 @@ EXPECTED_CSV_SHA256 = "108799c19f513327cb04872cec5dbcfb97107f2bd8bf2353acf28e311
 
 
 def main():
+    # Historical pilot invocation is no longer authorized; stop before file or DB access.
+    require_verified_free_tier()
     logger.info("=== Phase 3C-3: Starting Live Gemini 42-Story Evaluation ===")
 
     # 1. Gate 1: Check CSV Integrity

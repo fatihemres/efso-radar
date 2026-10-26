@@ -18,7 +18,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from efso_radar.ai.client import (
     AIEvaluationError,
@@ -131,6 +131,7 @@ class TestPhase3C2DContract(unittest.TestCase):
         self.assertEqual(len(ret_ids), len(set(ret_ids)))
         self.assertTrue(len(batch_res.run_editorial_summary_tr) > 5)
 
+    @patch("efso_radar.ai.phase3c2b_eval.require_verified_free_tier", new=lambda: None)
     def test_live_runner_validates_exact_8_decisions_from_mock_client(self):
         """Mock Gemini client returning 8 explicit decisions succeeds and records predictions."""
         mock_client = MagicMock()
@@ -162,6 +163,7 @@ class TestPhase3C2DContract(unittest.TestCase):
             self.assertIsNotNone(p.disposition)
             self.assertEqual(p.disposition, "DIGEST")
 
+    @patch("efso_radar.ai.phase3c2b_eval.require_verified_free_tier", new=lambda: None)
     def test_runner_rejects_missing_candidate_ids_fail_closed(self):
         """If the model returns fewer decisions than candidates (missing IDs), runner raises AIEvaluationError."""
         mock_client = MagicMock()
@@ -181,6 +183,7 @@ class TestPhase3C2DContract(unittest.TestCase):
         self.assertIn("missing 1 candidate decision(s)", str(ctx.exception))
         self.assertIn("Silent defaulting is prohibited", str(ctx.exception))
 
+    @patch("efso_radar.ai.phase3c2b_eval.require_verified_free_tier", new=lambda: None)
     def test_runner_rejects_hallucinated_ids_fail_closed(self):
         """If the model returns non-candidate IDs, runner raises AIEvaluationError."""
         mock_client = MagicMock()
@@ -199,6 +202,7 @@ class TestPhase3C2DContract(unittest.TestCase):
             )
         self.assertIn("missing 1 candidate decision(s)", str(ctx.exception))
 
+    @patch("efso_radar.ai.phase3c2b_eval.require_verified_free_tier", new=lambda: None)
     def test_runner_rejects_duplicate_ids_in_decisions(self):
         """If the model returns the same article_id more than once in decisions, runner raises AIEvaluationError."""
         mock_client = MagicMock()
@@ -217,6 +221,7 @@ class TestPhase3C2DContract(unittest.TestCase):
             )
         self.assertIn("duplicate article_ids returned in decisions", str(ctx.exception))
 
+    @patch("efso_radar.ai.phase3c2b_eval.require_verified_free_tier", new=lambda: None)
     def test_runner_rejects_malformed_json_and_records_in_repository(self):
         """Malformed JSON from provider raises AIEvaluationError and records failure in repository."""
         mock_client = MagicMock()
@@ -244,6 +249,7 @@ class TestPhase3C2DContract(unittest.TestCase):
         finally:
             conn.close()
 
+    @patch("efso_radar.ai.phase3c2b_eval.require_verified_free_tier", new=lambda: None)
     def test_runner_rejects_truncated_output_max_tokens(self):
         """Candidate truncation (finish_reason == 'MAX_TOKENS') raises AIEvaluationError before parsing."""
         mock_client = MagicMock()
@@ -263,6 +269,7 @@ class TestPhase3C2DContract(unittest.TestCase):
             )
         self.assertIn("finish_reason=MAX_TOKENS", str(ctx.exception))
 
+    @patch("efso_radar.ai.phase3c2b_eval.require_verified_free_tier", new=lambda: None)
     def test_fail_closed_budget_circuit_breaker(self):
         """Pre-call budget check halts execution before network dispatch if projected cost exceeds ceiling."""
         tight_settings = Settings(
@@ -289,6 +296,7 @@ class TestPhase3C2DContract(unittest.TestCase):
         # Verify mock client was never called!
         self.assertEqual(mock_client.models.generate_content.call_count, 0)
 
+    @patch("efso_radar.ai.phase3c2b_eval.require_verified_free_tier", new=lambda: None)
     def test_idempotent_cache_and_ledger_resume(self):
         """Completed batch is saved in repository cache and re-read on subsequent invocation with 0 API calls."""
         mock_client = MagicMock()
@@ -760,6 +768,7 @@ class TestPhase3C2DContract(unittest.TestCase):
         self.assertIsNotNone(asms_update[0].development_tr)
         self.assertIn("beraat", asms_update[0].development_tr)
 
+    @patch("efso_radar.ai.phase3c2b_eval.require_verified_free_tier", new=lambda: None)
     def test_data_provenance_validation_detects_corrupted_or_mismatched_canary_records(self):
         """Audit test: data-provenance validation must detect and fail on corrupted, missing, or mismatched records."""
         blind_articles = self.articles
@@ -870,6 +879,7 @@ class TestPhase3C2DContract(unittest.TestCase):
         Path(DEFAULT_FILLED_CALIBRATION_CSV).exists(),
         "Requires authentic calibration CSV dataset in data/",
     )
+    @patch("efso_radar.ai.phase3c2b_eval.require_verified_free_tier", new=lambda: None)
     def test_sensitive_review_calib_11_regression_case(self):
         """CALIB-11 regression test: Cindy Crawford / Presley Gerber death story must route to SENSITIVE_REVIEW."""
         calib_items = load_and_verify_calibration_csv(DEFAULT_FILLED_CALIBRATION_CSV)

@@ -27,6 +27,13 @@ class TestConfig(unittest.TestCase):
         with self.assertRaises(ValidationError):
             Settings(max_monthly_ai_cost_usd=-0.01)
 
+    def test_nonfinite_monetary_config_is_rejected(self):
+        for budget in ("max_estimated_run_cost_usd", "max_monthly_ai_cost_usd", "max_shadow_eval_budget_usd"):
+            for nonfinite in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(budget=budget, value=str(nonfinite)):
+                    with self.assertRaises(ValidationError):
+                        Settings(**{budget: nonfinite})
+
     def test_from_env_refuses_positive_budget_without_touching_dotenv(self):
         with patch.object(Path, "exists", return_value=False):
             with patch.dict(os.environ, {"MAX_MONTHLY_AI_COST_USD": "1.20"}, clear=True):
