@@ -81,15 +81,52 @@ class SealedHermeticStagingRunner(StagingSessionRunner):
 
     _seal: OfflineManifestSeal | None = None
     _preflight_accepted: bool = False
+    _preflight_attempted: bool = False
 
     def _create_and_persist_manifest(self) -> None:
-        super()._create_and_persist_manifest()
-        assert self.manifest_path is not None
-        self._seal = OfflineManifestSeal.from_persisted(self.manifest_path, self.run_id)
+        # A manifest and its preflight approval form ONE immutable session.
+        # Re-entry must not replace the on-disk manifest or refresh the seal.
+        # Check both parent fields: a partial persistence/sealing failure may
+        # have created the manifest without assigning _seal yet.
+        if (
+            self.halt_before_cleanup
+            or self.manifest is not None
+            or self.manifest_path is not None
+            or self._seal is not None
+            or self._preflight_attempted
+            or self._preflight_accepted
+        ):
+            self._deny("MANIFEST_REENTRY")
+        self._preflight_accepted = False
+        try:
+            super()._create_and_persist_manifest()
+            if self.manifest_path is None:
+                self._deny("MANIFEST_MISSING")
+            self._seal = OfflineManifestSeal.from_persisted(
+                self.manifest_path, self.run_id
+            )
+        except Exception:
+            # Do not permit retry after a partial filesystem write and do not
+            # expose the underlying path/manifest/permission error.
+            self._deny("MANIFEST_PREPARATION_FAILED")
 
     def _run_live_01(self) -> None:
-        # Fresh per-run baseline checks must succeed before ANY synthetic write.
-        super()._run_live_01()
+        # Preflight is a one-shot gate, not a refreshable boolean. A second
+        # attempt after success or failure permanently halts the session.
+        if (
+            self.halt_before_cleanup
+            or self._preflight_attempted
+            or self._preflight_accepted
+        ):
+            self._deny("PREFLIGHT_REENTRY")
+        if self._seal is None or self.manifest_path is None:
+            self._deny("MANIFEST_REQUIRED")
+        self._preflight_accepted = False
+        self._preflight_attempted = True
+        try:
+            super()._run_live_01()
+        except Exception:
+            self._deny("PREFLIGHT_FAILED")
         self._preflight_accepted = True
 
     def _deny(self, code: str) -> None:
