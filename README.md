@@ -11,7 +11,8 @@
 > - **Instagram Entegrasyonu:** Instagram otomatik paylaşımı kesinlikle kapalıdır; sistem yalnızca Telegram üzerinden editöre taslak öneri sunar.
 > - **Üretim Aktivasyonu:** Canlı sistem geçişi ve zamanlanmış iş akışlarının etkinleştirilmesi Ürün Sahibi'nin (Product Owner) ayrı ve açık onayına tabidir.
 
-\n> **Lisans notu:** Bu deponun sahibine ait özgün çalışmalar için tüm haklar saklıdır ve yeniden kullanım izni verilmemektedir. Ayrıntılar için [LICENSE](LICENSE) dosyasına bakın. Üçüncü taraf haber verileri ve bağımlılıkların hakları ayrıca saklıdır.\n
+> **Lisans notu:** Bu deponun sahibine ait özgün çalışmalar için tüm haklar saklıdır ve yeniden kullanım izni verilmemektedir. Ayrıntılar için [LICENSE](LICENSE) dosyasına bakın. Üçüncü taraf haber verileri ve bağımlılıkların hakları ayrıca saklıdır.
+
 ---
 
 ## 👥 Alıcı Politikası (Recipient Policy)
@@ -71,3 +72,22 @@ python -m efso_radar.workflow --task editorial-digest --timestamp 2026-10-24T01:
 2. **Fail-Closed Tasarım:** Eksik kimlik bilgisi, zaman aşımı veya belirsiz teslimat durumunda sistem beklemeye geçer; mükerrer gönderim yapmaz.
 3. **Uçucu Runner İzolasyonu:** GitHub Actions üzerinde çalışan işler geçicidir; kalıcı durum Turso/SQLite üzerinde korunur.
 4. **Token ve Kimlik Maskeleme:** Loglarda veya konsol çıktılarında gizli anahtarlar ve sohbet kimlikleri asla açık metin olarak yer almaz.
+
+---
+
+## 📋 Product & Engineering Yönetimi
+
+GitHub kanonik proje kaydıdır; ChatGPT Project karar alma/çalışma alanıdır. Güncel belge bağlantıları:
+
+- [AI ajanları ve iş yetkisi — AGENTS.md](AGENTS.md)
+- [Son doğrulanmış durum — PROJECT_STATUS.md](PROJECT_STATUS.md)
+- [PO kararları ve açık kararlar — DECISIONS.md](DECISIONS.md)
+- [Milestone / Roadmap — ROADMAP.md](ROADMAP.md)
+- [Test, CI ve doğrulama kanıtları — VERIFICATION.md](VERIFICATION.md)
+- [Mimari — docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [Git / PR / kod inceleme yönetişimi — docs/ENGINEERING_GOVERNANCE.md](docs/ENGINEERING_GOVERNANCE.md)
+- [Sürüm ve release ilkeleri — docs/RELEASE_POLICY.md](docs/RELEASE_POLICY.md)
+- [Ürün fikirleri — docs/IDEA_REGISTER.md](docs/IDEA_REGISTER.md)
+- [Kontrollü Turso staging test planı — Phase 5B.3G](docs/PHASE5B3G_LIVE_STAGING_RELIABILITY_PLAN.md)
+
+Önemli: Dokümandaki planlar veya geçmiş canlı pilotlar, bugün Turso erişimi, üretim/cron etkinleştirmesi, Gemini/Telegram çağrısı ya da release izni vermez. Bunlar ayrı ve açık PO onayına bağlıdır. GitHub PR/CI kanıtları ile tarihlendirilmiş durum kayıtlarını birbirinden ayırın.
