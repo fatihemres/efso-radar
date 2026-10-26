@@ -26,6 +26,7 @@ from efso_radar.staging.runner import (
     EXACT_STAGING_DESTINATION,
     HermeticStagingTransport,
     SessionStatus,
+    StagingSessionRunner,
 )
 
 
@@ -100,6 +101,100 @@ class TestSealedHermeticOperator(unittest.TestCase):
         self.assertFalse(Path(report.manifest_path).exists())
         for table in ("processed_articles", "stories", "run_locks", "durable_recovery_state"):
             self.assertEqual(self.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0)
+
+    def test_manifest_recreation_cannot_reuse_preflight_or_overwrite_file(self):
+        self._prepared()
+        assert self.runner.manifest_path is not None
+        assert self.runner._seal is not None
+        manifest_path = self.runner.manifest_path
+        original_bytes = manifest_path.read_bytes()
+        original_digest = self.runner._seal.sha256
+        before = self.budget.request_count
+        with self.assertRaisesRegex(PermissionError, "MANIFEST_REENTRY"):
+            self.runner._create_and_persist_manifest()
+        self.assertEqual(self.budget.request_count, before)
+        self.assertEqual(manifest_path.read_bytes(), original_bytes)
+        self.assertEqual(self.runner._seal.sha256, original_digest)
+        self.assertFalse(self.runner._preflight_accepted)
+        self.assertTrue(self.runner.halt_before_cleanup)
+        self.assertEqual(self.runner.audit_state, AuditOutcomeState.UNKNOWN)
+        self.assertTrue(manifest_path.exists())
+        with self.assertRaisesRegex(PermissionError, "SESSION_HALTED"):
+            self.runner._execute(_INSERT_ARTICLE, self._article_params())
+        self.assertEqual(self.budget.request_count, before)
+        self.assertEqual(
+            self.db.execute("SELECT COUNT(*) FROM processed_articles").fetchone()[0], 0
+        )
+
+    def test_preflight_reentry_after_success_rejected_without_dispatch(self):
+        self._prepared()
+        before = self.budget.request_count
+        with patch.object(
+            StagingSessionRunner,
+            "_run_live_01",
+            side_effect=AssertionError("A second preflight must not dispatch"),
+        ) as parent_spy:
+            with self.assertRaisesRegex(PermissionError, "PREFLIGHT_REENTRY"):
+                self.runner._run_live_01()
+            parent_spy.assert_not_called()
+        self.assertEqual(self.budget.request_count, before)
+        self.assertFalse(self.runner._preflight_accepted)
+        self.assertTrue(self.runner.halt_before_cleanup)
+        self.assertEqual(self.runner.audit_state, AuditOutcomeState.UNKNOWN)
+        with self.assertRaisesRegex(PermissionError, "SESSION_HALTED"):
+            self.runner._execute(_INSERT_ARTICLE, self._article_params())
+        self.assertEqual(self.budget.request_count, before)
+
+    def test_first_preflight_failure_revokes_authorization_and_blocks_retry(self):
+        self.runner._create_and_persist_manifest()
+        assert self.runner.manifest_path is not None
+        before = self.budget.request_count
+        with patch.object(
+            StagingSessionRunner,
+            "_run_live_01",
+            side_effect=RuntimeError("PRIVATE_PREFLIGHT_FAILURE"),
+        ) as preflight:
+            with self.assertRaisesRegex(
+                PermissionError, "OFFLINE_SEALED_GATE_PREFLIGHT_FAILED"
+            ) as err:
+                self.runner._run_live_01()
+            preflight.assert_called_once()
+        self.assertNotIn("PRIVATE_PREFLIGHT_FAILURE", str(err.exception))
+        self.assertEqual(self.budget.request_count, before)
+        self.assertTrue(self.runner._preflight_attempted)
+        self.assertFalse(self.runner._preflight_accepted)
+        self.assertTrue(self.runner.halt_before_cleanup)
+        self.assertEqual(self.runner.audit_state, AuditOutcomeState.UNKNOWN)
+        self.assertTrue(self.runner.manifest_path.exists())
+        with self.assertRaises(PermissionError):
+            self.runner._run_live_01()
+        with self.assertRaisesRegex(PermissionError, "SESSION_HALTED"):
+            self.runner._execute(_INSERT_ARTICLE, self._article_params())
+        self.assertEqual(self.budget.request_count, before)
+
+    def test_partial_manifest_creation_failure_keeps_file_and_denies_retry(self):
+        before = self.budget.request_count
+        with patch.object(
+            OfflineManifestSeal,
+            "from_persisted",
+            side_effect=RuntimeError("PRIVATE_MANIFEST_FAILURE"),
+        ):
+            with self.assertRaisesRegex(
+                PermissionError, "OFFLINE_SEALED_GATE_MANIFEST_PREPARATION_FAILED"
+            ) as err:
+                self.runner._create_and_persist_manifest()
+        self.assertNotIn("PRIVATE_MANIFEST_FAILURE", str(err.exception))
+        assert self.runner.manifest_path is not None
+        self.assertTrue(self.runner.manifest_path.exists())
+        self.assertIsNone(self.runner._seal)
+        self.assertFalse(self.runner._preflight_accepted)
+        self.assertTrue(self.runner.halt_before_cleanup)
+        self.assertEqual(self.runner.audit_state, AuditOutcomeState.UNKNOWN)
+        with self.assertRaises(PermissionError):
+            self.runner._create_and_persist_manifest()
+        with self.assertRaises(PermissionError):
+            self.runner._run_live_01()
+        self.assertEqual(self.budget.request_count, before)
 
     def test_preflight_is_mandatory_for_mutations(self):
         self._assert_no_new_requests(
