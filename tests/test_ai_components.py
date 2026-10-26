@@ -124,7 +124,6 @@ class TestAIComponents(unittest.TestCase):
             engine.evaluate([art], [], self.now)
         engine.client.models.generate_content.assert_not_called()
 
-    @patch("efso_radar.ai.phase3c2b_eval.require_verified_free_tier", new=lambda: None)
     def test_injected_shadow_client_cannot_bypass_verification_gate(self):
         from efso_radar.ai.phase3c2b_eval import BlindShadowEvaluationRunner
         runner = BlindShadowEvaluationRunner(settings=Settings())
