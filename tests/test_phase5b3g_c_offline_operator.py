@@ -257,6 +257,57 @@ class TestSealedHermeticOperator(unittest.TestCase):
             lambda: self.runner._execute(_INSERT_RECOVERY, recovery_args)
         )
 
+    def test_halted_session_rejects_later_valid_reads_and_writes(self):
+        self._prepared()
+        invalid = self._article_params()
+        invalid[3] = "wrong_owner"
+        with self.assertRaisesRegex(PermissionError, "OWNERSHIP_MISMATCH"):
+            self.runner._execute(_INSERT_ARTICLE, invalid)
+        self.assertTrue(self.runner.halt_before_cleanup)
+        before = self.budget.request_count
+        with self.assertRaisesRegex(PermissionError, "SESSION_HALTED"):
+            self.runner._execute(_INSERT_ARTICLE, self._article_params())
+        with self.assertRaisesRegex(PermissionError, "SESSION_HALTED"):
+            self.runner._execute(
+                "SELECT title, source FROM processed_articles WHERE article_id = ?",
+                [self._article_params()[0]],
+            )
+        with self.assertRaisesRegex(PermissionError, "SESSION_HALTED"):
+            self.runner._execute_transaction(
+                [(_INSERT_ARTICLE, self._article_params())]
+            )
+        self.assertEqual(self.budget.request_count, before)
+        self.assertEqual(self.runner.audit_state, AuditOutcomeState.UNKNOWN)
+
+    def test_unexpected_manifest_error_fails_closed_without_leak(self):
+        self._prepared()
+        assert self.runner._seal is not None
+        before = self.budget.request_count
+        with patch.object(
+            self.runner._seal,
+            "require_registered_identity",
+            side_effect=RuntimeError("SENSITIVE_RAW_MESSAGE"),
+        ):
+            with self.assertRaisesRegex(
+                PermissionError, "OFFLINE_SEALED_GATE_MANIFEST_INVALID"
+            ) as ctx:
+                self.runner._execute(_INSERT_ARTICLE, self._article_params())
+        self.assertNotIn("SENSITIVE_RAW_MESSAGE", str(ctx.exception))
+        self.assertEqual(self.budget.request_count, before)
+        self.assertTrue(self.runner.halt_before_cleanup)
+        self.assertEqual(self.runner.audit_state, AuditOutcomeState.UNKNOWN)
+
+    def test_registered_read_still_allowed_after_successful_preflight(self):
+        self._prepared()
+        before = self.budget.request_count
+        rows = self.runner._execute(
+            "SELECT title, source FROM processed_articles WHERE article_id = ?",
+            [self._article_params()[0]],
+        ).fetchall()
+        self.assertEqual(rows, [])
+        self.assertEqual(self.budget.request_count, before + 1)
+        self.assertFalse(self.runner.halt_before_cleanup)
+
     def test_whole_transaction_validated_before_any_dispatch(self):
         self._prepared()
         run_id = self.runner.run_id
