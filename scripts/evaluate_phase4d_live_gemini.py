@@ -44,6 +44,7 @@ from efso_radar.ai.cost import (
     estimate_call_cost,
     estimate_tokens_from_text,
     extract_provider_token_usage,
+    require_verified_free_tier,
 )
 from efso_radar.ai.prompts import build_diagnostic_editorial_prompt
 from efso_radar.ai.schemas import DiagnosticArticleDecision, DiagnosticEvaluationBatch
@@ -120,6 +121,9 @@ def build_domain_articles(raw_articles: list[dict[str, Any]], trial_timestamp: s
 
 def run_phase4d_evaluation(live: bool = False) -> dict[str, Any]:
     """Execute Phase 4D live or simulated Gemini evaluation."""
+    # Fail before private evidence reads, ledger initialization or any other side effect.
+    if live:
+        require_verified_free_tier()
     logger.info("=== Phase 4D: Starting Supervised Live RSS-to-Gemini Evaluation ===")
 
     # 0. Safety Enforcement: Force TELEGRAM_DELIVERY_ENABLED to false
@@ -198,8 +202,8 @@ def run_phase4d_evaluation(live: bool = False) -> dict[str, Any]:
         raise RuntimeError("GEMINI_API_KEY is missing or invalid! Halting execution.")
     logger.info("Preflight 4.1 Passed: GEMINI_API_KEY presence verified (Value masked).")
 
-    # Verify billing status: Ensure no paid billing credentials or services configured
-    logger.info("Preflight 4.2 Passed: System operating under free-tier / tariff-equivalent shadow accounting.")
+    # This historical diagnostic does NOT verify provider billing status.
+    logger.info("Preflight 4.2: Tariff-equivalent estimate only; provider Free Tier/billing unverified.")
 
     # Ledger verification
     budget_guard = ExperimentBudgetGuard(
@@ -320,6 +324,9 @@ def run_phase4d_evaluation(live: bool = False) -> dict[str, Any]:
         actual_cost_usd = estimate_call_cost(MODEL_NAME, actual_in_tokens, actual_out_tokens)
         logger.info("[DRY-RUN] Simulated evaluation completed. Theoretical cost: $%.6f", actual_cost_usd)
     else:
+        # The historical Phase 4D live pilot does not grant current API permission.
+        # Stop before budget ledger writes or network client construction.
+        require_verified_free_tier()
         logger.info("Executing REAL Gemini API call for model '%s'...", MODEL_NAME)
         # Reserve batch first in budget ledger
         budget_guard.reserve_batch(

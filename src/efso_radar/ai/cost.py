@@ -302,12 +302,27 @@ def compute_enforceable_batch_output_tokens(
     return max(500, min(max_configured_output_tokens, calculated))
 
 
+def require_verified_free_tier() -> None:
+    """Fail closed before real Gemini API dispatch until provider-side billing is proven safe.
+
+    Paid-rate token estimates and internal budget caps do not verify Free Tier
+    eligibility or guarantee zero charges for a billing-linked project.
+    No environment variable, positive ceiling, or API key lifts this guard.
+    A future separately reviewed and PO-approved implementation is required.
+    """
+    raise RuntimeError(
+        "Real Gemini API calls blocked: project free-tier/no-billing status and "
+        "provider-side $0 enforcement are not independently verified. "
+        "No paid fallback; separate Product Owner authorization required."
+    )
+
+
 def check_monthly_budget_guard(
     est_run_cost_usd: float,
     current_monthly_cost_usd: float,
     current_monthly_calls: int,
-    max_run_cost_usd: float = 0.05,
-    max_monthly_cost_usd: float = 1.20,
+    max_run_cost_usd: float = 0.0,
+    max_monthly_cost_usd: float = 0.0,
     max_monthly_calls: int = 300,
 ) -> tuple[bool, str]:
     """
@@ -352,7 +367,7 @@ class ExperimentBudgetGuard:
     def __init__(
         self,
         ledger_path: Path = Path("data/experiment_budget_ledger.json"),
-        budget_ceiling_usd: float = 0.050000,
+        budget_ceiling_usd: float = 0.0,
         canary1_db_path: Path = Path("data/canary_radar.db"),
         canary2_db_path: Path = Path("data/canary2_radar.db"),
         repository: Optional[Any] = None,

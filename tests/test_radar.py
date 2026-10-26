@@ -1,5 +1,7 @@
+import os
 import sys
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,6 +17,11 @@ class RadarTests(unittest.TestCase):
             "source": "Example", "market": "EN", "published_utc": self.now.isoformat(),
             "description": "Artist officially announced album", "id": "abc123",
         }
+
+    def test_legacy_judge_does_not_dispatch_with_a_key(self):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "synthetic-test-key"}):
+            with self.assertRaisesRegex(RuntimeError, "free-tier/no-billing"):
+                radar.judge([self.article], {"sent": []}, self.now)
 
     def test_rss_date_source_and_old_filter(self):
         sample = b'''<rss><channel><item><title>A new album - Pop Times</title><link>https://news.google.com/abc</link><pubDate>Sun, 11 Oct 2026 07:00:00 GMT</pubDate><source>Pop Times</source><description>News</description></item><item><title>Old news</title><link>https://news.google.com/old</link><pubDate>Fri, 09 Oct 2026 07:00:00 GMT</pubDate></item></channel></rss>'''

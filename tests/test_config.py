@@ -1,7 +1,11 @@
 """Tests for Settings and quiet hours logic."""
+import os
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import patch
 
+from pydantic import ValidationError
 from efso_radar.config import Settings
 
 
@@ -12,6 +16,38 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(s.max_per_run, 3)
         self.assertEqual(s.max_age_hours, 16)
         self.assertFalse(s.quiet_hours_enabled)
+
+    def test_zero_spend_defaults_and_zero_is_valid(self):
+        s = Settings()
+        self.assertEqual(s.max_estimated_run_cost_usd, 0.0)
+        self.assertEqual(s.max_monthly_ai_cost_usd, 0.0)
+        self.assertEqual(s.max_shadow_eval_budget_usd, 0.0)
+        self.assertFalse(s.ai_evaluation_enabled)
+        self.assertEqual(Settings(max_estimated_run_cost_usd=0.0).max_estimated_run_cost_usd, 0.0)
+        with self.assertRaises(ValidationError):
+            Settings(max_monthly_ai_cost_usd=-0.01)
+
+    def test_nonfinite_monetary_config_is_rejected(self):
+        for budget in ("max_estimated_run_cost_usd", "max_monthly_ai_cost_usd", "max_shadow_eval_budget_usd"):
+            for nonfinite in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(budget=budget, value=str(nonfinite)):
+                    with self.assertRaises(ValidationError):
+                        Settings(**{budget: nonfinite})
+
+    def test_from_env_refuses_positive_budget_without_touching_dotenv(self):
+        with patch.object(Path, "exists", return_value=False):
+            for key, old_value in (
+                ("MAX_ESTIMATED_RUN_COST_USD", "0.05"),
+                ("MAX_MONTHLY_AI_COST_USD", "1.20"),
+                ("MAX_SHADOW_EVAL_BUDGET_USD", "0.05"),
+            ):
+                with self.subTest(legacy_budget=key):
+                    with patch.dict(os.environ, {key: old_value, "AI_EVALUATION_ENABLED": "true"}, clear=True):
+                        with self.assertRaisesRegex(ValueError, "Positive AI monetary budgets"):
+                            Settings.from_env()
+            with patch.dict(os.environ, {}, clear=True):
+                s = Settings.from_env()
+                self.assertEqual(s.max_monthly_ai_cost_usd, 0.0)
 
     def test_quiet_hours_cross_midnight(self):
         s = Settings(
