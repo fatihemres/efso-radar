@@ -258,7 +258,7 @@ def judge(candidates: list[dict[str, Any]], state: dict[str, Any], now: datetime
     # This legacy public function remains importable even though the CLI disables live legacy mode.
     from efso_radar.ai.cost import require_verified_free_tier
     require_verified_free_tier()
-    from google import genai  # noqa: lazy import supports no-dependency demo
+    from google import genai  # lazy import supports no-dependency demo
     from google.genai import types
     client = genai.Client(api_key=api_key)
     resp = client.models.generate_content(

@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from difflib import SequenceMatcher
 import re
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import ValidationError
 
