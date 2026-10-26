@@ -108,6 +108,11 @@ class SealedHermeticStagingRunner(StagingSessionRunner):
         table, operation, count = spec
         if type(params) is not list or len(params) != count:
             self._deny("PARAMETERS_INVALID")
+        # Reject custom objects, nested values and unhashable payloads before
+        # checking synthetic marker allowlists; malformed arguments must never
+        # bypass the UNKNOWN/preserve-manifest failure path.
+        if any(type(value) not in (str, int, float, bool) for value in params):
+            self._deny("PARAMETERS_INVALID")
 
         assert params is not None
         target = params[0]
