@@ -12,6 +12,7 @@ import httpx
 
 from efso_radar.repositories.schema import get_all_init_statements
 from efso_radar.repositories.turso_client import TursoHTTPClient
+from efso_radar.staging.manifest_seal import OfflineManifestSeal
 from efso_radar.staging.offline_operator import (
     SealedHermeticStagingRunner,
     _INSERT_ARTICLE,
@@ -286,7 +287,7 @@ class TestSealedHermeticOperator(unittest.TestCase):
         assert self.runner._seal is not None
         before = self.budget.request_count
         with patch.object(
-            self.runner._seal,
+            OfflineManifestSeal,
             "require_registered_identity",
             side_effect=RuntimeError("SENSITIVE_RAW_MESSAGE"),
         ):
