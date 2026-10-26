@@ -1,11 +1,11 @@
 """Tests for AI components: pricing, schemas, prompts, and business rule validation."""
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from pydantic import ValidationError
 
-from efso_radar.ai.client import GeminiEditorialEngine, is_headline_too_similar
+from efso_radar.ai.client import AIEvaluationError, GeminiEditorialEngine, is_headline_too_similar
 from efso_radar.ai.cost import estimate_call_cost, estimate_tokens_from_text
 from efso_radar.ai.prompts import build_editorial_prompt
 from efso_radar.ai.schemas import EditorialDecisionBatch, EditorialPickSchema
@@ -95,8 +95,10 @@ class TestAIComponents(unittest.TestCase):
             engine.client.models.generate_content.side_effect = RuntimeError("504 Gateway Timeout")
             art = Article.create("Test Haberi", "https://example.com/1", "Kaynak", self.now)
 
-            with self.assertRaises(AIEvaluationError):
-                engine.evaluate([art], [], self.now)
+            # The old monetary ledger behavior is retained as a MOCK-ONLY fixture.
+            with patch("efso_radar.ai.client.require_verified_free_tier"):
+                with self.assertRaises(AIEvaluationError):
+                    engine.evaluate([art], [], self.now)
 
             # Verify cost was accounted in monthly usage summary
             usage = repo.get_monthly_ai_usage(now=self.now)
@@ -108,6 +110,26 @@ class TestAIComponents(unittest.TestCase):
                 row = conn.execute("SELECT run_mode, response_json FROM ai_usage_ledger").fetchone()
                 self.assertEqual(row["run_mode"], "FAILED_AMBIGUOUS")
                 self.assertIsNone(row["response_json"])
+
+    def test_unverified_tier_blocks_even_positive_test_budget(self):
+        settings = Settings(
+            gemini_api_key="synthetic-key",
+            max_estimated_run_cost_usd=0.05,
+            max_monthly_ai_cost_usd=1.20,
+        )
+        engine = GeminiEditorialEngine(settings)
+        engine.client = MagicMock()
+        art = Article.create("Sentetik Haber", "https://example.com/deny", "Kaynak", self.now)
+        with self.assertRaisesRegex(AIEvaluationError, "free-tier/no-billing"):
+            engine.evaluate([art], [], self.now)
+        engine.client.models.generate_content.assert_not_called()
+
+    def test_unverified_shadow_runner_refuses_real_client(self):
+        from efso_radar.ai.phase3c2b_eval import BlindShadowEvaluationRunner
+        runner = BlindShadowEvaluationRunner(settings=Settings(gemini_api_key="synthetic-key"))
+        art = Article.create("Sentetik Haber", "https://example.com/deny-shadow", "Kaynak", self.now)
+        with self.assertRaisesRegex(AIEvaluationError, "free-tier/no-billing"):
+            runner.run_live_gemini_evaluation([art], dry_run=False)
 
     def test_search_grounding_cost(self):
         cost_with_search = estimate_call_cost("gemini-3.5-flash-lite", 10_000, 1_000, used_search_grounding=True)
@@ -257,7 +279,7 @@ class TestAIComponents(unittest.TestCase):
         art2 = Article.create("Haber 2", "https://url.com/2", "Kaynak", self.now)
         art3 = Article.create("Haber 3", "https://url.com/3", "Kaynak", self.now)
 
-        settings = Settings(gemini_api_key="mock-key", max_output_tokens=4096)
+        settings = Settings(gemini_api_key="mock-key", max_output_tokens=4096, max_estimated_run_cost_usd=0.05)
         engine = GeminiEditorialEngine(settings)
         engine.client = MagicMock()
 
@@ -266,7 +288,8 @@ class TestAIComponents(unittest.TestCase):
         mock_resp.text = '{"picks": []}'
         engine.client.models.generate_content.return_value = mock_resp
 
-        engine.evaluate([art1, art2, art3], [], self.now)
+        with patch("efso_radar.ai.client.require_verified_free_tier"):
+            engine.evaluate([art1, art2, art3], [], self.now)
 
         # Inspect the config passed to client.models.generate_content
         call_kwargs = engine.client.models.generate_content.call_args.kwargs

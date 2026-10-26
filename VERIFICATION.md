@@ -13,6 +13,12 @@
 | Prior manual editorial pilot | [Phase 4 closure](docs/PHASE4_CLOSURE.md) | **Historical claimed acceptance**, including narrowly scoped RSS/Gemini/Telegram tests. Not authorization for present live operations or proof of current unattended reliability. |
 | Repository governance PR | This documentation-only branch | Prior reviewed HEAD `c3cc34a` passed both CI jobs as above; any new documentation commit must be rechecked. Markdown links/rendering and explicit PO merge approval are separate review gates. No runtime test or live activation is claimed here. |
 
+## Issue #21 — Zero-spend implementation candidate (unmerged)
+
+- Candidate branch `fix/issue-21-zero-spend-gates-20261026` attempts hard-blocking of real Gemini calls in the editorial engine, shadow evaluator and historical Phase 4D helper until separately approved provider billing safeguards exist. Existing offline cached results and synthetic mocks are deliberately distinct.
+- Operational AI monetary defaults are zero; `Settings.from_env` rejects positive historical budget overrides, while explicit positive values remain available only to legacy hermetic price-estimation tests. This is not provider Free Tier verification or permission to activate services.
+- Added negative tests for defaults, zero/negative validation, positive environment rejection, production engine no-dispatch and real shadow client no-dispatch. **Tests have not been locally run by ChatGPT**; CI outcome at final PR HEAD must be independently checked before a VERIFIED label.
+
 ## Reproducible offline commands
 
 Windows PowerShell from `C:\Dev\EfsoRadar`:
