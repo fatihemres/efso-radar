@@ -194,7 +194,7 @@ Every record that might potentially be written—including tentative records lik
 > [!IMPORTANT]
 > **Storage Durability Limitation:** Storage in the OS temporary directory (`tempfile.gettempdir()`) is **best-effort process crash protection, NOT guaranteed persistent storage**. Operating systems may purge temporary directories upon reboot, under disk storage pressure, or through background maintenance services (e.g. Windows Storage Sense or POSIX tmpfs unmounts). Operators must not rely on temp directory retention across system restarts.
 > 
-> **Architectural Status Notice:** The `--recover-manifest` mode is a **planned architectural design specification for the future Phase 5B.3G live runner implementation**. It is **NOT** currently implemented in the codebase. This milestone is strictly a planning and specification review; no runner code is implemented under this PR.
+> **Post-integration status (2026-10-26):** Under the earlier documentation-only Phase 5B.3G-A PR, live recovery was only a design. Subsequent integrated G-B now implements `--recover-manifest` **for offline manifest validation only**, using in-memory SQLite. It does not connect to Turso, establish remote CLEAN, mutate staging or delete the source manifest. A **live remote recovery procedure** remains unimplemented, and requires separate PO authorization.
 
 ---
 
@@ -361,7 +361,13 @@ An empirical offline simulation against Schema v6 establishes the exact nominal 
   - Further execution halts for manual operator investigation and Product Owner review.
 
 ### 5.3. Execution Timeout
-- Fixed at **< 120 seconds**, providing adequate headroom for 79 remote TLS round-trips with normal internet latency and libSQL response processing.
+- A future authorized live session must remain **< 120 seconds**. Real remote latency and cleanup duration have not been verified. The integrated G-B simulator declares `SESSION_TIMEOUT_SECONDS = 120.0`, but does **not enforce a hard elapsed-time circuit breaker** for the full session.
+- **G-C gate:** Implement and test a real session deadline including cleanup/audit; on expiry stop all unverified writes, retain an UNKNOWN/residual manifest and escalate to the operator. No live session is authorized.
+
+### 5.4. Post-G-B code reconciliation (2026-10-26; OFFLINE evidence only)
+- The preceding **78 nominal / 79 hypothetical persisted-rollback** table is a planning baseline, not a guarantee for every injected failure. The G-B test suite asserts **78 nominal** requests and permits **79 or 80** in its simulated persisted-rollback branch: the mock-only failure injection adds an extra INSERT. Corresponding LIVE-08 cleanup counts are **14 nominal / 15 injected-worst-case**. The strict **<100 dispatched requests** ceiling and 20-request cleanup reserve remain unchanged.
+- **Simultaneous row occupancy differs from mutating SQL operations.** The G-B nominal test asserts four peak synthetic rows and 14 total mutating SQL operations, including updates/deletions. Define and separately check the plan's `<10 row writes` constraint before any live session rather than equating it with the number of mutating statements.
+- G-B's `StagingSessionRunner` accepts only verified in-memory hermetic transports. It is **not** an integrated live G-C runner and implements no real Turso preflight, Block Writes sequencing, token handling, live cleanup, or live recovery. Basis: `src/efso_radar/staging/runner.py` and `tests/test_phase5b3g_b_hermetic_runner.py` at `main` `948f651c30cfb4b354696bdc48175580c0c4ae4a`. This records source/test assertions; no Windows test or remote operation was performed in this review.
 
 ---
 

@@ -68,7 +68,7 @@ python -m efso_radar.workflow --task editorial-digest --timestamp 2026-10-24T01:
 
 ## 🔒 Güvenlik İlkeleri
 
-1. **Katı 0 TRY / $0.00 Harcama:** Ücretsiz kota limitleri içinde kalınır; harici sağlayıcı faturası bağımsız denetlenmeden kesin sıfır harcama garantisi verilmez.
+1. **Katı 0 TRY / $0.00 Harcama:** Operasyonel AI para limitleri artık varsayılan olarak `0.00`; gerçek Gemini API çağrıları, sağlayıcı Free Tier/faturalandırma güvenliği bağımsız doğrulanıp ayrıca PO tarafından yetkilendirilene kadar **kod seviyesinde engellenir** (Issue #21 adayı). Paid-tier fiyat tahminleri gerçek ücretsiz katman ücretleri değildir. Uygulama bütçesi veya Google spend cap tek başına sıfır fatura garantisi vermez. Eski pozitif `.env` bütçeleri yüklemede hata verir; testlerdeki pozitif değerler yalnızca hermetik tarihsel fiyat/ledger senaryolarına aittir.
 2. **Fail-Closed Tasarım:** Eksik kimlik bilgisi, zaman aşımı veya belirsiz teslimat durumunda sistem beklemeye geçer; mükerrer gönderim yapmaz.
 3. **Uçucu Runner İzolasyonu:** GitHub Actions üzerinde çalışan işler geçicidir; kalıcı durum Turso/SQLite üzerinde korunur.
 4. **Token ve Kimlik Maskeleme:** Loglarda veya konsol çıktılarında gizli anahtarlar ve sohbet kimlikleri asla açık metin olarak yer almaz.
