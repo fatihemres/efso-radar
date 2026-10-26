@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from enum import Enum
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -28,7 +29,7 @@ import sqlite3
 import sys
 import tempfile
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 import uuid
 
@@ -518,22 +519,54 @@ class StagingRunnerReport(BaseModel):
 # =============================================================================
 
 class BudgetTrackingTransport(httpx.BaseTransport):
-    """Wraps an underlying transport to enforce hard request limits and cleanup reserves."""
+    """Enforce request ceilings, cleanup reserves and an offline request deadline.
+
+    This rejects NEW requests after the deadline, but cannot interrupt an
+    in-flight network call or prove any future live session's hard timeout.
+    """
 
     def __init__(
         self,
         inner: httpx.BaseTransport,
         ceiling: int = MAX_REQUEST_CEILING,
         cutoff: int = TEST_CUTOFF_REQUESTS,
+        session_timeout_seconds: float = SESSION_TIMEOUT_SECONDS,
+        clock: Optional[Callable[[], float]] = None,
     ):
+        if (
+            isinstance(session_timeout_seconds, bool)
+            or not isinstance(session_timeout_seconds, (int, float))
+            or not math.isfinite(session_timeout_seconds)
+            or not 0 < session_timeout_seconds <= SESSION_TIMEOUT_SECONDS
+        ):
+            raise ValueError("Session deadline must be finite, positive, and at most 120 seconds.")
+        if clock is not None and not callable(clock):
+            raise TypeError("Session clock must be callable.")
+
         self.inner = inner
         self.request_count = 0
         self.cleanup_request_count = 0
         self.in_cleanup = False
         self.ceiling = ceiling
         self.cutoff = cutoff
+        self.session_timeout_seconds = float(session_timeout_seconds)
+        self._clock = clock if clock is not None else time.monotonic
+        self._session_started_at: Optional[float] = None
+
+    def begin_session(self) -> None:
+        """Start once before manifest creation; cannot reset the deadline."""
+        if self._session_started_at is not None:
+            raise TursoClientError("SESSION_DEADLINE_ALREADY_STARTED: refusing to reset the session clock.")
+        self._session_started_at = self._clock()
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
+        # Direct transport use gets a deadline; StagingSessionRunner starts it earlier.
+        if self._session_started_at is None:
+            self.begin_session()
+        if self._clock() - self._session_started_at >= self.session_timeout_seconds:
+            raise TursoClientError(
+                "SESSION_TIMEOUT_AUDIT_INCOMPLETE: elapsed deadline; no further HTTP requests dispatched."
+            )
         self.request_count += 1
         if self.in_cleanup:
             self.cleanup_request_count += 1
@@ -985,6 +1018,12 @@ class StagingSessionRunner:
             raise PermissionError(
                 "Hermetic security boundary violation: client has an already initialized internal HTTP client before dispatch."
             )
+
+        # Include manifest registration in the offline request-boundary deadline.
+        # This does not replace the future live end-to-end timeout mechanism.
+        bt = self.budget_transport
+        if bt:
+            bt.begin_session()
 
         manifest_unlinked = False
 
