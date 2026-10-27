@@ -71,6 +71,98 @@ def _intent_key(sql: str, args: list[dict[str, Any]]) -> str:
     return json.dumps([sql, args], separators=(",", ":"), sort_keys=True)
 
 
+_CANONICAL_STAMP = "2026-10-25T15:00:00Z"
+
+
+def _require_canonical_mutation(
+    *,
+    table: str,
+    operation: str,
+    args: tuple[str | int, ...],
+    run_id: str,
+    attrs: dict[str, Any],
+) -> None:
+    """Check EVERY bound value against the fixed synthetic stage inventory.
+
+    Intents are untrusted caller inputs: matching the SQL template and row's
+    PK/ownership markers alone is not enough. This policy remains mock-only.
+    """
+    key = args[0]
+    stamp = _CANONICAL_STAMP
+    if operation == "delete":
+        tails = {
+            "processed_articles": (attrs["source"], attrs["title"]),
+            "stories": (attrs["category"], attrs["headline_tr"]),
+            "run_locks": tuple(attrs["worker_ids"]),
+            "durable_recovery_state": (attrs["stage"], attrs["worker_id"]),
+        }
+        if args[1:] != tails[table]:
+            raise ValueError("Noncanonical mock cleanup parameters.")
+        return
+
+    if operation != "insert":
+        raise ValueError("Unexpected mock mutation operation.")
+
+    if table == "processed_articles":
+        if key == f"synth_art_{run_id}_01":
+            urls = (f"https://example.com/synth/{run_id}/01",)
+        elif key == f"synth_art_{run_id}_02_rollback":
+            urls = (
+                f"https://example.com/synth/{run_id}/02",
+                f"https://example.com/synth/{run_id}/02_duplicate",
+            )
+        else:
+            raise ValueError("Noncanonical mock article key.")
+        if args[1] not in urls or args[2:] != (
+            attrs["title"], attrs["source"], stamp, stamp
+        ):
+            raise ValueError("Noncanonical mock article payload.")
+        return
+
+    if table == "stories":
+        expected = (
+            attrs["headline_tr"],
+            attrs["category"],
+            stamp,
+            stamp,
+            json.dumps([f"synth_art_{run_id}_01"]),
+            1,
+            1,
+        )
+        if args[1:] != expected:
+            raise ValueError("Noncanonical mock story payload.")
+        return
+
+    if table == "run_locks":
+        alpha, beta = attrs["worker_ids"]
+        allowed = (
+            (alpha, stamp, "2026-10-25T15:05:00Z", stamp),
+            (beta, stamp, "2026-10-25T15:05:00Z", stamp),
+            (
+                beta,
+                "2026-10-25T15:06:00Z",
+                "2026-10-25T15:11:00Z",
+                "2026-10-25T15:06:00Z",
+            ),
+        )
+        if args[1:] not in allowed:
+            raise ValueError("Noncanonical mock lease payload.")
+        return
+
+    if table == "durable_recovery_state":
+        if args[1:] != (
+            attrs["stage"],
+            attrs["worker_id"],
+            json.dumps({"cursor": 100}),
+            stamp,
+            stamp,
+        ):
+            raise ValueError("Noncanonical mock recovery payload.")
+        return
+
+    raise ValueError("Unsupported mock mutation table.")
+
+
 class GuardedHermeticHranaTransport(httpx.BaseTransport):
     """Enforce SQL and parameter allowlists *at the mock outbound edge*.
 
@@ -138,33 +230,14 @@ class GuardedHermeticHranaTransport(httpx.BaseTransport):
             seal.require_registered_identity(
                 entity.table, entity.pk_column, entity.pk_value
             )
-            attrs = entity.expected_attributes
-            if operation == "insert":
-                if table == "processed_articles" and (
-                    item.args[2] != attrs["title"] or item.args[3] != attrs["source"]
-                ):
-                    raise ValueError("Unregistered synthetic article marker.")
-                if table == "stories" and (
-                    item.args[1] != attrs["headline_tr"]
-                    or item.args[2] != attrs["category"]
-                ):
-                    raise ValueError("Unregistered synthetic story marker.")
-                if table == "run_locks" and item.args[1] not in attrs["worker_ids"]:
-                    raise ValueError("Unregistered synthetic lock owner.")
-                if table == "durable_recovery_state" and (
-                    item.args[1] != attrs["stage"]
-                    or item.args[2] != attrs["worker_id"]
-                ):
-                    raise ValueError("Unregistered synthetic recovery marker.")
-            if operation == "delete":
-                expected = {
-                    "processed_articles": (attrs["source"], attrs["title"]),
-                    "stories": (attrs["category"], attrs["headline_tr"]),
-                    "run_locks": tuple(attrs["worker_ids"]),
-                    "durable_recovery_state": (attrs["stage"], attrs["worker_id"]),
-                }[table]
-                if item.args[1:] != expected:
-                    raise ValueError("Unregistered synthetic cleanup marker.")
+            if operation in ("insert", "delete"):
+                _require_canonical_mutation(
+                    table=table,
+                    operation=operation,
+                    args=item.args,
+                    run_id=seal.run_id,
+                    attrs=entity.expected_attributes,
+                )
             key = _intent_key(sql, values)
             if key in allowed:
                 raise ValueError("Duplicate mock intent would allow retries.")
