@@ -12,15 +12,17 @@ Efso Radar supplies selective Turkish/global entertainment-news discovery and ed
 ## Latest operational checkpoint — Phase 5B.3G-C Operator Candidate Preparation (2026-10-27)
 
 - **Main baseline:** `b6982b499c97cedeb32fadb06df537d3837fd85e` (PR #31, #32, #33, #34 integrated).
-- **Candidate implementation:** `LiveReadyStagingOperator` (`src/efso_radar/staging/live_ready_operator.py`) and `HranaOutboundSecurityBoundary` (`src/efso_radar/staging/hrana_outbound_guard.py`).
+- **Candidate implementation:** `LiveReadyStagingOperator` (`src/efso_radar/staging/live_ready_operator.py`) and `HranaOutboundSecurityBoundary` (`src/efso_radar/staging/hrana_outbound_guard.py`) under Draft PR #35 (unmerged candidate).
 - **Safety guarantees enforced:**
-  1. Default-deny for live execution: attempts to initialize with real network transports strictly fail closed (`PermissionError`) by default.
-  2. Crash-recoverable ownership manifest & seal before any mutation.
-  3. Preflight gate (LIVE-01 under Block Writes ON) & explicit Human Approval Window gate before Stage 2 mutations.
-  4. Session deadline (<120.0s) & budget ceiling (<100 requests, 20 cleanup reserve).
-  5. Ambiguous COMMIT outcome handling: produces `UNKNOWN`, stops permanently, no blind retry, retains manifest on disk.
-  6. Parameterized conditional DELETE with affected row count verification (`== 1`) and independent 3-state audit (`CLEAN/RESIDUAL/UNKNOWN`).
-  7. Sanitized error reporting with zero SQL, token, or operational secret leakage.
+  1. Default-deny for live execution: attempts to initialize with real network transports or spoofed transports strictly fail closed (`PermissionError`) by default.
+  2. Outbound HTTP wire security boundary: wired into the operator's transport chain to inspect every HTTP wire request, validate batons, enforce templates and calendar-valid ISO timestamps.
+  3. Process-crash recoverable ownership manifest & seal before any mutation (stored in OS tempdir; not machine-reboot durable; reboot resilience remains an open live prerequisite).
+  4. Preflight gate (LIVE-01 under Block Writes ON) & explicit Human Approval Window gate before Stage 2 mutations. Incomplete stages or missing human approval strictly prevent `PASSED` status and manifest deletion.
+  5. Session deadline (<120.0s) & budget ceiling (<100 requests, 20 cleanup reserve).
+  6. Ambiguous COMMIT outcome handling: produces `UNKNOWN`, stops permanently, no blind retry, retains manifest on disk.
+  7. Parameterized conditional DELETE with affected row count verification (`== 1`) and independent 3-state audit (`CLEAN/RESIDUAL/UNKNOWN`).
+  8. Post-run lockdown recording: offline simulated assertion only (does not prove live cloud dashboard state or token revocation).
+  9. Sanitized error reporting with zero SQL, token, or operational secret leakage.
 - **Phase 5B.3G-C remains OFFLINE-ONLY:** live execution is NOT enabled. No real Turso connection, no credentials created, and Block Writes remains ON.
 
 ## Historical operational checkpoint — LIVE-01 READ-ONLY (2026-10-26)

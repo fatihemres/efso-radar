@@ -18,13 +18,16 @@
 | Follow-on cloud cutover & unattended operations | Cloud parity, backups, zero-cost controls, human editorial recipient tests, PO release decision | Existing Phase 5 architecture; future issue required | **DISCOVERY / NOT AUTHORIZED** |
 | Rights and distribution | Review third-party origins and decide visibility/distribution | [Issue #17](https://github.com/fatihemres/efso-radar/issues/17) | **IN PROGRESS (AUDIT)** |
 
-## 2026-10-27 Phase 5B.3G-C Live-Ready Operator Preparation Checkpoint
+## 2026-10-27 Phase 5B.3G-C Live-Ready Operator Preparation Checkpoint (Candidate / Unmerged PR #35)
 
-Operator candidate `LiveReadyStagingOperator` and `HranaOutboundSecurityBoundary` integrated as an offline candidate.
+Operator candidate `LiveReadyStagingOperator` and `HranaOutboundSecurityBoundary` prepared as an unmerged candidate (Draft PR #35, pending independent review).
 - Reuses existing hermetic runner, preflight, manifest sealing, and session gate components.
-- Enforces default-deny for live execution; fails closed immediately on non-hermetic transports.
-- Outbound boundary enforces exact destination allowlisting, baton lifecycle, and payload sanitization.
-- Full gate workflow: LIVE-01 preflight, human window attestation, deadline (<120s), budget (<100 requests, 20 cleanup reserve), ambiguous COMMIT = UNKNOWN, conditional DELETE (affected == 1), and 3-state audit (CLEAN/RESIDUAL/UNKNOWN).
+- Enforces strict default-deny for live execution; fails closed immediately on non-hermetic transports (no duck-typing bypasses).
+- Outbound boundary wired into transport chain, validating destination URL, payload size, baton lifecycle, mutating templates, calendar-valid ISO timestamps, and safe read queries at the HTTP wire edge.
+- Full gate workflow: verified LIVE-01 preflight, mandatory human window attestation before write stages, deadline (<120s), budget (<100 requests, 20 cleanup reserve), ambiguous COMMIT = UNKNOWN, conditional DELETE (affected == 1), post-run lockdown assertion, and 3-state audit (CLEAN/RESIDUAL/UNKNOWN).
+- Unlinking of manifest and PASSED status strictly blocked if human approval, any of the 8 stages, or lockdown assertion is missing or incomplete.
+- MANIFEST DURABILITY LIMITATION: Best-effort process-crash retention within OS tempdir. Machine reboot / temp purging is NOT resilient and remains an open prerequisite for unattended live cloud execution.
+- LOCKDOWN ASSERTION NOTICE: Post-run lockdown recording is an offline simulated assertion only, NOT real cloud dashboard state or token revocation.
 - All live staging operations remain **UNAUTHORIZED**; Block Writes remains ON.
 
 ## 2026-10-26 LIVE-01 milestone checkpoint

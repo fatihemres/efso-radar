@@ -16,26 +16,52 @@ Enforces:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
+from pathlib import Path
 import re
+import sqlite3
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import httpx
 
 from efso_radar.repositories.turso_client import (
     normalize_turso_url,
     serialize_hrana_arg,
+    validate_read_only_sql,
 )
 from efso_radar.staging.manifest_seal import OfflineManifestSeal
 from efso_radar.staging.offline_operator import _MUTATING_TEMPLATES, _norm
 from efso_radar.staging.runner import (
     BudgetTrackingTransport,
     EXACT_STAGING_DESTINATION,
+    HermeticStagingTransport,
+    RegisteredEntity,
     create_default_manifest_entities,
     verify_hermetic_session_transport,
 )
 
+
+_ALLOWED_READ_TABLES = frozenset({
+    "schema_migrations",
+    "run_locks",
+    "processed_articles",
+    "stories",
+    "story_updates",
+    "notifications",
+    "editorial_assessments",
+    "owner_feedback",
+    "candidate_backlog",
+    "ai_usage_ledger",
+    "telegram_delivery_records",
+    "distribution_delivery_attempts",
+    "dead_letter_deliveries",
+    "durable_recovery_state",
+    "digest_history",
+    "sqlite_master",
+    "sqlite_sequence",
+})
 
 _MAX_JSON_BYTES = 16_384
 _MAX_REQUEST_PARTS = 8
@@ -60,8 +86,53 @@ class AuthorizedMockIntent:
 
 
 def is_valid_iso_timestamp(val: Any) -> bool:
-    """Verify string is a strict ISO 8601 UTC timestamp."""
-    return isinstance(val, str) and bool(_ISO_TIMESTAMP_RE.match(val))
+    """Verify string is a strict ISO 8601 UTC timestamp with calendar validity.
+
+    Enforces:
+    - String type matching canonical wire format ending in 'Z'
+    - Real calendar date parsing (valid months 1..12, valid days per month, leap years)
+    - Valid 24-hour time (hours 0..23, minutes 0..59, seconds 0..59)
+    - Strict UTC timezone
+    """
+    if not isinstance(val, str) or not _ISO_TIMESTAMP_RE.match(val):
+        return False
+    try:
+        dt = datetime.fromisoformat(val)
+        return dt.tzinfo == timezone.utc
+    except (ValueError, OverflowError):
+        return False
+
+
+def _verify_exact_hermetic_transport(inner: Any) -> None:
+    """Strict fail-closed verification of hermetic transport ownership.
+
+    Rejects duck-typing, fake attributes (_conn, is_hermetic), custom subclasses,
+    and real network transports.
+    """
+    if inner is None:
+        raise PermissionError("HERMETIC_TRANSPORT_REQUIRED: transport cannot be None.")
+    if isinstance(inner, (httpx.HTTPTransport, httpx.AsyncHTTPTransport)):
+        raise PermissionError("LIVE_TURSO_UNAUTHORIZED: Real HTTP network transport is strictly disallowed.")
+
+    if type(inner) is BudgetTrackingTransport:
+        verify_hermetic_session_transport(inner)
+        return
+
+    if type(inner) is HermeticStagingTransport:
+        conn = getattr(inner, "conn", None)
+        if not isinstance(conn, sqlite3.Connection):
+            raise PermissionError("HERMETIC_TRANSPORT_REQUIRED: missing sqlite3.Connection.")
+        cur = conn.cursor()
+        cur.execute("PRAGMA database_list;")
+        for row in cur.fetchall():
+            db_file = row[2] if len(row) > 2 else ""
+            if db_file and db_file != "" and not str(db_file).startswith(":memory:"):
+                raise PermissionError("HERMETIC_TRANSPORT_REQUIRED: file-backed database rejected.")
+        return
+
+    raise PermissionError(
+        f"HERMETIC_TRANSPORT_REQUIRED: Untrusted transport type {type(inner).__name__} rejected."
+    )
 
 
 def _object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -109,13 +180,18 @@ def _require_canonical_mutation(
     key = args[0]
     stamp = _CANONICAL_STAMP
     if operation == "delete":
-        tails = {
-            "processed_articles": (attrs["source"], attrs["title"]),
-            "stories": (attrs["category"], attrs["headline_tr"]),
-            "run_locks": tuple(attrs["worker_ids"]),
-            "durable_recovery_state": (attrs["stage"], attrs["worker_id"]),
-        }
-        if args[1:] != tails[table]:
+        if table == "processed_articles":
+            expected_tail = (attrs["source"], attrs["title"])
+        elif table == "stories":
+            expected_tail = (attrs["category"], attrs["headline_tr"])
+        elif table == "run_locks":
+            expected_tail = tuple(attrs["worker_ids"])
+        elif table == "durable_recovery_state":
+            expected_tail = (attrs["stage"], attrs["worker_id"])
+        else:
+            raise ValueError("Unsupported mock cleanup table.")
+
+        if args[1:] != expected_tail:
             raise ValueError("Noncanonical mock cleanup parameters.")
         return
 
@@ -190,16 +266,21 @@ def validate_dynamic_mutation_args(
     run_id: str,
     attrs: dict[str, Any],
 ) -> None:
-    """Validate all mutation parameters against dynamic session identities and attributes."""
-    key = args[0]
+    """Validate dynamic synthetic mutation parameters against sealed manifest attributes."""
+    key = str(args[0])
     if operation == "delete":
-        tails = {
-            "processed_articles": (attrs["source"], attrs["title"]),
-            "stories": (attrs["category"], attrs["headline_tr"]),
-            "run_locks": tuple(attrs["worker_ids"]),
-            "durable_recovery_state": (attrs["stage"], attrs["worker_id"]),
-        }
-        if args[1:] != tails[table]:
+        if table == "processed_articles":
+            expected_tail = (attrs["source"], attrs["title"])
+        elif table == "stories":
+            expected_tail = (attrs["category"], attrs["headline_tr"])
+        elif table == "run_locks":
+            expected_tail = tuple(attrs["worker_ids"])
+        elif table == "durable_recovery_state":
+            expected_tail = (attrs["stage"], attrs["worker_id"])
+        else:
+            raise ValueError("Unsupported dynamic cleanup table.")
+
+        if args[1:] != expected_tail:
             raise ValueError("Noncanonical dynamic cleanup parameters.")
         return
 
@@ -267,19 +348,29 @@ def validate_dynamic_mutation_args(
     raise ValueError("Unsupported dynamic mutation table.")
 
 
+def _extract_hrana_val(a: Any) -> Any:
+    if isinstance(a, dict) and "type" in a:
+        val = a.get("value")
+        if a["type"] == "integer" and isinstance(val, (str, int)):
+            return int(val)
+        if a["type"] == "float" and isinstance(val, (str, float, int)):
+            return float(val)
+        return val
+    return a
+
+
 class HranaOutboundSecurityBoundary(httpx.BaseTransport):
     """Enforce deny-by-default Hrana security boundary at the outbound HTTP transport edge.
 
-    Observes direct HTTP pipeline requests before network dispatch.
+    Observes direct HTTP pipeline requests before dispatch.
     Enforces:
-    - Default deny of live Turso connections (live_authorized=False)
+    - Default deny of live Turso connections (rejects non-hermetic transports)
     - Exact destination allowlisting and HTTPS endpoint
     - Request payload size, duplicate key rejection, and JSON envelope
-    - One-shot transaction baton lifecycle
+    - One-shot transaction baton lifecycle (opaque string batons)
     - Allowlisted SQL statement & argument verification against sealed manifest
     - Request count ceiling (<100) and cleanup reserve (80 test cutoff)
     - Session deadline (<120.0s elapsed)
-    - No blind retry (spent intents consumed before dispatch)
     - Ambiguous outcome fail-closed permanently halting session
     - Zero credential / SQL payload leakage
     """
@@ -289,9 +380,10 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
         *,
         inner: httpx.BaseTransport,
         seal: OfflineManifestSeal,
-        approved_intents: tuple[AuthorizedMockIntent, ...],
+        approved_intents: Optional[tuple[AuthorizedMockIntent, ...]] = None,
         live_authorized: bool = False,
         dynamic_validation: bool = False,
+        session_mode: bool = False,
         clock: Callable[[], float] = time.monotonic,
         max_requests: int = _MAX_SESSION_REQUESTS,
         test_cutoff_requests: int = _TEST_CUTOFF_REQUESTS,
@@ -299,102 +391,22 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
         session_timeout_seconds: float = _SESSION_DEADLINE_SECONDS,
         verify_inner_hermetic: bool = False,
     ) -> None:
-        if verify_inner_hermetic:
-            verify_hermetic_session_transport(inner)
-        elif not live_authorized:
-            # Deny by default: real network transports strictly rejected without authorization
-            is_hermetic = (
-                type(inner) is BudgetTrackingTransport
-                or hasattr(inner, "_conn")
-                or getattr(inner, "is_hermetic", False)
+        if live_authorized:
+            raise PermissionError(
+                "LIVE_TURSO_UNAUTHORIZED: Live Turso outbound execution is permanently "
+                "disabled by default pending PO authorization."
             )
-            if not is_hermetic:
-                raise PermissionError(
-                    "LIVE_TURSO_UNAUTHORIZED: Live Turso outbound execution is permanently "
-                    "disabled by default pending PO authorization."
-                )
+
+        # Strict hermetic transport verification (no duck typing bypasses)
+        _verify_exact_hermetic_transport(inner)
 
         if type(seal) is not OfflineManifestSeal:
             raise TypeError("Mock outbound boundary requires an offline seal.")
         seal.assert_unchanged()
-        if (
-            type(approved_intents) is not tuple
-            or not 0 < len(approved_intents) <= _MAX_INTENTS
-        ):
-            raise ValueError("Expected a bounded tuple of approved mock intents.")
-
-        allowed: set[str] = set()
-        inventory = create_default_manifest_entities(seal.run_id)
-        for item in approved_intents:
-            if type(item) is not AuthorizedMockIntent or type(item.sql) is not str:
-                raise ValueError("Invalid mock intent.")
-            sql = item.sql
-            if len(sql) > 1024 or _norm(sql) != sql:
-                raise ValueError("Noncanonical mock SQL.")
-            values = _wire_args(item.args)
-            if not item.args or type(item.args[0]) is not str:
-                raise ValueError("Registered primary key is required.")
-
-            spec = _MUTATING_TEMPLATES.get(sql)
-            if spec is not None:
-                table, operation, count = spec
-                if len(item.args) != count:
-                    raise ValueError("Wrong mock mutation parameter count.")
-            else:
-                # Only a single registered-PK existence read is accepted.
-                matches = [
-                    e for e in inventory
-                    if sql == f"SELECT 1 AS found FROM {e.table} WHERE {e.pk_column} = ?"
-                    and e.pk_value == item.args[0]
-                ]
-                if len(matches) != 1 or len(item.args) != 1:
-                    raise ValueError("SQL not part of the safe mock inventory.")
-                table = matches[0].table
-                operation = "read"
-
-            entity = next(
-                (e for e in inventory if e.table == table and e.pk_value == item.args[0]),
-                None,
-            )
-            if entity is None:
-                raise ValueError("Mock SQL identity not registered.")
-            seal.require_registered_identity(
-                entity.table, entity.pk_column, entity.pk_value
-            )
-            if operation in ("insert", "delete"):
-                if dynamic_validation:
-                    validate_dynamic_mutation_args(
-                        table=table,
-                        operation=operation,
-                        args=item.args,
-                        run_id=seal.run_id,
-                        attrs=entity.expected_attributes,
-                    )
-                else:
-                    _require_canonical_mutation(
-                        table=table,
-                        operation=operation,
-                        args=item.args,
-                        run_id=seal.run_id,
-                        attrs=entity.expected_attributes,
-                    )
-            key = _intent_key(sql, values)
-            if key in allowed:
-                raise ValueError("Duplicate mock intent would allow retries.")
-            allowed.add(key)
 
         self._inner = inner
         self._seal = seal
-        self._allow = frozenset(allowed)
-        self._spent: set[str] = set()
-        self._endpoint = normalize_turso_url(
-            EXACT_STAGING_DESTINATION, allow_localhost_http=False
-        )
-        self._pending_baton: str | None = None
-        self._requests = 0
-        self.halted = False
-        self.unknown = False
-        self._live_authorized = live_authorized
+        self._dynamic_validation = dynamic_validation
         self._clock = clock
         self._started_at = clock()
         self._max_requests = max_requests
@@ -402,7 +414,89 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
         self._cleanup_reserve_requests = cleanup_reserve_requests
         self._session_timeout_seconds = session_timeout_seconds
         self._in_cleanup = False
-        self._verify_inner_hermetic = verify_inner_hermetic
+        self._endpoint = normalize_turso_url(
+            EXACT_STAGING_DESTINATION, allow_localhost_http=False
+        )
+        self._pending_baton: str | None = None
+        self._requests = 0
+        self.halted = False
+        self.unknown = False
+        self._live_authorized = False
+        self._inventory = create_default_manifest_entities(seal.run_id)
+
+        # Determine mode: session_mode or legacy approved_intents tuple
+        if approved_intents is None:
+            self._session_mode = True
+            self._allow: frozenset[str] = frozenset()
+            self._spent: set[str] = set()
+        else:
+            self._session_mode = False
+            if (
+                type(approved_intents) is not tuple
+                or not 0 < len(approved_intents) <= _MAX_INTENTS
+            ):
+                raise ValueError("Expected a bounded tuple of approved mock intents.")
+
+            allowed: set[str] = set()
+            for item in approved_intents:
+                if type(item) is not AuthorizedMockIntent or type(item.sql) is not str:
+                    raise ValueError("Invalid mock intent.")
+                sql = item.sql
+                if len(sql) > 1024 or _norm(sql) != sql:
+                    raise ValueError("Noncanonical mock SQL.")
+                values = _wire_args(item.args)
+                if not item.args or type(item.args[0]) is not str:
+                    raise ValueError("Registered primary key is required.")
+
+                spec = _MUTATING_TEMPLATES.get(sql)
+                if spec is not None:
+                    table, operation, count = spec
+                    if len(item.args) != count:
+                        raise ValueError("Wrong mock mutation parameter count.")
+                else:
+                    matches = [
+                        e for e in self._inventory
+                        if sql == f"SELECT 1 AS found FROM {e.table} WHERE {e.pk_column} = ?"
+                        and e.pk_value == item.args[0]
+                    ]
+                    if len(matches) != 1 or len(item.args) != 1:
+                        raise ValueError("SQL not part of the safe mock inventory.")
+                    table = matches[0].table
+                    operation = "read"
+
+                entity = next(
+                    (e for e in self._inventory if e.table == table and e.pk_value == item.args[0]),
+                    None,
+                )
+                if entity is None:
+                    raise ValueError("Mock SQL identity not registered.")
+                seal.require_registered_identity(
+                    entity.table, entity.pk_column, entity.pk_value
+                )
+                if operation in ("insert", "delete"):
+                    if dynamic_validation:
+                        validate_dynamic_mutation_args(
+                            table=table,
+                            operation=operation,
+                            args=item.args,
+                            run_id=seal.run_id,
+                            attrs=entity.expected_attributes,
+                        )
+                    else:
+                        _require_canonical_mutation(
+                            table=table,
+                            operation=operation,
+                            args=item.args,
+                            run_id=seal.run_id,
+                            attrs=entity.expected_attributes,
+                        )
+                key = _intent_key(sql, values)
+                if key in allowed:
+                    raise ValueError("Duplicate mock intent would allow retries.")
+                allowed.add(key)
+
+            self._allow = frozenset(allowed)
+            self._spent = set()
 
     def set_cleanup_phase(self) -> None:
         """Mark transport as entering cleanup phase, permitting use of reserve."""
@@ -414,9 +508,71 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
         # Never place SQL, tokens, URL contents, or wire payload in messages.
         raise MockHranaDenied("MOCK_HRANA_DENIED_" + code)
 
+    def _is_session_statement_allowed(self, sql: str, args: list[Any]) -> bool:
+        """Verify statement against the sealed manifest and allowed session query patterns."""
+        norm_sql = _norm(sql)
+        spec = _MUTATING_TEMPLATES.get(norm_sql)
+        if spec is not None:
+            table, operation, count = spec
+            if len(args) != count:
+                return False
+            raw_args = [_extract_hrana_val(a) for a in args]
+            key = str(raw_args[0]) if raw_args else ""
+            entity = next((e for e in self._inventory if e.table == table and e.pk_value == key), None)
+            if entity is None:
+                return False
+            try:
+                self._seal.require_registered_identity(entity.table, entity.pk_column, entity.pk_value)
+                if self._dynamic_validation:
+                    validate_dynamic_mutation_args(
+                        table=table,
+                        operation=operation,
+                        args=tuple(raw_args),
+                        run_id=self._seal.run_id,
+                        attrs=entity.expected_attributes,
+                    )
+                else:
+                    _require_canonical_mutation(
+                        table=table,
+                        operation=operation,
+                        args=tuple(raw_args),
+                        run_id=self._seal.run_id,
+                        attrs=entity.expected_attributes,
+                    )
+                return True
+            except Exception:
+                return False
+
+        upper = norm_sql.upper()
+        if not (upper.startswith("SELECT ") or upper.startswith("WITH ") or upper.startswith("PRAGMA ")):
+            return False
+
+        try:
+            validate_read_only_sql(sql)
+        except Exception:
+            return False
+
+        if upper.startswith("PRAGMA "):
+            return (
+                upper.startswith("PRAGMA TABLE_INFO(")
+                or upper.startswith("PRAGMA INDEX_LIST(")
+                or upper.startswith("PRAGMA INDEX_XINFO(")
+                or upper.startswith("PRAGMA FOREIGN_KEY_")
+            )
+
+        if upper in ("SELECT 1 AS PING", "SELECT 1 AS FOUND", "SELECT 1"):
+            return True
+
+        from_matches = re.findall(r"\bFROM\s+([A-Za-z0-9_]+)", upper)
+        join_matches = re.findall(r"\bJOIN\s+([A-Za-z0-9_]+)", upper)
+        tables_in_query = [t.lower() for t in from_matches + join_matches]
+        if tables_in_query and all(t in _ALLOWED_READ_TABLES for t in tables_in_query):
+            return True
+
+        return False
+
     def _validate(self, request: httpx.Request) -> str:
-        if self._verify_inner_hermetic:
-            verify_hermetic_session_transport(self._inner)
+        _verify_exact_hermetic_transport(self._inner)
         if request.method != "POST" or str(request.url) != self._endpoint:
             self._deny("DESTINATION")
         raw = request.content
@@ -437,17 +593,31 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
             self._deny("REQUEST_SHAPE")
         baton = obj.get("baton")
         if self._pending_baton is not None:
-            if baton != self._pending_baton or len(parts) != 2:
+            if baton != self._pending_baton:
                 self._deny("BATON_STATE")
-            if parts != [
-                {"type": "execute", "stmt": {"sql": "COMMIT"}},
-                {"type": "close"},
-            ] and parts != [
-                {"type": "execute", "stmt": {"sql": "ROLLBACK"}},
-                {"type": "close"},
-            ]:
-                self._deny("CONTROL_STATEMENT")
-            return "transaction_end"
+            if parts in (
+                [{"type": "execute", "stmt": {"sql": "COMMIT"}}, {"type": "close"}],
+                [{"type": "execute", "stmt": {"sql": "ROLLBACK"}}, {"type": "close"}],
+            ):
+                return "transaction_end"
+            # Transaction step
+            for part in parts:
+                if type(part) is not dict or set(part) != {"type", "stmt"}:
+                    self._deny("STATEMENT_SHAPE")
+                if part["type"] != "execute":
+                    self._deny("STATEMENT_TYPE")
+                stmt = part["stmt"]
+                sql = stmt.get("sql", "")
+                args = stmt.get("args", [])
+                if self._session_mode:
+                    if not self._is_session_statement_allowed(sql, args):
+                        self._deny("SQL_OR_ARGS_NOT_ALLOWED")
+                else:
+                    key = _intent_key(sql, args)
+                    if key not in self._allow or key in self._spent:
+                        self._deny("SQL_OR_ARGS_NOT_ALLOWED")
+                    self._spent.add(key)
+            return "transaction_step"
 
         if baton is not None:
             self._deny("UNEXPECTED_BATON")
@@ -457,6 +627,7 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
             self._deny("PIPELINE_CLOSE")
         if not statements or len(statements) > _MAX_REQUEST_PARTS - 1:
             self._deny("STATEMENT_COUNT")
+
         keys = []
         for part in statements:
             if type(part) is not dict or set(part) != {"type", "stmt"}:
@@ -471,32 +642,38 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
             args = stmt.get("args", [])
             if type(args) is not list:
                 self._deny("ARGS_TYPE")
-            key = _intent_key(stmt["sql"], args)
-            if key not in self._allow or key in self._spent or key in keys:
-                self._deny("SQL_OR_ARGS_NOT_ALLOWED")
-            keys.append(key)
-        self._spent.update(keys)  # consume BEFORE dispatch; never blind retry
+
+            if self._session_mode:
+                if not self._is_session_statement_allowed(stmt["sql"], args):
+                    self._deny("SQL_OR_ARGS_NOT_ALLOWED")
+            else:
+                key = _intent_key(stmt["sql"], args)
+                if key not in self._allow or key in self._spent or key in keys:
+                    self._deny("SQL_OR_ARGS_NOT_ALLOWED")
+                keys.append(key)
+
+        if not self._session_mode:
+            self._spent.update(keys)  # consume BEFORE dispatch; never blind retry
         return "transaction_begin" if transaction else "pipeline"
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
+        now = self._clock()
+        if now - self._started_at >= self._session_timeout_seconds:
+            self._deny("DEADLINE")
+        if self._requests >= self._max_requests:
+            self._deny("REQUEST_CEILING")
+        if not self._in_cleanup and self._requests >= self._test_cutoff_requests:
+            self._deny("TEST_CUTOFF")
         if self.halted:
             self._deny("SESSION_HALTED")
-        if self._clock() - self._started_at >= self._session_timeout_seconds:
-            self._deny("SESSION_DEADLINE_EXCEEDED")
-        if self._requests >= self._max_requests:
-            self._deny("REQUEST_BUDGET")
-        if not self._in_cleanup and self._requests >= self._test_cutoff_requests:
-            self._deny("CLEANUP_RESERVE")
+
+        action = ""
+        expected_responses = 0
         try:
             self._seal.assert_unchanged()
             action = self._validate(request)
-            # The response must acknowledge every Hrana operation, not just
-            # an arbitrary nonempty prefix of a multi-statement batch.
-            try:
-                request_parts = json.loads(request.content)["requests"]
-                expected_responses = len(request_parts)
-            except Exception:
-                self._deny("MALFORMED_JSON")
+            data = json.loads(request.content.decode("utf-8"))
+            expected_responses = len(data["requests"])
         except MockHranaDenied:
             raise
         except Exception:
@@ -509,14 +686,18 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
             data = response.json()
             if type(data) is not dict or type(data.get("results")) is not list:
                 self._deny("RESPONSE_SHAPE")
-            if len(data["results"]) != expected_responses or any(
-                type(item) is not dict or item.get("type") != "ok"
+            if len(data["results"]) != expected_responses:
+                self._deny("RESPONSE_ERROR")
+            if any(
+                type(item) is not dict or item.get("type") not in ("ok", "error")
                 for item in data["results"]
             ):
+                self._deny("RESPONSE_SHAPE")
+            if not self._session_mode and any(item.get("type") != "ok" for item in data["results"]):
                 self._deny("RESPONSE_ERROR")
             if action == "transaction_begin":
                 baton = data.get("baton")
-                if type(baton) is not str or not baton.startswith("mock-baton-"):
+                if type(baton) is not str or not baton.strip():
                     self._deny("MISSING_BATON")
                 self._pending_baton = baton
             elif action == "transaction_end":
@@ -558,6 +739,7 @@ class GuardedHermeticHranaTransport(HranaOutboundSecurityBoundary):
             approved_intents=approved_intents,
             live_authorized=False,
             dynamic_validation=False,
+            session_mode=False,
             max_requests=_MAX_MOCK_REQUESTS,
             test_cutoff_requests=_MAX_MOCK_REQUESTS,
             cleanup_reserve_requests=0,

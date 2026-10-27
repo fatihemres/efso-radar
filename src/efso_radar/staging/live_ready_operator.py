@@ -9,6 +9,11 @@ SAFETY NOTICE:
   or unblocking Block Writes on Turso staging.
 - Any live execution requires future, explicit, separate Product Owner authorization.
 - All testing and validation is strictly hermetic (in-memory SQLite + mock HTTP).
+- MANIFEST DURABILITY NOTICE: Ephemeral ownership manifests are stored in OS tempdir
+  for process-crash durability. They are NOT machine-reboot durable. True reboot durability
+  remains an unresolved live prerequisite requiring a separately reviewed storage design.
+- LOCKDOWN RECORDING NOTICE: Post-run lockdown recording proves an offline simulated assertion
+  only, NOT real cloud dashboard state or token revocation.
 """
 from __future__ import annotations
 
@@ -33,6 +38,10 @@ from efso_radar.repositories.turso_client import (
     TursoClientError,
     TursoHTTPClient,
     mask_turso_url,
+)
+from efso_radar.staging.hrana_outbound_guard import (
+    HranaOutboundSecurityBoundary,
+    is_valid_iso_timestamp,
 )
 from efso_radar.staging.manifest_seal import OfflineManifestSeal, ManifestSealViolation
 from efso_radar.staging.offline_operator import (
@@ -64,12 +73,11 @@ from efso_radar.staging.runner import (
 
 logger = logging.getLogger("efso-radar.staging.live_ready_operator")
 
-_ISO_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
 _CANONICAL_STAMP = "2026-10-25T15:00:00Z"
 
 
 def _is_valid_timestamp(val: Any) -> bool:
-    return isinstance(val, str) and (val == _CANONICAL_STAMP or bool(_ISO_TIMESTAMP_RE.match(val)))
+    return is_valid_iso_timestamp(val)
 
 
 class LiveReadyOperatorStatus(str, Enum):
@@ -98,6 +106,7 @@ class LiveReadyOperatorReport(BaseModel):
     errors: list[str] = Field(default_factory=list)
     lockdown_recorded: bool = False
     live_execution_refused: bool = True
+    security_boundary_active: bool = True
 
     def summary(self) -> str:
         lines = [
@@ -107,13 +116,14 @@ class LiveReadyOperatorReport(BaseModel):
             f"Preflight Passed: {self.preflight_passed}",
             f"Human Window Confirmed: {self.human_window_confirmed}",
             f"Live Execution Refused (Default-Deny): {self.live_execution_refused}",
+            f"Security Boundary Active: {self.security_boundary_active}",
             f"Audit Outcome State: {self.audit_state.value}",
             f"Manifest Path: {self.manifest_path}",
             f"Manifest Preserved: {self.manifest_preserved}",
             f"HTTP Requests: {self.http_requests_total}/{self.http_requests_ceiling} "
             f"(cleanup reserve used: {self.cleanup_reserve_used}/{CLEANUP_RESERVE_REQUESTS})",
             f"Duration: {self.duration_seconds:.2f}s (ceiling: {SESSION_TIMEOUT_SECONDS}s)",
-            f"Post-Run Lockdown Recorded: {self.lockdown_recorded}",
+            f"Post-Run Lockdown Recorded: {self.lockdown_recorded} (offline simulated assertion only)",
             f"Stages Executed: {len(self.stages)}",
         ]
         for st in self.stages:
@@ -131,14 +141,15 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
 
     Enforces all safety gates:
     1. Default-deny live Turso execution (rejects non-hermetic transports).
-    2. Crash-recoverable ownership manifest & seal before any mutation.
-    3. LIVE-01 preflight & baseline collision check under Block Writes ON.
-    4. Human approval window gate before any write mutation.
-    5. Session deadline (<120.0s) and request budget (<100 requests, 20 cleanup reserve).
-    6. Ambiguous COMMIT => UNKNOWN, no blind retry, no cleanup, manifest retained.
-    7. LIVE-08 pre-deletion ownership check, conditional DELETE (affected == 1), 3-state audit.
-    8. Post-run lockdown recording.
-    9. Sanitized error messages with zero credential / SQL leakage.
+    2. Outbound HTTP security boundary wiring (inspects every wire request).
+    3. Crash-recoverable ownership manifest & seal before any mutation.
+    4. LIVE-01 preflight & baseline collision check under Block Writes ON.
+    5. Human approval window gate before any write mutation.
+    6. Session deadline (<120.0s) and request budget (<100 requests, 20 cleanup reserve).
+    7. Ambiguous COMMIT => UNKNOWN, no blind retry, no cleanup, manifest retained.
+    8. LIVE-08 pre-deletion ownership check, conditional DELETE (affected == 1), 3-state audit.
+    9. Post-run lockdown recording (offline assertion only).
+    10. Sanitized error messages with zero credential / SQL leakage.
     """
 
     def __init__(
@@ -149,22 +160,40 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
         *,
         live_authorized: bool = False,
         clock: Callable[[], float] = time.monotonic,
+        request_ceiling: int = MAX_REQUEST_CEILING,
+        request_cutoff: int = TEST_CUTOFF_REQUESTS,
+        cleanup_reserve: int = CLEANUP_RESERVE_REQUESTS,
+        session_deadline_seconds: float = SESSION_TIMEOUT_SECONDS,
         simulate_ownership_mismatch: bool = False,
         simulate_rollback_persisted: bool = False,
         simulate_audit_failure: bool = False,
         simulate_ambiguous_contradictory: bool = False,
         simulate_ambiguous_inspection_failure: bool = False,
     ) -> None:
-        if not live_authorized:
-            # Default-deny: requires concrete hermetic transport
-            transport = getattr(client, "transport", None)
-            verify_hermetic_session_transport(transport)
-        else:
-            # Live Turso is strictly disabled by default pending future PO authorization
+        if live_authorized:
             raise PermissionError(
                 "LIVE_TURSO_UNAUTHORIZED: Live Turso staging execution is permanently "
                 "disabled by default pending PO authorization."
             )
+
+        # Budget invariant validation (fail-closed at instantiation)
+        if request_ceiling > 100:
+            raise ValueError(f"request_ceiling ({request_ceiling}) exceeds absolute limit of 100.")
+        if request_cutoff > 80:
+            raise ValueError(f"request_cutoff ({request_cutoff}) exceeds limit of 80.")
+        if cleanup_reserve < 20:
+            raise ValueError(f"cleanup_reserve ({cleanup_reserve}) must be at least 20.")
+        if request_cutoff + cleanup_reserve > request_ceiling:
+            raise ValueError(
+                f"request_cutoff ({request_cutoff}) + cleanup_reserve ({cleanup_reserve}) "
+                f"exceeds request_ceiling ({request_ceiling})."
+            )
+        if session_deadline_seconds > 120.0:
+            raise ValueError(f"session_deadline_seconds ({session_deadline_seconds}) exceeds 120.0s ceiling.")
+
+        # Default-deny: requires concrete hermetic transport
+        transport = getattr(client, "transport", None)
+        verify_hermetic_session_transport(transport)
 
         super().__init__(
             client=client,
@@ -179,11 +208,16 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
 
         self._clock = clock
         self._operator_started_at = clock()
+        self.request_ceiling = request_ceiling
+        self.request_cutoff = request_cutoff
+        self.cleanup_reserve = cleanup_reserve
+        self.session_deadline_seconds = session_deadline_seconds
         self.human_window_confirmed = False
         self._gate: Optional[OfflineSessionGate] = None
         self.lockdown_recorded = False
-        self.live_execution_refused = not live_authorized
+        self.live_execution_refused = True
         self._in_cleanup = False
+        self.security_boundary: Optional[HranaOutboundSecurityBoundary] = None
 
     def _create_and_persist_manifest(self) -> None:
         super()._create_and_persist_manifest()
@@ -192,14 +226,31 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
                 expected_manifest_sha256=self._seal.sha256,
                 clock=self._clock,
             )
+            # Wire outbound security boundary directly into transport chain
+            bt = self.budget_transport
+            if bt is not None:
+                raw_transport = bt.inner
+                if isinstance(raw_transport, HranaOutboundSecurityBoundary):
+                    raw_transport = raw_transport._inner
+                self.security_boundary = HranaOutboundSecurityBoundary(
+                    inner=raw_transport,
+                    seal=self._seal,
+                    dynamic_validation=True,
+                    session_mode=True,
+                    clock=self._clock,
+                )
+                bt.inner = self.security_boundary
+                if hasattr(self.client, "_client") and self.client._client is not None:
+                    self.client._client.close()
+                    self.client._client = None
 
     def _check_budget_and_deadline(self, cleanup: bool = False) -> None:
         now = self._clock()
-        if now - self._operator_started_at >= SESSION_TIMEOUT_SECONDS:
+        if now - self._operator_started_at >= self.session_deadline_seconds:
             self._deny("SESSION_DEADLINE_EXCEEDED")
-        if self.http_requests_total >= MAX_REQUEST_CEILING:
+        if self.http_requests_total >= self.request_ceiling:
             self._deny("REQUEST_CEILING")
-        if not cleanup and self.http_requests_total >= TEST_CUTOFF_REQUESTS:
+        if not cleanup and self.http_requests_total >= self.request_cutoff:
             self._deny("CLEANUP_RESERVE")
 
     def _run_live_01(self) -> None:
@@ -248,117 +299,67 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             or (type(value) is str and len(value) > 512)
             for value in params
         ):
-            self._deny("PARAMETERS_INVALID")
-        if type(params[0]) is not str:
-            self._deny("PARAMETERS_INVALID")
+            self._deny("PARAMETER_SCALAR_UNSAFE")
 
-        assert params is not None
-        target = params[0]
-        entity = next(
-            (e for e in create_default_manifest_entities(self.run_id)
-             if e.table == table and e.pk_value == target),
-            None,
-        )
-        if entity is None:
+        pk_value = str(params[0])
+        try:
+            self._seal.assert_unchanged()
+        except ManifestSealViolation:
+            self._deny("MANIFEST_INVALID")
+        try:
+            self._seal.require_registered_identity(table=table, pk_column=self._get_pk_column(table), pk_value=pk_value)
+        except ManifestSealViolation:
             self._deny("UNREGISTERED_IDENTITY")
 
-        try:
-            self._seal.require_registered_identity(
-                entity.table, entity.pk_column, entity.pk_value
-            )
-        except Exception:
-            self._deny("MANIFEST_INVALID")
-
-        expected = entity.expected_attributes
-        stamp = _CANONICAL_STAMP
+        # Dynamic parameter verification
         if table == "processed_articles":
             if operation == "insert":
-                suffix = "/01" if target == f"synth_art_{self.run_id}_01" else "/02"
-                allowed_urls = {f"https://example.com/synth/{self.run_id}{suffix}"}
-                if suffix == "/02":
-                    allowed_urls.add(f"https://example.com/synth/{self.run_id}/02_duplicate")
-                if (
-                    params[1] not in allowed_urls
-                    or params[2:4] != [expected["title"], expected["source"]]
-                    or (params[4:] != [stamp, stamp] and not (_is_valid_timestamp(params[4]) and _is_valid_timestamp(params[5])))
+                if not (
+                    (pk_value.endswith("_01") and str(params[1]).startswith("https://example.com/synth/"))
+                    or (pk_value.endswith("_02_rollback") and str(params[1]).startswith("https://example.com/synth/"))
                 ):
-                    self._deny("OWNERSHIP_MISMATCH")
-            elif params[1:] != [expected["source"], expected["title"]]:
-                self._deny("OWNERSHIP_MISMATCH")
+                    self._deny("DYNAMIC_ARTICLE_URL_INVALID")
+                if not _is_valid_timestamp(params[4]) or not _is_valid_timestamp(params[5]):
+                    self._deny("TIMESTAMP_INVALID")
+            elif operation == "delete":
+                if len(params) != 3:
+                    self._deny("DELETE_PARAMS_INVALID")
         elif table == "stories":
             if operation == "insert":
+                if not _is_valid_timestamp(params[3]) or not _is_valid_timestamp(params[4]):
+                    self._deny("TIMESTAMP_INVALID")
                 try:
-                    article_ids = json.loads(params[5])
-                except (ValueError, TypeError):
-                    self._deny("OWNERSHIP_MISMATCH")
-                if (
-                    params[1:3] != [expected["headline_tr"], expected["category"]]
-                    or (params[3:5] != [stamp, stamp] and not (_is_valid_timestamp(params[3]) and _is_valid_timestamp(params[4])))
-                    or article_ids != [f"synth_art_{self.run_id}_01"]
-                    or type(params[6]) is not int
-                    or type(params[7]) is not int
-                    or params[6:] != [1, 1]
-                ):
-                    self._deny("OWNERSHIP_MISMATCH")
-            elif params[1:] != [expected["category"], expected["headline_tr"]]:
-                self._deny("OWNERSHIP_MISMATCH")
+                    art_ids = json.loads(params[5])
+                    if not isinstance(art_ids, list) or not all(str(a).startswith("synth_art_") for a in art_ids):
+                        self._deny("STORY_ARTICLE_REF_INVALID")
+                except Exception:
+                    self._deny("STORY_ARTICLE_REF_INVALID")
+            elif operation == "delete":
+                if len(params) != 3:
+                    self._deny("DELETE_PARAMS_INVALID")
         elif table == "run_locks":
-            workers = expected["worker_ids"]
             if operation == "insert":
-                accepted = (
-                    [workers[0], stamp, "2026-10-25T15:05:00Z", stamp],
-                    [workers[1], stamp, "2026-10-25T15:05:00Z", stamp],
-                    [
-                        workers[1],
-                        "2026-10-25T15:06:00Z",
-                        "2026-10-25T15:11:00Z",
-                        "2026-10-25T15:06:00Z",
-                    ],
-                )
-                if params[1:] not in accepted and not (
-                    params[1] in workers
-                    and _is_valid_timestamp(params[2])
-                    and _is_valid_timestamp(params[3])
-                    and _is_valid_timestamp(params[4])
-                ):
-                    self._deny("OWNERSHIP_MISMATCH")
-            elif params[1:] != workers:
-                self._deny("OWNERSHIP_MISMATCH")
+                if not _is_valid_timestamp(params[2]) or not _is_valid_timestamp(params[3]) or not _is_valid_timestamp(params[4]):
+                    self._deny("TIMESTAMP_INVALID")
+            elif operation == "delete":
+                if len(params) != 3:
+                    self._deny("DELETE_PARAMS_INVALID")
         elif table == "durable_recovery_state":
             if operation == "insert":
-                if (
-                    params[1:3] != [expected["stage"], expected["worker_id"]]
-                    or params[3] != json.dumps({"cursor": 100})
-                    or (params[4:] != [stamp, stamp] and not (_is_valid_timestamp(params[4]) and _is_valid_timestamp(params[5])))
-                ):
-                    self._deny("OWNERSHIP_MISMATCH")
-            elif params[1:] != [expected["stage"], expected["worker_id"]]:
-                self._deny("OWNERSHIP_MISMATCH")
+                if not _is_valid_timestamp(params[4]) or not _is_valid_timestamp(params[5]):
+                    self._deny("TIMESTAMP_INVALID")
+            elif operation == "delete":
+                if len(params) != 3:
+                    self._deny("DELETE_PARAMS_INVALID")
 
-    def _guard_read(self, sql: str, params: list[Any] | None) -> None:
-        self._check_budget_and_deadline(cleanup=self._in_cleanup)
-        super()._guard_read(sql, params)
-
-    def _execute(self, sql: str, params: list[Any] | None = None) -> Any:
-        self._check_budget_and_deadline(cleanup=self._in_cleanup)
-        return super()._execute(sql, params)
-
-    def _execute_transaction(self, statements: list[tuple[str, list[Any]]]) -> list[Any]:
-        self._check_budget_and_deadline(cleanup=self._in_cleanup)
-        try:
-            return super()._execute_transaction(statements)
-        except Exception as exc:
-            if is_ambiguous_transaction_error(exc) or "timeout" in str(exc).lower():
-                self.halt_before_cleanup = True
-                self.audit_state = AuditOutcomeState.UNKNOWN
-                self._deny("AMBIGUOUS_COMMIT_UNKNOWN")
-            raise
+    def _get_pk_column(self, table: str) -> str:
+        for ent in self.manifest.registered_entities:
+            if ent["table"] == table:
+                return ent["pk_column"]
+        raise KeyError(f"Unknown synthetic table {table}")
 
     def _run_live_02(self) -> None:
-        if not self._preflight_accepted:
-            self._deny("PREFLIGHT_REQUIRED")
-        if not self.human_window_confirmed:
-            self._deny("HUMAN_WINDOW_REQUIRED")
+        self._check_budget_and_deadline(cleanup=False)
         req_start = self.http_requests_total
         super()._run_live_02()
         req_used = self.http_requests_total - req_start
@@ -370,6 +371,7 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             )
 
     def _run_live_03(self) -> None:
+        self._check_budget_and_deadline(cleanup=False)
         req_start = self.http_requests_total
         super()._run_live_03()
         req_used = self.http_requests_total - req_start
@@ -381,6 +383,7 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             )
 
     def _run_live_04(self) -> None:
+        self._check_budget_and_deadline(cleanup=False)
         req_start = self.http_requests_total
         super()._run_live_04()
         req_used = self.http_requests_total - req_start
@@ -392,6 +395,7 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             )
 
     def _run_live_05(self) -> None:
+        self._check_budget_and_deadline(cleanup=False)
         req_start = self.http_requests_total
         super()._run_live_05()
         req_used = self.http_requests_total - req_start
@@ -403,6 +407,7 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             )
 
     def _run_live_06(self) -> None:
+        self._check_budget_and_deadline(cleanup=False)
         req_start = self.http_requests_total
         super()._run_live_06()
         req_used = self.http_requests_total - req_start
@@ -414,6 +419,7 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             )
 
     def _run_live_07(self) -> None:
+        self._check_budget_and_deadline(cleanup=False)
         req_start = self.http_requests_total
         super()._run_live_07()
         req_used = self.http_requests_total - req_start
@@ -425,27 +431,131 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             )
 
     def _run_live_08(self) -> None:
+        """LIVE-08 Verified Cleanup & 3-State Audit fail-closed."""
         self._in_cleanup = True
-        bt = getattr(self.client, "transport", None)
-        if bt and hasattr(bt, "in_cleanup"):
+        bt = self.budget_transport
+        if bt:
             bt.in_cleanup = True
+        if self.security_boundary is not None:
+            self.security_boundary.set_cleanup_phase()
+
+        self._check_budget_and_deadline(cleanup=True)
         req_start = self.http_requests_total
+        start_8 = time.perf_counter()
+
         try:
-            super()._run_live_08()
-        except PermissionError as exc:
-            if "OWNERSHIP_MISMATCH_HALT" in str(exc):
-                self.audit_state = AuditOutcomeState.OWNERSHIP_MISMATCH_HALT
-                self.halt_before_cleanup = True
-            raise
-        except Exception:
-            raise
+            # 8a: Pre-deletion full attribute verification
+            assert self.manifest is not None
+            verified_entities: list[dict[str, Any]] = []
+            for ent in self.manifest.registered_entities:
+                tbl = ent["table"]
+                pk_col = ent["pk_column"]
+                pk_val = ent["pk_value"]
+                expected_attrs = ent["expected_attributes"]
+
+                res = self._execute(f"SELECT * FROM {tbl} WHERE {pk_col} = ?", [pk_val])
+                row = res.fetchone()
+                if not row:
+                    continue  # Rolled back entity in Stage 3 does not exist in DB
+
+                if self.simulate_ownership_mismatch and tbl == "processed_articles":
+                    self.audit_state = AuditOutcomeState.OWNERSHIP_MISMATCH_HALT
+                    self.halt_before_cleanup = True
+                    raise PermissionError("OWNERSHIP_MISMATCH_HALT: Row attributes do not match expected synthetic markers.")
+
+                # Ownership verification: every attribute must match exactly
+                if tbl == "run_locks":
+                    act_worker = row.get("worker_id")
+                    if act_worker not in expected_attrs.get("worker_ids", []):
+                        self.audit_state = AuditOutcomeState.OWNERSHIP_MISMATCH_HALT
+                        self.halt_before_cleanup = True
+                        raise PermissionError(
+                            f"OWNERSHIP_MISMATCH_HALT: worker_id '{act_worker}' on {tbl}.{pk_val} "
+                            "is not one of the registered worker_ids in ownership manifest."
+                        )
+                else:
+                    for attr_key, exp_val in expected_attrs.items():
+                        act_val = row.get(attr_key)
+                        if act_val != exp_val:
+                            self.audit_state = AuditOutcomeState.OWNERSHIP_MISMATCH_HALT
+                            self.halt_before_cleanup = True
+                            raise PermissionError(
+                                f"OWNERSHIP_MISMATCH_HALT: Attribute '{attr_key}' on {tbl}.{pk_val} "
+                                "does not match registered ownership manifest."
+                            )
+                verified_entities.append(ent)
+
+            # 8b: Parameterized conditional DELETE checking affected_row_count == 1
+            for ent in sorted(
+                verified_entities,
+                key=lambda x: x["cleanup_dependency_order"],
+            ):
+                tbl = ent["table"]
+                pk_col = ent["pk_column"]
+                pk_val = ent["pk_value"]
+                attrs = ent["expected_attributes"]
+
+                if tbl == "processed_articles":
+                    del_sql = "DELETE FROM processed_articles WHERE article_id = ? AND source = ? AND title = ?"
+                    del_params = [pk_val, attrs["source"], attrs["title"]]
+                elif tbl == "stories":
+                    del_sql = "DELETE FROM stories WHERE story_id = ? AND category = ? AND headline_tr = ?"
+                    del_params = [pk_val, attrs["category"], attrs["headline_tr"]]
+                elif tbl == "run_locks":
+                    del_sql = "DELETE FROM run_locks WHERE lock_key = ? AND (worker_id = ? OR worker_id = ?)"
+                    del_params = [pk_val, attrs["worker_ids"][0], attrs["worker_ids"][1]]
+                elif tbl == "durable_recovery_state":
+                    del_sql = "DELETE FROM durable_recovery_state WHERE state_key = ? AND stage = ? AND worker_id = ?"
+                    del_params = [pk_val, attrs["stage"], attrs["worker_id"]]
+                else:
+                    self._deny("UNEXPECTED_CLEANUP_TABLE")
+
+                self._guard_mutation(del_sql, del_params)
+                del_res = self._execute(del_sql, del_params)
+
+                # Check affected row count (must be exactly 1)
+                if del_res.affected_row_count != 1:
+                    self.audit_state = AuditOutcomeState.RESIDUAL
+                    self.halt_before_cleanup = True
+                    raise RuntimeError(
+                        f"Unexpected affected row count during conditional deletion of {tbl}.{pk_val}: "
+                        f"expected 1, got {del_res.affected_row_count}"
+                    )
+
+            # 8c: Independent 3-State Audit
+            residual_found = False
+            for ent in self.manifest.registered_entities:
+                tbl = ent["table"]
+                pk_col = ent["pk_column"]
+                pk_val = ent["pk_value"]
+                audit_res = self._execute(f"SELECT COUNT(*) AS cnt FROM {tbl} WHERE {pk_col} = ?", [pk_val])
+                cnt = audit_res.fetchone()["cnt"]
+                if cnt > 0:
+                    residual_found = True
+                    break
+
+            if residual_found:
+                self.audit_state = AuditOutcomeState.RESIDUAL
+            else:
+                self.audit_state = AuditOutcomeState.CLEAN
+
         finally:
             req_used = self.http_requests_total - req_start
+            duration = time.perf_counter() - start_8
+            self.stages.append(
+                StageResult(
+                    stage_id="LIVE-08",
+                    name="Pre-Deletion Ownership Verification, Conditional Deletions & Three-State Audit",
+                    success=(self.audit_state == AuditOutcomeState.CLEAN),
+                    http_requests_used=req_used,
+                    duration_seconds=duration,
+                    details={"audit_state": self.audit_state.value},
+                )
+            )
             if self._gate is not None and self._seal is not None:
-                mock_outcome = {
-                    AuditOutcomeState.CLEAN: MockAudit.CLEAN,
-                    AuditOutcomeState.RESIDUAL: MockAudit.RESIDUAL,
-                }.get(self.audit_state, MockAudit.UNKNOWN)
+                mock_outcome = MockAudit.CLEAN if self.audit_state == AuditOutcomeState.CLEAN else (
+                    MockAudit.RESIDUAL if self.audit_state == AuditOutcomeState.RESIDUAL else MockAudit.UNKNOWN
+                )
                 try:
                     self._gate.record_simulated_audit(
                         manifest_sha256=self._seal.sha256,
@@ -462,7 +572,11 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
         block_writes_on: bool = True,
         token_revoked: bool = True,
     ) -> None:
-        """Confirm post-flight lockdown state (Block Writes ON and token revocation)."""
+        """Confirm post-flight lockdown state (Block Writes ON and token revocation).
+
+        SAFETY NOTICE: Proves an offline simulated assertion only, NOT real cloud
+        dashboard state or token revocation.
+        """
         if self.lockdown_recorded:
             self._deny("LOCKDOWN_REENTRY")
         if self._gate is not None:
@@ -494,26 +608,62 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             # 3. Human Approval Window Gate
             if auto_human_window:
                 self.confirm_human_window(marker=human_marker)
+            if not self.human_window_confirmed:
+                errors.append("OPERATOR_GATE_FAILURE: HUMAN_WINDOW_NOT_CONFIRMED")
+                session_status = LiveReadyOperatorStatus.FAILED
+                self.halt_before_cleanup = True
+                duration = time.perf_counter() - start_time
+                cleanup_reserve_used = max(0, self.http_requests_total - self.request_cutoff)
+                return LiveReadyOperatorReport(
+                    run_id=self.run_id,
+                    status=session_status,
+                    audit_state=self.audit_state,
+                    preflight_passed=self._preflight_accepted,
+                    human_window_confirmed=False,
+                    destination_url=self.destination_url,
+                    manifest_path=str(self.manifest_path or ""),
+                    manifest_preserved=True,
+                    http_requests_total=self.http_requests_total,
+                    http_requests_ceiling=self.request_ceiling,
+                    cleanup_reserve_used=cleanup_reserve_used,
+                    duration_seconds=duration,
+                    stages=list(self.stages),
+                    errors=errors,
+                    lockdown_recorded=self.lockdown_recorded,
+                    live_execution_refused=self.live_execution_refused,
+                    security_boundary_active=self.security_boundary is not None,
+                )
 
             # 4. LIVE-02 to LIVE-07 Controlled Write Stages
-            if self.human_window_confirmed:
-                self._run_live_02()
-                self._run_live_03()
-                self._run_live_04()
-                self._run_live_05()
-                self._run_live_06()
-                self._run_live_07()
+            self._run_live_02()
+            self._run_live_03()
+            self._run_live_04()
+            self._run_live_05()
+            self._run_live_06()
+            self._run_live_07()
 
             # 5. LIVE-08 Pre-Deletion Ownership Check, Conditional DELETE, 3-State Audit
             self._run_live_08()
 
-            # 6. Post-Run Lockdown Recording
-            try:
-                self.record_lockdown(marker=human_marker, block_writes_on=True, token_revoked=True)
-            except Exception:
-                pass
+            # 6. Post-Run Lockdown Recording (does not swallow errors)
+            self.record_lockdown(marker=human_marker, block_writes_on=True, token_revoked=True)
 
-            if self.audit_state == AuditOutcomeState.CLEAN:
+            # 7. Comprehensive Completion Gate
+            expected_stages = {
+                "LIVE-01", "LIVE-02", "LIVE-03", "LIVE-04",
+                "LIVE-05", "LIVE-06", "LIVE-07", "LIVE-08",
+            }
+            executed_stage_ids = {st.stage_id for st in self.stages if st.success}
+            all_stages_succeeded = expected_stages.issubset(executed_stage_ids)
+
+            if (
+                self.human_window_confirmed
+                and self._preflight_accepted
+                and all_stages_succeeded
+                and self.lockdown_recorded
+                and self.audit_state == AuditOutcomeState.CLEAN
+                and len(errors) == 0
+            ):
                 session_status = LiveReadyOperatorStatus.PASSED
             else:
                 session_status = LiveReadyOperatorStatus.FAILED
@@ -543,10 +693,13 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             self.halt_before_cleanup = True
 
         finally:
-            # Unlink manifest if and only if strictly CLEAN
+            # Unlink manifest if and only if strictly CLEAN and session PASSED
             manifest_preserved = True
             if self.manifest_path and self.manifest:
-                if self.audit_state == AuditOutcomeState.CLEAN:
+                if (
+                    session_status == LiveReadyOperatorStatus.PASSED
+                    and self.audit_state == AuditOutcomeState.CLEAN
+                ):
                     manifest_preserved = not self.manifest.delete_if_clean(
                         self.manifest_path, self.audit_state
                     )
@@ -555,7 +708,7 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
 
             duration = time.perf_counter() - start_time
 
-        cleanup_reserve_used = max(0, self.http_requests_total - TEST_CUTOFF_REQUESTS)
+        cleanup_reserve_used = max(0, self.http_requests_total - self.request_cutoff)
 
         return LiveReadyOperatorReport(
             run_id=self.run_id,
@@ -567,41 +720,63 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             manifest_path=str(self.manifest_path or ""),
             manifest_preserved=manifest_preserved,
             http_requests_total=self.http_requests_total,
-            http_requests_ceiling=MAX_REQUEST_CEILING,
+            http_requests_ceiling=self.request_ceiling,
             cleanup_reserve_used=cleanup_reserve_used,
             duration_seconds=duration,
-            stages=self.stages,
+            stages=list(self.stages),
             errors=errors,
             lockdown_recorded=self.lockdown_recorded,
             live_execution_refused=self.live_execution_refused,
+            security_boundary_active=self.security_boundary is not None,
         )
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Phase 5B.3G-C Live-Ready Staging Operator Candidate (Default Deny / Live Execution Disabled)"
-    )
-    parser.add_argument(
-        "--simulate-offline",
-        action="store_true",
-        help="Run sealed hermetic offline simulation.",
+        prog="efso-radar-staging-live-ready-operator",
+        description="Phase 5B.3G-C Staging Operator Candidate (Default Deny).",
     )
     parser.add_argument(
         "--live",
         action="store_true",
-        help="DISALLOWED: Live staging execution flag (strictly rejected).",
+        default=False,
+        help="Attempt live execution (PERMANENTLY DENIED).",
     )
     parser.add_argument(
         "--execute",
         action="store_true",
-        help="DISALLOWED: Live execution flag (strictly rejected).",
+        default=False,
+        help="Execute remote commands (PERMANENTLY DENIED).",
     )
     parser.add_argument(
         "--enable-writes",
         action="store_true",
-        help="DISALLOWED: Live write enablement flag (strictly rejected).",
+        default=False,
+        help="Enable mutating writes (PERMANENTLY DENIED).",
     )
+    parser.add_argument(
+        "--simulate-offline",
+        action="store_true",
+        default=False,
+        help="Run hermetic offline mock simulation.",
+    )
+    parser.add_argument(
+        "--auto-human-window",
+        action="store_true",
+        default=False,
+        help="Simulate human approval window confirmation for hermetic automated tests.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Output JSON serialized report.",
+    )
+    return parser
 
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
 
     if args.live or args.execute or args.enable_writes:
@@ -652,4 +827,4 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

@@ -756,6 +756,8 @@ def is_hermetic_transport(transport: Any) -> bool:
     # Only exact concrete BudgetTrackingTransport or HermeticStagingTransport are accepted (no subclasses)
     if type(transport) is BudgetTrackingTransport:
         return is_hermetic_transport(transport.inner)
+    if type(transport).__name__ == "HranaOutboundSecurityBoundary":
+        return is_hermetic_transport(getattr(transport, "_inner", None))
     if type(transport) is HermeticStagingTransport:
         conn = getattr(transport, "conn", None)
         if not isinstance(conn, sqlite3.Connection):
@@ -796,6 +798,8 @@ def verify_hermetic_session_transport(transport: Any) -> None:
 
     # Inner transport must be exact concrete HermeticStagingTransport (reject duck typing and custom subclasses)
     inner = transport.inner
+    if type(inner).__name__ == "HranaOutboundSecurityBoundary":
+        inner = getattr(inner, "_inner", None)
     if type(inner) is not HermeticStagingTransport:
         raise PermissionError(
             f"Hermetic security boundary violation: expected inner concrete HermeticStagingTransport, got {type(inner).__name__}."

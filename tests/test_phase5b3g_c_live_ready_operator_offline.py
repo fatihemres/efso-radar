@@ -532,6 +532,248 @@ class TestPhase5B3GCLiveReadyOperator(unittest.TestCase):
             # Offline simulation: exit 0
             self.assertEqual(operator_cli_main(["--simulate-offline"]), 0)
 
+    # -------------------------------------------------------------------------
+    # 13. P1-A False Acceptance & Missing Stages Prevention
+    # -------------------------------------------------------------------------
+
+    def test_no_human_window_empty_db_fails_and_preserves_manifest(self):
+        op = self._make_operator()
+        report = op.run(auto_human_window=False)
+        self.assertEqual(report.status, LiveReadyOperatorStatus.FAILED)
+        self.assertFalse(report.human_window_confirmed)
+        self.assertTrue(report.manifest_preserved)
+        self.assertTrue(Path(report.manifest_path).exists())
+        # Confirms only LIVE-01 preflight was attempted; stages 2..8 were not run
+        executed_stages = [s.stage_id for s in report.stages]
+        self.assertIn("LIVE-01", executed_stages)
+        self.assertNotIn("LIVE-02", executed_stages)
+        self.assertNotIn("LIVE-08", executed_stages)
+
+    def test_incomplete_stages_fails_and_preserves_manifest(self):
+        op = self._make_operator()
+        def failing_stage_05():
+            raise RuntimeError("Simulated transient connection failure in stage 5")
+        op._run_live_05 = failing_stage_05
+
+        report = op.run(auto_human_window=True, human_marker="MOCK_ONLY")
+        self.assertEqual(report.status, LiveReadyOperatorStatus.FAILED)
+        self.assertTrue(report.manifest_preserved)
+        self.assertTrue(Path(report.manifest_path).exists())
+        executed_successes = {s.stage_id for s in report.stages if s.success}
+        self.assertNotIn("LIVE-05", executed_successes)
+
+    def test_failed_lockdown_fails_and_preserves_manifest(self):
+        op = self._make_operator()
+        def failing_lockdown(*args, **kwargs):
+            raise RuntimeError("Simulated lockdown assertion failure")
+        op.record_lockdown = failing_lockdown
+
+        report = op.run(auto_human_window=True, human_marker="MOCK_ONLY")
+        self.assertEqual(report.status, LiveReadyOperatorStatus.FAILED)
+        self.assertFalse(report.lockdown_recorded)
+        self.assertTrue(report.manifest_preserved)
+        self.assertTrue(Path(report.manifest_path).exists())
+
+    # -------------------------------------------------------------------------
+    # 14. P1-B Anti-Spoofing & Live Escape Hatch Removal
+    # -------------------------------------------------------------------------
+
+    def test_outbound_guard_rejects_duck_typing_spoofed_conn(self):
+        class SpoofedConnTransport:
+            def __init__(self, conn):
+                self.conn = conn
+                self._conn = conn
+
+        manifest_entities = create_default_manifest_entities("run_20261027T120000Z_abcdef123456")
+        manifest = PerRunOwnershipManifest(
+            run_id="run_20261027T120000Z_abcdef123456",
+            created_at="2026-10-27T12:00:00Z",
+            registered_entities=manifest_entities,
+        )
+        manifest_path = manifest.save_atomic(self.temp_dir)
+        seal = OfflineManifestSeal.from_persisted(manifest_path, manifest.run_id)
+
+        with self.assertRaisesRegex(PermissionError, "HERMETIC_TRANSPORT_REQUIRED"):
+            HranaOutboundSecurityBoundary(
+                inner=SpoofedConnTransport(self.db),
+                seal=seal,
+                approved_intents=(),
+                live_authorized=False,
+            )
+
+    def test_outbound_guard_rejects_duck_typing_is_hermetic(self):
+        class SpoofedHermeticFlagTransport:
+            is_hermetic = True
+
+        manifest_entities = create_default_manifest_entities("run_20261027T120000Z_abcdef123456")
+        manifest = PerRunOwnershipManifest(
+            run_id="run_20261027T120000Z_abcdef123456",
+            created_at="2026-10-27T12:00:00Z",
+            registered_entities=manifest_entities,
+        )
+        manifest_path = manifest.save_atomic(self.temp_dir)
+        seal = OfflineManifestSeal.from_persisted(manifest_path, manifest.run_id)
+
+        with self.assertRaisesRegex(PermissionError, "HERMETIC_TRANSPORT_REQUIRED"):
+            HranaOutboundSecurityBoundary(
+                inner=SpoofedHermeticFlagTransport(),
+                seal=seal,
+                approved_intents=(),
+                live_authorized=False,
+            )
+
+    def test_outbound_guard_rejects_subclass_spoofing(self):
+        class SubclassedHermeticTransport(HermeticStagingTransport):
+            pass
+
+        class SubclassedBudgetTransport(BudgetTrackingTransport):
+            pass
+
+        manifest_entities = create_default_manifest_entities("run_20261027T120000Z_abcdef123456")
+        manifest = PerRunOwnershipManifest(
+            run_id="run_20261027T120000Z_abcdef123456",
+            created_at="2026-10-27T12:00:00Z",
+            registered_entities=manifest_entities,
+        )
+        manifest_path = manifest.save_atomic(self.temp_dir)
+        seal = OfflineManifestSeal.from_persisted(manifest_path, manifest.run_id)
+
+        with self.assertRaisesRegex(PermissionError, "HERMETIC_TRANSPORT_REQUIRED"):
+            HranaOutboundSecurityBoundary(
+                inner=SubclassedHermeticTransport(self.db),
+                seal=seal,
+                approved_intents=(),
+                live_authorized=False,
+            )
+
+        with self.assertRaisesRegex(PermissionError, "HERMETIC_TRANSPORT_REQUIRED"):
+            HranaOutboundSecurityBoundary(
+                inner=SubclassedBudgetTransport(self.raw_transport),
+                seal=seal,
+                approved_intents=(),
+                live_authorized=False,
+            )
+
+    def test_outbound_guard_rejects_live_authorized_escape_hatch(self):
+        manifest_entities = create_default_manifest_entities("run_20261027T120000Z_abcdef123456")
+        manifest = PerRunOwnershipManifest(
+            run_id="run_20261027T120000Z_abcdef123456",
+            created_at="2026-10-27T12:00:00Z",
+            registered_entities=manifest_entities,
+        )
+        manifest_path = manifest.save_atomic(self.temp_dir)
+        seal = OfflineManifestSeal.from_persisted(manifest_path, manifest.run_id)
+
+        with self.assertRaisesRegex(PermissionError, "LIVE_TURSO_UNAUTHORIZED"):
+            HranaOutboundSecurityBoundary(
+                inner=self.budget_transport,
+                seal=seal,
+                approved_intents=(),
+                live_authorized=True,
+            )
+
+    # -------------------------------------------------------------------------
+    # 15. P1-C Wire Integration & Wire Guard Verification
+    # -------------------------------------------------------------------------
+
+    def test_operator_routes_all_8_stages_through_security_boundary(self):
+        op = self._make_operator()
+        report = op.run(auto_human_window=True, human_marker="MOCK_ONLY")
+        self.assertEqual(report.status, LiveReadyOperatorStatus.PASSED)
+        self.assertIsNotNone(op.security_boundary)
+        self.assertIsInstance(op.security_boundary, HranaOutboundSecurityBoundary)
+        self.assertGreater(op.security_boundary._requests, 20)
+        self.assertFalse(op.security_boundary.halted)
+        self.assertTrue(report.security_boundary_active)
+
+    def test_security_boundary_blocks_unallowlisted_sql_at_wire_level(self):
+        op = self._make_operator()
+        op._create_and_persist_manifest()
+        op._run_live_01()
+        op.confirm_human_window(marker="MOCK_ONLY")
+
+        with self.assertRaises(Exception) as ctx:
+            op.client.execute("DROP TABLE processed_articles")
+        err_str = str(ctx.exception)
+        self.assertTrue(
+            "MOCK_HRANA_DENIED" in err_str or "SQL_NOT_ALLOWLISTED" in err_str or "MockHranaDenied" in type(ctx.exception).__name__,
+            f"Expected MockHranaDenied, got {ctx.exception}"
+        )
+        self.assertTrue(op.security_boundary.halted)
+
+    # -------------------------------------------------------------------------
+    # 16. P1-D Temp Manifest Crash Durability & Operational Boundaries
+    # -------------------------------------------------------------------------
+
+    def test_process_restart_with_missing_manifest_fails_closed(self):
+        missing_path = self.temp_dir / "efso_radar_staging_manifest_missing_run.json"
+        with self.assertRaises(ManifestSealViolation):
+            OfflineManifestSeal.from_persisted(missing_path, "missing_run")
+
+        # Pointing manifest to operational data directory is strictly rejected
+        operational_manifest_path = Path("data/efso_radar_staging_manifest_run_20261027T120000Z_abcdef123456.json")
+        with self.assertRaisesRegex(ManifestSealViolation, "Canonical per-run staging manifest is missing or unsafe"):
+            OfflineManifestSeal.from_persisted(operational_manifest_path, "run_20261027T120000Z_abcdef123456")
+
+        default_op = self._make_operator(manifest_dir=None)
+        # Default manifest dir is strictly inside the system tempdir, never data/
+        norm_dir = str(default_op.manifest_dir).replace("\\", "/")
+        self.assertNotIn("/data/", f"/{norm_dir}/")
+
+    # -------------------------------------------------------------------------
+    # 17. P2-E ISO 8601 Calendar & UTC Validity
+    # -------------------------------------------------------------------------
+
+    def test_is_valid_iso_timestamp_calendar_validity(self):
+        # Valid cases
+        self.assertTrue(is_valid_iso_timestamp("2024-02-29T12:00:00Z"))  # 2024 leap year
+        self.assertTrue(is_valid_iso_timestamp("2026-10-27T15:30:00Z"))
+        self.assertTrue(is_valid_iso_timestamp("2026-12-31T23:59:59Z"))
+        self.assertTrue(is_valid_iso_timestamp("2026-01-01T00:00:00.123456Z"))
+
+        # Invalid calendar dates
+        self.assertFalse(is_valid_iso_timestamp("2026-02-29T12:00:00Z"))  # 2026 not leap year
+        self.assertFalse(is_valid_iso_timestamp("2026-04-31T12:00:00Z"))  # April has 30 days
+        self.assertFalse(is_valid_iso_timestamp("2026-13-01T12:00:00Z"))  # Month 13
+        self.assertFalse(is_valid_iso_timestamp("2026-00-10T12:00:00Z"))  # Month 0
+        self.assertFalse(is_valid_iso_timestamp("2026-10-00T12:00:00Z"))  # Day 0
+        self.assertFalse(is_valid_iso_timestamp("2026-10-32T12:00:00Z"))  # Day 32
+
+        # Invalid clock times
+        self.assertFalse(is_valid_iso_timestamp("2026-10-27T24:00:00Z"))  # Hour 24
+        self.assertFalse(is_valid_iso_timestamp("2026-10-27T25:00:00Z"))  # Hour 25
+        self.assertFalse(is_valid_iso_timestamp("2026-10-27T12:60:00Z"))  # Minute 60
+        self.assertFalse(is_valid_iso_timestamp("2026-10-27T12:00:61Z"))  # Second 61
+
+        # Invalid timezone / non-UTC / impossible
+        self.assertFalse(is_valid_iso_timestamp("2026-10-27T12:00:00+03:00"))  # Offset not Z
+        self.assertFalse(is_valid_iso_timestamp("2026-10-27T12:00:00-05:00"))
+        self.assertFalse(is_valid_iso_timestamp("2026-10-27T12:00:00"))  # Missing timezone
+        self.assertFalse(is_valid_iso_timestamp("2026-99-99T99:99:99Z"))  # Impossible date
+        self.assertFalse(is_valid_iso_timestamp("not-a-timestamp"))
+        self.assertFalse(is_valid_iso_timestamp(123456))
+        self.assertFalse(is_valid_iso_timestamp(None))
+
+    # -------------------------------------------------------------------------
+    # 18. P2-F Constructor Budget Invariant Enforcement
+    # -------------------------------------------------------------------------
+
+    def test_operator_rejects_exceeded_budget_invariants(self):
+        with self.assertRaisesRegex(ValueError, "request_ceiling .* exceeds absolute limit of 100"):
+            self._make_operator(request_ceiling=101)
+
+        with self.assertRaisesRegex(ValueError, "request_cutoff .* exceeds limit of 80"):
+            self._make_operator(request_cutoff=81)
+
+        with self.assertRaisesRegex(ValueError, "cleanup_reserve .* must be at least 20"):
+            self._make_operator(cleanup_reserve=19)
+
+        with self.assertRaisesRegex(ValueError, "exceeds request_ceiling"):
+            self._make_operator(request_ceiling=90, request_cutoff=75, cleanup_reserve=20)
+
+        with self.assertRaisesRegex(ValueError, "session_deadline_seconds .* exceeds 120.0s ceiling"):
+            self._make_operator(session_deadline_seconds=121.0)
+
 
 if __name__ == "__main__":
     unittest.main()
