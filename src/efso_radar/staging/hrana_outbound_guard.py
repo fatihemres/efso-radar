@@ -122,6 +122,7 @@ class GuardedHermeticHranaTransport(httpx.BaseTransport):
                 matches = [
                     e for e in inventory
                     if sql == f"SELECT 1 AS found FROM {e.table} WHERE {e.pk_column} = ?"
+                    and e.pk_value == item.args[0]
                 ]
                 if len(matches) != 1 or len(item.args) != 1:
                     raise ValueError("SQL not part of the safe mock inventory.")
