@@ -259,6 +259,13 @@ class GuardedHermeticHranaTransport(httpx.BaseTransport):
         try:
             self._seal.assert_unchanged()
             action = self._validate(request)
+            # The response must acknowledge every Hrana operation, not just
+            # an arbitrary nonempty prefix of a multi-statement batch.
+            try:
+                request_parts = json.loads(request.content)["requests"]
+                expected_responses = len(request_parts)
+            except Exception:
+                self._deny("MALFORMED_JSON")
         except MockHranaDenied:
             raise
         except Exception:
@@ -271,7 +278,7 @@ class GuardedHermeticHranaTransport(httpx.BaseTransport):
             data = response.json()
             if type(data) is not dict or type(data.get("results")) is not list:
                 self._deny("RESPONSE_SHAPE")
-            if len(data["results"]) == 0 or any(
+            if len(data["results"]) != expected_responses or any(
                 type(item) is not dict or item.get("type") != "ok"
                 for item in data["results"]
             ):
