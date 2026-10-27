@@ -163,6 +163,23 @@ class TestOfflineIntentTransportBridge(unittest.TestCase):
         self.assertEqual(self.count("stories"), 1)
         self.assertTrue(self.path.exists())
 
+    def test_invalid_second_payload_rejects_whole_atomic_pair_before_begin(self):
+        client, guard, budget = self.make_client()
+        invalid_story_args = list(self.pair[1].args)
+        invalid_story_args[5] = json.dumps(["forged-link"])
+        with self.assertRaisesRegex(MockHranaDenied, "SQL_OR_ARGS_NOT_ALLOWED"):
+            client.execute_transaction([
+                (self.pair[0].sql, list(self.pair[0].args)),
+                (self.pair[1].sql, invalid_story_args),
+            ])
+        self.assertEqual(guard._requests, 0)
+        self.assertEqual(budget.request_count, 0)
+        self.assertTrue(guard.halted)
+        self.assertTrue(guard.unknown)
+        self.assertEqual(self.count("processed_articles"), 0)
+        self.assertEqual(self.count("stories"), 0)
+        self.assertTrue(self.path.exists())
+
     def test_manifest_swap_after_plan_is_denied_before_any_sql(self):
         client, guard, budget = self.make_client()
         data = json.loads(self.path.read_text(encoding="utf-8"))
