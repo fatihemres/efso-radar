@@ -194,6 +194,24 @@ class TestGuardedHermeticHranaTransport(unittest.TestCase):
             client.execute(self.read.sql, list(self.read.args))
         self.assertTrue(self.path.exists())
 
+    def test_truncated_mock_hrana_response_is_unknown_and_never_retried(self):
+        # An HTTP 200 with only one result for execute+close is not success.
+        malformed = httpx.Response(
+            200, json={"baton": None, "results": [{"type": "ok"}]}
+        )
+        with patch.object(
+            self.transport._inner, "handle_request", return_value=malformed
+        ) as backend:
+            with self.assertRaisesRegex(MockHranaDenied, "RESPONSE_ERROR"):
+                self.client.execute(self.article.sql, list(self.article.args))
+            self.assertEqual(backend.call_count, 1)
+            with self.assertRaisesRegex(MockHranaDenied, "SESSION_HALTED"):
+                self.client.execute(self.article.sql, list(self.article.args))
+            self.assertEqual(backend.call_count, 1)
+        self.assertTrue(self.transport.unknown)
+        self.assertTrue(self.path.exists())
+        self.assertEqual(self.count("processed_articles"), 0)
+
     def test_manifest_tampering_fails_before_mock_dispatch(self):
         data = json.loads(self.path.read_text(encoding="utf-8"))
         data["created_at"] = "2099-12-31T23:59:59Z"
