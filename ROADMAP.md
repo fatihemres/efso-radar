@@ -18,6 +18,15 @@
 | Follow-on cloud cutover & unattended operations | Cloud parity, backups, zero-cost controls, human editorial recipient tests, PO release decision | Existing Phase 5 architecture; future issue required | **DISCOVERY / NOT AUTHORIZED** |
 | Rights and distribution | Review third-party origins and decide visibility/distribution | [Issue #17](https://github.com/fatihemres/efso-radar/issues/17) | **IN PROGRESS (AUDIT)** |
 
+## 2026-10-27 Phase 5B.3G-C Live-Ready Operator Preparation Checkpoint
+
+Operator candidate `LiveReadyStagingOperator` and `HranaOutboundSecurityBoundary` integrated as an offline candidate.
+- Reuses existing hermetic runner, preflight, manifest sealing, and session gate components.
+- Enforces default-deny for live execution; fails closed immediately on non-hermetic transports.
+- Outbound boundary enforces exact destination allowlisting, baton lifecycle, and payload sanitization.
+- Full gate workflow: LIVE-01 preflight, human window attestation, deadline (<120s), budget (<100 requests, 20 cleanup reserve), ambiguous COMMIT = UNKNOWN, conditional DELETE (affected == 1), and 3-state audit (CLEAN/RESIDUAL/UNKNOWN).
+- All live staging operations remain **UNAUTHORIZED**; Block Writes remains ON.
+
 ## 2026-10-26 LIVE-01 milestone checkpoint
 
 Read-only schema/integrity preflight passed on the owner-operated staging connection, with **15 expected tables, 129 expected columns and five ephemeral synthetic-key collision checks**. This is a **verified read-only substep**, not closure of G-C and not an approval to unblock writes. Afterward the owner invalidated all database tokens; any future authenticated session needs freshly scoped credentials and a new approval for its exact operation.

@@ -23,6 +23,14 @@
 - **Independent review correction (2026-10-26):** Review of all 63 non-test Python files identified four Gemini SDK dispatch locations, including previously unguarded `src/radar.py:judge` and a bypass via injected `mock_client` in the shadow evaluator. Scoped commits [`462b9956`](https://github.com/fatihemres/efso-radar/commit/462b9956e3be6ea81e8ec1583274c7d5f5b8465f) and [`27723b0a`](https://github.com/fatihemres/efso-radar/commit/27723b0a72599aa2b63ba5c273b990a23e98ec9d) close both routes, move historical pilot live-denial before local file/ledger access, reject NaN/infinite monetary budgets, and explicitly scope mocks to hermetic tests. They do not authorize live operations.
 - **Post-review code CI:** [run 40321496127](https://github.com/fatihemres/efso-radar/actions/runs/40321496127) on commit `27723b0a72599aa2b63ba5c273b990a23e98ec9d` **PASSED** on Linux Python **3.11 and 3.12**: **561 passed, 14 skipped, 163 subtests passed per job**, confirmed independently from raw job logs. No independent local Windows or provider test. Any subsequent doc/test commit needs its own CI evidence. The PR remains DRAFT / UNMERGED pending the Product Owner.
 
+## Phase 5B.3G-C Live-Ready Operator Candidate Evidence — 2026-10-27
+
+| What | Exact evidence / environment | Result and boundary |
+| --- | --- | --- |
+| Live-Ready Operator candidate tests | Windows Python 3.12.10, `venv\Scripts\python.exe -m pytest tests/test_phase5b3g_c_live_ready_operator_offline.py -v` | **24 passed in 2.46s**; zero real network calls. Covered: default deny on real HTTP transports, unallowlisted SQL, manifest tampering, unregistered identities, preflight gate, collision abortion, human approval window, deadline exhaustion (>120s), request ceiling (100) and cleanup reserve (80), ambiguous COMMIT = UNKNOWN, ownership mismatch halt, affected row count != 1, 3-state audit (CLEAN/RESIDUAL), dynamic parameter validation, and CLI default-deny. |
+| Phase 5B.3G full staging suite | Windows Python 3.12.10, `venv\Scripts\python.exe -m pytest tests/test_phase5b3g* -v` | **188 passed, 1 skipped, 118 subtests passed in 10.05s** across all Phase 5B.3G test modules. |
+| Outbound Hrana security boundary | `HranaOutboundSecurityBoundary` in `src/efso_radar/staging/hrana_outbound_guard.py` | Deny-by-default on real HTTP transports; enforces destination URL, POST method, payload size <= 16KB, non-duplicate JSON keys, transaction baton state machine, request budget (<100 requests, 20 reserve), deadline (<120s), and error sanitization. |
+
 ## Latest checked implementation and live read-only evidence — 2026-10-26
 
 | What | Exact evidence / environment | Result and boundary |

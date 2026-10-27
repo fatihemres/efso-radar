@@ -9,7 +9,21 @@ Efso Radar supplies selective Turkish/global entertainment-news discovery and ed
 
 **Version ambiguity:** Historical Phase 4 closure and ADR call `v0.4.0` an anchor; actual `src/efso_radar/__init__.py` declares `__version__ = "2.0.0"`. No GitHub Releases were returned on inspection. Treat public stable release identity as **unreconciled**, not 2.0.0 or v0.4.0 by assumption. See [Release Policy](docs/RELEASE_POLICY.md).
 
-## Latest operational checkpoint — LIVE-01 READ-ONLY (2026-10-26)
+## Latest operational checkpoint — Phase 5B.3G-C Operator Candidate Preparation (2026-10-27)
+
+- **Main baseline:** `b6982b499c97cedeb32fadb06df537d3837fd85e` (PR #31, #32, #33, #34 integrated).
+- **Candidate implementation:** `LiveReadyStagingOperator` (`src/efso_radar/staging/live_ready_operator.py`) and `HranaOutboundSecurityBoundary` (`src/efso_radar/staging/hrana_outbound_guard.py`).
+- **Safety guarantees enforced:**
+  1. Default-deny for live execution: attempts to initialize with real network transports strictly fail closed (`PermissionError`) by default.
+  2. Crash-recoverable ownership manifest & seal before any mutation.
+  3. Preflight gate (LIVE-01 under Block Writes ON) & explicit Human Approval Window gate before Stage 2 mutations.
+  4. Session deadline (<120.0s) & budget ceiling (<100 requests, 20 cleanup reserve).
+  5. Ambiguous COMMIT outcome handling: produces `UNKNOWN`, stops permanently, no blind retry, retains manifest on disk.
+  6. Parameterized conditional DELETE with affected row count verification (`== 1`) and independent 3-state audit (`CLEAN/RESIDUAL/UNKNOWN`).
+  7. Sanitized error reporting with zero SQL, token, or operational secret leakage.
+- **Phase 5B.3G-C remains OFFLINE-ONLY:** live execution is NOT enabled. No real Turso connection, no credentials created, and Block Writes remains ON.
+
+## Historical operational checkpoint — LIVE-01 READ-ONLY (2026-10-26)
 
 This dated addendum supersedes the *planning-only* LIVE-01 assessment in the earlier snapshot below; it does not rewrite that historical baseline.
 

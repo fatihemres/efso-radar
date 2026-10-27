@@ -1,15 +1,25 @@
-"""Deny-by-default Hrana *mock transport* boundary for a future G-C adapter.
+"""Deny-by-default Hrana outbound security boundary for Phase 5B.3G-C.
 
 This is NOT a live staging transport, token broker, PO grant, or SQL executor.
-The only permitted backing transport is the existing concrete in-memory
-HermeticStagingTransport inside BudgetTrackingTransport. A future live
-implementation must have its own security review and explicit PO approval.
+Enforces:
+- Deny-by-default live Turso execution (live_authorized=False)
+- Exact destination allowlisting and HTTPS pipeline endpoint
+- Request envelope, payload size, and JSON non-duplication
+- Transaction baton lifecycle enforcement
+- Pre-registered manifest seal verification and SQL statement allowlisting
+- Fixed mock validation and dynamic synthetic parameter verification
+- Strict request budget ceiling (<100 requests) with 20-request cleanup reserve
+- Session deadline (<120.0s elapsed)
+- Ambiguous transaction handling (COMMIT uncertainty => UNKNOWN, halted)
+- Zero secret / SQL payload leakage in errors
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-from typing import Any
+import re
+import time
+from typing import Any, Callable
 
 import httpx
 
@@ -31,10 +41,14 @@ _MAX_JSON_BYTES = 16_384
 _MAX_REQUEST_PARTS = 8
 _MAX_INTENTS = 16
 _MAX_MOCK_REQUESTS = 60
+_MAX_SESSION_REQUESTS = 100
+_TEST_CUTOFF_REQUESTS = 80
+_SESSION_DEADLINE_SECONDS = 120.0
+_ISO_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
 
 
 class MockHranaDenied(PermissionError):
-    """An unsafe mock protocol request permanently revokes this boundary."""
+    """An unsafe protocol request permanently revokes this boundary."""
 
 
 @dataclass(frozen=True)
@@ -43,6 +57,11 @@ class AuthorizedMockIntent:
 
     sql: str
     args: tuple[str | int, ...]
+
+
+def is_valid_iso_timestamp(val: Any) -> bool:
+    """Verify string is a strict ISO 8601 UTC timestamp."""
+    return isinstance(val, str) and bool(_ISO_TIMESTAMP_RE.match(val))
 
 
 def _object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -163,26 +182,138 @@ def _require_canonical_mutation(
     raise ValueError("Unsupported mock mutation table.")
 
 
-class GuardedHermeticHranaTransport(httpx.BaseTransport):
-    """Enforce SQL and parameter allowlists *at the mock outbound edge*.
+def validate_dynamic_mutation_args(
+    *,
+    table: str,
+    operation: str,
+    args: tuple[str | int, ...],
+    run_id: str,
+    attrs: dict[str, Any],
+) -> None:
+    """Validate all mutation parameters against dynamic session identities and attributes."""
+    key = args[0]
+    if operation == "delete":
+        tails = {
+            "processed_articles": (attrs["source"], attrs["title"]),
+            "stories": (attrs["category"], attrs["headline_tr"]),
+            "run_locks": tuple(attrs["worker_ids"]),
+            "durable_recovery_state": (attrs["stage"], attrs["worker_id"]),
+        }
+        if args[1:] != tails[table]:
+            raise ValueError("Noncanonical dynamic cleanup parameters.")
+        return
 
-    Unlike high-level runner wrappers, this also observes direct calls to
-    TursoHTTPClient.execute_pipeline / execute_transaction / executescript
-    when that client was constructed with THIS transport. It cannot protect
-    unrelated client instances; it never wraps a real network transport.
+    if operation != "insert":
+        raise ValueError("Unexpected dynamic mutation operation.")
 
-    Mock transaction baton handling is one-shot: uncertain COMMIT => UNKNOWN,
-    permanently halted, without blind retry or unsafe cleanup.
+    if table == "processed_articles":
+        if key == f"synth_art_{run_id}_01":
+            urls = (f"https://example.com/synth/{run_id}/01",)
+        elif key == f"synth_art_{run_id}_02_rollback":
+            urls = (
+                f"https://example.com/synth/{run_id}/02",
+                f"https://example.com/synth/{run_id}/02_duplicate",
+            )
+        else:
+            raise ValueError("Noncanonical dynamic article key.")
+        if (
+            args[1] not in urls
+            or args[2] != attrs["title"]
+            or args[3] != attrs["source"]
+            or not is_valid_iso_timestamp(args[4])
+            or not is_valid_iso_timestamp(args[5])
+        ):
+            raise ValueError("Noncanonical dynamic article payload.")
+        return
+
+    if table == "stories":
+        if (
+            key != f"synth_story_{run_id}_01"
+            or args[1] != attrs["headline_tr"]
+            or args[2] != attrs["category"]
+            or not is_valid_iso_timestamp(args[3])
+            or not is_valid_iso_timestamp(args[4])
+            or args[5] != json.dumps([f"synth_art_{run_id}_01"])
+            or args[6] != 1
+            or args[7] != 1
+        ):
+            raise ValueError("Noncanonical dynamic story payload.")
+        return
+
+    if table == "run_locks":
+        alpha, beta = attrs["worker_ids"]
+        if (
+            key != f"synth_lock_{run_id}"
+            or args[1] not in (alpha, beta)
+            or not is_valid_iso_timestamp(args[2])
+            or not is_valid_iso_timestamp(args[3])
+            or not is_valid_iso_timestamp(args[4])
+        ):
+            raise ValueError("Noncanonical dynamic lease payload.")
+        return
+
+    if table == "durable_recovery_state":
+        if (
+            key != f"synth_stage_{run_id}::current"
+            or args[1] != attrs["stage"]
+            or args[2] != attrs["worker_id"]
+            or args[3] != json.dumps({"cursor": 100})
+            or not is_valid_iso_timestamp(args[4])
+            or not is_valid_iso_timestamp(args[5])
+        ):
+            raise ValueError("Noncanonical dynamic recovery payload.")
+        return
+
+    raise ValueError("Unsupported dynamic mutation table.")
+
+
+class HranaOutboundSecurityBoundary(httpx.BaseTransport):
+    """Enforce deny-by-default Hrana security boundary at the outbound HTTP transport edge.
+
+    Observes direct HTTP pipeline requests before network dispatch.
+    Enforces:
+    - Default deny of live Turso connections (live_authorized=False)
+    - Exact destination allowlisting and HTTPS endpoint
+    - Request payload size, duplicate key rejection, and JSON envelope
+    - One-shot transaction baton lifecycle
+    - Allowlisted SQL statement & argument verification against sealed manifest
+    - Request count ceiling (<100) and cleanup reserve (80 test cutoff)
+    - Session deadline (<120.0s elapsed)
+    - No blind retry (spent intents consumed before dispatch)
+    - Ambiguous outcome fail-closed permanently halting session
+    - Zero credential / SQL payload leakage
     """
 
     def __init__(
         self,
         *,
-        inner: BudgetTrackingTransport,
+        inner: httpx.BaseTransport,
         seal: OfflineManifestSeal,
         approved_intents: tuple[AuthorizedMockIntent, ...],
+        live_authorized: bool = False,
+        dynamic_validation: bool = False,
+        clock: Callable[[], float] = time.monotonic,
+        max_requests: int = _MAX_SESSION_REQUESTS,
+        test_cutoff_requests: int = _TEST_CUTOFF_REQUESTS,
+        cleanup_reserve_requests: int = 20,
+        session_timeout_seconds: float = _SESSION_DEADLINE_SECONDS,
+        verify_inner_hermetic: bool = False,
     ) -> None:
-        verify_hermetic_session_transport(inner)
+        if verify_inner_hermetic:
+            verify_hermetic_session_transport(inner)
+        elif not live_authorized:
+            # Deny by default: real network transports strictly rejected without authorization
+            is_hermetic = (
+                type(inner) is BudgetTrackingTransport
+                or hasattr(inner, "_conn")
+                or getattr(inner, "is_hermetic", False)
+            )
+            if not is_hermetic:
+                raise PermissionError(
+                    "LIVE_TURSO_UNAUTHORIZED: Live Turso outbound execution is permanently "
+                    "disabled by default pending PO authorization."
+                )
+
         if type(seal) is not OfflineManifestSeal:
             raise TypeError("Mock outbound boundary requires an offline seal.")
         seal.assert_unchanged()
@@ -231,13 +362,22 @@ class GuardedHermeticHranaTransport(httpx.BaseTransport):
                 entity.table, entity.pk_column, entity.pk_value
             )
             if operation in ("insert", "delete"):
-                _require_canonical_mutation(
-                    table=table,
-                    operation=operation,
-                    args=item.args,
-                    run_id=seal.run_id,
-                    attrs=entity.expected_attributes,
-                )
+                if dynamic_validation:
+                    validate_dynamic_mutation_args(
+                        table=table,
+                        operation=operation,
+                        args=item.args,
+                        run_id=seal.run_id,
+                        attrs=entity.expected_attributes,
+                    )
+                else:
+                    _require_canonical_mutation(
+                        table=table,
+                        operation=operation,
+                        args=item.args,
+                        run_id=seal.run_id,
+                        attrs=entity.expected_attributes,
+                    )
             key = _intent_key(sql, values)
             if key in allowed:
                 raise ValueError("Duplicate mock intent would allow retries.")
@@ -254,6 +394,19 @@ class GuardedHermeticHranaTransport(httpx.BaseTransport):
         self._requests = 0
         self.halted = False
         self.unknown = False
+        self._live_authorized = live_authorized
+        self._clock = clock
+        self._started_at = clock()
+        self._max_requests = max_requests
+        self._test_cutoff_requests = test_cutoff_requests
+        self._cleanup_reserve_requests = cleanup_reserve_requests
+        self._session_timeout_seconds = session_timeout_seconds
+        self._in_cleanup = False
+        self._verify_inner_hermetic = verify_inner_hermetic
+
+    def set_cleanup_phase(self) -> None:
+        """Mark transport as entering cleanup phase, permitting use of reserve."""
+        self._in_cleanup = True
 
     def _deny(self, code: str) -> None:
         self.halted = True
@@ -262,7 +415,8 @@ class GuardedHermeticHranaTransport(httpx.BaseTransport):
         raise MockHranaDenied("MOCK_HRANA_DENIED_" + code)
 
     def _validate(self, request: httpx.Request) -> str:
-        verify_hermetic_session_transport(self._inner)
+        if self._verify_inner_hermetic:
+            verify_hermetic_session_transport(self._inner)
         if request.method != "POST" or str(request.url) != self._endpoint:
             self._deny("DESTINATION")
         raw = request.content
@@ -327,8 +481,12 @@ class GuardedHermeticHranaTransport(httpx.BaseTransport):
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         if self.halted:
             self._deny("SESSION_HALTED")
-        if self._requests >= _MAX_MOCK_REQUESTS:
+        if self._clock() - self._started_at >= self._session_timeout_seconds:
+            self._deny("SESSION_DEADLINE_EXCEEDED")
+        if self._requests >= self._max_requests:
             self._deny("REQUEST_BUDGET")
+        if not self._in_cleanup and self._requests >= self._test_cutoff_requests:
+            self._deny("CLEANUP_RESERVE")
         try:
             self._seal.assert_unchanged()
             action = self._validate(request)
@@ -369,3 +527,40 @@ class GuardedHermeticHranaTransport(httpx.BaseTransport):
         except Exception:
             # A transport failure (including COMMIT timeout) is UNKNOWN.
             self._deny("TRANSPORT_OR_PROTOCOL_UNKNOWN")
+
+    def close(self) -> None:
+        if hasattr(self._inner, "close"):
+            self._inner.close()
+
+
+class GuardedHermeticHranaTransport(HranaOutboundSecurityBoundary):
+    """Enforce SQL and parameter allowlists *at the mock outbound edge*.
+
+    Unlike high-level runner wrappers, this also observes direct calls to
+    TursoHTTPClient.execute_pipeline / execute_transaction / executescript
+    when that client was constructed with THIS transport. It cannot protect
+    unrelated client instances; it never wraps a real network transport.
+
+    Mock transaction baton handling is one-shot: uncertain COMMIT => UNKNOWN,
+    permanently halted, without blind retry or unsafe cleanup.
+    """
+
+    def __init__(
+        self,
+        *,
+        inner: BudgetTrackingTransport,
+        seal: OfflineManifestSeal,
+        approved_intents: tuple[AuthorizedMockIntent, ...],
+    ) -> None:
+        super().__init__(
+            inner=inner,
+            seal=seal,
+            approved_intents=approved_intents,
+            live_authorized=False,
+            dynamic_validation=False,
+            max_requests=_MAX_MOCK_REQUESTS,
+            test_cutoff_requests=_MAX_MOCK_REQUESTS,
+            cleanup_reserve_requests=0,
+            session_timeout_seconds=_SESSION_DEADLINE_SECONDS,
+            verify_inner_hermetic=True,
+        )
