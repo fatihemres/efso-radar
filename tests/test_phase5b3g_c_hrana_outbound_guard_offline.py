@@ -19,7 +19,12 @@ from efso_radar.staging.hrana_outbound_guard import (
     MockHranaDenied,
 )
 from efso_radar.staging.manifest_seal import OfflineManifestSeal
-from efso_radar.staging.offline_operator import _INSERT_ARTICLE, _INSERT_STORY
+from efso_radar.staging.offline_operator import (
+    _INSERT_ARTICLE,
+    _INSERT_LOCK,
+    _INSERT_RECOVERY,
+    _INSERT_STORY,
+)
 from efso_radar.staging.runner import (
     BudgetTrackingTransport,
     EXACT_STAGING_DESTINATION,
@@ -83,7 +88,6 @@ class TestGuardedHermeticHranaTransport(unittest.TestCase):
             (self.article_id,),
         )
         self.mock = HermeticStagingTransport(self.conn)
-        self.budget = BudgetTrackingTransport(self.mock)
         self.transport = self.make_transport()
         self.client = TursoHTTPClient(
             database_url=EXACT_STAGING_DESTINATION,
@@ -118,7 +122,7 @@ class TestGuardedHermeticHranaTransport(unittest.TestCase):
         self.assertEqual(read.fetchone()["found"], 1)
         self.assertEqual(self.count("processed_articles"), 1)
         self.assertEqual(self.count("stories"), 1)
-        self.assertEqual(self.budget.request_count, 0)
+        self.assertEqual(self.transport._inner.request_count, 3)
         self.assertEqual(self.transport._requests, 3)
         self.assertFalse(self.transport.halted)
         self.assertFalse(self.transport.unknown)
@@ -130,6 +134,7 @@ class TestGuardedHermeticHranaTransport(unittest.TestCase):
         self.assertTrue(self.transport.halted)
         self.assertTrue(self.transport.unknown)
         self.assertEqual(self.transport._requests, 0)
+        self.assertEqual(self.transport._inner.request_count, 0)
         self.assertEqual(self.count("processed_articles"), 0)
 
     def test_direct_executescript_does_not_bypass(self):
@@ -276,6 +281,120 @@ class TestGuardedHermeticHranaTransport(unittest.TestCase):
         for item in invalid:
             with self.subTest(sql=item.sql), self.assertRaises(ValueError):
                 self.make_transport(intents=(item,))
+
+    def test_untrusted_intents_require_exact_values_for_all_mutation_columns(self):
+        """A caller cannot whitelist its own altered URL, JSON, time or lease."""
+        stamp = "2026-10-25T15:00:00Z"
+        inventory = create_default_manifest_entities(RUN)
+        lock = next(ent for ent in inventory if ent.table == "run_locks")
+        recovery = next(
+            ent for ent in inventory if ent.table == "durable_recovery_state"
+        )
+        lock_intent = AuthorizedMockIntent(
+            _INSERT_LOCK,
+            (
+                lock.pk_value, lock.expected_attributes["worker_ids"][0],
+                stamp, "2026-10-25T15:05:00Z", stamp,
+            ),
+        )
+        recovery_intent = AuthorizedMockIntent(
+            _INSERT_RECOVERY,
+            (
+                recovery.pk_value, recovery.expected_attributes["stage"],
+                recovery.expected_attributes["worker_id"],
+                json.dumps({"cursor": 100}), stamp, stamp,
+            ),
+        )
+        inputs = (
+            (
+                self.article,
+                {
+                    1: "https://unexpected.invalid/",  # URL was not checked
+                    2: "FAKE_ARTICLE",
+                    3: "unknown-source",
+                    4: "2099-01-01T00:00:00Z",
+                    5: "2099-01-01T00:00:00Z",
+                },
+            ),
+            (
+                self.story,
+                {
+                    1: "FAKE_STORY",
+                    2: "other-category",
+                    3: "2099-01-01T00:00:00Z",
+                    4: "2099-01-01T00:00:00Z",
+                    5: json.dumps(["other-article-id"]),
+                    6: 2,
+                    7: 0,
+                },
+            ),
+            (
+                lock_intent,
+                {
+                    1: "foreign-worker",
+                    2: "2099-01-01T00:00:00Z",
+                    3: "2099-01-01T00:00:00Z",
+                    4: "2099-01-01T00:00:00Z",
+                },
+            ),
+            (
+                recovery_intent,
+                {
+                    1: "other-stage",
+                    2: "other-worker",
+                    3: json.dumps({"cursor": 101}),
+                    4: "2099-01-01T00:00:00Z",
+                    5: "2099-01-01T00:00:00Z",
+                },
+            ),
+        )
+        for baseline, replacements in inputs:
+            # These baseline intents must be accepted without dispatch.
+            valid = self.make_transport(intents=(baseline,))
+            self.assertEqual(valid._requests, 0)
+            self.assertEqual(valid._inner.request_count, 0)
+            for index, mutated in replacements.items():
+                with self.subTest(sql=baseline.sql, arg=index):
+                    args = list(baseline.args)
+                    args[index] = mutated
+                    forged = AuthorizedMockIntent(baseline.sql, tuple(args))
+                    with self.assertRaisesRegex(ValueError, "Noncanonical"):
+                        self.make_transport(intents=(forged,))
+                    self.assertEqual(self.count("processed_articles"), 0)
+                    self.assertEqual(self.count("stories"), 0)
+        self.assertEqual(self.transport._inner.request_count, 0)
+
+    def test_rollback_article_urls_follow_only_canonical_mock_fixture(self):
+        """Preserve known rollback/duplicate fixture URLs, deny arbitrary host."""
+        entity = next(
+            ent for ent in create_default_manifest_entities(RUN)
+            if ent.pk_value == f"synth_art_{RUN}_02_rollback"
+        )
+        for suffix in ("02", "02_duplicate"):
+            valid = AuthorizedMockIntent(
+                _INSERT_ARTICLE,
+                (
+                    entity.pk_value,
+                    f"https://example.com/synth/{RUN}/{suffix}",
+                    entity.expected_attributes["title"],
+                    entity.expected_attributes["source"],
+                    "2026-10-25T15:00:00Z",
+                    "2026-10-25T15:00:00Z",
+                ),
+            )
+            self.assertEqual(self.make_transport(intents=(valid,))._requests, 0)
+        invalid = AuthorizedMockIntent(
+            _INSERT_ARTICLE,
+            (
+                entity.pk_value, "https://example.com/synth/malicious",
+                entity.expected_attributes["title"],
+                entity.expected_attributes["source"],
+                "2026-10-25T15:00:00Z",
+                "2026-10-25T15:00:00Z",
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "Noncanonical"):
+            self.make_transport(intents=(invalid,))
 
     def test_duplicate_intent_does_not_expand_retry_capability(self):
         with self.assertRaises(ValueError):
