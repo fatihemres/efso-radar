@@ -15,14 +15,16 @@ Efso Radar supplies selective Turkish/global entertainment-news discovery and ed
 - **Candidate implementation:** `LiveReadyStagingOperator` (`src/efso_radar/staging/live_ready_operator.py`) and `HranaOutboundSecurityBoundary` (`src/efso_radar/staging/hrana_outbound_guard.py`) under Draft PR #35 (unmerged candidate).
 - **Safety guarantees enforced:**
   1. Default-deny for live execution: attempts to initialize with real network transports or spoofed transports strictly fail closed (`PermissionError`) by default.
-  2. Outbound HTTP wire security boundary: wired into the operator's transport chain to inspect every HTTP wire request, validate batons, enforce templates and calendar-valid ISO timestamps.
-  3. Process-crash recoverable ownership manifest & seal before any mutation (stored in OS tempdir; not machine-reboot durable; reboot resilience remains an open live prerequisite).
-  4. Preflight gate (LIVE-01 under Block Writes ON) & explicit Human Approval Window gate before Stage 2 mutations. Incomplete stages or missing human approval strictly prevent `PASSED` status and manifest deletion.
-  5. Session deadline (<120.0s) & budget ceiling (<100 requests, 20 cleanup reserve).
-  6. Ambiguous COMMIT outcome handling: produces `UNKNOWN`, stops permanently, no blind retry, retains manifest on disk.
-  7. Parameterized conditional DELETE with affected row count verification (`== 1`) and independent 3-state audit (`CLEAN/RESIDUAL/UNKNOWN`).
-  8. Post-run lockdown recording: offline simulated assertion only (does not prove live cloud dashboard state or token revocation).
-  9. Sanitized error reporting with zero SQL, token, or operational secret leakage.
+  2. Wire-level authorization & stage sequence gating: mutations at the HTTP wire edge require preflight completion, explicit human window confirmation, and an active stage matching the mutation type. Bypasses via direct `operator.client.execute()` or `execute_transaction()` are strictly blocked. Replay of spent mutations is rejected. State transitions require sealed manifest SHA-256 validation (no public boolean escalation).
+  3. Read-only least privilege: broad table reads replaced by an exact allowlist of schema/preflight queries (`_EXACT_PREFLIGHT_QUERIES`, inspection PRAGMAs) and manifest-scoped synthetic reads with single-PK predicate (`_SYNTHETIC_READ_TABLES`). Broad SELECTs on operational tables (`telegram_delivery_records`, `owner_feedback`, `candidate_backlog`, `ai_usage_ledger`, etc.) and full table scans are strictly blocked with `READ_NOT_ALLOWLISTED`.
+  4. Transport lifecycle & session invalidation: all session exits (nominal run, early halt without human approval, and exceptions) execute in `finally:` to close the HTTP client and permanently invalidate the outbound security boundary (`close_session()`). Any post-session call is blocked with `SESSION_HALTED`.
+  5. Strict hard bounds: request budget ceiling strictly $< 100$ calls (request #100 is blocked); 20-request cleanup reserve enforced (test cutoff at 80); session deadline (<120.0s); numeric budget invariants validated fail-closed rejecting booleans (`bool` is an `int` subclass), non-finite floats, negative/zero values, and invalid ranges.
+  6. Process-crash recoverable ownership manifest & seal before any mutation (stored in OS tempdir; not machine-reboot durable; reboot resilience remains an open live prerequisite).
+  7. Preflight gate (LIVE-01 under Block Writes ON) & explicit Human Approval Window gate before Stage 2 mutations. Incomplete stages or missing human approval strictly prevent `PASSED` status and manifest deletion.
+  8. Ambiguous COMMIT outcome handling: produces `UNKNOWN`, stops permanently, no blind retry, retains manifest on disk.
+  9. Parameterized conditional DELETE with affected row count verification (`== 1`) and independent 3-state audit (`CLEAN/RESIDUAL/UNKNOWN`).
+  10. Post-run lockdown recording: offline simulated assertion only (does not prove live cloud dashboard state or token revocation).
+  11. Sanitized error reporting with zero SQL, token, or operational secret leakage.
 - **Phase 5B.3G-C remains OFFLINE-ONLY:** live execution is NOT enabled. No real Turso connection, no credentials created, and Block Writes remains ON.
 
 ## Historical operational checkpoint — LIVE-01 READ-ONLY (2026-10-26)

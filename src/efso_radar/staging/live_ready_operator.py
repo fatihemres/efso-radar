@@ -42,6 +42,7 @@ from efso_radar.repositories.turso_client import (
 from efso_radar.staging.hrana_outbound_guard import (
     HranaOutboundSecurityBoundary,
     is_valid_iso_timestamp,
+    validate_budget_invariants,
 )
 from efso_radar.staging.manifest_seal import OfflineManifestSeal, ManifestSealViolation
 from efso_radar.staging.offline_operator import (
@@ -177,19 +178,13 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             )
 
         # Budget invariant validation (fail-closed at instantiation)
-        if request_ceiling > 100:
-            raise ValueError(f"request_ceiling ({request_ceiling}) exceeds absolute limit of 100.")
-        if request_cutoff > 80:
-            raise ValueError(f"request_cutoff ({request_cutoff}) exceeds limit of 80.")
-        if cleanup_reserve < 20:
-            raise ValueError(f"cleanup_reserve ({cleanup_reserve}) must be at least 20.")
-        if request_cutoff + cleanup_reserve > request_ceiling:
-            raise ValueError(
-                f"request_cutoff ({request_cutoff}) + cleanup_reserve ({cleanup_reserve}) "
-                f"exceeds request_ceiling ({request_ceiling})."
-            )
-        if session_deadline_seconds > 120.0:
-            raise ValueError(f"session_deadline_seconds ({session_deadline_seconds}) exceeds 120.0s ceiling.")
+        validate_budget_invariants(
+            request_ceiling=request_ceiling,
+            request_cutoff=request_cutoff,
+            cleanup_reserve=cleanup_reserve,
+            session_deadline_seconds=session_deadline_seconds,
+            is_session=True,
+        )
 
         # Default-deny: requires concrete hermetic transport
         transport = getattr(client, "transport", None)
@@ -238,6 +233,10 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
                     dynamic_validation=True,
                     session_mode=True,
                     clock=self._clock,
+                    max_requests=self.request_ceiling,
+                    test_cutoff_requests=self.request_cutoff,
+                    cleanup_reserve_requests=self.cleanup_reserve,
+                    session_timeout_seconds=self.session_deadline_seconds,
                 )
                 bt.inner = self.security_boundary
                 if hasattr(self.client, "_client") and self.client._client is not None:
@@ -256,7 +255,13 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
     def _run_live_01(self) -> None:
         self._check_budget_and_deadline(cleanup=False)
         req_start = self.http_requests_total
-        super()._run_live_01()
+        if self.security_boundary is not None and self._seal is not None:
+            self.security_boundary.record_active_stage("LIVE-01", self._seal.sha256)
+        try:
+            super()._run_live_01()
+        finally:
+            if self.security_boundary is not None and self._seal is not None:
+                self.security_boundary.record_stage_completed("LIVE-01", self._seal.sha256)
         req_used = self.http_requests_total - req_start
         if self._gate is not None and self._seal is not None:
             self._gate.record_simulated_preflight(
@@ -268,6 +273,8 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
                 simulated_block_writes_on=True,
                 request_count=req_used,
             )
+        if self.security_boundary is not None and self._seal is not None:
+            self.security_boundary.record_preflight_completed(self._seal.sha256)
 
     def confirm_human_window(self, marker: str = "MOCK_ONLY") -> None:
         """Explicit human approval window gate; required before any write mutation."""
@@ -278,6 +285,10 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
         self._check_budget_and_deadline(cleanup=False)
         if self._gate is not None:
             self._gate.record_simulated_human_window(marker=marker)
+        if self.security_boundary is not None and self._seal is not None:
+            self.security_boundary.record_human_window_confirmed(
+                marker=marker, manifest_sha256=self._seal.sha256
+            )
         self.human_window_confirmed = True
 
     def _guard_mutation(self, sql: str, params: list[Any] | None) -> None:
@@ -361,7 +372,13 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
     def _run_live_02(self) -> None:
         self._check_budget_and_deadline(cleanup=False)
         req_start = self.http_requests_total
-        super()._run_live_02()
+        if self.security_boundary is not None and self._seal is not None:
+            self.security_boundary.record_active_stage("LIVE-02", self._seal.sha256)
+        try:
+            super()._run_live_02()
+        finally:
+            if self.security_boundary is not None and self._seal is not None:
+                self.security_boundary.record_stage_completed("LIVE-02", self._seal.sha256)
         req_used = self.http_requests_total - req_start
         if self._gate is not None and self._seal is not None:
             self._gate.record_simulated_stage(
@@ -373,7 +390,13 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
     def _run_live_03(self) -> None:
         self._check_budget_and_deadline(cleanup=False)
         req_start = self.http_requests_total
-        super()._run_live_03()
+        if self.security_boundary is not None and self._seal is not None:
+            self.security_boundary.record_active_stage("LIVE-03", self._seal.sha256)
+        try:
+            super()._run_live_03()
+        finally:
+            if self.security_boundary is not None and self._seal is not None:
+                self.security_boundary.record_stage_completed("LIVE-03", self._seal.sha256)
         req_used = self.http_requests_total - req_start
         if self._gate is not None and self._seal is not None:
             self._gate.record_simulated_stage(
@@ -385,7 +408,13 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
     def _run_live_04(self) -> None:
         self._check_budget_and_deadline(cleanup=False)
         req_start = self.http_requests_total
-        super()._run_live_04()
+        if self.security_boundary is not None and self._seal is not None:
+            self.security_boundary.record_active_stage("LIVE-04", self._seal.sha256)
+        try:
+            super()._run_live_04()
+        finally:
+            if self.security_boundary is not None and self._seal is not None:
+                self.security_boundary.record_stage_completed("LIVE-04", self._seal.sha256)
         req_used = self.http_requests_total - req_start
         if self._gate is not None and self._seal is not None:
             self._gate.record_simulated_stage(
@@ -397,7 +426,13 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
     def _run_live_05(self) -> None:
         self._check_budget_and_deadline(cleanup=False)
         req_start = self.http_requests_total
-        super()._run_live_05()
+        if self.security_boundary is not None and self._seal is not None:
+            self.security_boundary.record_active_stage("LIVE-05", self._seal.sha256)
+        try:
+            super()._run_live_05()
+        finally:
+            if self.security_boundary is not None and self._seal is not None:
+                self.security_boundary.record_stage_completed("LIVE-05", self._seal.sha256)
         req_used = self.http_requests_total - req_start
         if self._gate is not None and self._seal is not None:
             self._gate.record_simulated_stage(
@@ -409,7 +444,13 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
     def _run_live_06(self) -> None:
         self._check_budget_and_deadline(cleanup=False)
         req_start = self.http_requests_total
-        super()._run_live_06()
+        if self.security_boundary is not None and self._seal is not None:
+            self.security_boundary.record_active_stage("LIVE-06", self._seal.sha256)
+        try:
+            super()._run_live_06()
+        finally:
+            if self.security_boundary is not None and self._seal is not None:
+                self.security_boundary.record_stage_completed("LIVE-06", self._seal.sha256)
         req_used = self.http_requests_total - req_start
         if self._gate is not None and self._seal is not None:
             self._gate.record_simulated_stage(
@@ -421,7 +462,13 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
     def _run_live_07(self) -> None:
         self._check_budget_and_deadline(cleanup=False)
         req_start = self.http_requests_total
-        super()._run_live_07()
+        if self.security_boundary is not None and self._seal is not None:
+            self.security_boundary.record_active_stage("LIVE-07", self._seal.sha256)
+        try:
+            super()._run_live_07()
+        finally:
+            if self.security_boundary is not None and self._seal is not None:
+                self.security_boundary.record_stage_completed("LIVE-07", self._seal.sha256)
         req_used = self.http_requests_total - req_start
         if self._gate is not None and self._seal is not None:
             self._gate.record_simulated_stage(
@@ -437,6 +484,9 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
         if bt:
             bt.in_cleanup = True
         if self.security_boundary is not None:
+            self.security_boundary.set_cleanup_phase()
+            if self._seal is not None:
+                self.security_boundary.record_active_stage("LIVE-08", self._seal.sha256)
             self.security_boundary.set_cleanup_phase()
 
         self._check_budget_and_deadline(cleanup=True)
@@ -540,6 +590,8 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
                 self.audit_state = AuditOutcomeState.CLEAN
 
         finally:
+            if self.security_boundary is not None and self._seal is not None:
+                self.security_boundary.record_stage_completed("LIVE-08", self._seal.sha256)
             req_used = self.http_requests_total - req_start
             duration = time.perf_counter() - start_8
             self.stages.append(
@@ -612,61 +664,40 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
                 errors.append("OPERATOR_GATE_FAILURE: HUMAN_WINDOW_NOT_CONFIRMED")
                 session_status = LiveReadyOperatorStatus.FAILED
                 self.halt_before_cleanup = True
-                duration = time.perf_counter() - start_time
-                cleanup_reserve_used = max(0, self.http_requests_total - self.request_cutoff)
-                return LiveReadyOperatorReport(
-                    run_id=self.run_id,
-                    status=session_status,
-                    audit_state=self.audit_state,
-                    preflight_passed=self._preflight_accepted,
-                    human_window_confirmed=False,
-                    destination_url=self.destination_url,
-                    manifest_path=str(self.manifest_path or ""),
-                    manifest_preserved=True,
-                    http_requests_total=self.http_requests_total,
-                    http_requests_ceiling=self.request_ceiling,
-                    cleanup_reserve_used=cleanup_reserve_used,
-                    duration_seconds=duration,
-                    stages=list(self.stages),
-                    errors=errors,
-                    lockdown_recorded=self.lockdown_recorded,
-                    live_execution_refused=self.live_execution_refused,
-                    security_boundary_active=self.security_boundary is not None,
-                )
-
-            # 4. LIVE-02 to LIVE-07 Controlled Write Stages
-            self._run_live_02()
-            self._run_live_03()
-            self._run_live_04()
-            self._run_live_05()
-            self._run_live_06()
-            self._run_live_07()
-
-            # 5. LIVE-08 Pre-Deletion Ownership Check, Conditional DELETE, 3-State Audit
-            self._run_live_08()
-
-            # 6. Post-Run Lockdown Recording (does not swallow errors)
-            self.record_lockdown(marker=human_marker, block_writes_on=True, token_revoked=True)
-
-            # 7. Comprehensive Completion Gate
-            expected_stages = {
-                "LIVE-01", "LIVE-02", "LIVE-03", "LIVE-04",
-                "LIVE-05", "LIVE-06", "LIVE-07", "LIVE-08",
-            }
-            executed_stage_ids = {st.stage_id for st in self.stages if st.success}
-            all_stages_succeeded = expected_stages.issubset(executed_stage_ids)
-
-            if (
-                self.human_window_confirmed
-                and self._preflight_accepted
-                and all_stages_succeeded
-                and self.lockdown_recorded
-                and self.audit_state == AuditOutcomeState.CLEAN
-                and len(errors) == 0
-            ):
-                session_status = LiveReadyOperatorStatus.PASSED
             else:
-                session_status = LiveReadyOperatorStatus.FAILED
+                # 4. LIVE-02 to LIVE-07 Controlled Write Stages
+                self._run_live_02()
+                self._run_live_03()
+                self._run_live_04()
+                self._run_live_05()
+                self._run_live_06()
+                self._run_live_07()
+
+                # 5. LIVE-08 Pre-Deletion Ownership Check, Conditional DELETE, 3-State Audit
+                self._run_live_08()
+
+                # 6. Post-Run Lockdown Recording (does not swallow errors)
+                self.record_lockdown(marker=human_marker, block_writes_on=True, token_revoked=True)
+
+                # 7. Comprehensive Completion Gate
+                expected_stages = {
+                    "LIVE-01", "LIVE-02", "LIVE-03", "LIVE-04",
+                    "LIVE-05", "LIVE-06", "LIVE-07", "LIVE-08",
+                }
+                executed_stage_ids = {st.stage_id for st in self.stages if st.success}
+                all_stages_succeeded = expected_stages.issubset(executed_stage_ids)
+
+                if (
+                    self.human_window_confirmed
+                    and self._preflight_accepted
+                    and all_stages_succeeded
+                    and self.lockdown_recorded
+                    and self.audit_state == AuditOutcomeState.CLEAN
+                    and len(errors) == 0
+                ):
+                    session_status = LiveReadyOperatorStatus.PASSED
+                else:
+                    session_status = LiveReadyOperatorStatus.FAILED
 
         except Exception as exc:
             # Sanitized error capturing: never echo SQL or tokens
@@ -693,6 +724,12 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             self.halt_before_cleanup = True
 
         finally:
+            if self.security_boundary is not None:
+                self.security_boundary.close_session()
+                self.security_boundary.close()
+            if hasattr(self.client, "close"):
+                self.client.close()
+
             # Unlink manifest if and only if strictly CLEAN and session PASSED
             manifest_preserved = True
             if self.manifest_path and self.manifest:

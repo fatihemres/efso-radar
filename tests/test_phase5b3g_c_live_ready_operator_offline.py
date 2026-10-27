@@ -30,6 +30,7 @@ from efso_radar.staging.hrana_outbound_guard import (
     HranaOutboundSecurityBoundary,
     MockHranaDenied,
     is_valid_iso_timestamp,
+    validate_budget_invariants,
     validate_dynamic_mutation_args,
 )
 from efso_radar.staging.live_ready_operator import (
@@ -773,6 +774,351 @@ class TestPhase5B3GCLiveReadyOperator(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "session_deadline_seconds .* exceeds 120.0s ceiling"):
             self._make_operator(session_deadline_seconds=121.0)
+
+    # -------------------------------------------------------------------------
+    # 19. Priority 1: Wire-Level Authorization (P1-1)
+    # -------------------------------------------------------------------------
+
+    def test_wire_mutation_blocked_before_preflight(self):
+        op = self._make_operator()
+        op._create_and_persist_manifest()
+        art_id = f"synth_art_{op.run_id}_01"
+        valid_insert = (
+            "INSERT INTO processed_articles (article_id, canonical_url, title, source, published_at, processed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)"
+        )
+        params = [
+            art_id,
+            f"https://example.com/synth/{op.run_id}/01",
+            f"SYNTH_ARTICLE_{op.run_id}_01",
+            "staging_synth_test",
+            "2026-10-25T15:00:00Z",
+            "2026-10-25T15:00:00Z",
+        ]
+        with self.assertRaises(MockHranaDenied) as ctx:
+            op.client.execute(valid_insert, params)
+        self.assertIn("PREFLIGHT_REQUIRED", str(ctx.exception))
+        self.assertTrue(op.security_boundary.halted)
+        # Database remains untouched
+        cur = self.db.cursor()
+        cur.execute("SELECT COUNT(*) FROM processed_articles WHERE article_id = ?", [art_id])
+        self.assertEqual(cur.fetchone()[0], 0)
+        self.assertTrue(Path(op.manifest_path).exists())
+
+    def test_wire_mutation_blocked_after_preflight_before_human_window(self):
+        op = self._make_operator()
+        op._create_and_persist_manifest()
+        op._run_live_01()
+        self.assertTrue(op._preflight_accepted)
+        self.assertFalse(op.human_window_confirmed)
+
+        art_id = f"synth_art_{op.run_id}_01"
+        valid_insert = (
+            "INSERT INTO processed_articles (article_id, canonical_url, title, source, published_at, processed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)"
+        )
+        params = [
+            art_id,
+            f"https://example.com/synth/{op.run_id}/01",
+            f"SYNTH_ARTICLE_{op.run_id}_01",
+            "staging_synth_test",
+            "2026-10-25T15:00:00Z",
+            "2026-10-25T15:00:00Z",
+        ]
+        with self.assertRaises(MockHranaDenied) as ctx:
+            op.client.execute(valid_insert, params)
+        self.assertIn("HUMAN_WINDOW_REQUIRED", str(ctx.exception))
+        self.assertTrue(op.security_boundary.halted)
+
+    def test_wire_mutation_blocked_when_no_active_stage(self):
+        op = self._make_operator()
+        op._create_and_persist_manifest()
+        op._run_live_01()
+        op.confirm_human_window(marker="MOCK_ONLY")
+        self.assertIsNone(op.security_boundary._active_stage)
+
+        art_id = f"synth_art_{op.run_id}_01"
+        valid_insert = (
+            "INSERT INTO processed_articles (article_id, canonical_url, title, source, published_at, processed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)"
+        )
+        params = [
+            art_id,
+            f"https://example.com/synth/{op.run_id}/01",
+            f"SYNTH_ARTICLE_{op.run_id}_01",
+            "staging_synth_test",
+            "2026-10-25T15:00:00Z",
+            "2026-10-25T15:00:00Z",
+        ]
+        with self.assertRaises(MockHranaDenied) as ctx:
+            op.client.execute(valid_insert, params)
+        self.assertIn("NO_ACTIVE_STAGE", str(ctx.exception))
+        self.assertTrue(op.security_boundary.halted)
+
+    def test_wire_mutation_blocked_on_stage_mismatch(self):
+        op = self._make_operator()
+        op._create_and_persist_manifest()
+        op._run_live_01()
+        op.confirm_human_window(marker="MOCK_ONLY")
+
+        # Simulate active stage LIVE-04 (run_locks), but caller attempts article insert
+        op.security_boundary.record_active_stage("LIVE-04", op._seal.sha256)
+        art_id = f"synth_art_{op.run_id}_01"
+        valid_insert = (
+            "INSERT INTO processed_articles (article_id, canonical_url, title, source, published_at, processed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)"
+        )
+        params = [
+            art_id,
+            f"https://example.com/synth/{op.run_id}/01",
+            f"SYNTH_ARTICLE_{op.run_id}_01",
+            "staging_synth_test",
+            "2026-10-25T15:00:00Z",
+            "2026-10-25T15:00:00Z",
+        ]
+        with self.assertRaises(MockHranaDenied) as ctx:
+            op.client.execute(valid_insert, params)
+        self.assertIn("STAGE_MUTATION_MISMATCH", str(ctx.exception))
+        self.assertTrue(op.security_boundary.halted)
+
+    def test_wire_duplicate_mutation_replay_blocked(self):
+        op = self._make_operator()
+        op._create_and_persist_manifest()
+        op._run_live_01()
+        op.confirm_human_window(marker="MOCK_ONLY")
+        op.security_boundary.record_active_stage("LIVE-02", op._seal.sha256)
+
+        art_id = f"synth_art_{op.run_id}_01"
+        valid_insert = (
+            "INSERT INTO processed_articles (article_id, canonical_url, title, source, published_at, processed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)"
+        )
+        params = [
+            art_id,
+            f"https://example.com/synth/{op.run_id}/01",
+            f"SYNTH_ARTICLE_{op.run_id}_01",
+            "staging_synth_test",
+            "2026-10-25T15:00:00Z",
+            "2026-10-25T15:00:00Z",
+        ]
+        # First execution succeeds
+        op.client.execute(valid_insert, params)
+
+        # Attempting identical mutation again within LIVE-02 is blocked as replay
+        with self.assertRaises(MockHranaDenied) as ctx:
+            op.client.execute(valid_insert, params)
+        self.assertIn("MUTATION_ALREADY_SPENT", str(ctx.exception))
+        self.assertTrue(op.security_boundary.halted)
+
+    def test_wire_state_transitions_cannot_be_escalated_without_manifest_sha256(self):
+        op = self._make_operator()
+        op._create_and_persist_manifest()
+        boundary = op.security_boundary
+        assert boundary is not None
+
+        with self.assertRaises(MockHranaDenied) as ctx:
+            boundary.record_preflight_completed("invalid_forged_sha256")
+        self.assertIn("MANIFEST_MISMATCH", str(ctx.exception))
+
+        with self.assertRaises(MockHranaDenied) as ctx:
+            boundary.record_human_window_confirmed("MOCK_ONLY", "invalid_forged_sha256")
+        self.assertIn("MANIFEST_MISMATCH", str(ctx.exception))
+
+        with self.assertRaises(MockHranaDenied) as ctx:
+            boundary.record_active_stage("LIVE-02", "invalid_forged_sha256")
+        self.assertIn("MANIFEST_MISMATCH", str(ctx.exception))
+
+    # -------------------------------------------------------------------------
+    # 20. Priority 2: Read-Only Least Privilege (P1-2)
+    # -------------------------------------------------------------------------
+
+    def test_wire_rejects_broad_select_on_operational_tables(self):
+        op = self._make_operator()
+        op._create_and_persist_manifest()
+
+        disallowed_queries = [
+            "SELECT * FROM telegram_delivery_records",
+            "SELECT * FROM owner_feedback",
+            "SELECT * FROM candidate_backlog",
+            "SELECT * FROM ai_usage_ledger",
+            "SELECT * FROM distribution_delivery_attempts",
+            "SELECT * FROM dead_letter_deliveries",
+            "SELECT * FROM digest_history",
+        ]
+        for query in disallowed_queries:
+            with self.assertRaises(MockHranaDenied) as ctx:
+                op.client.execute(query)
+            self.assertIn("READ_NOT_ALLOWLISTED", str(ctx.exception), f"Failed for {query}")
+            op.security_boundary.halted = False
+
+    def test_wire_rejects_unconstrained_full_table_scan_on_synthetic_tables(self):
+        op = self._make_operator()
+        op._create_and_persist_manifest()
+
+        unconstrained_queries = [
+            "SELECT * FROM processed_articles",
+            "SELECT * FROM stories",
+            "SELECT * FROM run_locks",
+            "SELECT * FROM durable_recovery_state",
+            "SELECT * FROM processed_articles WHERE source = 'test'",
+        ]
+        for query in unconstrained_queries:
+            with self.assertRaises(MockHranaDenied) as ctx:
+                op.client.execute(query)
+            self.assertIn("READ_NOT_ALLOWLISTED", str(ctx.exception), f"Failed for {query}")
+            op.security_boundary.halted = False
+
+        with self.assertRaises(MockHranaDenied) as ctx:
+            op.client.execute("SELECT * FROM processed_articles WHERE article_id = ?", ["prod_article_9999"])
+        self.assertIn("READ_NOT_ALLOWLISTED", str(ctx.exception))
+
+    def test_wire_permits_exact_preflight_and_manifest_scoped_reads(self):
+        op = self._make_operator()
+        op._create_and_persist_manifest()
+
+        res1 = op.client.execute("SELECT MAX(version) AS ver FROM schema_migrations")
+        self.assertIsNotNone(res1.fetchone())
+
+        res2 = op.client.execute("SELECT DISTINCT status FROM telegram_delivery_records")
+        self.assertIsNotNone(res2.fetchall())
+
+        res3 = op.client.execute("PRAGMA table_info(telegram_delivery_records)")
+        self.assertIsNotNone(res3.fetchall())
+
+        art_id = f"synth_art_{op.run_id}_01"
+        res4 = op.client.execute("SELECT 1 AS found FROM processed_articles WHERE article_id = ?", [art_id])
+        self.assertEqual(len(res4.fetchall()), 0)
+
+    # -------------------------------------------------------------------------
+    # 21. Priority 3: Lifecycle Transport Closure & Strict Hard Bounds (P2)
+    # -------------------------------------------------------------------------
+
+    def test_lifecycle_transport_closed_on_nominal_run(self):
+        op = self._make_operator()
+        report = op.run(auto_human_window=True, human_marker="MOCK_ONLY")
+        self.assertEqual(report.status, LiveReadyOperatorStatus.PASSED)
+        self.assertTrue(op.security_boundary._session_closed)
+
+        with self.assertRaises(MockHranaDenied) as ctx:
+            op.client.execute("SELECT 1 AS ping")
+        self.assertIn("SESSION_HALTED", str(ctx.exception))
+
+    def test_lifecycle_transport_closed_on_early_exit_no_human_window(self):
+        op = self._make_operator()
+        report = op.run(auto_human_window=False)
+        self.assertEqual(report.status, LiveReadyOperatorStatus.FAILED)
+        self.assertTrue(op.security_boundary._session_closed)
+        self.assertTrue(Path(op.manifest_path).exists())
+
+        with self.assertRaises(MockHranaDenied) as ctx:
+            op.client.execute("SELECT 1 AS ping")
+        self.assertIn("SESSION_HALTED", str(ctx.exception))
+
+    def test_lifecycle_transport_closed_on_exception(self):
+        op = self._make_operator(simulate_ownership_mismatch=True)
+        report = op.run(auto_human_window=True, human_marker="MOCK_ONLY")
+        self.assertEqual(report.status, LiveReadyOperatorStatus.FAILED)
+        self.assertTrue(op.security_boundary._session_closed)
+        self.assertTrue(Path(op.manifest_path).exists())
+
+        with self.assertRaises(MockHranaDenied) as ctx:
+            op.client.execute("SELECT 1 AS ping")
+        self.assertIn("SESSION_HALTED", str(ctx.exception))
+
+    def test_budget_invariants_reject_booleans_and_nonfinite_values(self):
+        with self.assertRaises(TypeError):
+            validate_budget_invariants(
+                request_ceiling=True,
+                request_cutoff=80,
+                cleanup_reserve=20,
+                session_deadline_seconds=120.0,
+            )
+
+        with self.assertRaises(TypeError):
+            validate_budget_invariants(
+                request_ceiling=100,
+                request_cutoff=True,
+                cleanup_reserve=20,
+                session_deadline_seconds=120.0,
+            )
+
+        with self.assertRaises(TypeError):
+            validate_budget_invariants(
+                request_ceiling=100,
+                request_cutoff=80,
+                cleanup_reserve=True,
+                session_deadline_seconds=120.0,
+            )
+
+        with self.assertRaises(TypeError):
+            validate_budget_invariants(
+                request_ceiling=100,
+                request_cutoff=80,
+                cleanup_reserve=20,
+                session_deadline_seconds=True,
+            )
+
+        with self.assertRaises(ValueError):
+            validate_budget_invariants(
+                request_ceiling=100,
+                request_cutoff=80,
+                cleanup_reserve=20,
+                session_deadline_seconds=float("nan"),
+            )
+
+        with self.assertRaises(ValueError):
+            validate_budget_invariants(
+                request_ceiling=100,
+                request_cutoff=80,
+                cleanup_reserve=20,
+                session_deadline_seconds=float("inf"),
+            )
+
+        with self.assertRaises(ValueError):
+            validate_budget_invariants(
+                request_ceiling=0,
+                request_cutoff=80,
+                cleanup_reserve=20,
+                session_deadline_seconds=120.0,
+            )
+
+        with self.assertRaises(ValueError):
+            validate_budget_invariants(
+                request_ceiling=100,
+                request_cutoff=-10,
+                cleanup_reserve=20,
+                session_deadline_seconds=120.0,
+            )
+
+    def test_strict_request_ceiling_under_100(self):
+        run_id = "run_20261027T120000Z_abcdef123456"
+        manifest_entities = create_default_manifest_entities(run_id)
+        manifest = PerRunOwnershipManifest(
+            run_id=run_id,
+            created_at="2026-10-27T12:00:00Z",
+            registered_entities=manifest_entities,
+        )
+        seal = OfflineManifestSeal.from_persisted(
+            manifest.save_atomic(self.temp_dir), manifest.run_id
+        )
+        boundary = HranaOutboundSecurityBoundary(
+            inner=self.budget_transport,
+            seal=seal,
+            session_mode=True,
+            max_requests=100,
+            test_cutoff_requests=80,
+            cleanup_reserve_requests=20,
+            session_timeout_seconds=120.0,
+        )
+        boundary._requests = 99
+        req = httpx.Request(
+            "POST",
+            "https://efso-radar-staging.turso.io/v2/pipeline",
+            content=json.dumps({"requests": [{"type": "execute", "stmt": {"sql": "SELECT 1 AS ping"}}, {"type": "close"}]}).encode("utf-8"),
+        )
+        with self.assertRaises(MockHranaDenied) as ctx:
+            boundary.handle_request(req)
+        self.assertIn("REQUEST_CEILING", str(ctx.exception))
 
 
 if __name__ == "__main__":

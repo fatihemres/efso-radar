@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 import re
 import sqlite3
@@ -43,25 +44,53 @@ from efso_radar.staging.runner import (
 )
 
 
-_ALLOWED_READ_TABLES = frozenset({
-    "schema_migrations",
-    "run_locks",
+_EXACT_PREFLIGHT_QUERIES = frozenset({
+    _norm("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"),
+    _norm("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"),
+    _norm("SELECT name FROM sqlite_master WHERE type='table' AND name = ?"),
+    _norm("SELECT MAX(version) AS ver FROM schema_migrations"),
+    _norm("SELECT DISTINCT status FROM telegram_delivery_records"),
+    _norm("SELECT state_json FROM durable_recovery_state"),
+    _norm(
+        "SELECT recipient_chat_id, message_key, COUNT(*) as cnt "
+        "FROM telegram_delivery_records "
+        "GROUP BY recipient_chat_id, message_key "
+        "HAVING COUNT(*) > 1"
+    ),
+    _norm("SELECT 1 AS ping"),
+    _norm("SELECT 1 AS found"),
+    _norm("SELECT 1"),
+})
+
+_SYNTHETIC_READ_TABLES = frozenset({
     "processed_articles",
     "stories",
-    "story_updates",
-    "notifications",
-    "editorial_assessments",
-    "owner_feedback",
-    "candidate_backlog",
-    "ai_usage_ledger",
-    "telegram_delivery_records",
-    "distribution_delivery_attempts",
-    "dead_letter_deliveries",
+    "run_locks",
     "durable_recovery_state",
-    "digest_history",
-    "sqlite_master",
-    "sqlite_sequence",
 })
+
+_TABLE_PK_COLUMNS = {
+    "processed_articles": "article_id",
+    "stories": "story_id",
+    "run_locks": "lock_key",
+    "durable_recovery_state": "state_key",
+}
+
+_STAGE_ALLOWED_MUTATIONS: dict[str, frozenset[tuple[str, str]]] = {
+    "LIVE-01": frozenset(),
+    "LIVE-02": frozenset({("processed_articles", "insert"), ("stories", "insert")}),
+    "LIVE-03": frozenset({("processed_articles", "insert")}),
+    "LIVE-04": frozenset({("run_locks", "insert")}),
+    "LIVE-05": frozenset({("run_locks", "insert")}),
+    "LIVE-06": frozenset({("durable_recovery_state", "insert")}),
+    "LIVE-07": frozenset(),
+    "LIVE-08": frozenset({
+        ("processed_articles", "delete"),
+        ("stories", "delete"),
+        ("run_locks", "delete"),
+        ("durable_recovery_state", "delete"),
+    }),
+}
 
 _MAX_JSON_BYTES = 16_384
 _MAX_REQUEST_PARTS = 8
@@ -71,6 +100,52 @@ _MAX_SESSION_REQUESTS = 100
 _TEST_CUTOFF_REQUESTS = 80
 _SESSION_DEADLINE_SECONDS = 120.0
 _ISO_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+
+
+def validate_budget_invariants(
+    *,
+    request_ceiling: int,
+    request_cutoff: int,
+    cleanup_reserve: int,
+    session_deadline_seconds: float,
+    is_session: bool = True,
+) -> None:
+    """Validate numeric budget and deadline invariants fail-closed at instantiation."""
+    for name, val in [
+        ("request_ceiling", request_ceiling),
+        ("request_cutoff", request_cutoff),
+        ("cleanup_reserve", cleanup_reserve),
+        ("session_deadline_seconds", session_deadline_seconds),
+    ]:
+        if isinstance(val, bool):
+            raise TypeError(f"Invalid boolean type for {name}: {val!r}")
+        if not isinstance(val, (int, float)):
+            raise TypeError(f"Invalid numeric type for {name}: {type(val).__name__}")
+        if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+            raise ValueError(f"Non-finite float value for {name}: {val!r}")
+        if val <= 0 and (name != "cleanup_reserve" or is_session):
+            raise ValueError(f"{name} must be positive, got {val}")
+        if val < 0:
+            raise ValueError(f"{name} cannot be negative, got {val}")
+
+    if request_ceiling > 100:
+        raise ValueError(f"request_ceiling ({request_ceiling}) exceeds absolute limit of 100.")
+    if request_cutoff > 80:
+        raise ValueError(f"request_cutoff ({request_cutoff}) exceeds limit of 80.")
+    if is_session:
+        if cleanup_reserve < 20:
+            raise ValueError(f"cleanup_reserve ({cleanup_reserve}) must be at least 20.")
+        if request_cutoff + cleanup_reserve > request_ceiling:
+            raise ValueError(
+                f"request_cutoff ({request_cutoff}) + cleanup_reserve ({cleanup_reserve}) "
+                f"exceeds request_ceiling ({request_ceiling})."
+            )
+    else:
+        if request_cutoff > request_ceiling:
+            raise ValueError(f"request_cutoff ({request_cutoff}) exceeds request_ceiling ({request_ceiling}).")
+
+    if session_deadline_seconds > 120.0:
+        raise ValueError(f"session_deadline_seconds ({session_deadline_seconds}) exceeds 120.0s ceiling.")
 
 
 class MockHranaDenied(PermissionError):
@@ -400,6 +475,14 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
         # Strict hermetic transport verification (no duck typing bypasses)
         _verify_exact_hermetic_transport(inner)
 
+        validate_budget_invariants(
+            request_ceiling=max_requests,
+            request_cutoff=test_cutoff_requests,
+            cleanup_reserve=cleanup_reserve_requests,
+            session_deadline_seconds=session_timeout_seconds,
+            is_session=(approved_intents is None),
+        )
+
         if type(seal) is not OfflineManifestSeal:
             raise TypeError("Mock outbound boundary requires an offline seal.")
         seal.assert_unchanged()
@@ -423,6 +506,13 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
         self.unknown = False
         self._live_authorized = False
         self._inventory = create_default_manifest_entities(seal.run_id)
+
+        # Wire-level gate and stage tracking (cannot be escalated via public boolean)
+        self._preflight_passed: bool = False
+        self._human_window_confirmed: bool = False
+        self._active_stage: str | None = None
+        self._spent_mutations: set[tuple[str, str, str, str]] = set()
+        self._session_closed: bool = False
 
         # Determine mode: session_mode or legacy approved_intents tuple
         if approved_intents is None:
@@ -502,25 +592,90 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
         """Mark transport as entering cleanup phase, permitting use of reserve."""
         self._in_cleanup = True
 
+    def record_preflight_completed(self, manifest_sha256: str) -> None:
+        """Record preflight completion at wire boundary under sealed manifest assertion."""
+        self._seal.assert_unchanged()
+        if manifest_sha256 != self._seal.sha256:
+            self._deny("MANIFEST_MISMATCH")
+        if self._session_closed or self.halted:
+            self._deny("SESSION_HALTED")
+        if self._preflight_passed:
+            self._deny("PREFLIGHT_ALREADY_RECORDED")
+        self._preflight_passed = True
+
+    def record_human_window_confirmed(self, marker: str, manifest_sha256: str) -> None:
+        """Record human approval window at wire boundary under sealed manifest assertion."""
+        self._seal.assert_unchanged()
+        if manifest_sha256 != self._seal.sha256:
+            self._deny("MANIFEST_MISMATCH")
+        if self._session_closed or self.halted:
+            self._deny("SESSION_HALTED")
+        if not self._preflight_passed:
+            self._deny("PREFLIGHT_REQUIRED")
+        if self._human_window_confirmed:
+            self._deny("HUMAN_WINDOW_ALREADY_CONFIRMED")
+        if marker != "MOCK_ONLY":
+            self._deny("INVALID_HUMAN_MARKER")
+        self._human_window_confirmed = True
+
+    def record_active_stage(self, stage_id: str, manifest_sha256: str) -> None:
+        """Record active controlled live stage at wire boundary under sealed manifest assertion."""
+        if manifest_sha256 != self._seal.sha256:
+            self._deny("MANIFEST_MISMATCH")
+        if self._session_closed or self.halted:
+            self._deny("SESSION_HALTED")
+        if stage_id not in _STAGE_ALLOWED_MUTATIONS:
+            self._deny("INVALID_STAGE")
+        self._active_stage = stage_id
+
+    def record_stage_completed(self, stage_id: str, manifest_sha256: str) -> None:
+        """Record stage completion under sealed manifest assertion."""
+        if self._active_stage == stage_id:
+            self._active_stage = None
+
+    def close_session(self) -> None:
+        """Permanently close and invalidate this security boundary session."""
+        self._session_closed = True
+
     def _deny(self, code: str) -> None:
         self.halted = True
         self.unknown = True
         # Never place SQL, tokens, URL contents, or wire payload in messages.
         raise MockHranaDenied("MOCK_HRANA_DENIED_" + code)
 
-    def _is_session_statement_allowed(self, sql: str, args: list[Any]) -> bool:
-        """Verify statement against the sealed manifest and allowed session query patterns."""
+    def _validate_session_statement(self, sql: str, args: list[Any]) -> None:
+        """Verify statement against wire gates, read least privilege, and sealed manifest."""
         norm_sql = _norm(sql)
         spec = _MUTATING_TEMPLATES.get(norm_sql)
         if spec is not None:
+            # Wire-level gate checks before any mutation dispatch
+            if not self._preflight_passed:
+                self._deny("PREFLIGHT_REQUIRED")
+            if not self._human_window_confirmed:
+                self._deny("HUMAN_WINDOW_REQUIRED")
+            if self._active_stage is None:
+                self._deny("NO_ACTIVE_STAGE")
+
             table, operation, count = spec
+            allowed_mutations = _STAGE_ALLOWED_MUTATIONS.get(self._active_stage, frozenset())
+            if (table, operation) not in allowed_mutations:
+                self._deny("STAGE_MUTATION_MISMATCH")
+
             if len(args) != count:
-                return False
+                self._deny("PARAMETERS_INVALID")
+
             raw_args = [_extract_hrana_val(a) for a in args]
-            key = str(raw_args[0]) if raw_args else ""
-            entity = next((e for e in self._inventory if e.table == table and e.pk_value == key), None)
+            pk_value = str(raw_args[0]) if raw_args else ""
+
+            # Mutation replay protection (strictly single-shot in LIVE-02 and LIVE-08)
+            mutation_key = (self._active_stage, table, operation, pk_value)
+            if self._active_stage in ("LIVE-02", "LIVE-08") and mutation_key in self._spent_mutations:
+                self._deny("MUTATION_ALREADY_SPENT")
+
+            entity = next((e for e in self._inventory if e.table == table and e.pk_value == pk_value), None)
             if entity is None:
-                return False
+                self._deny("UNREGISTERED_IDENTITY")
+
             try:
                 self._seal.require_registered_identity(entity.table, entity.pk_column, entity.pk_value)
                 if self._dynamic_validation:
@@ -539,37 +694,70 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
                         run_id=self._seal.run_id,
                         attrs=entity.expected_attributes,
                     )
-                return True
+            except MockHranaDenied:
+                raise
             except Exception:
-                return False
+                self._deny("PARAMETERS_INVALID")
+
+            self._spent_mutations.add(mutation_key)
+            return
 
         upper = norm_sql.upper()
         if not (upper.startswith("SELECT ") or upper.startswith("WITH ") or upper.startswith("PRAGMA ")):
-            return False
+            self._deny("SQL_NOT_ALLOWLISTED")
 
         try:
             validate_read_only_sql(sql)
         except Exception:
-            return False
+            self._deny("SQL_NOT_READ_ONLY")
 
         if upper.startswith("PRAGMA "):
-            return (
+            if not (
                 upper.startswith("PRAGMA TABLE_INFO(")
                 or upper.startswith("PRAGMA INDEX_LIST(")
                 or upper.startswith("PRAGMA INDEX_XINFO(")
                 or upper.startswith("PRAGMA FOREIGN_KEY_")
-            )
+            ):
+                self._deny("READ_NOT_ALLOWLISTED")
+            return
 
-        if upper in ("SELECT 1 AS PING", "SELECT 1 AS FOUND", "SELECT 1"):
-            return True
+        if norm_sql in _EXACT_PREFLIGHT_QUERIES:
+            return
 
+        # Scoped read queries on synthetic tables
         from_matches = re.findall(r"\bFROM\s+([A-Za-z0-9_]+)", upper)
         join_matches = re.findall(r"\bJOIN\s+([A-Za-z0-9_]+)", upper)
         tables_in_query = [t.lower() for t in from_matches + join_matches]
-        if tables_in_query and all(t in _ALLOWED_READ_TABLES for t in tables_in_query):
-            return True
 
-        return False
+        if not tables_in_query or any(t not in _SYNTHETIC_READ_TABLES for t in tables_in_query):
+            self._deny("READ_NOT_ALLOWLISTED")
+
+        target_table = tables_in_query[0]
+        expected_pk_col = _TABLE_PK_COLUMNS.get(target_table)
+        if expected_pk_col is None:
+            self._deny("READ_NOT_ALLOWLISTED")
+
+        # Must contain WHERE predicate on synthetic primary key
+        if not re.search(rf"\bWHERE\b[^\n;]*\b{re.escape(expected_pk_col)}\b\s*=\s*\?", upper, re.IGNORECASE):
+            self._deny("READ_NOT_ALLOWLISTED")
+
+        if not args:
+            self._deny("READ_NOT_ALLOWLISTED")
+
+        raw_arg = _extract_hrana_val(args[0])
+        if not isinstance(raw_arg, str) or not (
+            raw_arg.startswith("synth_")
+            and (self._seal.run_id in raw_arg or any(e.pk_value == raw_arg for e in self._inventory))
+        ):
+            self._deny("READ_NOT_ALLOWLISTED")
+
+    def _is_session_statement_allowed(self, sql: str, args: list[Any]) -> bool:
+        """Legacy compatibility check."""
+        try:
+            self._validate_session_statement(sql, args)
+            return True
+        except MockHranaDenied:
+            return False
 
     def _validate(self, request: httpx.Request) -> str:
         _verify_exact_hermetic_transport(self._inner)
@@ -610,8 +798,7 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
                 sql = stmt.get("sql", "")
                 args = stmt.get("args", [])
                 if self._session_mode:
-                    if not self._is_session_statement_allowed(sql, args):
-                        self._deny("SQL_OR_ARGS_NOT_ALLOWED")
+                    self._validate_session_statement(sql, args)
                 else:
                     key = _intent_key(sql, args)
                     if key not in self._allow or key in self._spent:
@@ -644,8 +831,7 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
                 self._deny("ARGS_TYPE")
 
             if self._session_mode:
-                if not self._is_session_statement_allowed(stmt["sql"], args):
-                    self._deny("SQL_OR_ARGS_NOT_ALLOWED")
+                self._validate_session_statement(stmt["sql"], args)
             else:
                 key = _intent_key(stmt["sql"], args)
                 if key not in self._allow or key in self._spent or key in keys:
@@ -660,11 +846,11 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
         now = self._clock()
         if now - self._started_at >= self._session_timeout_seconds:
             self._deny("DEADLINE")
-        if self._requests >= self._max_requests:
+        if self._requests + 1 >= self._max_requests:
             self._deny("REQUEST_CEILING")
         if not self._in_cleanup and self._requests >= self._test_cutoff_requests:
             self._deny("TEST_CUTOFF")
-        if self.halted:
+        if self.halted or self._session_closed:
             self._deny("SESSION_HALTED")
 
         action = ""
@@ -710,6 +896,7 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
             self._deny("TRANSPORT_OR_PROTOCOL_UNKNOWN")
 
     def close(self) -> None:
+        self.close_session()
         if hasattr(self._inner, "close"):
             self._inner.close()
 

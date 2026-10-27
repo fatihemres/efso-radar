@@ -23,8 +23,10 @@
 Operator candidate `LiveReadyStagingOperator` and `HranaOutboundSecurityBoundary` prepared as an unmerged candidate (Draft PR #35, pending independent review).
 - Reuses existing hermetic runner, preflight, manifest sealing, and session gate components.
 - Enforces strict default-deny for live execution; fails closed immediately on non-hermetic transports (no duck-typing bypasses).
-- Outbound boundary wired into transport chain, validating destination URL, payload size, baton lifecycle, mutating templates, calendar-valid ISO timestamps, and safe read queries at the HTTP wire edge.
-- Full gate workflow: verified LIVE-01 preflight, mandatory human window attestation before write stages, deadline (<120s), budget (<100 requests, 20 cleanup reserve), ambiguous COMMIT = UNKNOWN, conditional DELETE (affected == 1), post-run lockdown assertion, and 3-state audit (CLEAN/RESIDUAL/UNKNOWN).
+- Outbound boundary wired into transport chain, enforcing wire-level stage sequence and human approval gating: direct client mutations outside active stages or prior to preflight/human approval fail closed immediately.
+- Read-only least privilege at wire edge: broad operational table queries (`telegram_delivery_records`, etc.) and full table scans strictly rejected (`READ_NOT_ALLOWLISTED`); only exact preflight queries and single-PK manifest-scoped synthetic reads permitted.
+- Full gate workflow: verified LIVE-01 preflight, mandatory human window attestation before write stages, deadline (<120s), budget (<100 requests strictly enforced at wire edge, 20 cleanup reserve), ambiguous COMMIT = UNKNOWN, conditional DELETE (affected == 1), post-run lockdown assertion, and 3-state audit (CLEAN/RESIDUAL/UNKNOWN).
+- Transport lifecycle closure: client and security boundary permanently closed/invalidated across all exit paths (nominal run, early exit without human approval, exceptions).
 - Unlinking of manifest and PASSED status strictly blocked if human approval, any of the 8 stages, or lockdown assertion is missing or incomplete.
 - MANIFEST DURABILITY LIMITATION: Best-effort process-crash retention within OS tempdir. Machine reboot / temp purging is NOT resilient and remains an open prerequisite for unattended live cloud execution.
 - LOCKDOWN ASSERTION NOTICE: Post-run lockdown recording is an offline simulated assertion only, NOT real cloud dashboard state or token revocation.
