@@ -40,6 +40,17 @@ if TYPE_CHECKING:
         EXACT_STAGING_HOSTNAME,
         recover_manifest_offline,
     )
+    from efso_radar.staging.hrana_outbound_guard import (
+        HranaOutboundSecurityBoundary,
+        GuardedHermeticHranaTransport,
+        AuthorizedMockIntent,
+        MockHranaDenied,
+    )
+    from efso_radar.staging.live_ready_operator import (
+        LiveReadyStagingOperator,
+        LiveReadyOperatorReport,
+        LiveReadyOperatorStatus,
+    )
 
 __all__ = [
     "CloudPreflightValidator",
@@ -67,6 +78,13 @@ __all__ = [
     "recover_manifest_offline",
     "StagingConnectionReport",
     "check_staging_connection",
+    "HranaOutboundSecurityBoundary",
+    "GuardedHermeticHranaTransport",
+    "AuthorizedMockIntent",
+    "MockHranaDenied",
+    "LiveReadyStagingOperator",
+    "LiveReadyOperatorReport",
+    "LiveReadyOperatorStatus",
 ]
 
 _RUNNER_EXPORTS = frozenset({
@@ -92,6 +110,19 @@ _CONNECTION_EXPORTS = frozenset({
     "check_staging_connection",
 })
 
+_GUARD_EXPORTS = frozenset({
+    "HranaOutboundSecurityBoundary",
+    "GuardedHermeticHranaTransport",
+    "AuthorizedMockIntent",
+    "MockHranaDenied",
+})
+
+_OPERATOR_EXPORTS = frozenset({
+    "LiveReadyStagingOperator",
+    "LiveReadyOperatorReport",
+    "LiveReadyOperatorStatus",
+})
+
 
 def __getattr__(name: str) -> Any:
     if name in _CONNECTION_EXPORTS:
@@ -107,4 +138,10 @@ def __getattr__(name: str) -> Any:
     if name in _RUNNER_EXPORTS:
         import efso_radar.staging.runner as runner_mod
         return getattr(runner_mod, name)
+    if name in _GUARD_EXPORTS:
+        import efso_radar.staging.hrana_outbound_guard as guard_mod
+        return getattr(guard_mod, name)
+    if name in _OPERATOR_EXPORTS:
+        import efso_radar.staging.live_ready_operator as op_mod
+        return getattr(op_mod, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

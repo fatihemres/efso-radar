@@ -18,6 +18,24 @@
 | Follow-on cloud cutover & unattended operations | Cloud parity, backups, zero-cost controls, human editorial recipient tests, PO release decision | Existing Phase 5 architecture; future issue required | **DISCOVERY / NOT AUTHORIZED** |
 | Rights and distribution | Review third-party origins and decide visibility/distribution | [Issue #17](https://github.com/fatihemres/efso-radar/issues/17) | **IN PROGRESS (AUDIT)** |
 
+## 2026-10-28 Phase 5B.3G-C Live-Ready Operator Preparation Checkpoint (Candidate / Unmerged PR #35)
+
+Operator candidate `LiveReadyStagingOperator` and `HranaOutboundSecurityBoundary` prepared as an unmerged candidate (Draft PR #35, Review Round 4 remediation, pending independent review).
+- Reuses existing hermetic runner, preflight, manifest sealing, and session gate components.
+- Enforces strict default-deny for live execution; fails closed immediately on non-hermetic transports (no duck-typing bypasses).
+- Outbound boundary wired into transport chain, enforcing wire-level stage sequence and human approval gating: direct client mutations outside active stages or prior to preflight/human approval fail closed immediately. Transitions require source-backed evidence (verified wire preflight requests and operator attestation); public SHA-256 cannot be self-issued to escalate permissions.
+- Strict monotonic stage sequence: `LIVE-08` requires all preceding stages completed (stage sequence index 8); early transitions to `LIVE-08` are strictly denied with `OUT_OF_ORDER_STAGE`.
+- Wire-level full-row ownership precheck: conditional DELETE statements require verified attribute pre-checks on the wire (`SELECT * FROM {table} WHERE {pk_col} = ?`) and operator verification attestation (`OWNERSHIP_PRECHECK_REQUIRED` if attempted directly or prematurely).
+- Early stage failure cleanup policy: in-session early cleanup bypasses are prohibited. Early failures fail closed, preserve the manifest, and mark status `FAILED`; any future early-failure cleanup remains an open, separate fail-closed recovery requirement with cryptographic proof of ownership.
+- Read-only least privilege at wire edge: broad operational table queries (`telegram_delivery_records`, etc.) and full table scans strictly rejected (`READ_NOT_ALLOWLISTED`); exact SQL template inventory (`_SYNTHETIC_READ_TEMPLATES`) with exact parameter count (1) and manifest PK match enforced. Preflight queries strictly stage-scoped to LIVE-01 only.
+- Strict cleanup reserve protection: `set_cleanup_phase()` strictly restricted to `LIVE-08` at index 8; attempts to escalate cleanup reserve before `LIVE-08` are permanently denied with `CLEANUP_RESERVE_ESCALATION`.
+- Full gate workflow: verified LIVE-01 preflight, mandatory human window attestation before write stages, deadline (<120s), budget (<100 requests strictly enforced at wire edge, 20 cleanup reserve), ambiguous COMMIT = UNKNOWN, conditional DELETE (affected == 1), post-run lockdown assertion, and 3-state audit (CLEAN/RESIDUAL/UNKNOWN).
+- Transport lifecycle closure: client and security boundary permanently closed/invalidated across all exit paths (nominal run, early exit without human approval, exceptions).
+- Unlinking of manifest and PASSED status strictly blocked if human approval, any of the 8 stages, or lockdown assertion is missing or incomplete.
+- MANIFEST DURABILITY LIMITATION: Best-effort process-crash retention within OS tempdir. Machine reboot / temp purging is NOT resilient and remains an open prerequisite for unattended live cloud execution.
+- LOCKDOWN ASSERTION NOTICE: Post-run lockdown recording is an offline simulated assertion only, NOT real cloud dashboard state or token revocation.
+- All live staging operations remain **UNAUTHORIZED**; Block Writes remains ON. 60 focused offline operator tests passing.
+
 ## 2026-10-26 LIVE-01 milestone checkpoint
 
 Read-only schema/integrity preflight passed on the owner-operated staging connection, with **15 expected tables, 129 expected columns and five ephemeral synthetic-key collision checks**. This is a **verified read-only substep**, not closure of G-C and not an approval to unblock writes. Afterward the owner invalidated all database tokens; any future authenticated session needs freshly scoped credentials and a new approval for its exact operation.
