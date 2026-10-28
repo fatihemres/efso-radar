@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from efso_radar.staging.persistent_manifest_store import (
         PersistentManifestStore,
         HermeticTestManifestStore,
+        HermeticTestFixtureScope,
         ManifestStoreError,
         ManifestStoreSecurityError,
         ManifestStoreFileExistsError,
@@ -96,6 +97,7 @@ __all__ = [
     "ManifestSealViolation",
     "PersistentManifestStore",
     "HermeticTestManifestStore",
+    "HermeticTestFixtureScope",
     "ManifestStoreError",
     "ManifestStoreSecurityError",
     "ManifestStoreFileExistsError",
@@ -141,6 +143,7 @@ _SEAL_EXPORTS = frozenset({
 _PERSISTENT_STORE_EXPORTS = frozenset({
     "PersistentManifestStore",
     "HermeticTestManifestStore",
+    "HermeticTestFixtureScope",
     "ManifestStoreError",
     "ManifestStoreSecurityError",
     "ManifestStoreFileExistsError",

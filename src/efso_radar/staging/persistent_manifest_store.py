@@ -577,8 +577,14 @@ class _ManifestRunLock:
         """Release lockfile only if this instance demonstrably owns it.
 
         Never unlinks foreign lockfiles under any circumstances. Checks file descriptor,
-        inode/device identity on POSIX, and ownership token content before unlinking.
+        inode/device identity across platforms, and strict ownership token content before unlinking.
+        Empty or missing content alone is NEVER treated as proof of ownership.
         """
+        opened_by_us = self._opened_by_us
+        was_acquired = self._acquired
+        captured_ino = self._ino
+        captured_dev = self._dev
+
         if self._fd is not None:
             try:
                 os.close(self._fd)
@@ -587,43 +593,56 @@ class _ManifestRunLock:
             self._fd = None
 
         # If this instance never even opened the lockfile and never acquired it, we have zero ownership
-        if not self._opened_by_us and not self._acquired:
+        if not opened_by_us and not was_acquired:
             return
 
         try:
             if not os.path.lexists(str(self.lock_path)) or self.lock_path.is_symlink() or _is_reparse_point(self.lock_path):
                 return
 
-            # Inode & device check on POSIX
-            if sys.platform != "win32" and self._ino is not None and self._dev is not None:
-                try:
-                    st = self.lock_path.stat()
-                    if st.st_ino != self._ino or st.st_dev != self._dev:
-                        # Inode mismatch: lockfile was replaced or is foreign! Do not unlink!
-                        return
-                except OSError:
+            st = self.lock_path.stat()
+
+            # File identity check (inode & device verification)
+            if captured_ino is not None and captured_dev is not None:
+                if st.st_ino != captured_ino or st.st_dev != captured_dev:
+                    # Inode mismatch: lockfile was replaced or is foreign! Do not unlink!
                     return
+            elif not was_acquired:
+                # If the lock was not fully acquired, inode/file identity is mandatory.
+                # Without verified file identity from an active open descriptor, an unacquired
+                # or incomplete lock cannot be unlinked under any circumstances.
+                return
 
             # Token content verification
             try:
                 content = self.lock_path.read_text(encoding="utf-8")
-                # When lock was fully acquired, content must match self._lock_token exactly.
-                # In acquisition failure paths, content may be empty or a prefix of our token.
-                is_our_token = (content == self._lock_token)
-                if not is_our_token and not self._acquired:
-                    if content == "" or (len(content) < len(self._lock_token) and self._lock_token.startswith(content)):
-                        is_our_token = True
-                if not is_our_token:
-                    # Foreign lockfile content: do not unlink under any circumstances!
-                    return
             except OSError:
                 return
+
+            # When lock was fully acquired, content must match self._lock_token exactly.
+            if was_acquired:
+                if content != self._lock_token:
+                    # Foreign or altered lockfile content: do not unlink under any circumstances!
+                    return
+            else:
+                # Acquisition was NOT completed (failed during token write).
+                # Empty or missing content alone is NEVER treated as proof of ownership!
+                # Unlinking incomplete lock is only permitted if this instance demonstrably
+                # opened the file descriptor during the active acquisition attempt (opened_by_us is True),
+                # AND file identity (inode/dev) matched above.
+                if not opened_by_us:
+                    return
+                # If bytes were written, they must be a prefix of our token.
+                # Foreign content or content differing from our token prefix is never unlinked.
+                if content and not self._lock_token.startswith(content):
+                    return
 
             self.lock_path.unlink()
         except OSError:
             pass
         finally:
             self._acquired = False
+            self._opened_by_us = False
 
     def __enter__(self) -> _ManifestRunLock:
         try:
@@ -633,14 +652,14 @@ class _ManifestRunLock:
                 0o600,
             )
             self._opened_by_us = True
-            # Capture device and inode on POSIX while fd is open
-            if sys.platform != "win32":
-                try:
-                    st = os.fstat(self._fd)
+            # Capture device and file identity (inode/file index) while fd is open
+            try:
+                st = os.fstat(self._fd)
+                if getattr(st, "st_ino", 0) and getattr(st, "st_dev", 0):
                     self._dev = st.st_dev
                     self._ino = st.st_ino
-                except OSError:
-                    pass
+            except OSError:
+                pass
 
             # Write ownership token to lockfile using unpatched write
             payload = self._lock_token.encode("utf-8")
@@ -1126,41 +1145,42 @@ class PersistentManifestStore:
         )
 
 
-class HermeticTestManifestStore(PersistentManifestStore):
-    """Dedicated test adapter for hermetic test suites.
+class HermeticTestFixtureScope:
+    """Explicitly scoped fixture authorization manager for hermetic test execution.
 
-    Permits operation strictly inside isolated test fixture directories (e.g. pytest tmp_path)
-    within temporary storage, while enforcing repository boundary isolation, .git/.env/data blocking,
-    symlink/junction rejection, overwrite protection, schema validation, and hash sealing.
-    Arbitrary user, system, or non-temp directories are strictly rejected.
+    Carries trusted test fixture scope directly from pytest's tmp_path fixture.
+
+    Threat Model Notice:
+        Hermetic test mode and fixture scoping are structural test harness guardrails
+        designed to prevent test stores from accidentally targeting or mutating production,
+        repository, or arbitrary user directories. They do NOT provide a security or
+        privilege-separation boundary against malicious Python code running under the same
+        OS user in the same process address space.
     """
 
-    _AUTHORIZED_FIXTURE_ROOTS: set[Path] = set()
+    def __init__(self, fixture_root: Path | str) -> None:
+        self._fixture_root: Path = self._validate_fixture_root(fixture_root)
+        self._entered: bool = False
+
+    @property
+    def fixture_root(self) -> Path:
+        return self._fixture_root
 
     @classmethod
-    def register_authorized_fixture_root(cls, root: Path | str) -> None:
-        """Register an authorized temporary test fixture root for hermetic testing.
+    def _validate_fixture_root(cls, root: Path | str) -> Path:
+        """Validate candidate fixture root path strictly before authorization.
 
-        Strictly enforces that the candidate root:
-        - Is invoked during active test runner execution (PYTEST_CURRENT_TEST).
-        - Already exists and is a directory.
-        - Has no symlinks, junctions, or reparse points in its path or ancestors.
-        - Resides strictly within system temporary storage, but is NOT the system temp root itself.
-        - Does NOT reside in repository, home, system, or operational data paths.
-        - On POSIX, possesses strictly owner-private permissions (0700, no 0o077 group/world bits)
-          and matches the process owner UID.
+        Enforces:
+        - Candidate is non-empty Path or str without traversal (..) or null bytes.
+        - Candidate pre-exists as a real directory.
+        - Candidate and ancestors contain no symlinks, junctions, or reparse points.
+        - Candidate does not target repository, .git, .env, or operational data paths.
+        - Candidate does not target user home directory or system roots.
+        - Candidate resides strictly within system temporary storage, and is NOT the temp root itself.
+        - Candidate belongs to a genuine pytest fixture hierarchy (relative to temp root, starts with
+          'pytest-of-*' or 'pytest-*'). Arbitrary temporary directories cannot self-authorize.
+        - On POSIX, owner UID matches process UID and permissions are strictly 0700 (no 0o077 bits).
         """
-        # 1. Active test runner context check
-        in_test_env = bool(
-            os.environ.get("PYTEST_CURRENT_TEST")
-            or "pytest" in sys.modules
-            or getattr(sys, "_efso_test_mode", False)
-        )
-        if not in_test_env:
-            raise ManifestStoreSecurityError(
-                "Authorized fixture root registration is only permitted during active pytest execution."
-            )
-
         if root is None or not isinstance(root, (str, Path)):
             raise ManifestStoreSecurityError("Candidate fixture root must be a Path or str.")
 
@@ -1174,7 +1194,7 @@ class HermeticTestManifestStore(PersistentManifestStore):
 
         candidate = Path(raw_str)
 
-        # 2. Must already exist as a directory prior to registration
+        # 1. Pre-creation check
         if not candidate.exists():
             raise ManifestStoreSecurityError(
                 f"Candidate fixture root does not exist: {candidate}. Pre-creation of fixture is required."
@@ -1182,7 +1202,7 @@ class HermeticTestManifestStore(PersistentManifestStore):
         if not candidate.is_dir():
             raise ManifestStoreSecurityError(f"Candidate fixture root is not a directory: {candidate}")
 
-        # 3. Check symlinks/reparse points across ancestors and candidate
+        # 2. Check symlinks/reparse points across ancestors and candidate
         curr_unresolved: Path | None = candidate
         while curr_unresolved is not None and curr_unresolved != curr_unresolved.parent:
             if curr_unresolved.is_symlink() or _is_reparse_point(curr_unresolved):
@@ -1193,7 +1213,7 @@ class HermeticTestManifestStore(PersistentManifestStore):
         if _is_reparse_point(resolved):
             raise ManifestStoreSecurityError(f"Symlink or reparse point detected in fixture root: {resolved}")
 
-        # 4. Prohibit repository, .git, .env, and operational data paths
+        # 3. Prohibit repository, .git, .env, and operational data paths
         repo_root = _find_repo_root()
         if repo_root is not None:
             if resolved == repo_root:
@@ -1204,7 +1224,7 @@ class HermeticTestManifestStore(PersistentManifestStore):
             except ValueError:
                 pass
 
-        # 5. Prohibit user home directory and system directories
+        # 4. Prohibit user home directory and system directories
         try:
             user_home = Path.home().resolve()
             if resolved == user_home:
@@ -1231,13 +1251,14 @@ class HermeticTestManifestStore(PersistentManifestStore):
             if resolved in system_roots:
                 raise ManifestStoreSecurityError(f"System directory cannot be registered: {resolved}")
 
-        # 6. Must reside strictly within system temporary storage, but not the temp root itself
+        # 5. System temporary storage check
         temp_roots = [Path(tempfile.gettempdir()).resolve()]
         for fallback_tmp in (Path("/tmp"), Path("/var/tmp")):
             if fallback_tmp.exists():
                 temp_roots.append(fallback_tmp.resolve())
 
         is_subpath_of_temp = False
+        matching_temp_root: Path | None = None
         for tr in temp_roots:
             if resolved == tr:
                 raise ManifestStoreSecurityError(
@@ -1246,13 +1267,29 @@ class HermeticTestManifestStore(PersistentManifestStore):
             try:
                 resolved.relative_to(tr)
                 is_subpath_of_temp = True
+                matching_temp_root = tr
                 break
             except ValueError:
                 pass
 
-        if not is_subpath_of_temp:
+        if not is_subpath_of_temp or matching_temp_root is None:
             raise ManifestStoreSecurityError(
                 f"Candidate fixture root '{resolved}' does not reside within system temporary storage."
+            )
+
+        # 6. Pytest fixture hierarchy provenance check:
+        # Candidate must reside within an authentic pytest fixture directory hierarchy.
+        rel_parts = resolved.relative_to(matching_temp_root).parts
+        if not rel_parts:
+            raise ManifestStoreSecurityError(
+                f"Candidate fixture root '{resolved}' is the temporary root itself; rejected."
+            )
+        top_component = rel_parts[0].lower()
+        if not (top_component.startswith("pytest-of-") or top_component.startswith("pytest-")):
+            raise ManifestStoreSecurityError(
+                f"Candidate fixture root '{resolved}' does not belong to a valid pytest fixture hierarchy "
+                f"(expected 'pytest-of-*' or 'pytest-*' directory structure within temporary storage). "
+                f"Arbitrary temporary directories cannot be authorized."
             )
 
         # 7. POSIX ownership and permissions verification (mode 0700)
@@ -1273,7 +1310,60 @@ class HermeticTestManifestStore(PersistentManifestStore):
                     raise
                 raise ManifestStoreSecurityError(f"Failed to inspect fixture root permissions: {exc}") from exc
 
-        cls._AUTHORIZED_FIXTURE_ROOTS.add(resolved)
+        return resolved
+
+    def __enter__(self) -> HermeticTestFixtureScope:
+        HermeticTestManifestStore._AUTHORIZED_FIXTURE_ROOTS.add(self._fixture_root)
+        self._entered = True
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        HermeticTestManifestStore._AUTHORIZED_FIXTURE_ROOTS.discard(self._fixture_root)
+        self._entered = False
+
+    def close(self) -> None:
+        self.__exit__(None, None, None)
+
+    @classmethod
+    def enter(cls, root: Path | str) -> HermeticTestFixtureScope:
+        scope = cls(root)
+        scope.__enter__()
+        return scope
+
+
+class HermeticTestManifestStore(PersistentManifestStore):
+    """Dedicated test adapter for hermetic test suites.
+
+    Permits operation strictly inside isolated test fixture directories (e.g. pytest tmp_path)
+    within temporary storage, while enforcing repository boundary isolation, .git/.env/data blocking,
+    symlink/junction rejection, overwrite protection, schema validation, and hash sealing.
+    Arbitrary user, system, or non-temp directories are strictly rejected.
+
+    Threat Model Notice:
+        Hermetic test mode is a structural test harness guardrail designed to prevent
+        tests from mutating production, repository, or arbitrary user directories. It does NOT
+        provide a security or privilege-separation boundary against malicious Python code
+        running under the same OS user in the same process address space.
+    """
+
+    _AUTHORIZED_FIXTURE_ROOTS: set[Path] = set()
+
+    @classmethod
+    def register_authorized_fixture_root(cls, root: Path | str) -> None:
+        """Internal trusted-harness helper to register an authorized test fixture root.
+
+        Threat Model Notice:
+            Hermetic test mode and fixture scoping are structural test harness guardrails
+            designed to prevent test stores from accidentally targeting or mutating production,
+            repository, or arbitrary user directories. They do NOT provide a security or
+            privilege-separation boundary against malicious Python code running under the same
+            OS user in the same process address space.
+
+        Restricted strictly to authentic pytest fixture hierarchies within temporary storage.
+        Arbitrary directories cannot self-authorize.
+        """
+        validated = HermeticTestFixtureScope._validate_fixture_root(root)
+        cls._AUTHORIZED_FIXTURE_ROOTS.add(validated)
 
     @classmethod
     def clear_authorized_fixture_roots(cls) -> None:

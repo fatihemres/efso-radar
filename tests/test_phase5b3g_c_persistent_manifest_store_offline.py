@@ -26,6 +26,7 @@ from efso_radar.staging.manifest_seal import (
     OfflineManifestSeal,
 )
 from efso_radar.staging.persistent_manifest_store import (
+    HermeticTestFixtureScope,
     HermeticTestManifestStore,
     ManifestStoreConcurrencyError,
     ManifestStoreCorruptionError,
@@ -50,11 +51,8 @@ from efso_radar.staging.runner import (
 @pytest.fixture(autouse=True)
 def _authorize_test_tmp_path(tmp_path: Path) -> Generator[Path, None, None]:
     """Link each test execution to its ownership-proven pytest tmp_path fixture root."""
-    HermeticTestManifestStore.register_authorized_fixture_root(tmp_path)
-    try:
+    with HermeticTestFixtureScope(tmp_path):
         yield tmp_path
-    finally:
-        HermeticTestManifestStore.clear_authorized_fixture_roots()
 
 
 def _generate_valid_run_id(suffix: str | None = None) -> str:
@@ -145,30 +143,56 @@ class TestPersistentManifestStoreSecurity:
             after_mode = preexisting.stat().st_mode & 0o777
             assert after_mode == initial_mode == 0o755
 
-    def test_hermetic_test_store_authorized_fixture_root_registration(self) -> None:
-        """Custom test roots registered via register_authorized_fixture_root are permitted and clean up cleanly."""
-        custom_root = Path(tempfile.gettempdir()) / f"custom_fixture_root_{uuid.uuid4().hex}"
+    def test_hermetic_test_store_scoped_fixture_lifecycle(self, tmp_path: Path) -> None:
+        """HermeticTestFixtureScope cleanly registers and unregisters fixture roots without leak."""
+        custom_root = tmp_path / "scoped_subroot"
+        custom_root.mkdir(mode=0o700)
+        if sys.platform != "win32":
+            os.chmod(custom_root, 0o700)
+
+        # Clear active registrations to verify scoped entry
+        HermeticTestManifestStore.clear_authorized_fixture_roots()
         try:
-            # Unregistered: rejected and not created
             with pytest.raises(ManifestStoreSecurityError, match="ownership-verified isolated test fixture"):
                 HermeticTestManifestStore(custom_root)
-            assert not custom_root.exists()
 
-            # Pre-create fixture root with secure permissions before registration
-            custom_root.mkdir(mode=0o700)
-            if sys.platform != "win32":
-                os.chmod(custom_root, 0o700)
+            # Enter scope explicitly via context manager
+            with HermeticTestFixtureScope(custom_root):
+                store = HermeticTestManifestStore(custom_root / "store")
+                assert store.root_dir.exists()
 
-            # Register authorized fixture root
-            HermeticTestManifestStore.register_authorized_fixture_root(custom_root)
-            store = HermeticTestManifestStore(custom_root / "store")
-            assert store.root_dir.exists()
+            # Exited scope: registration discarded automatically
+            with pytest.raises(ManifestStoreSecurityError, match="ownership-verified isolated test fixture"):
+                HermeticTestManifestStore(custom_root / "another_store")
         finally:
             HermeticTestManifestStore.clear_authorized_fixture_roots()
-            if (custom_root / "store").exists():
-                (custom_root / "store").rmdir()
-            if custom_root.exists():
-                custom_root.rmdir()
+
+    def test_fake_pytest_current_test_cannot_authorize_non_pytest_directory(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Setting fake PYTEST_CURRENT_TEST environment variable cannot authorize a non-pytest directory."""
+        monkeypatch.setenv("PYTEST_CURRENT_TEST", "fake_test_suite_running_maliciously[test_case]")
+
+        non_pytest_dir = Path(tempfile.gettempdir()) / f"fake_non_pytest_dir_{uuid.uuid4().hex}"
+        non_pytest_dir.mkdir(mode=0o700)
+        try:
+            if sys.platform != "win32":
+                os.chmod(non_pytest_dir, 0o700)
+
+            # 1. Attempt to register via register_authorized_fixture_root
+            with pytest.raises(ManifestStoreSecurityError, match="pytest fixture hierarchy"):
+                HermeticTestManifestStore.register_authorized_fixture_root(non_pytest_dir)
+
+            # 2. Attempt to scope via HermeticTestFixtureScope
+            with pytest.raises(ManifestStoreSecurityError, match="pytest fixture hierarchy"):
+                HermeticTestFixtureScope(non_pytest_dir)
+
+            # 3. Attempt direct store initialization
+            with pytest.raises(ManifestStoreSecurityError, match="pytest fixture hierarchy|ownership-verified"):
+                HermeticTestManifestStore(non_pytest_dir)
+        finally:
+            if non_pytest_dir.exists():
+                non_pytest_dir.rmdir()
 
     def test_hermetic_store_rejects_unauthorized_directory_with_pytest_in_name(self) -> None:
         """A directory with 'pytest' in its name that has not been authorized is strictly rejected."""
@@ -182,7 +206,7 @@ class TestPersistentManifestStoreSecurity:
         """Arbitrary directories (temp root itself, repo root, non-existent, insecure mode) cannot be registered."""
         # 1. Temp root itself cannot be registered
         temp_root = Path(tempfile.gettempdir())
-        with pytest.raises(ManifestStoreSecurityError, match="cannot be registered as an authorized fixture root"):
+        with pytest.raises(ManifestStoreSecurityError, match="cannot be registered as an authorized fixture root|temporary root itself"):
             HermeticTestManifestStore.register_authorized_fixture_root(temp_root)
 
         # 2. Repo root cannot be registered
@@ -203,6 +227,18 @@ class TestPersistentManifestStoreSecurity:
             os.chmod(insecure_dir, 0o755)
             with pytest.raises(ManifestStoreSecurityError, match="insecure permissions"):
                 HermeticTestManifestStore.register_authorized_fixture_root(insecure_dir)
+
+        # 5. Non-pytest temporary directory cannot be registered
+        non_pytest_dir = Path(tempfile.gettempdir()) / f"arbitrary_non_pytest_{uuid.uuid4().hex}"
+        non_pytest_dir.mkdir(mode=0o700)
+        try:
+            if sys.platform != "win32":
+                os.chmod(non_pytest_dir, 0o700)
+            with pytest.raises(ManifestStoreSecurityError, match="pytest fixture hierarchy"):
+                HermeticTestManifestStore.register_authorized_fixture_root(non_pytest_dir)
+        finally:
+            if non_pytest_dir.exists():
+                non_pytest_dir.rmdir()
 
     def test_direct_is_hermetic_test_true_rejects_unauthorized_directory(self) -> None:
         """Passing is_hermetic_test=True directly cannot bypass fixture ownership and authorization checks."""
@@ -364,18 +400,18 @@ class TestPersistentManifestStoreOperations:
 import os
 import sys
 from pathlib import Path
-from efso_radar.staging.persistent_manifest_store import HermeticTestManifestStore
+from efso_radar.staging.persistent_manifest_store import HermeticTestManifestStore, HermeticTestFixtureScope
 from efso_radar.staging.manifest_seal import OfflineManifestSeal
 
 store_path = Path({str(store_dir.resolve())!r})
-HermeticTestManifestStore.register_authorized_fixture_root(store_path)
-store = HermeticTestManifestStore(store_path)
-manifest, seal = store.load_manifest({run_id!r})
-assert manifest.run_id == {run_id!r}
-assert len(manifest.registered_entities) == 5
-seal.assert_unchanged()
-seal.require_registered_identity("processed_articles", "article_id", "synth_art_{run_id}_01")
-print("SUBPROCESS_VERIFIED_OK")
+with HermeticTestFixtureScope(store_path):
+    store = HermeticTestManifestStore(store_path)
+    manifest, seal = store.load_manifest({run_id!r})
+    assert manifest.run_id == {run_id!r}
+    assert len(manifest.registered_entities) == 5
+    seal.assert_unchanged()
+    seal.require_registered_identity("processed_articles", "article_id", "synth_art_{run_id}_01")
+    print("SUBPROCESS_VERIFIED_OK")
 """
         env = dict(os.environ)
         repo_root = _find_repo_root()
@@ -819,6 +855,58 @@ print("SUBPROCESS_VERIFIED_OK")
                 pass
 
         assert not lock_path.exists(), "Own incomplete lockfile should be cleaned up on write failure"
+
+    def test_foreign_lockfile_empty_and_token_never_deleted_on_acquisition_or_release(
+        self, tmp_path: Path
+    ) -> None:
+        """Foreign lockfiles (empty, partial, or other token) are never deleted on contention or release attempt."""
+        run_id = _generate_valid_run_id("foreign0001")
+        lock_path = tmp_path / f".lock_{run_id}"
+
+        # Scenario 1: Foreign lockfile is EMPTY ("")
+        lock_path.write_text("", encoding="utf-8")
+        assert lock_path.exists()
+        assert lock_path.read_text(encoding="utf-8") == ""
+
+        # Lock contention on empty foreign lockfile: must fail closed with ManifestStoreConcurrencyError
+        lock_instance_1 = _ManifestRunLock(lock_path, run_id)
+        with pytest.raises(ManifestStoreConcurrencyError, match="Concurrent writer lock active"):
+            with lock_instance_1:
+                pass
+
+        # Foreign empty lockfile must NOT be deleted by contention
+        assert lock_path.exists(), "Foreign empty lockfile must NOT be deleted on acquisition failure"
+        assert lock_path.read_text(encoding="utf-8") == ""
+
+        # Calling _release_lock_if_owned directly on an unowned instance must NOT delete empty foreign file
+        lock_instance_1._release_lock_if_owned()
+        assert lock_path.exists(), "Direct release on unowned instance must NOT delete foreign empty file"
+
+        # Even if _opened_by_us were somehow set on a lock instance, unacquired empty file is never deleted
+        fake_lock = _ManifestRunLock(lock_path, run_id)
+        fake_lock._opened_by_us = True
+        fake_lock._release_lock_if_owned()
+        assert lock_path.exists(), "Empty content alone must NEVER be treated as ownership"
+
+        # Scenario 2: Foreign lockfile contains another process/token
+        foreign_token = "pid=999999:foreign_process_run"
+        lock_path.write_text(foreign_token, encoding="utf-8")
+
+        lock_instance_2 = _ManifestRunLock(lock_path, run_id)
+        with pytest.raises(ManifestStoreConcurrencyError, match="Concurrent writer lock active"):
+            with lock_instance_2:
+                pass
+
+        assert lock_path.exists(), "Foreign token lockfile must NOT be deleted on acquisition failure"
+        assert lock_path.read_text(encoding="utf-8") == foreign_token
+
+        # Calling _release_lock_if_owned directly must NOT delete foreign file
+        lock_instance_2._release_lock_if_owned()
+        assert lock_path.exists(), "Direct release on unowned instance must NOT delete foreign token file"
+        assert lock_path.read_text(encoding="utf-8") == foreign_token
+
+        # Cleanup test fixture file
+        lock_path.unlink()
 
     def test_zero_secrets_policy_enforcement(self, tmp_path: Path) -> None:
         """Manifest containing sensitive secret tokens is strictly rejected before write."""
