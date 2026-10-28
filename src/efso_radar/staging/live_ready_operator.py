@@ -108,6 +108,7 @@ class LiveReadyOperatorReport(BaseModel):
     lockdown_recorded: bool = False
     live_execution_refused: bool = True
     security_boundary_active: bool = True
+    recovery_notice: Optional[str] = None
 
     def summary(self) -> str:
         lines = [
@@ -130,6 +131,8 @@ class LiveReadyOperatorReport(BaseModel):
         for st in self.stages:
             st_res = "PASS" if st.success else "FAIL"
             lines.append(f"  [{st_res}] {st.stage_id}: {st.name} ({st.http_requests_used} calls, {st.duration_seconds:.3f}s)")
+        if self.recovery_notice:
+            lines.append(f"Recovery Notice: {self.recovery_notice}")
         if self.errors:
             lines.append("Errors:")
             for err in self.errors:
@@ -612,6 +615,10 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
                     )
 
             # 8c: Independent 3-State Audit
+            if self.simulate_audit_failure:
+                self.audit_state = AuditOutcomeState.UNKNOWN
+                raise TursoClientError("Simulated transport failure during audit verification query")
+
             residual_found = False
             for ent in self.manifest.registered_entities:
                 tbl = ent["table"]
@@ -809,6 +816,12 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             lockdown_recorded=self.lockdown_recorded,
             live_execution_refused=self.live_execution_refused,
             security_boundary_active=self.security_boundary is not None,
+            recovery_notice=(
+                "SEPARATE_OPERATOR_REVIEWED_RECOVERY_REQUIRED: Automatic retry or deletion is prohibited; "
+                "preserved manifest on disk requires a separate, independently reviewed recovery procedure."
+                if session_status != LiveReadyOperatorStatus.PASSED or self.audit_state != AuditOutcomeState.CLEAN
+                else None
+            ),
         )
 
 
