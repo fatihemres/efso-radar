@@ -1,6 +1,6 @@
 # Efso Radar — Verification Ledger
 
-**Checkpoint:** 2026-10-26. This ledger separates direct GitHub CI evidence, agent-reported local runs, historical pilot acceptance and missing validations. **No tests were run by ChatGPT against a local clone for this documentation task.** Evidence is not a release certificate.
+**Checkpoint:** 2026-10-28. This ledger separates direct GitHub CI evidence, agent-reported local runs, historical pilot acceptance and missing validations. **No tests were run by ChatGPT against a local clone for this documentation task.** Evidence is not a release certificate.
 
 ## Current independently checked evidence
 
@@ -13,17 +13,19 @@
 | Prior manual editorial pilot | [Phase 4 closure](docs/PHASE4_CLOSURE.md) | **Historical claimed acceptance**, including narrowly scoped RSS/Gemini/Telegram tests. Not authorization for present live operations or proof of current unattended reliability. |
 | Repository governance PR | This documentation-only branch | Prior reviewed HEAD `c3cc34a` passed both CI jobs as above; any new documentation commit must be rechecked. Markdown links/rendering and explicit PO merge approval are separate review gates. No runtime test or live activation is claimed here. |
 
-## Issue #21 — Zero-spend implementation candidate (unmerged)
+## Phase 5B.3G-C Persistent Manifest Foundation Evidence (2026-10-28)
 
-- Candidate branch `fix/issue-21-zero-spend-gates-20261026` attempts hard-blocking of real Gemini calls in the editorial engine, shadow evaluator and historical Phase 4D helper until separately approved provider billing safeguards exist. Existing offline cached results and synthetic mocks are deliberately distinct.
-- Operational AI monetary defaults are zero; `Settings.from_env` rejects positive historical budget overrides, while explicit positive values remain available only to legacy hermetic price-estimation tests. This is not provider Free Tier verification or permission to activate services.
-- Added negative tests for defaults, zero/negative validation, positive environment rejection, production engine no-dispatch and real shadow client no-dispatch. Historical mock-only calibration budget tests explicitly use old numeric ceilings so they still test the cost calculator without permitting real dispatch. **Tests have not been locally run by ChatGPT**.
-- Initial CI at `fbaf7a7` ([run 40311808779](https://github.com/fatihemres/efso-radar/actions/runs/40311808779)) **FAILED**: 4 pre-existing tests assumed positive defaults or the missing-key diagnostic. The candidate patch addresses those specific regressions; rerun CI and inspect exact logs before any VERIFIED classification.
-- After isolated regression corrections at `474fd344d08c3544f3d7cf29271b33f44152ae9d`, GitHub Actions [run 40312122720](https://github.com/fatihemres/efso-radar/actions/runs/40312122720) **PASSED** on Linux Python **3.11 and 3.12**: **558 passed, 14 skipped, 154 subtests passed per Python job**, confirmed from both raw job logs.
-- **Independent review correction (2026-10-26):** Review of all 63 non-test Python files identified four Gemini SDK dispatch locations, including previously unguarded `src/radar.py:judge` and a bypass via injected `mock_client` in the shadow evaluator. Scoped commits [`462b9956`](https://github.com/fatihemres/efso-radar/commit/462b9956e3be6ea81e8ec1583274c7d5f5b8465f) and [`27723b0a`](https://github.com/fatihemres/efso-radar/commit/27723b0a72599aa2b63ba5c273b990a23e98ec9d) close both routes, move historical pilot live-denial before local file/ledger access, reject NaN/infinite monetary budgets, and explicitly scope mocks to hermetic tests. They do not authorize live operations.
-- **Post-review code CI:** [run 40321496127](https://github.com/fatihemres/efso-radar/actions/runs/40321496127) on commit `27723b0a72599aa2b63ba5c273b990a23e98ec9d` **PASSED** on Linux Python **3.11 and 3.12**: **561 passed, 14 skipped, 163 subtests passed per job**, confirmed independently from raw job logs. No independent local Windows or provider test. Any subsequent doc/test commit needs its own CI evidence. The PR remains DRAFT / UNMERGED pending the Product Owner.
+| What | Exact evidence / environment | Result and boundary |
+| --- | --- | --- |
+| Persistent Manifest Store tests | Windows Python 3.12.10, `venv\Scripts\python.exe -m pytest tests/test_phase5b3g_c_persistent_manifest_store_offline.py -v` | **18 passed, 2 skipped in 1.10s** (2 symlink privilege tests skipped on Windows); zero real network calls. Covered: default-deny on live execution, strict rejection of repo root, `.git`, `.env`, `data/`, and OS temp (in production mode), empty/null byte path rejection, path traversal rejection, symlink/reparse point checks (`FILE_ATTRIBUTE_REPARSE_POINT`), process restart/reopen simulation, OS temp loss/purging simulation, atomic sibling temp file persistence with explicit `flush()` and `os.fsync()`, atomic replace, overwrite protection (`ManifestStoreFileExistsError`), lockfile concurrency safety (`_ManifestRunLock` with `O_CREAT | O_EXCL`), zero secrets policy enforcement, tamper detection across schema/attributes and formatting SHA-256 seal, retention on `UNKNOWN`/`RESIDUAL`/`OFFLINE_VALIDATION_PASSED` states, unlinking strictly on `CLEAN`, offline recovery validation against `:memory:` SQLite schema v6 fixture, and platform storage guarantees. |
+| Phase 5B.3G full staging suite | Windows Python 3.12.10, `venv\Scripts\python.exe -m pytest (Get-ChildItem tests/test_phase5b3g*.py) -q` | **242 passed, 3 skipped, 118 subtests passed in 17.48s** across all Phase 5B.3G test modules. |
+| Full hermetic test suite | Windows Python 3.12.10, `venv\Scripts\python.exe -m pytest tests -k "not test_phase3c2b_notification_quality_on_calibration_dataset and not test_budget_ledger_reporting_matches_ledger_file and not test_phase4d_final_editorial_review_override" -q` | **743 passed, 3 skipped, 3 deselected, 276 subtests passed in 164.88s**; zero real network calls. |
+| Static safety lint | Windows Python 3.12.10, `venv\Scripts\ruff.exe check --target-version py311 --select E9,F63,F7,F82 src scripts tests` | **PASS (All checks passed!)** |
+| Platform storage guarantees inspection | `StoragePlatformGuarantees` via `get_storage_platform_guarantees()` | Confirmed Windows and Linux platform guarantees and documented blockers: lack of directory fsync on Windows NTFS, Windows ACL vs POSIX permission bits (0700/0600), and POSIX cross-filesystem rename limits. |
 
-## Phase 5B.3G-C Live-Ready Operator Candidate Evidence — Post-Review 4 (2026-10-28)
+## Phase 5B.3G-C Live-Ready Operator Evidence (INTEGRATED PR #35, 2026-10-28)
+
+Merged into `main` at commit `1530f8340c37e3952b02a8edd56c6b5857845044`.
 
 | What | Exact evidence / environment | Result and boundary |
 | --- | --- | --- |

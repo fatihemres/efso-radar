@@ -1,6 +1,6 @@
 # Efso Radar — Roadmap and Acceptance Gates
 
-**Snapshot 2026-10-26** — roadmap records intent, not permission for live execution. Status meanings and quality gates: [Engineering Governance](docs/ENGINEERING_GOVERNANCE.md). PO alone closes milestones.
+**Snapshot 2026-10-28** — roadmap records intent, not permission for live execution. Status meanings and quality gates: [Engineering Governance](docs/ENGINEERING_GOVERNANCE.md). PO alone closes milestones.
 
 | Milestone | Scope & acceptance target | Evidence | Current classification |
 | --- | --- | --- | --- |
@@ -14,13 +14,29 @@
 | Phase 5B.3F | Hermetic reliability/concurrency and recovery validation | [PR #12](https://github.com/fatihemres/efso-radar/pull/12), [Issue #11](https://github.com/fatihemres/efso-radar/issues/11) | **INTEGRATED / OFFLINE VERIFIED** |
 | Phase 5B.3G-A | Controlled live staging *specification*, without live execution | [PR #14](https://github.com/fatihemres/efso-radar/pull/14) | **INTEGRATED (DESIGN)** |
 | Phase 5B.3G-B | Hermetic eight-step mock staging runner, strict safety barriers | [PR #16](https://github.com/fatihemres/efso-radar/pull/16) | **INTEGRATED / OFFLINE VERIFIED** |
-| Phase 5B.3G-C | Conditional real Turso staging reliability session, exactly scoped and audited | [Issue #13](https://github.com/fatihemres/efso-radar/issues/13), [LIVE-01 evidence](https://github.com/fatihemres/efso-radar/issues/13#issuecomment-6421424925), [plan](docs/PHASE5B3G_LIVE_STAGING_RELIABILITY_PLAN.md) | **READ-ONLY LIVE-01 OPERATOR PASS / WRITE PHASES NOT AUTHORIZED** |
+| Phase 5B.3G-C | Controlled Turso staging reliability session, operator safeguards & manifest store | [Issue #13](https://github.com/fatihemres/efso-radar/issues/13), [PR #35](https://github.com/fatihemres/efso-radar/pull/35), [LIVE-01 evidence](https://github.com/fatihemres/efso-radar/issues/13#issuecomment-6421424925), [plan](docs/PHASE5B3G_LIVE_STAGING_RELIABILITY_PLAN.md) | **PR #35 INTEGRATED / STORE FOUNDATION CANDIDATE (OFFLINE ONLY)** |
 | Follow-on cloud cutover & unattended operations | Cloud parity, backups, zero-cost controls, human editorial recipient tests, PO release decision | Existing Phase 5 architecture; future issue required | **DISCOVERY / NOT AUTHORIZED** |
 | Rights and distribution | Review third-party origins and decide visibility/distribution | [Issue #17](https://github.com/fatihemres/efso-radar/issues/17) | **IN PROGRESS (AUDIT)** |
 
-## 2026-10-28 Phase 5B.3G-C Live-Ready Operator Preparation Checkpoint (Candidate / Unmerged PR #35)
+## 2026-10-28 Phase 5B.3G-C Persistent Manifest Foundation Checkpoint (Candidate / Draft PR)
 
-Operator candidate `LiveReadyStagingOperator` and `HranaOutboundSecurityBoundary` prepared as an unmerged candidate (Draft PR #35, Review Round 4 remediation, pending independent review).
+Persistent manifest store foundation implemented under `PersistentManifestStore` and `HermeticTestManifestStore` (`src/efso_radar/staging/persistent_manifest_store.py`) to provide machine-reboot durability and process-restart resilience:
+- Enforces strict default-deny for live execution: unconfigured or unauthorized live persistence fails closed (`PermissionError`) by default.
+- Fail-closed security boundaries rejecting repository root, `.git`, `.env`, `data/`, OS temp (in production mode), symlinks, junctions, reparse points, and insecure permissions.
+- Dedicated hermetic test store adapter (`HermeticTestManifestStore`) for isolated test fixtures.
+- Durable atomic file writes: unique sibling temp file, explicit `flush()` and `os.fsync()`, atomic replace, POSIX directory fsync, POSIX 0o600 / 0o700 permission bits.
+- Overwrite protection: manifests for the same `run_id` can never be overwritten; fails closed with `ManifestStoreFileExistsError`.
+- Concurrency safety: atomic lockfile per `run_id` (`O_CREAT | O_EXCL`) preventing race conditions across processes and threads.
+- Read-only reload and SHA-256 seal verification: missing or tampered manifest files fail closed and never grant write permissions.
+- Manifest retention on non-clean outcomes: manifests are preserved under `UNKNOWN`, `RESIDUAL`, `FAILED`, and ownership mismatch states; unlinking is only permitted for verified `CLEAN` state.
+- Hermetic-only offline recovery validation: simulates inspection against in-memory SQLite Schema v6 fixture; never modifies remote Turso, never unlinks manifest, returns `OFFLINE_VALIDATION_PASSED` (never remote `CLEAN`).
+- Platform storage guarantees: explicit reporting of Windows and Linux storage guarantees and identified blockers (`StoragePlatformGuarantees`).
+- Architectural inconsistency documented: noted the contradiction between the historical 80-request cutoff automatic LIVE-08 transition and PR #35's strict monotonic stage sequence, proposing safe policy (no automatic cleanup on early failure; retain manifest fail-closed; separate controlled recovery).
+- All live staging operations remain **UNAUTHORIZED**; Block Writes remains ON. 20 focused store tests passing, 242 passed across all Phase 5B.3G tests, Ruff clean.
+
+## 2026-10-28 Phase 5B.3G-C Live-Ready Operator Preparation Checkpoint (INTEGRATED PR #35)
+
+Operator safeguards integrated into `main` at `1530f8340c37e3952b02a8edd56c6b5857845044` (PR #35 merged).
 - Reuses existing hermetic runner, preflight, manifest sealing, and session gate components.
 - Enforces strict default-deny for live execution; fails closed immediately on non-hermetic transports (no duck-typing bypasses).
 - Outbound boundary wired into transport chain, enforcing wire-level stage sequence and human approval gating: direct client mutations outside active stages or prior to preflight/human approval fail closed immediately. Transitions require source-backed evidence (verified wire preflight requests and operator attestation); public SHA-256 cannot be self-issued to escalate permissions.
@@ -32,7 +48,6 @@ Operator candidate `LiveReadyStagingOperator` and `HranaOutboundSecurityBoundary
 - Full gate workflow: verified LIVE-01 preflight, mandatory human window attestation before write stages, deadline (<120s), budget (<100 requests strictly enforced at wire edge, 20 cleanup reserve), ambiguous COMMIT = UNKNOWN, conditional DELETE (affected == 1), post-run lockdown assertion, and 3-state audit (CLEAN/RESIDUAL/UNKNOWN).
 - Transport lifecycle closure: client and security boundary permanently closed/invalidated across all exit paths (nominal run, early exit without human approval, exceptions).
 - Unlinking of manifest and PASSED status strictly blocked if human approval, any of the 8 stages, or lockdown assertion is missing or incomplete.
-- MANIFEST DURABILITY LIMITATION: Best-effort process-crash retention within OS tempdir. Machine reboot / temp purging is NOT resilient and remains an open prerequisite for unattended live cloud execution.
 - LOCKDOWN ASSERTION NOTICE: Post-run lockdown recording is an offline simulated assertion only, NOT real cloud dashboard state or token revocation.
 - All live staging operations remain **UNAUTHORIZED**; Block Writes remains ON. 60 focused offline operator tests passing.
 

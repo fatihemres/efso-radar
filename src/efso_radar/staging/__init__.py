@@ -40,6 +40,21 @@ if TYPE_CHECKING:
         EXACT_STAGING_HOSTNAME,
         recover_manifest_offline,
     )
+    from efso_radar.staging.manifest_seal import (
+        OfflineManifestSeal,
+        ManifestSealViolation,
+    )
+    from efso_radar.staging.persistent_manifest_store import (
+        PersistentManifestStore,
+        HermeticTestManifestStore,
+        ManifestStoreError,
+        ManifestStoreSecurityError,
+        ManifestStoreFileExistsError,
+        ManifestStoreCorruptionError,
+        ManifestStoreConcurrencyError,
+        StoragePlatformGuarantees,
+        get_storage_platform_guarantees,
+    )
     from efso_radar.staging.hrana_outbound_guard import (
         HranaOutboundSecurityBoundary,
         GuardedHermeticHranaTransport,
@@ -76,6 +91,17 @@ __all__ = [
     "EXACT_STAGING_DESTINATION",
     "EXACT_STAGING_HOSTNAME",
     "recover_manifest_offline",
+    "OfflineManifestSeal",
+    "ManifestSealViolation",
+    "PersistentManifestStore",
+    "HermeticTestManifestStore",
+    "ManifestStoreError",
+    "ManifestStoreSecurityError",
+    "ManifestStoreFileExistsError",
+    "ManifestStoreCorruptionError",
+    "ManifestStoreConcurrencyError",
+    "StoragePlatformGuarantees",
+    "get_storage_platform_guarantees",
     "StagingConnectionReport",
     "check_staging_connection",
     "HranaOutboundSecurityBoundary",
@@ -103,6 +129,23 @@ _RUNNER_EXPORTS = frozenset({
     "EXACT_STAGING_DESTINATION",
     "EXACT_STAGING_HOSTNAME",
     "recover_manifest_offline",
+})
+
+_SEAL_EXPORTS = frozenset({
+    "OfflineManifestSeal",
+    "ManifestSealViolation",
+})
+
+_PERSISTENT_STORE_EXPORTS = frozenset({
+    "PersistentManifestStore",
+    "HermeticTestManifestStore",
+    "ManifestStoreError",
+    "ManifestStoreSecurityError",
+    "ManifestStoreFileExistsError",
+    "ManifestStoreCorruptionError",
+    "ManifestStoreConcurrencyError",
+    "StoragePlatformGuarantees",
+    "get_storage_platform_guarantees",
 })
 
 _CONNECTION_EXPORTS = frozenset({
@@ -138,6 +181,12 @@ def __getattr__(name: str) -> Any:
     if name in _RUNNER_EXPORTS:
         import efso_radar.staging.runner as runner_mod
         return getattr(runner_mod, name)
+    if name in _SEAL_EXPORTS:
+        import efso_radar.staging.manifest_seal as seal_mod
+        return getattr(seal_mod, name)
+    if name in _PERSISTENT_STORE_EXPORTS:
+        import efso_radar.staging.persistent_manifest_store as pstore_mod
+        return getattr(pstore_mod, name)
     if name in _GUARD_EXPORTS:
         import efso_radar.staging.hrana_outbound_guard as guard_mod
         return getattr(guard_mod, name)

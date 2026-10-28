@@ -1,18 +1,36 @@
 # Efso Radar — Project Checkpoint
 
-**Verified snapshot date:** 2026-10-26 (GitHub inspection; NOT a live status feed)
+**Verified snapshot date:** 2026-10-28 (GitHub inspection; NOT a live status feed)
 **Canonical repository:** [fatihemres/efso-radar](https://github.com/fatihemres/efso-radar)
-**Baseline inspected:** `main` at `d1660653e9c6438660386120d8b9f3ae5357aded` **before this governance PR**. This checkpoint remains anchored to that implementation baseline until integrated and reverified.
+**Baseline inspected:** `main` at `1530f8340c37e3952b02a8edd56c6b5857845044` (PR #35 integrated).
 
 ## Product & implementation
 Efso Radar supplies selective Turkish/global entertainment-news discovery and editorial decision support for Efso Magazin; it does not automatically publish Instagram posts. Python 3.11/3.12 project with modular RSS discovery, multi-source parsing, deduplication/story memory, Gemini integration, Telegram formatting/delivery, SQLite and Turso Hrana v2 repositories, orchestration, encrypted backup primitives and offline staging test runner. Full architectural detail: [Architecture](docs/ARCHITECTURE.md).
 
 **Version ambiguity:** Historical Phase 4 closure and ADR call `v0.4.0` an anchor; actual `src/efso_radar/__init__.py` declares `__version__ = "2.0.0"`. No GitHub Releases were returned on inspection. Treat public stable release identity as **unreconciled**, not 2.0.0 or v0.4.0 by assumption. See [Release Policy](docs/RELEASE_POLICY.md).
 
-## Latest operational checkpoint — Phase 5B.3G-C Operator Candidate Preparation (2026-10-28)
+## Latest operational checkpoint — Phase 5B.3G-C Persistent Manifest Foundation (2026-10-28)
 
-- **Main baseline:** `b6982b499c97cedeb32fadb06df537d3837fd85e` (PR #31, #32, #33, #34 integrated).
-- **Candidate implementation:** `LiveReadyStagingOperator` (`src/efso_radar/staging/live_ready_operator.py`) and `HranaOutboundSecurityBoundary` (`src/efso_radar/staging/hrana_outbound_guard.py`) under Draft PR #35 (unmerged candidate, Review Round 4 remediation).
+- **Main baseline:** `1530f8340c37e3952b02a8edd56c6b5857845044` (PR #35 integrated).
+- **Candidate implementation:** `PersistentManifestStore` and `HermeticTestManifestStore` (`src/efso_radar/staging/persistent_manifest_store.py`), plus extended `OfflineManifestSeal` supporting configured persistent roots (`src/efso_radar/staging/manifest_seal.py`).
+- **Safety guarantees enforced:**
+  1. Default-deny for live execution: persistent store defaults to `live_authorized=False`; live execution attempts fail closed (`PermissionError`) by default.
+  2. Fail-closed security boundaries: rejects repository root, `.git`, `.env`, `data/`, OS temp (in production mode), symlinks, junctions, reparse points, and insecure group/world permissions.
+  3. Hermetic test adapter: `HermeticTestManifestStore` explicitly scoped to hermetic test fixture directories while enforcing all security invariants.
+  4. Durable atomic persistence: sibling temporary file, explicit `flush()` and `os.fsync()`, atomic replace, POSIX directory fsync, POSIX 0o600 / 0o700 permission bits.
+  5. Overwrite protection: existing manifests for the same `run_id` can never be overwritten; fail closed immediately with `ManifestStoreFileExistsError`.
+  6. Concurrency safety: atomic lockfile per `run_id` (`O_CREAT | O_EXCL`) preventing race conditions across concurrent processes and threads.
+  7. Read-only reload & seal verification: missing or tampered manifest files fail closed and never grant write permissions.
+  8. Retention on non-clean outcomes: manifests are preserved under `UNKNOWN`, `RESIDUAL`, `FAILED`, and ownership mismatch states; unlinking is strictly restricted to verified `CLEAN` state.
+  9. Hermetic-only offline recovery validation: simulates inspection against in-memory SQLite Schema v6 fixture; never modifies remote Turso, never unlinks manifest, returns `OFFLINE_VALIDATION_PASSED` (never remote `CLEAN`).
+  10. Platform storage guarantees: explicit reporting of Windows and Linux storage guarantees and identified blockers (`StoragePlatformGuarantees`).
+  11. Architectural inconsistency documented: noted the contradiction between the historical 80-request cutoff automatic LIVE-08 transition and PR #35's strict monotonic stage sequence, proposing safe policy (no automatic cleanup on early failure; retain manifest fail-closed; separate controlled recovery).
+- **Phase 5B.3G-C remains OFFLINE-ONLY:** live execution is NOT enabled. No real Turso connection, no credentials created, and Block Writes remains ON. 20 focused store tests passing (18 passed, 2 skipped on Windows due to symlink privilege), 242 passed across all Phase 5B.3G tests, Ruff clean.
+
+## Historical operational checkpoint — Phase 5B.3G-C Operator Safeguards (INTEGRATED PR #35, 2026-10-28)
+
+- **Main baseline:** `b6982b499c97cedeb32fadb06df537d3837fd85e` -> integrated at `1530f8340c37e3952b02a8edd56c6b5857845044` (PR #35 merged).
+- **Integrated implementation:** `LiveReadyStagingOperator` (`src/efso_radar/staging/live_ready_operator.py`) and `HranaOutboundSecurityBoundary` (`src/efso_radar/staging/hrana_outbound_guard.py`).
 - **Safety guarantees enforced:**
   1. Default-deny for live execution: attempts to initialize with real network transports or spoofed transports strictly fail closed (`PermissionError`) by default.
   2. Wire-level authorization & stage sequence gating: mutations at the HTTP wire edge require preflight wire evidence (`_preflight_queries_count >= 10` and 5 baseline collision checks verified on the wire; cannot be caller-self-issued), explicit human window confirmation verified against the active operator instance (`operator._preflight_accepted is True`), and monotonic stage sequence (`LIVE-01` -> preflight completed -> human window confirmed -> `LIVE-02` -> ... -> `LIVE-08`). In the nominal flow, `LIVE-08` is only permissible at stage sequence index 8 after all preceding stages completed; out-of-order stage transitions rejected with `OUT_OF_ORDER_STAGE`. Replay of spent mutations is rejected. Direct-client conditional DELETE before full-row ownership precheck reads on the wire is strictly denied (`OWNERSHIP_PRECHECK_REQUIRED`). Early stage failure halts fail-closed; early cleanup is not permitted as an in-session bypass and remains an open fail-closed recovery requirement. State transitions require sealed manifest SHA-256 validation (no public boolean escalation).
@@ -38,13 +56,14 @@ This dated addendum supersedes the *planning-only* LIVE-01 assessment in the ear
 
 ## Delivery status
 - **CLOSED/ACCEPTED (historical):** Phase 4 pilot; [closure record](docs/PHASE4_CLOSURE.md). Historical live trials do not authorize present operation.
-- **INTEGRATED:** Phase 5A design PR [#2](https://github.com/fatihemres/efso-radar/pull/2); Phase 5B.1 [#3](https://github.com/fatihemres/efso-radar/pull/3), 5B.2 [#5](https://github.com/fatihemres/efso-radar/pull/5), 5B.3B [#6](https://github.com/fatihemres/efso-radar/pull/6), 5B.3C-1/-2 [#7](https://github.com/fatihemres/efso-radar/pull/7)/[#8](https://github.com/fatihemres/efso-radar/pull/8), 5B.3D [#9](https://github.com/fatihemres/efso-radar/pull/9), 5B.3E [#10](https://github.com/fatihemres/efso-radar/pull/10), 5B.3F [#12](https://github.com/fatihemres/efso-radar/pull/12), 5B.3G-A specification [#14](https://github.com/fatihemres/efso-radar/pull/14), 5B.3G-B offline runner [#16](https://github.com/fatihemres/efso-radar/pull/16).
+- **INTEGRATED:** Phase 5A design PR [#2](https://github.com/fatihemres/efso-radar/pull/2); Phase 5B.1 [#3](https://github.com/fatihemres/efso-radar/pull/3), 5B.2 [#5](https://github.com/fatihemres/efso-radar/pull/5), 5B.3B [#6](https://github.com/fatihemres/efso-radar/pull/6), 5B.3C-1/-2 [#7](https://github.com/fatihemres/efso-radar/pull/7)/[#8](https://github.com/fatihemres/efso-radar/pull/8), 5B.3D [#9](https://github.com/fatihemres/efso-radar/pull/9), 5B.3E [#10](https://github.com/fatihemres/efso-radar/pull/10), 5B.3F [#12](https://github.com/fatihemres/efso-radar/pull/12), 5B.3G-A specification [#14](https://github.com/fatihemres/efso-radar/pull/14), 5B.3G-B offline runner [#16](https://github.com/fatihemres/efso-radar/pull/16), 5B.3G-C operator safeguards [#35](https://github.com/fatihemres/efso-radar/pull/35).
+- **CANDIDATE (DRAFT PR):** Phase 5B.3G-C persistent manifest store foundation.
 - **Rights documentation INTEGRATED:** [#18](https://github.com/fatihemres/efso-radar/pull/18) and [#19](https://github.com/fatihemres/efso-radar/pull/19); rights audit [#17](https://github.com/fatihemres/efso-radar/issues/17) is OPEN.
 - **ACTIVE PLANNING / NOT AUTHORIZED LIVE:** [#13](https://github.com/fatihemres/efso-radar/issues/13) Phase 5B.3G controlled Turso staging validation. Next logical work: review staging readiness and safety gates, then obtain explicit per-operation PO authority before any remote action. 5B.3G-B is offline-only; it is **not** evidence that real Turso transaction tests have run.
 - No new product code or live workflow activated by this governance PR.
 
 ## Verified quality evidence
-GitHub Actions run [40211637125](https://github.com/fatihemres/efso-radar/actions/runs/40211637125) for merged PR #16 succeeded on Python 3.11 and 3.12. Antigravity **reported** 568 local passing tests and 154 subtests; independent historical code review and CI status were checked, but the local command was not rerun in this environment. See [VERIFICATION](VERIFICATION.md).
+GitHub Actions run [40211637125](https://github.com/fatihemres/efso-radar/actions/runs/40211637125) for merged PR #16 succeeded on Python 3.11 and 3.12. Merged PR #35 CI run [40650489716](https://github.com/fatihemres/efso-radar/actions/runs/40650489716) verified across all matrix jobs (Linux 3.11/3.12, Windows 3.12, Ruff). See [VERIFICATION](VERIFICATION.md).
 
 ## Immediate risks / decision gates
 1. **Live staging:** Block Writes ON, revoked credentials; real reads/writes and connection attempts prohibited without new PO authorization; $0 spend ceiling. Remote availability/state not independently rechecked now.

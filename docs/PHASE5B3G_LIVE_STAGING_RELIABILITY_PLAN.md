@@ -196,6 +196,8 @@ Every record that might potentially be written—including tentative records lik
 > 
 > **Post-integration status (2026-10-26):** Under the earlier documentation-only Phase 5B.3G-A PR, live recovery was only a design. Subsequent integrated G-B now implements `--recover-manifest` **for offline manifest validation only**, using in-memory SQLite. It does not connect to Turso, establish remote CLEAN, mutate staging or delete the source manifest. A **live remote recovery procedure** remains unimplemented, and requires separate PO authorization.
 
+> **Persistent Manifest Store Foundation (Phase 5B.3G-C, 2026-10-28):** A dedicated persistent manifest store (`PersistentManifestStore` / `HermeticTestManifestStore`) is introduced to provide reboot-durable, atomic file writes with `os.fsync()`, lockfile concurrency protection, overwrite rejection, and hash seal verification outside volatile OS temp directories. Live staging write execution remains strictly unauthorized (offline-only engineering foundation).
+
 ---
 
 ## 4. Controlled Live Test Specifications
@@ -353,6 +355,9 @@ An empirical offline simulation against Schema v6 establishes the exact nominal 
   - Exactly **20 HTTP requests are strictly reserved for LIVE-08 cleanup and audit** (worst-case requirement is 15 calls).
   - If cumulative HTTP calls reach **80 requests** during test steps LIVE-02 through LIVE-07, testing is immediately suspended and the runner transitions directly to LIVE-08 cleanup using its reserved allocation.
   - *Planning Allowance Notice:* The cleanup reserve is an operational planning allowance to prevent test steps from starving cleanup under nominal conditions; it is **NOT a mathematical guarantee of successful cleanup under network transport failures or cloud outages**.
+  - *Architectural Inconsistency & Recommended Safe Policy Proposal (Open Proposal — NOT an Approved PO Decision):*
+    - **Contradiction Identified:** The historical plan text above prescribes jumping directly from intermediate stages (LIVE-02..LIVE-07) to LIVE-08 upon reaching 80 requests. However, PR #35 enforces a strict monotonic stage sequence (`LIVE-01` -> preflight completed -> human window confirmed -> `LIVE-02` -> ... -> `LIVE-08`) at the wire security boundary, strictly prohibiting `LIVE-08` before stage sequence index 8 (`OUT_OF_ORDER_STAGE`).
+    - **Recommended Safe Policy (Proposed):** In any early stage failure, abort, or 80-request cutoff prior to LIVE-08, **no automatic in-session cleanup is dispatched**. Execution halts immediately fail-closed, the persistent manifest is preserved on disk, session status is marked `UNKNOWN` or `FAILED`, transports are permanently invalidated (`close_session()`), and manual operator review is required. Any remote cleanup for incomplete sessions must be architected as an independent, separately authorized, and strictly audited recovery procedure rather than an in-session sequence bypass. No remote early-failure recovery is implemented under Phase 5B.3G-C.
 - **Failure Handling on Budget Exhaustion Before Audit Completion:**
   - If unexpected query errors or connection retries cause cumulative calls to reach the hard 100-request ceiling before the 3-state audit can be fully completed, the runner **must not dispatch further requests**.
   - The outcome status is immediately marked **`UNKNOWN`**.
