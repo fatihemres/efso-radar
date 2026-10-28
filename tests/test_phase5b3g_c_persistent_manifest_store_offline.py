@@ -13,9 +13,11 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any
+import uuid
 import pytest
 
 from efso_radar.staging.manifest_seal import (
@@ -29,8 +31,10 @@ from efso_radar.staging.persistent_manifest_store import (
     ManifestStoreCorruptionError,
     ManifestStoreError,
     ManifestStoreFileExistsError,
+    ManifestStorePostPublicationError,
     ManifestStoreSecurityError,
     PersistentManifestStore,
+    _ManifestRunLock,
     _find_repo_root,
     _publish_file_no_overwrite,
     get_storage_platform_guarantees,
@@ -38,6 +42,7 @@ from efso_radar.staging.persistent_manifest_store import (
 from efso_radar.staging.runner import (
     AuditOutcomeState,
     PerRunOwnershipManifest,
+    RegisteredEntity,
     create_default_manifest_entities,
 )
 
@@ -108,6 +113,46 @@ class TestPersistentManifestStoreSecurity:
                 HermeticTestManifestStore(fake_user_dir)
         except (RuntimeError, OSError):
             pass
+
+    def test_hermetic_test_store_rejects_random_temp_directories(self) -> None:
+        """HermeticTestManifestStore rejects arbitrary temporary directories not in a verified fixture hierarchy."""
+        random_temp = Path(tempfile.gettempdir()) / f"unauthorized_random_temp_{uuid.uuid4().hex}"
+        with pytest.raises(ManifestStoreSecurityError, match="ownership-verified isolated test fixture"):
+            HermeticTestManifestStore(random_temp)
+
+    def test_hermetic_test_store_preserves_preexisting_directory_permissions(self, tmp_path: Path) -> None:
+        """Pre-existing directories with insecure permissions are rejected without mutating permissions."""
+        preexisting = tmp_path / "preexisting_insecure_dir"
+        preexisting.mkdir(mode=0o755)
+        if sys.platform != "win32":
+            os.chmod(preexisting, 0o755)
+            initial_mode = preexisting.stat().st_mode & 0o777
+
+            with pytest.raises(ManifestStoreSecurityError, match="Pre-existing directory has insecure permissions"):
+                HermeticTestManifestStore(preexisting)
+
+            # Permissions must remain UNCHANGED (not mutated to 0700)
+            after_mode = preexisting.stat().st_mode & 0o777
+            assert after_mode == initial_mode == 0o755
+
+    def test_hermetic_test_store_authorized_fixture_root_registration(self) -> None:
+        """Custom test roots registered via register_authorized_fixture_root are permitted and clean up cleanly."""
+        custom_root = Path(tempfile.gettempdir()) / f"custom_fixture_root_{uuid.uuid4().hex}"
+        try:
+            # Unregistered: rejected
+            with pytest.raises(ManifestStoreSecurityError, match="ownership-verified isolated test fixture"):
+                HermeticTestManifestStore(custom_root)
+
+            # Register authorized fixture root
+            HermeticTestManifestStore.register_authorized_fixture_root(custom_root)
+            store = HermeticTestManifestStore(custom_root / "store")
+            assert store.root_dir.exists()
+        finally:
+            HermeticTestManifestStore.clear_authorized_fixture_roots()
+            if (custom_root / "store").exists():
+                (custom_root / "store").rmdir()
+            if custom_root.exists():
+                custom_root.rmdir()
 
     def test_rejects_empty_or_null_byte_path(self, tmp_path: Path) -> None:
         """Store strictly rejects empty paths or null bytes."""
@@ -436,10 +481,15 @@ print("SUBPROCESS_VERIFIED_OK")
     def test_directory_fsync_failure_on_posix_fails_closed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Directory fsync failure on POSIX is not silently swallowed and raises ManifestStoreError."""
+        """Directory fsync failure on POSIX preserves published manifest and does not touch other files."""
         store = HermeticTestManifestStore(tmp_path / "store")
         run_id = _generate_valid_run_id("dirfsync0001")
         manifest = _create_sample_manifest(run_id)
+        expected_bytes = manifest.model_dump_json(indent=2).encode("utf-8")
+
+        # Create an unrelated sentinel file in the store directory to verify other files are untouched
+        sentinel_path = store.root_dir / "unrelated_sentinel.txt"
+        sentinel_path.write_text("sentinel_unrelated_content", encoding="utf-8")
 
         # Force platform to non-win32 to trigger directory fsync path
         monkeypatch.setattr(sys, "platform", "linux")
@@ -450,16 +500,30 @@ print("SUBPROCESS_VERIFIED_OK")
         def mock_fsync(fd: int) -> None:
             call_count[0] += 1
             if call_count[0] == 1:
-                # First call is file fsync: allow it to succeed
+                # First call is file fsync on temp_fd: allow it to succeed
                 real_fsync(fd)
             else:
-                # Second call is directory fsync: fail
+                # Second call is parent directory fsync: fail
                 raise OSError("Simulated directory fsync media error")
 
         monkeypatch.setattr(os, "fsync", mock_fsync)
 
-        with pytest.raises(ManifestStoreError, match="Parent directory fsync failed"):
+        with pytest.raises(ManifestStorePostPublicationError, match="Parent directory fsync failed.*preserved fail-closed"):
             store.save_manifest(manifest)
+
+        # Verify P1-A invariant: the canonical manifest file is NOT deleted!
+        target_path = store.get_manifest_path(run_id)
+        assert target_path.exists(), "Published canonical manifest must not be unlinked on directory fsync failure"
+        assert target_path.is_file()
+        assert target_path.read_bytes() == expected_bytes, "Published manifest bytes must be preserved intact"
+
+        # Verify unrelated files are untouched
+        assert sentinel_path.exists(), "Unrelated files in store directory must not be deleted or modified"
+        assert sentinel_path.read_text(encoding="utf-8") == "sentinel_unrelated_content"
+
+        # Verify no temporary or lock artifacts are leaked
+        leaked = [f.name for f in store.root_dir.iterdir() if f.name.startswith((".tmp_manifest_", ".lock_"))]
+        assert leaked == [], f"No leaked temp or lock artifacts expected, found: {leaked}"
 
     def test_tamper_detection_fails_closed(self, tmp_path: Path) -> None:
         """Modifying a single byte of a saved manifest triggers tamper detection."""
@@ -749,6 +813,188 @@ print("SUBPROCESS_VERIFIED_OK")
         monkeypatch.setattr(os, "lstat", lambda p: MockStat())
         monkeypatch.setattr(sys, "platform", "win32")
         assert _is_reparse_point(test_file) is True
+
+    def test_canonical_manifest_validation_rejects_non_canonical_before_publication_and_allows_subsequent_valid_save(
+        self, tmp_path: Path
+    ) -> None:
+        """save_manifest rejects invalid title, modified ownership markers, and duplicate entities before writing."""
+        store = HermeticTestManifestStore(tmp_path / "store")
+        run_id = _generate_valid_run_id("canonval0001")
+        canonical_entities = create_default_manifest_entities(run_id)
+
+        # 1. Invalid title
+        invalid_title_entities = [
+            RegisteredEntity(
+                table=e.table,
+                pk_column=e.pk_column,
+                pk_value=e.pk_value,
+                cleanup_dependency_order=e.cleanup_dependency_order,
+                expected_attributes=(
+                    {**e.expected_attributes, "title": "MALICIOUS_INJECTED_TITLE"}
+                    if "title" in e.expected_attributes
+                    else e.expected_attributes
+                ),
+            )
+            for e in canonical_entities
+        ]
+        manifest_bad_title = PerRunOwnershipManifest(
+            run_id=run_id,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            registered_entities=invalid_title_entities,
+        )
+        with pytest.raises(ValueError, match="attribute 'title' mismatch"):
+            store.save_manifest(manifest_bad_title)
+
+        # 2. Altered ownership marker (e.g. altered worker_ids)
+        invalid_worker_entities = [
+            RegisteredEntity(
+                table=e.table,
+                pk_column=e.pk_column,
+                pk_value=e.pk_value,
+                cleanup_dependency_order=e.cleanup_dependency_order,
+                expected_attributes=(
+                    {**e.expected_attributes, "worker_ids": ["rogue_worker"]}
+                    if "worker_ids" in e.expected_attributes
+                    else e.expected_attributes
+                ),
+            )
+            for e in canonical_entities
+        ]
+        manifest_bad_worker = PerRunOwnershipManifest(
+            run_id=run_id,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            registered_entities=invalid_worker_entities,
+        )
+        with pytest.raises(ValueError, match="attribute 'worker_ids' mismatch"):
+            store.save_manifest(manifest_bad_worker)
+
+        # 3. Duplicate entity (6 entries, or 5 entries with duplicate key)
+        duplicate_entities = list(canonical_entities) + [canonical_entities[0]]
+        manifest_duplicate = PerRunOwnershipManifest(
+            run_id=run_id,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            registered_entities=duplicate_entities,
+        )
+        with pytest.raises(ValueError, match="Manifest must contain exactly 5 registered entities"):
+            store.save_manifest(manifest_duplicate)
+
+        # 4. Wrong cleanup dependency order
+        wrong_order_entities = [
+            RegisteredEntity(
+                table=e.table,
+                pk_column=e.pk_column,
+                pk_value=e.pk_value,
+                cleanup_dependency_order=99,
+                expected_attributes=e.expected_attributes,
+            )
+            if e.cleanup_dependency_order == 1
+            else e
+            for e in canonical_entities
+        ]
+        manifest_wrong_order = PerRunOwnershipManifest(
+            run_id=run_id,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            registered_entities=wrong_order_entities,
+        )
+        with pytest.raises(ValueError, match="unexpected cleanup_dependency_order"):
+            store.save_manifest(manifest_wrong_order)
+
+        # Verify NO manifest file or temporary/lock file exists after rejections
+        target_path = store.get_manifest_path(run_id)
+        assert not target_path.exists(), "Target file must not be created on validation failure"
+        leaked = [f.name for f in store.root_dir.iterdir() if f.name.startswith((".tmp_manifest_", ".lock_"))]
+        assert leaked == [], f"No leaked temp or lock artifacts expected, found: {leaked}"
+
+        # 5. Subsequent valid save with the EXACT SAME run_id succeeds cleanly
+        valid_manifest = _create_sample_manifest(run_id)
+        published_path = store.save_manifest(valid_manifest)
+        assert published_path.exists()
+        assert published_path == target_path
+        loaded, seal = store.load_manifest(run_id)
+        assert loaded.run_id == run_id
+        seal.assert_unchanged()
+
+    def test_publish_linux_renameat2_fallback_narrowing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """renameat2 fails closed without blind link fallback on real I/O or permission errors."""
+        temp_file = tmp_path / "temp.txt"
+        target_file = tmp_path / "target.txt"
+
+        class MockRenameat2:
+            def __init__(self, ret_val: int) -> None:
+                self.ret_val = ret_val
+                self.argtypes: Any = None
+                self.restype: Any = None
+
+            def __call__(self, *args: Any) -> int:
+                return self.ret_val
+
+        class MockLibc:
+            def __init__(self, errno_to_return: int) -> None:
+                self._errno = errno_to_return
+                self.renameat2 = MockRenameat2(-1)
+
+        link_called = [False]
+        real_link = getattr(os, "link", None)
+
+        def mock_link(src: Any, dst: Any) -> None:
+            link_called[0] = True
+            if real_link is not None:
+                real_link(src, dst)
+
+        # 1. EIO (errno 5) - real I/O error: blind fallback must be rejected
+        temp_file.write_text("content", encoding="utf-8")
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr("ctypes.CDLL", lambda *args, **kwargs: MockLibc(errno.EIO))
+        monkeypatch.setattr("ctypes.get_errno", lambda: errno.EIO)
+        monkeypatch.setattr(os, "link", mock_link, raising=False)
+
+        with pytest.raises(ManifestStoreError, match="blind fallback to link prohibited"):
+            _publish_file_no_overwrite(temp_file, target_file)
+
+        assert link_called[0] is False, "os.link must NOT be called on renameat2 EIO"
+        assert not temp_file.exists(), "temp_file must be cleaned up"
+
+        # 2. ENOSYS (errno 38) - unsupported syscall: fallback to link IS allowed
+        temp_file.write_text("content2", encoding="utf-8")
+        link_called[0] = False
+        monkeypatch.setattr("ctypes.CDLL", lambda *args, **kwargs: MockLibc(errno.ENOSYS))
+        monkeypatch.setattr("ctypes.get_errno", lambda: errno.ENOSYS)
+
+        # In this test environment, mock link to succeed by copying
+        def mock_link_success(src: Any, dst: Any) -> None:
+            link_called[0] = True
+            Path(dst).write_bytes(Path(src).read_bytes())
+
+        monkeypatch.setattr(os, "link", mock_link_success, raising=False)
+        _publish_file_no_overwrite(temp_file, target_file)
+        assert link_called[0] is True, "os.link must be called when renameat2 is ENOSYS"
+        assert target_file.exists()
+        target_file.unlink()
+
+    def test_lockfile_ownership_checked_cleanup(self, tmp_path: Path) -> None:
+        """Lockfile exit does not delete foreign lockfiles if replaced or not acquired."""
+        lock_path = tmp_path / ".lock_test_ownership"
+        run_id = _generate_valid_run_id("lockowner001")
+
+        # Case 1: normal acquisition and clean exit
+        with _ManifestRunLock(lock_path, run_id):
+            assert lock_path.exists()
+        assert not lock_path.exists(), "Clean exit must unlink owned lockfile"
+
+        # Case 2: foreign lockfile replacement is NOT unlinked on exit
+        lock = _ManifestRunLock(lock_path, run_id)
+        lock.__enter__()
+        assert lock_path.exists()
+
+        # Simulate foreign process replacing lockfile content with a foreign token
+        lock_path.write_text("pid=999999:run_id=foreign:foreign_uuid_12345", encoding="utf-8")
+
+        # Exit should detect token mismatch and NOT unlink foreign lockfile
+        lock.__exit__(None, None, None)
+        assert lock_path.exists(), "Foreign lockfile must NOT be deleted on token mismatch"
+        lock_path.unlink()
 
 
 class TestStoragePlatformGuarantees:

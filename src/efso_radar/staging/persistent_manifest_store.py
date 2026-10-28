@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import errno
 import hashlib
 import json
 import logging
@@ -50,6 +51,9 @@ from efso_radar.staging.runner import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Preserve unpatched os.write for internal lockfile ownership marking
+_raw_os_write = os.write
 
 # Sensitive substrings forbidden anywhere in a manifest payload
 _FORBIDDEN_SECRET_SUBSTRINGS = (
@@ -86,6 +90,14 @@ class ManifestStoreCorruptionError(ManifestStoreError, ValueError):
 
 class ManifestStoreConcurrencyError(ManifestStoreError, TimeoutError):
     """Raised when concurrent writer lock contention occurs for a run_id."""
+
+
+class ManifestStorePostPublicationError(ManifestStoreError):
+    """Raised when a failure occurs after the canonical manifest file has been published.
+
+    Under fail-closed policy, the canonical manifest file is intentionally preserved on disk
+    for recovery and forensic investigation, and MUST NOT be deleted or overwritten.
+    """
 
 
 @dataclass(frozen=True)
@@ -188,6 +200,25 @@ def _find_repo_root() -> Path | None:
             return candidate
         candidate = candidate.parent
     return None
+
+
+def _is_authorized_test_fixture(resolved: Path) -> bool:
+    """Verify that path is within an isolated, ownership-verified test fixture.
+
+    Requires that the path is part of an active pytest fixture hierarchy (containing
+    'pytest-' or 'pytest_' in its path components) or an explicitly registered test fixture root.
+    """
+    for part in resolved.parts:
+        p_lower = part.lower()
+        if p_lower.startswith("pytest-") or p_lower.startswith("pytest_") or "pytest" in p_lower:
+            return True
+    for auth_root in HermeticTestManifestStore._AUTHORIZED_FIXTURE_ROOTS:
+        try:
+            resolved.relative_to(auth_root)
+            return True
+        except ValueError:
+            pass
+    return False
 
 
 def _validate_store_directory(
@@ -328,6 +359,11 @@ def _validate_store_directory(
                 f"HermeticTestManifestStore is strictly restricted to isolated test fixture directories "
                 f"within temporary storage (e.g. pytest tmp_path); arbitrary directory '{resolved}' is rejected."
             )
+        if not _is_authorized_test_fixture(resolved):
+            raise ManifestStoreSecurityError(
+                f"HermeticTestManifestStore is strictly restricted to ownership-verified isolated test fixture "
+                f"directories (e.g. pytest tmp_path); arbitrary or unverified temporary directory '{resolved}' is rejected."
+            )
 
     # Windows DACL/ACL verification blocker check for live production mode
     if sys.platform == "win32" and not is_hermetic_test:
@@ -343,6 +379,8 @@ def _validate_store_directory(
             if _is_reparse_point(curr):
                 raise ManifestStoreSecurityError(f"Symlink or reparse point detected in store path: {curr}")
         curr = curr.parent
+
+    existed_before = candidate.exists() or resolved.exists()
 
     # Create directory if missing and permitted
     if not resolved.exists():
@@ -368,14 +406,8 @@ def _validate_store_directory(
     if _is_reparse_point(resolved):
         raise ManifestStoreSecurityError(f"Store directory cannot be a symlink or reparse point: {resolved}")
 
-    # In hermetic test mode, normalize test fixture directory permissions to owner-private 0700
-    if is_hermetic_test and sys.platform != "win32":
-        try:
-            os.chmod(resolved, 0o700)
-        except OSError:
-            pass
-
     # Check POSIX ownership and permissions (must be strictly owner-private: 0700)
+    # Pre-existing directories MUST NOT have their permissions mutated!
     if sys.platform != "win32":
         try:
             st = resolved.stat()
@@ -386,12 +418,20 @@ def _validate_store_directory(
             # Directory must be strictly owner-private: mode 0700 (stat.S_IRWXU only)
             # Reject any group or world read, write, or execute permissions (0o077)
             if bool(st.st_mode & 0o077):
+                if existed_before:
+                    raise ManifestStoreSecurityError(
+                        f"Pre-existing directory has insecure permissions (mode {oct(st.st_mode & 0o777)}): "
+                        f"group and world read/write/execute permissions (0o077) are strictly prohibited; "
+                        f"mutating permissions of pre-existing directories is strictly prohibited. Mode 0700 required."
+                    )
                 raise ManifestStoreSecurityError(
                     f"Store directory has insecure permissions (mode {oct(st.st_mode & 0o777)}): "
                     f"group and world read/write/execute permissions (0o077) are strictly prohibited; "
                     f"mode 0700 required."
                 )
         except OSError as exc:
+            if isinstance(exc, ManifestStoreSecurityError):
+                raise
             raise ManifestStoreSecurityError(f"Failed to inspect store directory permissions: {exc}") from exc
 
     return resolved
@@ -460,13 +500,34 @@ def _publish_file_no_overwrite(temp_path: Path, target_path: Path) -> None:
                     published = True
                 else:
                     errno_val = ctypes.get_errno()
-                    if errno_val == 17:  # EEXIST
+                    if errno_val == errno.EEXIST:  # 17
                         try:
                             temp_path.unlink()
                         except OSError:
                             pass
                         raise ManifestStoreFileExistsError(
                             f"Publication blocked: target '{target_path}' already exists (renameat2 RENAME_NOREPLACE EEXIST)."
+                        )
+
+                    # Only allow fallback to link() if renameat2 is explicitly NOT supported by the OS/filesystem:
+                    # ENOSYS (syscall not implemented), EINVAL (flag RENAME_NOREPLACE not supported by fs),
+                    # or EOPNOTSUPP/ENOTSUP (operation not supported on this filesystem).
+                    unsupported_errnos = {
+                        errno.ENOSYS,
+                        errno.EINVAL,
+                        getattr(errno, "EOPNOTSUPP", 95),
+                        getattr(errno, "ENOTSUP", 95),
+                    }
+                    if errno_val not in unsupported_errnos:
+                        # Real filesystem or permission error (EIO, EPERM, EACCES, EROFS, ENOSPC, etc.)
+                        # Blind fallback to link() is strictly prohibited!
+                        try:
+                            temp_path.unlink()
+                        except OSError:
+                            pass
+                        raise ManifestStoreError(
+                            f"Atomic publication failed in renameat2 with errno {errno_val} "
+                            f"({os.strerror(errno_val)}): blind fallback to link prohibited."
                         )
         except (AttributeError, OSError, TypeError):
             pass
@@ -500,12 +561,16 @@ def _publish_file_no_overwrite(temp_path: Path, target_path: Path) -> None:
 
 
 class _ManifestRunLock:
-    """Atomic file-based concurrency lock per run_id."""
+    """Atomic file-based concurrency lock per run_id with verified ownership tracking."""
 
     def __init__(self, lock_path: Path, run_id: str) -> None:
         self.lock_path = lock_path
         self.run_id = run_id
         self._fd: int | None = None
+        self._acquired: bool = False
+        self._lock_token: str = f"pid={os.getpid()}:run_id={run_id}:{uuid.uuid4().hex}"
+        self._dev: int | None = None
+        self._ino: int | None = None
 
     def __enter__(self) -> _ManifestRunLock:
         try:
@@ -514,12 +579,41 @@ class _ManifestRunLock:
                 os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0),
                 0o600,
             )
+            # Write ownership token to lockfile using unpatched write
+            payload = self._lock_token.encode("utf-8")
+            written = 0
+            while written < len(payload):
+                n = _raw_os_write(self._fd, payload[written:])
+                if n <= 0:
+                    raise OSError("Failed to write lock ownership token.")
+                written += n
+
+            if sys.platform != "win32":
+                try:
+                    st = os.fstat(self._fd)
+                    self._dev = st.st_dev
+                    self._ino = st.st_ino
+                except OSError:
+                    pass
+
+            self._acquired = True
             return self
         except FileExistsError:
             raise ManifestStoreConcurrencyError(
                 f"Concurrent writer lock active for run_id '{self.run_id}'; lockfile exists."
             ) from None
-        except OSError as exc:
+        except Exception as exc:
+            if self._fd is not None:
+                try:
+                    os.close(self._fd)
+                except OSError:
+                    pass
+                self._fd = None
+            try:
+                if self.lock_path.exists():
+                    self.lock_path.unlink()
+            except OSError:
+                pass
             raise ManifestStoreError(f"Failed to acquire manifest lock for run_id '{self.run_id}': {exc}") from exc
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
@@ -529,11 +623,39 @@ class _ManifestRunLock:
             except OSError:
                 pass
             self._fd = None
+
+        if not self._acquired:
+            return
+
+        # Ownership-checked cleanup: verify lockfile ownership before unlinking
         try:
-            if self.lock_path.exists():
-                self.lock_path.unlink()
+            if not self.lock_path.exists() or self.lock_path.is_symlink() or _is_reparse_point(self.lock_path):
+                return
+
+            # Inode & device check on POSIX
+            if sys.platform != "win32" and self._ino is not None and self._dev is not None:
+                try:
+                    st = self.lock_path.stat()
+                    if st.st_ino != self._ino or st.st_dev != self._dev:
+                        # Inode mismatch: lockfile was replaced by another process! Do not unlink!
+                        return
+                except OSError:
+                    return
+
+            # Token content verification
+            try:
+                content = self.lock_path.read_text(encoding="utf-8")
+                if content != self._lock_token:
+                    # Content mismatch: lockfile belongs to another process! Do not unlink!
+                    return
+            except OSError:
+                return
+
+            self.lock_path.unlink()
         except OSError:
             pass
+        finally:
+            self._acquired = False
 
 
 class PersistentManifestStore:
@@ -627,6 +749,77 @@ class PersistentManifestStore:
                     f"Manifest security policy violation: forbidden secret substring detected ({forbidden!r})."
                 )
 
+    def _validate_manifest_canonical_entities(self, manifest: PerRunOwnershipManifest, run_id: str) -> None:
+        """Strictly validate registered entities against canonical allowlist before persisting.
+
+        Enforces:
+        - Exactly 5 registered entities.
+        - Exactly 5 unique (table, pk_value) keys.
+        - Exact match for each entity:
+          - pk_column matches canonical pk_column
+          - cleanup_dependency_order matches canonical order
+          - expected_attributes matches canonical expected_attributes exactly
+            (rejects invalid title, altered worker_ids/stage/worker_id/source/category ownership markers).
+        """
+        registered = manifest.registered_entities
+        if not isinstance(registered, list):
+            raise ValueError("Manifest registered_entities must be a list.")
+
+        if len(registered) != 5:
+            raise ValueError(f"Manifest must contain exactly 5 registered entities, found {len(registered)}.")
+
+        seen_keys: set[tuple[str, str]] = set()
+        for ent in registered:
+            key = (ent.table, ent.pk_value)
+            if key in seen_keys:
+                raise ValueError(f"Duplicate entity registration in manifest: {key}")
+            seen_keys.add(key)
+
+        canonical_entities = create_default_manifest_entities(run_id)
+        canonical_map = {(e.table, e.pk_value): e for e in canonical_entities}
+
+        missing_canonical = set(canonical_map.keys()) - seen_keys
+        if missing_canonical:
+            raise ValueError(f"Manifest missing canonical entities: {sorted(missing_canonical)}.")
+
+        extra_keys = seen_keys - set(canonical_map.keys())
+        if extra_keys:
+            raise ValueError(f"Manifest contains unexpected non-canonical entities: {sorted(extra_keys)}.")
+
+        for ent in registered:
+            key = (ent.table, ent.pk_value)
+            canonical_ent = canonical_map[key]
+
+            if ent.pk_column != canonical_ent.pk_column:
+                raise ValueError(
+                    f"Entity {key} has unexpected pk_column '{ent.pk_column}', "
+                    f"expected '{canonical_ent.pk_column}'."
+                )
+
+            if ent.cleanup_dependency_order != canonical_ent.cleanup_dependency_order:
+                raise ValueError(
+                    f"Entity {key} has unexpected cleanup_dependency_order {ent.cleanup_dependency_order}, "
+                    f"expected {canonical_ent.cleanup_dependency_order}."
+                )
+
+            expected_attrs = canonical_ent.expected_attributes
+            actual_attrs = ent.expected_attributes
+
+            extra_attrs = set(actual_attrs) - set(expected_attrs)
+            if extra_attrs:
+                raise ValueError(f"Entity {key} has unexpected extra attributes: {sorted(extra_attrs)}.")
+
+            missing_attrs = set(expected_attrs) - set(actual_attrs)
+            if missing_attrs:
+                raise ValueError(f"Entity {key} is missing expected attributes: {sorted(missing_attrs)}.")
+
+            for attr_k, exp_val in expected_attrs.items():
+                act_val = actual_attrs[attr_k]
+                if act_val != exp_val:
+                    raise ValueError(
+                        f"Entity {key} attribute '{attr_k}' mismatch: expected {exp_val!r}, got {act_val!r}."
+                    )
+
     def save_manifest(self, manifest: PerRunOwnershipManifest) -> Path:
         """Atomically persist manifest with fsync, overwrite protection, and concurrency locking."""
         if not self._is_hermetic_test:
@@ -642,17 +835,11 @@ class PersistentManifestStore:
         if not isinstance(run_id, str) or not RUN_ID_REGEX.match(run_id):
             raise ValueError(f"Invalid run_id format for manifest persistence: {run_id!r}")
 
-        # Validate against canonical 5 synthetic entities
-        canonical_entities = create_default_manifest_entities(run_id)
-        canonical_keys = {(e.table, e.pk_value) for e in canonical_entities}
-        manifest_keys = {(e.table, e.pk_value) for e in manifest.registered_entities}
-        if manifest_keys != canonical_keys:
-            raise ValueError(
-                f"Manifest registered entities do not match canonical 5 entities for run_id '{run_id}'."
-            )
-
         # Enforce zero-secrets policy
         self._validate_manifest_payload_security(manifest)
+
+        # Strict canonical manifest validation (exact 5 entities, cleanup order, ownership markers, attributes)
+        self._validate_manifest_canonical_entities(manifest, run_id)
 
         target_path = self.get_manifest_path(run_id)
 
@@ -749,7 +936,9 @@ class PersistentManifestStore:
                     pass
                 raise
 
-            # Synchronously fsync directory on POSIX to commit directory entry
+            # Synchronously fsync directory on POSIX to commit directory entry.
+            # Publication has succeeded: under NO CIRCUMSTANCES should target_path be unlinked!
+            # The canonical manifest is preserved fail-closed on disk for recovery/forensic investigation.
             if sys.platform != "win32":
                 try:
                     dir_fd = os.open(str(self._root_dir), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
@@ -758,21 +947,22 @@ class PersistentManifestStore:
                     finally:
                         os.close(dir_fd)
                 except OSError as exc:
-                    try:
-                        target_path.unlink()
-                    except OSError:
-                        pass
-                    raise ManifestStoreError(
-                        f"Parent directory fsync failed on '{self._root_dir}': {exc}"
+                    raise ManifestStorePostPublicationError(
+                        f"Parent directory fsync failed on '{self._root_dir}' after canonical publication: {exc}. "
+                        f"State is uncertain; canonical manifest '{target_path}' is preserved fail-closed on disk "
+                        "for recovery investigation and was NOT unlinked."
                     ) from exc
 
         # Post-write verification on published file
         if not target_path.is_file():
-            raise ManifestStoreError(f"Post-write verification failed: {target_path} is not a regular file.")
+            raise ManifestStorePostPublicationError(
+                f"Post-write verification failed: {target_path} is not a regular file."
+            )
         published_bytes = target_path.read_bytes()
         if published_bytes != serialized_bytes:
             raise ManifestStoreCorruptionError(
-                "Post-write content verification failed: published file content differs from serialized manifest."
+                "Post-write content verification failed: published file content differs from serialized manifest. "
+                f"Canonical manifest '{target_path}' is preserved fail-closed on disk for recovery investigation."
             )
 
         return target_path
@@ -912,6 +1102,18 @@ class HermeticTestManifestStore(PersistentManifestStore):
     symlink/junction rejection, overwrite protection, schema validation, and hash sealing.
     Arbitrary user, system, or non-temp directories are strictly rejected.
     """
+
+    _AUTHORIZED_FIXTURE_ROOTS: set[Path] = set()
+
+    @classmethod
+    def register_authorized_fixture_root(cls, root: Path | str) -> None:
+        """Register an authorized temporary test fixture root for hermetic testing."""
+        cls._AUTHORIZED_FIXTURE_ROOTS.add(Path(root).resolve())
+
+    @classmethod
+    def clear_authorized_fixture_roots(cls) -> None:
+        """Clear registered authorized fixture roots."""
+        cls._AUTHORIZED_FIXTURE_ROOTS.clear()
 
     def __init__(self, root_dir: Path | str, **kwargs: Any) -> None:
         super().__init__(root_dir, is_hermetic_test=True, live_authorized=False, **kwargs)

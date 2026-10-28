@@ -52,6 +52,7 @@ if TYPE_CHECKING:
         ManifestStoreFileExistsError,
         ManifestStoreCorruptionError,
         ManifestStoreConcurrencyError,
+        ManifestStorePostPublicationError,
         StoragePlatformGuarantees,
         get_storage_platform_guarantees,
     )
@@ -100,6 +101,7 @@ __all__ = [
     "ManifestStoreFileExistsError",
     "ManifestStoreCorruptionError",
     "ManifestStoreConcurrencyError",
+    "ManifestStorePostPublicationError",
     "StoragePlatformGuarantees",
     "get_storage_platform_guarantees",
     "StagingConnectionReport",
@@ -144,6 +146,7 @@ _PERSISTENT_STORE_EXPORTS = frozenset({
     "ManifestStoreFileExistsError",
     "ManifestStoreCorruptionError",
     "ManifestStoreConcurrencyError",
+    "ManifestStorePostPublicationError",
     "StoragePlatformGuarantees",
     "get_storage_platform_guarantees",
 })
