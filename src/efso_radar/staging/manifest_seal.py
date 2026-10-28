@@ -24,7 +24,12 @@ class ManifestSealViolation(PermissionError):
     """The pre-registered owned inventory is absent, altered or unauthorized."""
 
 
-def _load_snapshot(path: Path, expected_run_id: str) -> tuple[PerRunOwnershipManifest, bytes]:
+def _load_snapshot(
+    path: Path,
+    expected_run_id: str,
+    *,
+    allowed_root: Path | None = None,
+) -> tuple[PerRunOwnershipManifest, bytes]:
     # Deny any arbitrary file read, including .env and operational data files.
     if (
         not isinstance(expected_run_id, str)
@@ -37,18 +42,22 @@ def _load_snapshot(path: Path, expected_run_id: str) -> tuple[PerRunOwnershipMan
     try:
         # A matching filename alone does not make an arbitrary repository or
         # operational-data path safe to read. Resolve directory ancestors
-        # before touching file contents and require the system temp root.
-        temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+        # before touching file contents and require the configured or system temp root.
+        if allowed_root is not None:
+            expected_root = Path(allowed_root).resolve(strict=True)
+            root_err_msg = "Manifest must reside inside the configured root directory."
+        else:
+            expected_root = Path(tempfile.gettempdir()).resolve(strict=True)
+            root_err_msg = "Manifest must reside inside the OS temporary directory."
+
         manifest_parent = path.parent.resolve(strict=True)
-        if manifest_parent == temp_root:
+        if manifest_parent == expected_root:
             pass
         else:
             try:
-                manifest_parent.relative_to(temp_root)
+                manifest_parent.relative_to(expected_root)
             except ValueError:
-                raise ManifestSealViolation(
-                    "Manifest must reside inside the OS temporary directory."
-                ) from None
+                raise ManifestSealViolation(root_err_msg) from None
         stat = path.stat()
         if stat.st_nlink != 1:
             raise ManifestSealViolation("Linked manifest files are not permitted.")
@@ -87,22 +96,34 @@ class OfflineManifestSeal:
     path: Path
     run_id: str
     sha256: str
+    allowed_root: Path | None = None
 
     @classmethod
-    def from_persisted(cls, path: Path, expected_run_id: str) -> OfflineManifestSeal:
+    def from_persisted(
+        cls,
+        path: Path,
+        expected_run_id: str,
+        *,
+        allowed_root: Path | None = None,
+    ) -> OfflineManifestSeal:
         if not isinstance(path, Path):
             raise TypeError("Manifest path must be a pathlib.Path.")
-        _, data = _load_snapshot(path, expected_run_id)
-        return cls(path=path, run_id=expected_run_id, sha256=hashlib.sha256(data).hexdigest())
+        _, data = _load_snapshot(path, expected_run_id, allowed_root=allowed_root)
+        return cls(
+            path=path,
+            run_id=expected_run_id,
+            sha256=hashlib.sha256(data).hexdigest(),
+            allowed_root=allowed_root,
+        )
 
     def assert_unchanged(self) -> None:
-        _, data = _load_snapshot(self.path, self.run_id)
+        _, data = _load_snapshot(self.path, self.run_id, allowed_root=self.allowed_root)
         if hashlib.sha256(data).hexdigest() != self.sha256:
             raise ManifestSealViolation("Manifest differs from sealed pre-dispatch inventory.")
 
     def require_registered_identity(self, table: str, pk_column: str, pk_value: str) -> None:
         """Necessary (not sufficient) gate for a proposed synthetic write target."""
-        manifest, data = _load_snapshot(self.path, self.run_id)
+        manifest, data = _load_snapshot(self.path, self.run_id, allowed_root=self.allowed_root)
         if hashlib.sha256(data).hexdigest() != self.sha256:
             raise ManifestSealViolation("Manifest differs from sealed pre-dispatch inventory.")
         if not any(
