@@ -333,8 +333,26 @@ class TestPhase5B3GCLiveReadinessWireContract(unittest.TestCase):
         op = self._make_operator()  # default nominal: ceiling=100, cutoff=80, reserve=20
         report = op.run(auto_human_window=True, human_marker="MOCK_ONLY")
 
+        # Causal assertion 1: Verify exact failure status and audit outcome
         self.assertEqual(report.status, LiveReadyOperatorStatus.FAILED)
         self.assertEqual(report.audit_state, AuditOutcomeState.UNKNOWN)
+
+        # Causal assertion 2: Transport request counter reached exactly cutoff limit (80)
+        self.assertEqual(self.budget_transport.request_count, 80)
+
+        # Causal assertion 3: Verify the specific gate denial code in report errors
+        self.assertIn("OPERATOR_GATE_FAILURE: CLEANUP_RESERVE_EXHAUSTED", report.errors)
+
+        # Causal assertion 4: Exactly 47 requests were dispatched to mock wire before rejection;
+        # the disallowed readback query was blocked at the boundary and NOT forwarded.
+        self.assertEqual(len(self.recorded_requests), 47)
+        self.assertFalse(any("SELECT article_id FROM processed_articles" in req.content.decode("utf-8") for req in self.recorded_requests))
+
+        # Causal assertion 5: Direct transport check confirms cutoff exception
+        with self.assertRaises(TursoClientError) as ctx:
+            self.budget_transport.handle_request(httpx.Request("POST", EXACT_STAGING_DESTINATION + "/v2/pipeline", json={"requests": [{"type": "close"}]}))
+        self.assertIn("TEST_CUTOFF_REACHED: Reached test step cutoff (80)", str(ctx.exception))
+
         self.assertTrue(report.manifest_preserved)
         self.assertTrue(Path(report.manifest_path).exists())
         self.assertIsNotNone(report.recovery_notice)
@@ -673,8 +691,26 @@ class TestPhase5B3GCLiveReadinessWireContract(unittest.TestCase):
         op = self._make_operator()  # default nominal: ceiling=100, cutoff=80, reserve=20
         report = op.run(auto_human_window=True, human_marker="MOCK_ONLY")
 
+        # Causal assertion 1: Verify exact failure status and audit outcome
         self.assertEqual(report.status, LiveReadyOperatorStatus.FAILED)
         self.assertEqual(report.audit_state, AuditOutcomeState.UNKNOWN)
+
+        # Causal assertion 2: Transport request counter reached exactly ceiling limit (100)
+        self.assertEqual(self.budget_transport.request_count, 100)
+
+        # Causal assertion 3: Verify the specific ceiling denial code in report errors (ceiling checked before cutoff)
+        self.assertIn("OPERATOR_GATE_FAILURE: REQUEST_CEILING_EXCEEDED", report.errors)
+
+        # Causal assertion 4: Exactly 47 requests were dispatched to mock wire before rejection;
+        # the disallowed readback query was blocked at the boundary and NOT forwarded.
+        self.assertEqual(len(self.recorded_requests), 47)
+        self.assertFalse(any("SELECT article_id FROM processed_articles" in req.content.decode("utf-8") for req in self.recorded_requests))
+
+        # Causal assertion 5: Direct transport check confirms ceiling exception takes precedence
+        with self.assertRaises(TursoClientError) as ctx:
+            self.budget_transport.handle_request(httpx.Request("POST", EXACT_STAGING_DESTINATION + "/v2/pipeline", json={"requests": [{"type": "close"}]}))
+        self.assertIn("BUDGET_EXHAUSTED_AUDIT_INCOMPLETE: Reached hard request ceiling (100)", str(ctx.exception))
+
         self.assertTrue(report.manifest_preserved)
         self.assertTrue(Path(report.manifest_path).exists())
 
@@ -700,18 +736,16 @@ class TestPhase5B3GCLiveReadinessWireContract(unittest.TestCase):
 
     def test_nominal_session_deadline_120s_exhaustion_halts_session(self):
         """Elapsed session deadline (>=120.0s) strictly halts session fail-closed under nominal deadline=120.0s."""
-        fake_time = 1000.0
+        fake_time = [1000.0]
 
         def advance_clock():
-            nonlocal fake_time
-            return fake_time
+            return fake_time[0]
 
         def trip_clock_after_live01(req: httpx.Request) -> httpx.Response | None:
-            nonlocal fake_time
             body = json.loads(req.content.decode("utf-8"))
             requests = body.get("requests", [])
             if len(requests) > 1 and requests[0].get("stmt", {}).get("sql") == "BEGIN":
-                fake_time += 121.0  # Expire 120.0s deadline right before LIVE-02 readbacks
+                fake_time[0] += 121.0  # Expire 120.0s deadline right before LIVE-02 readbacks
             return None
 
         self._custom_hook = trip_clock_after_live01
@@ -729,8 +763,26 @@ class TestPhase5B3GCLiveReadinessWireContract(unittest.TestCase):
         )
         report = op.run(auto_human_window=True, human_marker="MOCK_ONLY")
 
+        # Causal assertion 1: Verify exact failure status and audit outcome
         self.assertEqual(report.status, LiveReadyOperatorStatus.FAILED)
         self.assertEqual(report.audit_state, AuditOutcomeState.UNKNOWN)
+
+        # Causal assertion 2: Clock elapsed time exceeded nominal 120.0s
+        self.assertGreaterEqual(advance_clock() - 1000.0, 120.0)
+
+        # Causal assertion 3: Verify the specific deadline denial code in report errors
+        self.assertIn("OPERATOR_GATE_FAILURE: SESSION_DEADLINE_EXCEEDED", report.errors)
+
+        # Causal assertion 4: Exactly 47 requests were dispatched to mock wire before rejection;
+        # the disallowed readback query was blocked at the boundary and NOT forwarded.
+        self.assertEqual(len(self.recorded_requests), 47)
+        self.assertFalse(any("SELECT article_id FROM processed_articles" in req.content.decode("utf-8") for req in self.recorded_requests))
+
+        # Causal assertion 5: Direct transport check confirms deadline exception and zero dispatch
+        with self.assertRaises(TursoClientError) as ctx:
+            clock_budget_transport.handle_request(httpx.Request("POST", EXACT_STAGING_DESTINATION + "/v2/pipeline", json={"requests": [{"type": "close"}]}))
+        self.assertIn("SESSION_TIMEOUT_AUDIT_INCOMPLETE: elapsed deadline", str(ctx.exception))
+
         self.assertTrue(report.manifest_preserved)
         self.assertTrue(Path(report.manifest_path).exists())
 

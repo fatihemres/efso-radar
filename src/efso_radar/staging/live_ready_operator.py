@@ -753,15 +753,29 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
         except Exception as exc:
             # Sanitized error capturing: never echo SQL or tokens
             err_code = f"OPERATOR_GATE_FAILURE: {type(exc).__name__}"
-            if "DEADLINE" in str(exc) or "SESSION_DEADLINE" in str(exc):
+            exc_str = str(exc)
+            if (
+                "DEADLINE" in exc_str
+                or "SESSION_DEADLINE" in exc_str
+                or "SESSION_TIMEOUT" in exc_str
+                or "elapsed deadline" in exc_str
+            ):
                 err_code = "OPERATOR_GATE_FAILURE: SESSION_DEADLINE_EXCEEDED"
-            elif "REQUEST_CEILING" in str(exc):
+            elif (
+                "REQUEST_CEILING" in exc_str
+                or "BUDGET_EXHAUSTED" in exc_str
+                or "hard request ceiling" in exc_str
+            ):
                 err_code = "OPERATOR_GATE_FAILURE: REQUEST_CEILING_EXCEEDED"
-            elif "CLEANUP_RESERVE" in str(exc):
+            elif (
+                "CLEANUP_RESERVE" in exc_str
+                or "TEST_CUTOFF" in exc_str
+                or "test step cutoff" in exc_str
+            ):
                 err_code = "OPERATOR_GATE_FAILURE: CLEANUP_RESERVE_EXHAUSTED"
-            elif "OWNERSHIP_MISMATCH" in str(exc):
+            elif "OWNERSHIP_MISMATCH" in exc_str:
                 err_code = "OPERATOR_GATE_FAILURE: OWNERSHIP_MISMATCH_HALT"
-            elif "HUMAN_WINDOW" in str(exc):
+            elif "HUMAN_WINDOW" in exc_str:
                 err_code = "OPERATOR_GATE_FAILURE: HUMAN_WINDOW_REQUIRED"
             errors.append(err_code)
             session_status = LiveReadyOperatorStatus.FAILED
