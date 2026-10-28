@@ -26,7 +26,7 @@ Efso Radar supplies selective Turkish/global entertainment-news discovery and ed
   10. Read-only reload & seal verification: missing or tampered manifest files fail closed and never grant write permissions.
   11. Hermetic-only offline recovery validation: simulates inspection against in-memory SQLite Schema v6 fixture; never modifies remote Turso, never unlinks manifest, returns `OFFLINE_VALIDATION_PASSED` (never remote `CLEAN`).
   12. Architectural inconsistency documented: noted the contradiction between the historical 80-request cutoff automatic LIVE-08 transition and PR #35's strict monotonic stage sequence, proposing safe policy (no automatic cleanup on early failure; retain manifest fail-closed; separate controlled recovery).
-- **Phase 5B.3G-C remains OFFLINE-ONLY:** live execution is NOT enabled. No real Turso connection, no credentials created, and Block Writes remains ON. 43 focused store tests passing (3 skipped on Windows due to unprivileged symlink creation; 46 total), 267 passed across all Phase 5B.3G tests, 768 passed across full hermetic suite, Ruff clean. Ready for independent review.
+- **Phase 5B.3G-C remains OFFLINE-ONLY:** live execution is NOT enabled. No real Turso connection, no credentials created, and Block Writes remains ON. 43 focused store tests passing (3 skipped on Windows due to unprivileged symlink creation; 46 total), 267 passed across all Phase 5B.3G tests, 768 passed across full hermetic suite, Ruff clean, GitHub Actions CI run 40681304111 clean across all 4 matrix jobs. Ready for independent review.
 
 ## Historical operational checkpoint — Phase 5B.3G-C Operator Safeguards (INTEGRATED PR #35, 2026-10-28)
 
