@@ -134,6 +134,8 @@ def get_storage_platform_guarantees() -> StoragePlatformGuarantees:
 
 def _is_reparse_point(path: Path) -> bool:
     """Detect symlinks, directory junctions, and reparse points across Windows and POSIX."""
+    if path.is_symlink():
+        return True
     if sys.platform == "win32":
         try:
             st = os.lstat(path)
@@ -143,7 +145,7 @@ def _is_reparse_point(path: Path) -> bool:
                 return True
         except OSError:
             pass
-    return path.is_symlink()
+    return False
 
 
 def _find_repo_root() -> Path | None:
@@ -182,7 +184,20 @@ def _validate_store_directory(
     if ".." in candidate.parts:
         raise ManifestStoreSecurityError("Path traversal indicators ('..') are strictly prohibited.")
 
+    # Check symlinks and reparse points on candidate and ancestors before resolution
+    curr_unresolved: Path | None = candidate
+    while curr_unresolved is not None and curr_unresolved != curr_unresolved.parent:
+        if curr_unresolved.is_symlink() or _is_reparse_point(curr_unresolved):
+            raise ManifestStoreSecurityError(f"Symlink or reparse point detected in store path: {curr_unresolved}")
+        curr_unresolved = curr_unresolved.parent
+
     resolved = candidate.resolve()
+
+    if candidate.exists():
+        if candidate.is_symlink() or _is_reparse_point(candidate):
+            raise ManifestStoreSecurityError(f"Symlink or reparse point detected in store path: {candidate}")
+        if sys.platform != "win32" and candidate.absolute() != resolved:
+            raise ManifestStoreSecurityError(f"Symlink or reparse point detected in store path: {candidate}")
 
     # Reject filesystem root directly
     if resolved == resolved.parent:
