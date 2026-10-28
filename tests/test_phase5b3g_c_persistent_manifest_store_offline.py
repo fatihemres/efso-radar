@@ -79,6 +79,8 @@ class TestPersistentManifestStoreSecurity:
         # On Linux, PersistentManifestStore outside temp will fail closed on save_manifest
         non_temp_dir = tmp_path / "non_temp_candidate"
         non_temp_dir.mkdir()
+        if sys.platform != "win32":
+            non_temp_dir.chmod(0o700)
 
         if sys.platform == "win32":
             with pytest.raises(ManifestStoreSecurityError, match="Windows NTFS DACL/ACL verification|OS temporary"):
@@ -498,6 +500,8 @@ print("SUBPROCESS_VERIFIED_OK")
         empty_run_id = _generate_valid_run_id("empty0000001")
         empty_path = store.get_manifest_path(empty_run_id)
         empty_path.touch()
+        if sys.platform != "win32":
+            empty_path.chmod(0o600)
         with pytest.raises(ManifestStoreCorruptionError, match="empty or oversized"):
             store.load_manifest(empty_run_id)
 
@@ -505,6 +509,8 @@ print("SUBPROCESS_VERIFIED_OK")
         partial_run_id = _generate_valid_run_id("partial00001")
         partial_path = store.get_manifest_path(partial_run_id)
         partial_path.write_text('{"run_id": "' + partial_run_id + '", "versio', encoding="utf-8")
+        if sys.platform != "win32":
+            partial_path.chmod(0o600)
         with pytest.raises(ManifestStoreCorruptionError, match="validation failed"):
             store.load_manifest(partial_run_id)
 
@@ -514,6 +520,8 @@ print("SUBPROCESS_VERIFIED_OK")
         other_run_id = _generate_valid_run_id("other0000001")
         other_manifest = _create_sample_manifest(other_run_id)
         mismatch_path.write_text(other_manifest.model_dump_json(), encoding="utf-8")
+        if sys.platform != "win32":
+            mismatch_path.chmod(0o600)
 
         with pytest.raises(ManifestStoreCorruptionError, match="run identifier mismatch"):
             store.load_manifest(mismatch_run_id)
@@ -524,8 +532,45 @@ print("SUBPROCESS_VERIFIED_OK")
         run_id = _generate_valid_run_id("oversize0001")
         oversized_path = store.get_manifest_path(run_id)
         oversized_path.write_bytes(b" " * (MAX_MANIFEST_BYTES + 10))
+        if sys.platform != "win32":
+            oversized_path.chmod(0o600)
 
         with pytest.raises(ManifestStoreCorruptionError, match="safety size limit"):
+            store.load_manifest(run_id)
+
+    def test_posix_insecure_file_permissions_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Manifest file with group or world access permissions (0o644) is rejected on POSIX."""
+        store = HermeticTestManifestStore(tmp_path / "store")
+        run_id = _generate_valid_run_id("insecfile001")
+        manifest = _create_sample_manifest(run_id)
+        path = store.save_manifest(manifest)
+
+        # Mock POSIX environment and stat mode to 0o644
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(os, "geteuid", lambda: 1000, raising=False)
+
+        real_os_stat = os.stat
+        target_str = str(path.resolve())
+
+        class MockStatInsecureFile:
+            st_uid = 1000
+            st_mode = 0o100644  # -rw-r--r-- (group/world read 0o044)
+            st_nlink = 1
+            st_size = 100
+
+        def mock_stat_file(path_arg: Any, *args: Any, **kwargs: Any) -> Any:
+            try:
+                if str(path_arg) == target_str:
+                    return MockStatInsecureFile()
+            except Exception:
+                pass
+            return real_os_stat(path_arg, *args, **kwargs)
+
+        monkeypatch.setattr(os, "stat", mock_stat_file)
+
+        with pytest.raises(ManifestStoreSecurityError, match="group and world access bits.*strictly prohibited; mode 0600 required"):
             store.load_manifest(run_id)
 
     def test_concurrency_lock_prevents_simultaneous_writers(self, tmp_path: Path) -> None:

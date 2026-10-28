@@ -349,6 +349,11 @@ def _validate_store_directory(
         if create_if_missing:
             try:
                 os.makedirs(resolved, mode=0o700, exist_ok=True)
+                if sys.platform != "win32":
+                    try:
+                        os.chmod(resolved, 0o700)
+                    except OSError:
+                        pass
             except OSError as exc:
                 raise ManifestStoreSecurityError(
                     f"Could not initialize persistent manifest store directory: {exc}"
@@ -362,6 +367,13 @@ def _validate_store_directory(
 
     if _is_reparse_point(resolved):
         raise ManifestStoreSecurityError(f"Store directory cannot be a symlink or reparse point: {resolved}")
+
+    # In hermetic test mode, normalize test fixture directory permissions to owner-private 0700
+    if is_hermetic_test and sys.platform != "win32":
+        try:
+            os.chmod(resolved, 0o700)
+        except OSError:
+            pass
 
     # Check POSIX ownership and permissions (must be strictly owner-private: 0700)
     if sys.platform != "win32":
