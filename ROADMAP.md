@@ -32,7 +32,7 @@ Persistent manifest store foundation implemented under `PersistentManifestStore`
 - Hermetic-only offline recovery validation: simulates inspection against in-memory SQLite Schema v6 fixture; never modifies remote Turso, never unlinks manifest, returns `OFFLINE_VALIDATION_PASSED` (never remote `CLEAN`).
 - Platform storage guarantees: explicit reporting of Windows and Linux storage guarantees and identified blockers (`StoragePlatformGuarantees`).
 - Architectural inconsistency documented: noted the contradiction between the historical 80-request cutoff automatic LIVE-08 transition and PR #35's strict monotonic stage sequence, proposing safe policy (no automatic cleanup on early failure; retain manifest fail-closed; separate controlled recovery).
-- All live staging operations remain **UNAUTHORIZED**; Block Writes remains ON. 34 focused store tests passing (3 skipped on Windows due to unprivileged symlink creation; 37 total), 258 passed across all Phase 5B.3G tests, 759 passed across full hermetic suite, Ruff clean.
+- All live staging operations remain **UNAUTHORIZED**; Block Writes remains ON. 34 focused store tests passing (3 skipped on Windows due to unprivileged symlink creation; 37 total), 258 passed across all Phase 5B.3G tests, 759 passed across full hermetic suite, Ruff clean, GitHub Actions CI run 40670398723 clean across all 4 matrix jobs.
 
 ## 2026-10-28 Phase 5B.3G-C Live-Ready Operator Preparation Checkpoint (INTEGRATED PR #35)
 
