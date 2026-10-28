@@ -9,23 +9,21 @@ Efso Radar supplies selective Turkish/global entertainment-news discovery and ed
 
 **Version ambiguity:** Historical Phase 4 closure and ADR call `v0.4.0` an anchor; actual `src/efso_radar/__init__.py` declares `__version__ = "2.0.0"`. No GitHub Releases were returned on inspection. Treat public stable release identity as **unreconciled**, not 2.0.0 or v0.4.0 by assumption. See [Release Policy](docs/RELEASE_POLICY.md).
 
-## Latest operational checkpoint — Phase 5B.3G-C Persistent Manifest Foundation (2026-10-28)
+## Latest operational checkpoint — Phase 5B.3G-C Persistent Manifest Foundation (2026-10-28 — Remediated Candidate)
 
 - **Main baseline:** `1530f8340c37e3952b02a8edd56c6b5857845044` (PR #35 integrated).
 - **Candidate implementation:** `PersistentManifestStore` and `HermeticTestManifestStore` (`src/efso_radar/staging/persistent_manifest_store.py`), plus extended `OfflineManifestSeal` supporting configured persistent roots (`src/efso_radar/staging/manifest_seal.py`).
-- **Safety guarantees enforced:**
-  1. Default-deny for live execution: persistent store defaults to `live_authorized=False`; live execution attempts fail closed (`PermissionError`) by default.
-  2. Fail-closed security boundaries: rejects repository root, `.git`, `.env`, `data/`, OS temp (in production mode), symlinks, junctions, reparse points, and insecure group/world permissions.
-  3. Hermetic test adapter: `HermeticTestManifestStore` explicitly scoped to hermetic test fixture directories while enforcing all security invariants.
-  4. Durable atomic persistence: sibling temporary file, explicit `flush()` and `os.fsync()`, atomic replace, POSIX directory fsync, POSIX 0o600 / 0o700 permission bits.
-  5. Overwrite protection: existing manifests for the same `run_id` can never be overwritten; fail closed immediately with `ManifestStoreFileExistsError`.
+- **Remediated safety guarantees enforced:**
+  1. Fail-closed deletion policy (P1-A): manifest deletion via caller-supplied `AuditOutcomeState.CLEAN` is strictly disabled and rejected (`ManifestStoreSecurityError`); offline foundation cannot verify remote cleanup; manifest is preserved under all outcomes.
+  2. Publication without overwrite (P1-B): `_publish_file_no_overwrite` uses Win32 `MoveFileWithProgressW` without `MOVEFILE_REPLACE_EXISTING` (Windows) and `renameat2(RENAME_NOREPLACE)` / `os.link` (POSIX) to prevent overwriting existing files, late race creations, and dangling symlinks.
+  3. Write verification & sync (P1-C): write-all loop preventing short writes, `os.fsync()`, pre-publication size and SHA-256 readback check, POSIX parent directory fsync (with fail-closed error escalation), and post-publication content verification. No leaked temp or lock files on any error path.
+  4. Neutralized authorization & strict scoping (P1-D): `live_authorized=True` boolean neutralized; live persistent writes fail closed. `HermeticTestManifestStore` strictly restricted to isolated test fixtures (`tmp_path`) and rejects arbitrary user/system directories. Strict owner-private POSIX permissions (`0700` dirs, `0600` files, `0o077` bits rejected). Windows DACL validation reported as explicit blocker.
+  5. Durability limits clarified (P2): documented as a candidate local persistent store foundation with limitations; in-process reopen simulation distinguished from true OS subprocess restart (verified via subprocess) and physical reboot/power-loss durability.
   6. Concurrency safety: atomic lockfile per `run_id` (`O_CREAT | O_EXCL`) preventing race conditions across concurrent processes and threads.
   7. Read-only reload & seal verification: missing or tampered manifest files fail closed and never grant write permissions.
-  8. Retention on non-clean outcomes: manifests are preserved under `UNKNOWN`, `RESIDUAL`, `FAILED`, and ownership mismatch states; unlinking is strictly restricted to verified `CLEAN` state.
-  9. Hermetic-only offline recovery validation: simulates inspection against in-memory SQLite Schema v6 fixture; never modifies remote Turso, never unlinks manifest, returns `OFFLINE_VALIDATION_PASSED` (never remote `CLEAN`).
-  10. Platform storage guarantees: explicit reporting of Windows and Linux storage guarantees and identified blockers (`StoragePlatformGuarantees`).
-  11. Architectural inconsistency documented: noted the contradiction between the historical 80-request cutoff automatic LIVE-08 transition and PR #35's strict monotonic stage sequence, proposing safe policy (no automatic cleanup on early failure; retain manifest fail-closed; separate controlled recovery).
-- **Phase 5B.3G-C remains OFFLINE-ONLY:** live execution is NOT enabled. No real Turso connection, no credentials created, and Block Writes remains ON. 20 focused store tests passing (18 passed, 2 skipped on Windows due to symlink privilege), 242 passed across all Phase 5B.3G tests, Ruff clean.
+  8. Hermetic-only offline recovery validation: simulates inspection against in-memory SQLite Schema v6 fixture; never modifies remote Turso, never unlinks manifest, returns `OFFLINE_VALIDATION_PASSED` (never remote `CLEAN`).
+  9. Architectural inconsistency documented: noted the contradiction between the historical 80-request cutoff automatic LIVE-08 transition and PR #35's strict monotonic stage sequence, proposing safe policy (no automatic cleanup on early failure; retain manifest fail-closed; separate controlled recovery).
+- **Phase 5B.3G-C remains OFFLINE-ONLY:** live execution is NOT enabled. No real Turso connection, no credentials created, and Block Writes remains ON. 27 focused store tests passing (3 skipped on Windows due to unprivileged symlink creation), 251 passed across all Phase 5B.3G tests, Ruff clean.
 
 ## Historical operational checkpoint — Phase 5B.3G-C Operator Safeguards (INTEGRATED PR #35, 2026-10-28)
 
