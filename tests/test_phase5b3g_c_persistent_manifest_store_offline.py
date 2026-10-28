@@ -16,7 +16,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any
+from typing import Any, Generator
 import uuid
 import pytest
 
@@ -45,6 +45,16 @@ from efso_radar.staging.runner import (
     RegisteredEntity,
     create_default_manifest_entities,
 )
+
+
+@pytest.fixture(autouse=True)
+def _authorize_test_tmp_path(tmp_path: Path) -> Generator[Path, None, None]:
+    """Link each test execution to its ownership-proven pytest tmp_path fixture root."""
+    HermeticTestManifestStore.register_authorized_fixture_root(tmp_path)
+    try:
+        yield tmp_path
+    finally:
+        HermeticTestManifestStore.clear_authorized_fixture_roots()
 
 
 def _generate_valid_run_id(suffix: str | None = None) -> str:
@@ -139,9 +149,15 @@ class TestPersistentManifestStoreSecurity:
         """Custom test roots registered via register_authorized_fixture_root are permitted and clean up cleanly."""
         custom_root = Path(tempfile.gettempdir()) / f"custom_fixture_root_{uuid.uuid4().hex}"
         try:
-            # Unregistered: rejected
+            # Unregistered: rejected and not created
             with pytest.raises(ManifestStoreSecurityError, match="ownership-verified isolated test fixture"):
                 HermeticTestManifestStore(custom_root)
+            assert not custom_root.exists()
+
+            # Pre-create fixture root with secure permissions before registration
+            custom_root.mkdir(mode=0o700)
+            if sys.platform != "win32":
+                os.chmod(custom_root, 0o700)
 
             # Register authorized fixture root
             HermeticTestManifestStore.register_authorized_fixture_root(custom_root)
@@ -153,6 +169,52 @@ class TestPersistentManifestStoreSecurity:
                 (custom_root / "store").rmdir()
             if custom_root.exists():
                 custom_root.rmdir()
+
+    def test_hermetic_store_rejects_unauthorized_directory_with_pytest_in_name(self) -> None:
+        """A directory with 'pytest' in its name that has not been authorized is strictly rejected."""
+        fake_pytest_dir = Path(tempfile.gettempdir()) / f"pytest_unauthorized_{uuid.uuid4().hex}"
+        with pytest.raises(ManifestStoreSecurityError, match="ownership-verified isolated test fixture"):
+            HermeticTestManifestStore(fake_pytest_dir)
+        # Ensure candidate was not created on disk
+        assert not fake_pytest_dir.exists(), "Unauthorized directory must not be created on disk"
+
+    def test_rejects_arbitrary_test_root_registration(self, tmp_path: Path) -> None:
+        """Arbitrary directories (temp root itself, repo root, non-existent, insecure mode) cannot be registered."""
+        # 1. Temp root itself cannot be registered
+        temp_root = Path(tempfile.gettempdir())
+        with pytest.raises(ManifestStoreSecurityError, match="cannot be registered as an authorized fixture root"):
+            HermeticTestManifestStore.register_authorized_fixture_root(temp_root)
+
+        # 2. Repo root cannot be registered
+        repo_root = _find_repo_root()
+        assert repo_root is not None
+        with pytest.raises(ManifestStoreSecurityError, match="cannot be registered as a fixture root"):
+            HermeticTestManifestStore.register_authorized_fixture_root(repo_root)
+
+        # 3. Non-existent path cannot be registered
+        non_existent = tmp_path / "does_not_exist_fixture"
+        with pytest.raises(ManifestStoreSecurityError, match="does not exist"):
+            HermeticTestManifestStore.register_authorized_fixture_root(non_existent)
+
+        # 4. Insecure permissions (0o755) directory cannot be registered
+        insecure_dir = tmp_path / "insecure_reg_dir"
+        insecure_dir.mkdir(mode=0o755)
+        if sys.platform != "win32":
+            os.chmod(insecure_dir, 0o755)
+            with pytest.raises(ManifestStoreSecurityError, match="insecure permissions"):
+                HermeticTestManifestStore.register_authorized_fixture_root(insecure_dir)
+
+    def test_direct_is_hermetic_test_true_rejects_unauthorized_directory(self) -> None:
+        """Passing is_hermetic_test=True directly cannot bypass fixture ownership and authorization checks."""
+        fake_dir = Path(tempfile.gettempdir()) / f"pytest_bypass_attempt_{uuid.uuid4().hex}"
+        with pytest.raises(ManifestStoreSecurityError, match="ownership-verified isolated test fixture"):
+            PersistentManifestStore(fake_dir, is_hermetic_test=True)
+        assert not fake_dir.exists(), "Directory must not be created when authorization fails"
+
+        # Also test with arbitrary non-temp directory
+        fake_user_dir = Path.home() / "decoy_bypass_attempt"
+        with pytest.raises(ManifestStoreSecurityError, match="strictly restricted to isolated test fixture directories"):
+            PersistentManifestStore(fake_user_dir, is_hermetic_test=True)
 
     def test_rejects_empty_or_null_byte_path(self, tmp_path: Path) -> None:
         """Store strictly rejects empty paths or null bytes."""
@@ -299,12 +361,15 @@ class TestPersistentManifestStoreOperations:
 
         # Launch an independent Python interpreter in a fresh OS process
         script = f"""
+import os
 import sys
 from pathlib import Path
 from efso_radar.staging.persistent_manifest_store import HermeticTestManifestStore
 from efso_radar.staging.manifest_seal import OfflineManifestSeal
 
-store = HermeticTestManifestStore(Path({str(store_dir.resolve())!r}))
+store_path = Path({str(store_dir.resolve())!r})
+HermeticTestManifestStore.register_authorized_fixture_root(store_path)
+store = HermeticTestManifestStore(store_path)
 manifest, seal = store.load_manifest({run_id!r})
 assert manifest.run_id == {run_id!r}
 assert len(manifest.registered_entities) == 5
@@ -316,6 +381,7 @@ print("SUBPROCESS_VERIFIED_OK")
         repo_root = _find_repo_root()
         assert repo_root is not None
         env["PYTHONPATH"] = str(repo_root / "src")
+        env["PYTEST_CURRENT_TEST"] = os.environ.get("PYTEST_CURRENT_TEST", "test_real_subprocess_process_restart_persistence")
 
         res = subprocess.run(
             [sys.executable, "-c", script],
@@ -525,6 +591,56 @@ print("SUBPROCESS_VERIFIED_OK")
         leaked = [f.name for f in store.root_dir.iterdir() if f.name.startswith((".tmp_manifest_", ".lock_"))]
         assert leaked == [], f"No leaked temp or lock artifacts expected, found: {leaked}"
 
+    def test_post_publication_readback_failure_preserves_manifest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Readback failure after publication raises ManifestStorePostPublicationError and preserves manifest."""
+        store = HermeticTestManifestStore(tmp_path / "store")
+        run_id = _generate_valid_run_id("postpubrd001")
+        manifest = _create_sample_manifest(run_id)
+        expected_bytes = manifest.model_dump_json(indent=2).encode("utf-8")
+
+        target_path = store.get_manifest_path(run_id)
+        real_read_bytes = Path.read_bytes
+
+        def mock_read_bytes(path_obj: Path) -> bytes:
+            if path_obj.name == store.manifest_filename(run_id):
+                raise OSError("Simulated post-publication media read error")
+            return real_read_bytes(path_obj)
+
+        monkeypatch.setattr(Path, "read_bytes", mock_read_bytes)
+
+        with pytest.raises(ManifestStorePostPublicationError, match="Post-publication readback/verification failed.*Publication outcome is uncertain.*canonical manifest is preserved fail-closed"):
+            store.save_manifest(manifest)
+
+        assert target_path.exists(), "Canonical manifest must be preserved on disk fail-closed"
+        assert real_read_bytes(target_path) == expected_bytes
+
+    def test_post_publication_hash_mismatch_preserves_manifest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Integrity mismatch after publication raises ManifestStorePostPublicationError and preserves manifest."""
+        store = HermeticTestManifestStore(tmp_path / "store")
+        run_id = _generate_valid_run_id("postpubhsh01")
+        manifest = _create_sample_manifest(run_id)
+
+        target_path = store.get_manifest_path(run_id)
+        real_read_bytes = Path.read_bytes
+
+        def mock_read_bytes(path_obj: Path) -> bytes:
+            data = real_read_bytes(path_obj)
+            if path_obj.name == store.manifest_filename(run_id):
+                # Return corrupted content of exact same length
+                return data[:-1] + b"X"
+            return data
+
+        monkeypatch.setattr(Path, "read_bytes", mock_read_bytes)
+
+        with pytest.raises(ManifestStorePostPublicationError, match="Post-publication.*verification failed.*Publication outcome is uncertain.*canonical manifest is preserved fail-closed"):
+            store.save_manifest(manifest)
+
+        assert target_path.exists(), "Canonical manifest must be preserved on disk fail-closed"
+
     def test_tamper_detection_fails_closed(self, tmp_path: Path) -> None:
         """Modifying a single byte of a saved manifest triggers tamper detection."""
         store = HermeticTestManifestStore(tmp_path / "store")
@@ -665,6 +781,44 @@ print("SUBPROCESS_VERIFIED_OK")
 
         assert len(successes) == 1
         assert len(failures) == 1
+
+    def test_lock_acquisition_failure_preserves_foreign_lockfile(self, tmp_path: Path) -> None:
+        """Lock acquisition failure must not delete or alter an existing foreign lockfile."""
+        run_id = _generate_valid_run_id("foreign00001")
+        lock_path = tmp_path / f".lock_{run_id}"
+        foreign_token = "pid=99999:run_id=foreign:foreign_secret_token"
+        lock_path.write_text(foreign_token, encoding="utf-8")
+        if sys.platform != "win32":
+            os.chmod(lock_path, 0o600)
+
+        lock = _ManifestRunLock(lock_path, run_id)
+        with pytest.raises(ManifestStoreConcurrencyError):
+            with lock:
+                pass
+
+        # Verify the foreign lockfile is still present with exact content intact
+        assert lock_path.exists(), "Foreign lockfile must NOT be deleted on acquisition contention"
+        assert lock_path.read_text(encoding="utf-8") == foreign_token
+
+    def test_lock_acquisition_write_failure_cleans_own_lock_without_touching_foreign(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Acquisition failure on own lock cleans up own lock, while foreign locks are never touched."""
+        run_id = _generate_valid_run_id("ownfail00001")
+        lock_path = tmp_path / f".lock_{run_id}"
+
+        # Mock unpatched write to fail during token writing
+        def mock_fail_write(fd: int, data: bytes) -> int:
+            raise OSError("Disk I/O error during lock token write")
+
+        monkeypatch.setattr("efso_radar.staging.persistent_manifest_store._raw_os_write", mock_fail_write)
+
+        lock = _ManifestRunLock(lock_path, run_id)
+        with pytest.raises(ManifestStoreError, match="Failed to acquire manifest lock"):
+            with lock:
+                pass
+
+        assert not lock_path.exists(), "Own incomplete lockfile should be cleaned up on write failure"
 
     def test_zero_secrets_policy_enforcement(self, tmp_path: Path) -> None:
         """Manifest containing sensitive secret tokens is strictly rejected before write."""

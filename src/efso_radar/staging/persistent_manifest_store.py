@@ -203,16 +203,16 @@ def _find_repo_root() -> Path | None:
 
 
 def _is_authorized_test_fixture(resolved: Path) -> bool:
-    """Verify that path is within an isolated, ownership-verified test fixture.
+    """Verify that path is strictly within an explicitly authorized, validated test fixture root.
 
-    Requires that the path is part of an active pytest fixture hierarchy (containing
-    'pytest-' or 'pytest_' in its path components) or an explicitly registered test fixture root.
+    Substring matching on 'pytest' is strictly prohibited as it does not constitute
+    proof of isolation or ownership. A directory is authorized IF AND ONLY IF it is
+    equal to or a subpath of an explicitly registered, validated fixture root in
+    HermeticTestManifestStore._AUTHORIZED_FIXTURE_ROOTS.
     """
-    for part in resolved.parts:
-        p_lower = part.lower()
-        if p_lower.startswith("pytest-") or p_lower.startswith("pytest_") or "pytest" in p_lower:
-            return True
     for auth_root in HermeticTestManifestStore._AUTHORIZED_FIXTURE_ROOTS:
+        if resolved == auth_root:
+            return True
         try:
             resolved.relative_to(auth_root)
             return True
@@ -567,56 +567,18 @@ class _ManifestRunLock:
         self.lock_path = lock_path
         self.run_id = run_id
         self._fd: int | None = None
+        self._opened_by_us: bool = False
         self._acquired: bool = False
         self._lock_token: str = f"pid={os.getpid()}:run_id={run_id}:{uuid.uuid4().hex}"
         self._dev: int | None = None
         self._ino: int | None = None
 
-    def __enter__(self) -> _ManifestRunLock:
-        try:
-            self._fd = os.open(
-                str(self.lock_path),
-                os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0),
-                0o600,
-            )
-            # Write ownership token to lockfile using unpatched write
-            payload = self._lock_token.encode("utf-8")
-            written = 0
-            while written < len(payload):
-                n = _raw_os_write(self._fd, payload[written:])
-                if n <= 0:
-                    raise OSError("Failed to write lock ownership token.")
-                written += n
+    def _release_lock_if_owned(self) -> None:
+        """Release lockfile only if this instance demonstrably owns it.
 
-            if sys.platform != "win32":
-                try:
-                    st = os.fstat(self._fd)
-                    self._dev = st.st_dev
-                    self._ino = st.st_ino
-                except OSError:
-                    pass
-
-            self._acquired = True
-            return self
-        except FileExistsError:
-            raise ManifestStoreConcurrencyError(
-                f"Concurrent writer lock active for run_id '{self.run_id}'; lockfile exists."
-            ) from None
-        except Exception as exc:
-            if self._fd is not None:
-                try:
-                    os.close(self._fd)
-                except OSError:
-                    pass
-                self._fd = None
-            try:
-                if self.lock_path.exists():
-                    self.lock_path.unlink()
-            except OSError:
-                pass
-            raise ManifestStoreError(f"Failed to acquire manifest lock for run_id '{self.run_id}': {exc}") from exc
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        Never unlinks foreign lockfiles under any circumstances. Checks file descriptor,
+        inode/device identity on POSIX, and ownership token content before unlinking.
+        """
         if self._fd is not None:
             try:
                 os.close(self._fd)
@@ -624,12 +586,12 @@ class _ManifestRunLock:
                 pass
             self._fd = None
 
-        if not self._acquired:
+        # If this instance never even opened the lockfile and never acquired it, we have zero ownership
+        if not self._opened_by_us and not self._acquired:
             return
 
-        # Ownership-checked cleanup: verify lockfile ownership before unlinking
         try:
-            if not self.lock_path.exists() or self.lock_path.is_symlink() or _is_reparse_point(self.lock_path):
+            if not os.path.lexists(str(self.lock_path)) or self.lock_path.is_symlink() or _is_reparse_point(self.lock_path):
                 return
 
             # Inode & device check on POSIX
@@ -637,7 +599,7 @@ class _ManifestRunLock:
                 try:
                     st = self.lock_path.stat()
                     if st.st_ino != self._ino or st.st_dev != self._dev:
-                        # Inode mismatch: lockfile was replaced by another process! Do not unlink!
+                        # Inode mismatch: lockfile was replaced or is foreign! Do not unlink!
                         return
                 except OSError:
                     return
@@ -645,8 +607,14 @@ class _ManifestRunLock:
             # Token content verification
             try:
                 content = self.lock_path.read_text(encoding="utf-8")
-                if content != self._lock_token:
-                    # Content mismatch: lockfile belongs to another process! Do not unlink!
+                # When lock was fully acquired, content must match self._lock_token exactly.
+                # In acquisition failure paths, content may be empty or a prefix of our token.
+                is_our_token = (content == self._lock_token)
+                if not is_our_token and not self._acquired:
+                    if content == "" or (len(content) < len(self._lock_token) and self._lock_token.startswith(content)):
+                        is_our_token = True
+                if not is_our_token:
+                    # Foreign lockfile content: do not unlink under any circumstances!
                     return
             except OSError:
                 return
@@ -656,6 +624,47 @@ class _ManifestRunLock:
             pass
         finally:
             self._acquired = False
+
+    def __enter__(self) -> _ManifestRunLock:
+        try:
+            self._fd = os.open(
+                str(self.lock_path),
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0),
+                0o600,
+            )
+            self._opened_by_us = True
+            # Capture device and inode on POSIX while fd is open
+            if sys.platform != "win32":
+                try:
+                    st = os.fstat(self._fd)
+                    self._dev = st.st_dev
+                    self._ino = st.st_ino
+                except OSError:
+                    pass
+
+            # Write ownership token to lockfile using unpatched write
+            payload = self._lock_token.encode("utf-8")
+            written = 0
+            while written < len(payload):
+                n = _raw_os_write(self._fd, payload[written:])
+                if n <= 0:
+                    raise OSError("Failed to write lock ownership token.")
+                written += n
+
+            self._acquired = True
+            return self
+        except FileExistsError:
+            raise ManifestStoreConcurrencyError(
+                f"Concurrent writer lock active for run_id '{self.run_id}'; lockfile exists."
+            ) from None
+        except Exception as exc:
+            # On acquisition failure: ONLY release if we demonstrably created and own it.
+            # Foreign lockfiles are never touched.
+            self._release_lock_if_owned()
+            raise ManifestStoreError(f"Failed to acquire manifest lock for run_id '{self.run_id}': {exc}") from exc
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self._release_lock_if_owned()
 
 
 class PersistentManifestStore:
@@ -953,17 +962,40 @@ class PersistentManifestStore:
                         "for recovery investigation and was NOT unlinked."
                     ) from exc
 
-        # Post-write verification on published file
-        if not target_path.is_file():
+        # Post-publication verification on published canonical file
+        # Once publication succeeds, ANY subsequent failure (readback OSError, content mismatch,
+        # hash mismatch, or corruption) MUST raise ManifestStorePostPublicationError.
+        # Outcome is uncertain; canonical manifest is preserved fail-closed on disk;
+        # automatic retries are strictly prohibited.
+        try:
+            if not target_path.is_file() or _is_reparse_point(target_path):
+                raise ManifestStorePostPublicationError(
+                    f"Post-publication verification failed: '{target_path}' is not a regular file. "
+                    "Publication outcome is uncertain; canonical manifest is preserved fail-closed on disk "
+                    "for recovery investigation; automatic retry is strictly prohibited."
+                )
+            published_bytes = target_path.read_bytes()
+            if len(published_bytes) != total_bytes or published_bytes != serialized_bytes:
+                raise ManifestStorePostPublicationError(
+                    f"Post-publication content verification failed: published manifest at '{target_path}' "
+                    f"differs from serialized bytes (read {len(published_bytes)} bytes, expected {total_bytes}). "
+                    "Publication outcome is uncertain; canonical manifest is preserved fail-closed on disk "
+                    "for recovery investigation; automatic retry is strictly prohibited."
+                )
+            if hashlib.sha256(published_bytes).hexdigest() != hashlib.sha256(serialized_bytes).hexdigest():
+                raise ManifestStorePostPublicationError(
+                    f"Post-publication integrity verification failed: SHA-256 hash mismatch on published file '{target_path}'. "
+                    "Publication outcome is uncertain; canonical manifest is preserved fail-closed on disk "
+                    "for recovery investigation; automatic retry is strictly prohibited."
+                )
+        except ManifestStorePostPublicationError:
+            raise
+        except Exception as exc:
             raise ManifestStorePostPublicationError(
-                f"Post-write verification failed: {target_path} is not a regular file."
-            )
-        published_bytes = target_path.read_bytes()
-        if published_bytes != serialized_bytes:
-            raise ManifestStoreCorruptionError(
-                "Post-write content verification failed: published file content differs from serialized manifest. "
-                f"Canonical manifest '{target_path}' is preserved fail-closed on disk for recovery investigation."
-            )
+                f"Post-publication readback/verification failed on '{target_path}' with {type(exc).__name__}: {exc}. "
+                "Publication outcome is uncertain; canonical manifest is preserved fail-closed on disk "
+                "for recovery investigation; automatic retry is strictly prohibited."
+            ) from exc
 
         return target_path
 
@@ -1107,8 +1139,141 @@ class HermeticTestManifestStore(PersistentManifestStore):
 
     @classmethod
     def register_authorized_fixture_root(cls, root: Path | str) -> None:
-        """Register an authorized temporary test fixture root for hermetic testing."""
-        cls._AUTHORIZED_FIXTURE_ROOTS.add(Path(root).resolve())
+        """Register an authorized temporary test fixture root for hermetic testing.
+
+        Strictly enforces that the candidate root:
+        - Is invoked during active test runner execution (PYTEST_CURRENT_TEST).
+        - Already exists and is a directory.
+        - Has no symlinks, junctions, or reparse points in its path or ancestors.
+        - Resides strictly within system temporary storage, but is NOT the system temp root itself.
+        - Does NOT reside in repository, home, system, or operational data paths.
+        - On POSIX, possesses strictly owner-private permissions (0700, no 0o077 group/world bits)
+          and matches the process owner UID.
+        """
+        # 1. Active test runner context check
+        in_test_env = bool(
+            os.environ.get("PYTEST_CURRENT_TEST")
+            or "pytest" in sys.modules
+            or getattr(sys, "_efso_test_mode", False)
+        )
+        if not in_test_env:
+            raise ManifestStoreSecurityError(
+                "Authorized fixture root registration is only permitted during active pytest execution."
+            )
+
+        if root is None or not isinstance(root, (str, Path)):
+            raise ManifestStoreSecurityError("Candidate fixture root must be a Path or str.")
+
+        raw_str = str(root).strip()
+        if not raw_str:
+            raise ManifestStoreSecurityError("Candidate fixture root path cannot be empty.")
+        if "\0" in raw_str:
+            raise ManifestStoreSecurityError("Candidate fixture root path contains invalid null byte.")
+        if ".." in Path(raw_str).parts:
+            raise ManifestStoreSecurityError("Candidate fixture root path traversal ('..') is prohibited.")
+
+        candidate = Path(raw_str)
+
+        # 2. Must already exist as a directory prior to registration
+        if not candidate.exists():
+            raise ManifestStoreSecurityError(
+                f"Candidate fixture root does not exist: {candidate}. Pre-creation of fixture is required."
+            )
+        if not candidate.is_dir():
+            raise ManifestStoreSecurityError(f"Candidate fixture root is not a directory: {candidate}")
+
+        # 3. Check symlinks/reparse points across ancestors and candidate
+        curr_unresolved: Path | None = candidate
+        while curr_unresolved is not None and curr_unresolved != curr_unresolved.parent:
+            if curr_unresolved.is_symlink() or _is_reparse_point(curr_unresolved):
+                raise ManifestStoreSecurityError(f"Symlink or reparse point detected in fixture root: {curr_unresolved}")
+            curr_unresolved = curr_unresolved.parent
+
+        resolved = candidate.resolve()
+        if _is_reparse_point(resolved):
+            raise ManifestStoreSecurityError(f"Symlink or reparse point detected in fixture root: {resolved}")
+
+        # 4. Prohibit repository, .git, .env, and operational data paths
+        repo_root = _find_repo_root()
+        if repo_root is not None:
+            if resolved == repo_root:
+                raise ManifestStoreSecurityError(f"Repository root cannot be registered as a fixture root: {resolved}")
+            try:
+                resolved.relative_to(repo_root)
+                raise ManifestStoreSecurityError(f"Store directory cannot reside inside repository: {resolved}")
+            except ValueError:
+                pass
+
+        # 5. Prohibit user home directory and system directories
+        try:
+            user_home = Path.home().resolve()
+            if resolved == user_home:
+                raise ManifestStoreSecurityError(f"User home directory root cannot be registered: {resolved}")
+        except (RuntimeError, OSError):
+            pass
+
+        for part in resolved.parts:
+            p_lower = part.lower()
+            if p_lower == ".git" or p_lower.startswith(".git"):
+                raise ManifestStoreSecurityError(f"Store directory cannot target .git paths: {resolved}")
+            if p_lower == ".env" or p_lower.startswith(".env"):
+                raise ManifestStoreSecurityError(f"Store directory cannot target .env paths: {resolved}")
+
+        if sys.platform == "win32":
+            sys_root = os.environ.get("SystemRoot")
+            if sys_root and resolved == Path(sys_root).resolve():
+                raise ManifestStoreSecurityError("SystemRoot directory cannot be registered as a fixture root.")
+            prog_files = os.environ.get("ProgramFiles")
+            if prog_files and resolved == Path(prog_files).resolve():
+                raise ManifestStoreSecurityError("ProgramFiles directory cannot be registered as a fixture root.")
+        else:
+            system_roots = {Path(p).resolve() for p in ("/etc", "/bin", "/sbin", "/usr", "/var", "/dev", "/proc", "/sys")}
+            if resolved in system_roots:
+                raise ManifestStoreSecurityError(f"System directory cannot be registered: {resolved}")
+
+        # 6. Must reside strictly within system temporary storage, but not the temp root itself
+        temp_roots = [Path(tempfile.gettempdir()).resolve()]
+        for fallback_tmp in (Path("/tmp"), Path("/var/tmp")):
+            if fallback_tmp.exists():
+                temp_roots.append(fallback_tmp.resolve())
+
+        is_subpath_of_temp = False
+        for tr in temp_roots:
+            if resolved == tr:
+                raise ManifestStoreSecurityError(
+                    f"System temporary root directory '{tr}' cannot be registered as an authorized fixture root."
+                )
+            try:
+                resolved.relative_to(tr)
+                is_subpath_of_temp = True
+                break
+            except ValueError:
+                pass
+
+        if not is_subpath_of_temp:
+            raise ManifestStoreSecurityError(
+                f"Candidate fixture root '{resolved}' does not reside within system temporary storage."
+            )
+
+        # 7. POSIX ownership and permissions verification (mode 0700)
+        if sys.platform != "win32":
+            try:
+                st = resolved.stat()
+                if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
+                    raise ManifestStoreSecurityError(
+                        f"Fixture root owner UID ({st.st_uid}) does not match current process UID ({os.geteuid()})."
+                    )
+                if bool(st.st_mode & 0o077):
+                    raise ManifestStoreSecurityError(
+                        f"Fixture root has insecure permissions (mode {oct(st.st_mode & 0o777)}): "
+                        f"group and world access bits (0o077) are strictly prohibited; mode 0700 required."
+                    )
+            except OSError as exc:
+                if isinstance(exc, ManifestStoreSecurityError):
+                    raise
+                raise ManifestStoreSecurityError(f"Failed to inspect fixture root permissions: {exc}") from exc
+
+        cls._AUTHORIZED_FIXTURE_ROOTS.add(resolved)
 
     @classmethod
     def clear_authorized_fixture_roots(cls) -> None:
