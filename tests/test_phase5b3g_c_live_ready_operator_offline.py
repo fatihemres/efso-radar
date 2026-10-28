@@ -324,6 +324,11 @@ class TestPhase5B3GCLiveReadyOperator(unittest.TestCase):
         op._run_live_01()
         op.confirm_human_window(marker="MOCK_ONLY")
         op._run_live_02()
+        op._run_live_03()
+        op._run_live_04()
+        op._run_live_05()
+        op._run_live_06()
+        op._run_live_07()
 
         orig_execute = op._execute
         def execute_with_residual_delete(sql, params=None):
@@ -1200,6 +1205,12 @@ class TestPhase5B3GCLiveReadyOperator(unittest.TestCase):
         self.assertIn("OUT_OF_ORDER_STAGE", str(ctx.exception))
         boundary.halted = False
 
+        # Attempting to jump directly to LIVE-08 is rejected
+        with self.assertRaises(MockHranaDenied) as ctx:
+            boundary.record_active_stage("LIVE-08", op._seal.sha256)
+        self.assertIn("OUT_OF_ORDER_STAGE", str(ctx.exception))
+        boundary.halted = False
+
     def test_cleanup_reserve_escalation_before_live_08_blocked(self):
         op = self._make_operator()
         op._create_and_persist_manifest()
@@ -1295,6 +1306,108 @@ class TestPhase5B3GCLiveReadyOperator(unittest.TestCase):
         with self.assertRaises(MockHranaDenied) as ctx:
             op.client.execute(agg_query)
         self.assertIn("READ_NOT_ALLOWLISTED", str(ctx.exception))
+
+    def test_adversarial_early_live_08_and_cleanup_reserve_blocked(self):
+        op = self._make_operator()
+        op._create_and_persist_manifest()
+        op._run_live_01()
+        op.confirm_human_window(marker="MOCK_ONLY")
+        boundary = op.security_boundary
+        assert boundary is not None
+
+        # 1. Attacker attempts to jump directly to LIVE-08 after preflight + human window
+        with self.assertRaises(MockHranaDenied) as ctx:
+            boundary.record_active_stage("LIVE-08", op._seal.sha256)
+        self.assertIn("OUT_OF_ORDER_STAGE", str(ctx.exception))
+        self.assertTrue(boundary.halted)
+
+        # 2. Boundary is halted: cleanup reserve escalation is fail-closed denied
+        with self.assertRaises(MockHranaDenied):
+            boundary.set_cleanup_phase()
+        self.assertTrue(boundary.halted)
+
+        # 3. Direct client conditional DELETE is rejected
+        del_sql = "DELETE FROM processed_articles WHERE article_id = ? AND source = ? AND title = ?"
+        del_params = [
+            f"synth_art_{op.run_id}_01",
+            "staging_synth_test",
+            f"SYNTH_ARTICLE_{op.run_id}_01",
+        ]
+        with self.assertRaises(MockHranaDenied):
+            op.client.execute(del_sql, del_params)
+
+        # 4. Manifest preserved on disk, DB row count strictly unchanged
+        self.assertTrue(Path(op.manifest_path).exists())
+
+    def test_adversarial_direct_client_delete_before_ownership_precheck_blocked(self):
+        op = self._make_operator()
+        op._create_and_persist_manifest()
+        op._run_live_01()
+        op.confirm_human_window(marker="MOCK_ONLY")
+        op._run_live_02()
+        op._run_live_03()
+        op._run_live_04()
+        op._run_live_05()
+        op._run_live_06()
+        op._run_live_07()
+
+        boundary = op.security_boundary
+        assert boundary is not None
+
+        # Stages 1..7 completed: sequence index is 8. LIVE-08 activated and cleanup reserve set.
+        boundary.record_active_stage("LIVE-08", op._seal.sha256)
+        boundary.set_cleanup_phase()
+
+        # Attacker attempts direct conditional DELETE via client.execute() BEFORE step 8a ownership precheck
+        del_sql = "DELETE FROM processed_articles WHERE article_id = ? AND source = ? AND title = ?"
+        del_params = [
+            f"synth_art_{op.run_id}_01",
+            "staging_synth_test",
+            f"SYNTH_ARTICLE_{op.run_id}_01",
+        ]
+        with self.assertRaises(MockHranaDenied) as ctx:
+            op.client.execute(del_sql, del_params)
+        self.assertIn("OWNERSHIP_PRECHECK_REQUIRED", str(ctx.exception))
+        self.assertTrue(boundary.halted)
+
+        # Verify row still exists in database (NOT deleted)
+        cur = self.db.cursor()
+        cur.execute("SELECT COUNT(*) FROM processed_articles WHERE article_id = ?", [del_params[0]])
+        self.assertEqual(cur.fetchone()[0], 1)
+        self.assertTrue(Path(op.manifest_path).exists())
+
+    def test_adversarial_delete_without_wire_select_precheck_blocked(self):
+        op = self._make_operator()
+        op._create_and_persist_manifest()
+        op._run_live_01()
+        op.confirm_human_window(marker="MOCK_ONLY")
+        op._run_live_02()
+        op._run_live_03()
+        op._run_live_04()
+        op._run_live_05()
+        op._run_live_06()
+        op._run_live_07()
+
+        boundary = op.security_boundary
+        assert boundary is not None
+
+        boundary.record_active_stage("LIVE-08", op._seal.sha256)
+        boundary.set_cleanup_phase()
+
+        # Boundary ownership_verification_completed marked, but the specific entity was NOT prechecked on wire
+        boundary._ownership_verification_completed = True
+        boundary._ownership_prechecked_keys.clear()  # No wire SELECT executed
+
+        del_sql = "DELETE FROM processed_articles WHERE article_id = ? AND source = ? AND title = ?"
+        del_params = [
+            f"synth_art_{op.run_id}_01",
+            "staging_synth_test",
+            f"SYNTH_ARTICLE_{op.run_id}_01",
+        ]
+        with self.assertRaises(MockHranaDenied) as ctx:
+            op.client.execute(del_sql, del_params)
+        self.assertIn("OWNERSHIP_PRECHECK_REQUIRED", str(ctx.exception))
+        self.assertTrue(boundary.halted)
 
 
 if __name__ == "__main__":

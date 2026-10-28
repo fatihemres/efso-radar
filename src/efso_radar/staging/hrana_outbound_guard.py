@@ -593,6 +593,8 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
         self._preflight_queries_count: int = 0
         self._preflight_collision_checks: set[str] = set()
         self._spent_mutations: set[tuple[str, str, str, str]] = set()
+        self._ownership_prechecked_keys: set[tuple[str, str]] = set()
+        self._ownership_verification_completed: bool = False
         self._session_closed: bool = False
 
         # Determine mode: session_mode or legacy approved_intents tuple
@@ -730,6 +732,27 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
         self._human_window_confirmed = True
         self._stage_sequence_index = 2
 
+    def record_ownership_verification_completed(
+        self,
+        operator: Any,
+        manifest_sha256: str,
+    ) -> None:
+        """Record full pre-deletion attribute ownership verification completed by operator."""
+        self._seal.assert_unchanged()
+        if manifest_sha256 != self._seal.sha256:
+            self._deny("MANIFEST_MISMATCH")
+        if self._session_closed or self.halted:
+            self._deny("SESSION_HALTED")
+        if self._active_stage != "LIVE-08" or self._stage_sequence_index != 8:
+            self._deny("STAGE_MISMATCH")
+        if getattr(operator, "security_boundary", None) is not self:
+            self._deny("OPERATOR_BOUNDARY_MISMATCH")
+        if not getattr(operator, "_ownership_verified", False):
+            self._deny("OWNERSHIP_PRECHECK_REQUIRED")
+        if len(self._ownership_prechecked_keys) < 4:
+            self._deny("OWNERSHIP_PRECHECK_EVIDENCE_MISSING")
+        self._ownership_verification_completed = True
+
     def record_active_stage(self, stage_id: str, manifest_sha256: str) -> None:
         """Record active controlled live stage at wire boundary under sealed manifest assertion."""
         self._seal.assert_unchanged()
@@ -758,9 +781,8 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
                 self._deny("PREFLIGHT_REQUIRED")
             if not self._human_window_confirmed:
                 self._deny("HUMAN_WINDOW_REQUIRED")
-            if self._stage_sequence_index < 2:
+            if self._stage_sequence_index != 8:
                 self._deny("OUT_OF_ORDER_STAGE")
-            self._stage_sequence_index = 8
         else:
             expected_index = _STAGES_ORDER.index(stage_id) + 1
             if self._stage_sequence_index != expected_index:
@@ -821,6 +843,12 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
 
             raw_args = [_extract_hrana_val(a) for a in args]
             pk_value = str(raw_args[0]) if raw_args else ""
+
+            if operation == "delete":
+                if not self._ownership_verification_completed:
+                    self._deny("OWNERSHIP_PRECHECK_REQUIRED")
+                if (table, pk_value) not in self._ownership_prechecked_keys:
+                    self._deny("OWNERSHIP_PRECHECK_REQUIRED")
 
             # Mutation replay protection (strictly single-shot in LIVE-02 and LIVE-08)
             mutation_key = (self._active_stage, table, operation, pk_value)
@@ -931,6 +959,9 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
             entity = next((e for e in self._inventory if e.table == table and e.pk_value == raw_arg), None)
             if entity is None:
                 self._deny("READ_NOT_ALLOWLISTED")
+
+        if self._active_stage == "LIVE-08":
+            self._ownership_prechecked_keys.add((table, raw_arg))
 
         return
 

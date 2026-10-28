@@ -212,6 +212,7 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
         self.lockdown_recorded = False
         self.live_execution_refused = True
         self._in_cleanup = False
+        self._ownership_verified = False
         self.security_boundary: Optional[HranaOutboundSecurityBoundary] = None
 
     def _create_and_persist_manifest(self) -> None:
@@ -568,6 +569,11 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
                             )
                 verified_entities.append(ent)
 
+            # Record verified ownership precheck at wire boundary before initiating conditional DELETE
+            self._ownership_verified = True
+            if self.security_boundary is not None and self._seal is not None:
+                self.security_boundary.record_ownership_verification_completed(self, self._seal.sha256)
+
             # 8b: Parameterized conditional DELETE checking affected_row_count == 1
             for ent in sorted(
                 verified_entities,
@@ -622,9 +628,14 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             else:
                 self.audit_state = AuditOutcomeState.CLEAN
 
-        finally:
             if self.security_boundary is not None and self._seal is not None:
                 self.security_boundary.record_stage_completed("LIVE-08", self._seal.sha256)
+
+        except Exception:
+            if self.security_boundary is not None:
+                self.security_boundary.close_session()
+            raise
+        finally:
             req_used = self.http_requests_total - req_start
             duration = time.perf_counter() - start_8
             self.stages.append(
