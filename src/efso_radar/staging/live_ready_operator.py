@@ -254,14 +254,23 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
 
     def _run_live_01(self) -> None:
         self._check_budget_and_deadline(cleanup=False)
+        if (
+            self.halt_before_cleanup
+            or self._preflight_attempted
+            or self._preflight_accepted
+        ):
+            self._deny("PREFLIGHT_REENTRY")
         req_start = self.http_requests_total
         if self.security_boundary is not None and self._seal is not None:
             self.security_boundary.record_active_stage("LIVE-01", self._seal.sha256)
         try:
             super()._run_live_01()
-        finally:
             if self.security_boundary is not None and self._seal is not None:
                 self.security_boundary.record_stage_completed("LIVE-01", self._seal.sha256)
+        except Exception:
+            if self.security_boundary is not None:
+                self.security_boundary.close_session()
+            raise
         req_used = self.http_requests_total - req_start
         if self._gate is not None and self._seal is not None:
             self._gate.record_simulated_preflight(
@@ -273,8 +282,6 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
                 simulated_block_writes_on=True,
                 request_count=req_used,
             )
-        if self.security_boundary is not None and self._seal is not None:
-            self.security_boundary.record_preflight_completed(self._seal.sha256)
 
     def confirm_human_window(self, marker: str = "MOCK_ONLY") -> None:
         """Explicit human approval window gate; required before any write mutation."""
@@ -287,7 +294,7 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             self._gate.record_simulated_human_window(marker=marker)
         if self.security_boundary is not None and self._seal is not None:
             self.security_boundary.record_human_window_confirmed(
-                marker=marker, manifest_sha256=self._seal.sha256
+                self, marker, self._seal.sha256
             )
         self.human_window_confirmed = True
 
@@ -371,14 +378,26 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
 
     def _run_live_02(self) -> None:
         self._check_budget_and_deadline(cleanup=False)
+        if not self._preflight_accepted:
+            self._deny("PREFLIGHT_REQUIRED")
+        if not self.human_window_confirmed:
+            self._deny("HUMAN_WINDOW_REQUIRED")
+        if self._seal is not None:
+            try:
+                self._seal.assert_unchanged()
+            except Exception:
+                self._deny("MANIFEST_INVALID")
         req_start = self.http_requests_total
         if self.security_boundary is not None and self._seal is not None:
             self.security_boundary.record_active_stage("LIVE-02", self._seal.sha256)
         try:
             super()._run_live_02()
-        finally:
             if self.security_boundary is not None and self._seal is not None:
                 self.security_boundary.record_stage_completed("LIVE-02", self._seal.sha256)
+        except Exception:
+            if self.security_boundary is not None:
+                self.security_boundary.close_session()
+            raise
         req_used = self.http_requests_total - req_start
         if self._gate is not None and self._seal is not None:
             self._gate.record_simulated_stage(
@@ -394,9 +413,12 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             self.security_boundary.record_active_stage("LIVE-03", self._seal.sha256)
         try:
             super()._run_live_03()
-        finally:
             if self.security_boundary is not None and self._seal is not None:
                 self.security_boundary.record_stage_completed("LIVE-03", self._seal.sha256)
+        except Exception:
+            if self.security_boundary is not None:
+                self.security_boundary.close_session()
+            raise
         req_used = self.http_requests_total - req_start
         if self._gate is not None and self._seal is not None:
             self._gate.record_simulated_stage(
@@ -412,9 +434,12 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             self.security_boundary.record_active_stage("LIVE-04", self._seal.sha256)
         try:
             super()._run_live_04()
-        finally:
             if self.security_boundary is not None and self._seal is not None:
                 self.security_boundary.record_stage_completed("LIVE-04", self._seal.sha256)
+        except Exception:
+            if self.security_boundary is not None:
+                self.security_boundary.close_session()
+            raise
         req_used = self.http_requests_total - req_start
         if self._gate is not None and self._seal is not None:
             self._gate.record_simulated_stage(
@@ -430,9 +455,12 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             self.security_boundary.record_active_stage("LIVE-05", self._seal.sha256)
         try:
             super()._run_live_05()
-        finally:
             if self.security_boundary is not None and self._seal is not None:
                 self.security_boundary.record_stage_completed("LIVE-05", self._seal.sha256)
+        except Exception:
+            if self.security_boundary is not None:
+                self.security_boundary.close_session()
+            raise
         req_used = self.http_requests_total - req_start
         if self._gate is not None and self._seal is not None:
             self._gate.record_simulated_stage(
@@ -448,9 +476,12 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             self.security_boundary.record_active_stage("LIVE-06", self._seal.sha256)
         try:
             super()._run_live_06()
-        finally:
             if self.security_boundary is not None and self._seal is not None:
                 self.security_boundary.record_stage_completed("LIVE-06", self._seal.sha256)
+        except Exception:
+            if self.security_boundary is not None:
+                self.security_boundary.close_session()
+            raise
         req_used = self.http_requests_total - req_start
         if self._gate is not None and self._seal is not None:
             self._gate.record_simulated_stage(
@@ -466,9 +497,12 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             self.security_boundary.record_active_stage("LIVE-07", self._seal.sha256)
         try:
             super()._run_live_07()
-        finally:
             if self.security_boundary is not None and self._seal is not None:
                 self.security_boundary.record_stage_completed("LIVE-07", self._seal.sha256)
+        except Exception:
+            if self.security_boundary is not None:
+                self.security_boundary.close_session()
+            raise
         req_used = self.http_requests_total - req_start
         if self._gate is not None and self._seal is not None:
             self._gate.record_simulated_stage(
@@ -484,7 +518,6 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
         if bt:
             bt.in_cleanup = True
         if self.security_boundary is not None:
-            self.security_boundary.set_cleanup_phase()
             if self._seal is not None:
                 self.security_boundary.record_active_stage("LIVE-08", self._seal.sha256)
             self.security_boundary.set_cleanup_phase()

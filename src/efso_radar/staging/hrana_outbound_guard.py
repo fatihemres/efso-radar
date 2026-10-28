@@ -58,23 +58,101 @@ _EXACT_PREFLIGHT_QUERIES = frozenset({
         "HAVING COUNT(*) > 1"
     ),
     _norm("SELECT 1 AS ping"),
+    _norm("SELECT 1 AS live01_probe"),
     _norm("SELECT 1 AS found"),
     _norm("SELECT 1"),
 })
 
-_SYNTHETIC_READ_TABLES = frozenset({
-    "processed_articles",
-    "stories",
-    "run_locks",
-    "durable_recovery_state",
-})
-
-_TABLE_PK_COLUMNS = {
-    "processed_articles": "article_id",
-    "stories": "story_id",
-    "run_locks": "lock_key",
-    "durable_recovery_state": "state_key",
+_SYNTHETIC_READ_TEMPLATES: dict[str, tuple[str, str, int, frozenset[str]]] = {
+    # LIVE-02 read-backs
+    _norm("SELECT title, source FROM processed_articles WHERE article_id = ?"): (
+        "processed_articles", "article_id", 1, frozenset({"LIVE-02"})
+    ),
+    _norm("SELECT headline_tr, category FROM stories WHERE story_id = ?"): (
+        "stories", "story_id", 1, frozenset({"LIVE-02"})
+    ),
+    # LIVE-03 read-back
+    _norm("SELECT article_id FROM processed_articles WHERE article_id = ?"): (
+        "processed_articles", "article_id", 1, frozenset({"LIVE-03"})
+    ),
+    # LIVE-05 read-back
+    _norm("SELECT worker_id FROM run_locks WHERE lock_key = ?"): (
+        "run_locks", "lock_key", 1, frozenset({"LIVE-05"})
+    ),
+    # LIVE-06 pre-read & read-back
+    _norm("SELECT state_json FROM durable_recovery_state WHERE state_key = ?"): (
+        "durable_recovery_state", "state_key", 1, frozenset({"LIVE-06"})
+    ),
+    # LIVE-07 reconciliation reads
+    _norm("SELECT 1 AS f FROM processed_articles WHERE article_id = ?"): (
+        "processed_articles", "article_id", 1, frozenset({"LIVE-07"})
+    ),
+    _norm("SELECT 1 AS f FROM stories WHERE story_id = ?"): (
+        "stories", "story_id", 1, frozenset({"LIVE-07"})
+    ),
+    # LIVE-08 pre-deletion ownership reads
+    _norm("SELECT * FROM processed_articles WHERE article_id = ?"): (
+        "processed_articles", "article_id", 1, frozenset({"LIVE-08"})
+    ),
+    _norm("SELECT * FROM stories WHERE story_id = ?"): (
+        "stories", "story_id", 1, frozenset({"LIVE-08"})
+    ),
+    _norm("SELECT * FROM run_locks WHERE lock_key = ?"): (
+        "run_locks", "lock_key", 1, frozenset({"LIVE-08"})
+    ),
+    _norm("SELECT * FROM durable_recovery_state WHERE state_key = ?"): (
+        "durable_recovery_state", "state_key", 1, frozenset({"LIVE-08"})
+    ),
+    # LIVE-08 3-state audit reads (COUNT)
+    _norm("SELECT COUNT(*) AS cnt FROM processed_articles WHERE article_id = ?"): (
+        "processed_articles", "article_id", 1, frozenset({"LIVE-08"})
+    ),
+    _norm("SELECT COUNT(*) AS cnt FROM stories WHERE story_id = ?"): (
+        "stories", "story_id", 1, frozenset({"LIVE-08"})
+    ),
+    _norm("SELECT COUNT(*) AS cnt FROM run_locks WHERE lock_key = ?"): (
+        "run_locks", "lock_key", 1, frozenset({"LIVE-08"})
+    ),
+    _norm("SELECT COUNT(*) AS cnt FROM durable_recovery_state WHERE state_key = ?"): (
+        "durable_recovery_state", "state_key", 1, frozenset({"LIVE-08"})
+    ),
+    # Baseline pre-existence collision checks in LIVE-01 / LIVE-08
+    _norm("SELECT 1 AS found FROM processed_articles WHERE article_id = ?"): (
+        "processed_articles", "article_id", 1, frozenset({"LIVE-01", "LIVE-08"})
+    ),
+    _norm("SELECT 1 AS found FROM stories WHERE story_id = ?"): (
+        "stories", "story_id", 1, frozenset({"LIVE-01", "LIVE-08"})
+    ),
+    _norm("SELECT 1 AS found FROM run_locks WHERE lock_key = ?"): (
+        "run_locks", "lock_key", 1, frozenset({"LIVE-01", "LIVE-08"})
+    ),
+    _norm("SELECT 1 AS found FROM durable_recovery_state WHERE state_key = ?"): (
+        "durable_recovery_state", "state_key", 1, frozenset({"LIVE-01", "LIVE-08"})
+    ),
+    _norm("SELECT 1 AS found FROM processed_articles WHERE article_id = ? LIMIT 1"): (
+        "processed_articles", "article_id", 1, frozenset({"LIVE-01", "LIVE-08"})
+    ),
+    _norm("SELECT 1 AS found FROM stories WHERE story_id = ? LIMIT 1"): (
+        "stories", "story_id", 1, frozenset({"LIVE-01", "LIVE-08"})
+    ),
+    _norm("SELECT 1 AS found FROM run_locks WHERE lock_key = ? LIMIT 1"): (
+        "run_locks", "lock_key", 1, frozenset({"LIVE-01", "LIVE-08"})
+    ),
+    _norm("SELECT 1 AS found FROM durable_recovery_state WHERE state_key = ? LIMIT 1"): (
+        "durable_recovery_state", "state_key", 1, frozenset({"LIVE-01", "LIVE-08"})
+    ),
 }
+
+_STAGES_ORDER = (
+    "LIVE-01",
+    "LIVE-02",
+    "LIVE-03",
+    "LIVE-04",
+    "LIVE-05",
+    "LIVE-06",
+    "LIVE-07",
+    "LIVE-08",
+)
 
 _STAGE_ALLOWED_MUTATIONS: dict[str, frozenset[tuple[str, str]]] = {
     "LIVE-01": frozenset(),
@@ -511,6 +589,9 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
         self._preflight_passed: bool = False
         self._human_window_confirmed: bool = False
         self._active_stage: str | None = None
+        self._stage_sequence_index: int = 0
+        self._preflight_queries_count: int = 0
+        self._preflight_collision_checks: set[str] = set()
         self._spent_mutations: set[tuple[str, str, str, str]] = set()
         self._session_closed: bool = False
 
@@ -589,7 +670,9 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
             self._spent = set()
 
     def set_cleanup_phase(self) -> None:
-        """Mark transport as entering cleanup phase, permitting use of reserve."""
+        """Mark transport as entering cleanup phase, permitting use of reserve strictly during LIVE-08."""
+        if self._active_stage != "LIVE-08" or self._stage_sequence_index != 8:
+            self._deny("CLEANUP_RESERVE_ESCALATION")
         self._in_cleanup = True
 
     def record_preflight_completed(self, manifest_sha256: str) -> None:
@@ -599,14 +682,35 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
             self._deny("MANIFEST_MISMATCH")
         if self._session_closed or self.halted:
             self._deny("SESSION_HALTED")
+        if self._preflight_queries_count < 10 or len(self._preflight_collision_checks) < 5:
+            self._deny("PREFLIGHT_EVIDENCE_MISSING")
         if self._preflight_passed:
             self._deny("PREFLIGHT_ALREADY_RECORDED")
         self._preflight_passed = True
+        self._stage_sequence_index = 1
 
-    def record_human_window_confirmed(self, marker: str, manifest_sha256: str) -> None:
-        """Record human approval window at wire boundary under sealed manifest assertion."""
+    def record_human_window_confirmed(
+        self,
+        marker_or_operator: Any,
+        manifest_sha256_or_marker: str,
+        manifest_sha256: str | None = None,
+        *,
+        operator: Any = None,
+    ) -> None:
+        """Record human approval window at wire boundary under sealed manifest and operator attestation."""
+        if manifest_sha256 is None:
+            # Legacy 2-argument call: record_human_window_confirmed(marker, manifest_sha256)
+            marker = marker_or_operator
+            sha = manifest_sha256_or_marker
+            op = operator
+        else:
+            # 3-argument call: record_human_window_confirmed(operator, marker, manifest_sha256)
+            op = marker_or_operator
+            marker = manifest_sha256_or_marker
+            sha = manifest_sha256
+
         self._seal.assert_unchanged()
-        if manifest_sha256 != self._seal.sha256:
+        if sha != self._seal.sha256:
             self._deny("MANIFEST_MISMATCH")
         if self._session_closed or self.halted:
             self._deny("SESSION_HALTED")
@@ -614,24 +718,75 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
             self._deny("PREFLIGHT_REQUIRED")
         if self._human_window_confirmed:
             self._deny("HUMAN_WINDOW_ALREADY_CONFIRMED")
+        if self._stage_sequence_index != 1:
+            self._deny("OUT_OF_ORDER_STAGE")
         if marker != "MOCK_ONLY":
             self._deny("INVALID_HUMAN_MARKER")
+        if op is None or not getattr(op, "_preflight_accepted", False) or getattr(op, "halt_before_cleanup", False):
+            self._deny("OPERATOR_PREFLIGHT_NOT_ACCEPTED")
+        if getattr(op, "security_boundary", None) is not self:
+            self._deny("OPERATOR_BOUNDARY_MISMATCH")
+
         self._human_window_confirmed = True
+        self._stage_sequence_index = 2
 
     def record_active_stage(self, stage_id: str, manifest_sha256: str) -> None:
         """Record active controlled live stage at wire boundary under sealed manifest assertion."""
+        self._seal.assert_unchanged()
         if manifest_sha256 != self._seal.sha256:
             self._deny("MANIFEST_MISMATCH")
         if self._session_closed or self.halted:
             self._deny("SESSION_HALTED")
-        if stage_id not in _STAGE_ALLOWED_MUTATIONS:
+        if self._active_stage is not None:
+            self._deny("STAGE_ALREADY_ACTIVE")
+        if stage_id not in _STAGES_ORDER:
             self._deny("INVALID_STAGE")
+
+        # Sequence ordering validation
+        if stage_id == "LIVE-01":
+            if self._stage_sequence_index != 0:
+                self._deny("OUT_OF_ORDER_STAGE")
+        elif stage_id == "LIVE-02":
+            if not self._preflight_passed:
+                self._deny("PREFLIGHT_REQUIRED")
+            if not self._human_window_confirmed:
+                self._deny("HUMAN_WINDOW_REQUIRED")
+            if self._stage_sequence_index != 2:
+                self._deny("OUT_OF_ORDER_STAGE")
+        elif stage_id == "LIVE-08":
+            if not self._preflight_passed:
+                self._deny("PREFLIGHT_REQUIRED")
+            if not self._human_window_confirmed:
+                self._deny("HUMAN_WINDOW_REQUIRED")
+            if self._stage_sequence_index < 2:
+                self._deny("OUT_OF_ORDER_STAGE")
+            self._stage_sequence_index = 8
+        else:
+            expected_index = _STAGES_ORDER.index(stage_id) + 1
+            if self._stage_sequence_index != expected_index:
+                self._deny("OUT_OF_ORDER_STAGE")
+
         self._active_stage = stage_id
 
     def record_stage_completed(self, stage_id: str, manifest_sha256: str) -> None:
-        """Record stage completion under sealed manifest assertion."""
-        if self._active_stage == stage_id:
-            self._active_stage = None
+        """Record stage completion under sealed manifest assertion and evidence verification."""
+        self._seal.assert_unchanged()
+        if manifest_sha256 != self._seal.sha256:
+            self._deny("MANIFEST_MISMATCH")
+        if self._session_closed or self.halted:
+            self._deny("SESSION_HALTED")
+        if self._active_stage != stage_id:
+            self._deny("STAGE_MISMATCH")
+
+        if stage_id == "LIVE-01":
+            if self._preflight_queries_count < 10 or len(self._preflight_collision_checks) < 5:
+                self._deny("PREFLIGHT_EVIDENCE_MISSING")
+            self._preflight_passed = True
+            self._stage_sequence_index = 1
+        else:
+            self._stage_sequence_index += 1
+
+        self._active_stage = None
 
     def close_session(self) -> None:
         """Permanently close and invalidate this security boundary session."""
@@ -711,45 +866,73 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
         except Exception:
             self._deny("SQL_NOT_READ_ONLY")
 
-        if upper.startswith("PRAGMA "):
-            if not (
-                upper.startswith("PRAGMA TABLE_INFO(")
-                or upper.startswith("PRAGMA INDEX_LIST(")
-                or upper.startswith("PRAGMA INDEX_XINFO(")
-                or upper.startswith("PRAGMA FOREIGN_KEY_")
+        # In LIVE-01: strictly preflight and baseline collision check queries allowed
+        if self._active_stage == "LIVE-01":
+            if upper.startswith("PRAGMA "):
+                if not (
+                    upper.startswith("PRAGMA TABLE_INFO(")
+                    or upper.startswith("PRAGMA INDEX_LIST(")
+                    or upper.startswith("PRAGMA INDEX_XINFO(")
+                    or upper.startswith("PRAGMA FOREIGN_KEY_")
+                    or upper == "PRAGMA FOREIGN_KEYS"
+                ):
+                    self._deny("READ_NOT_ALLOWLISTED")
+                self._preflight_queries_count += 1
+                return
+
+            if norm_sql in _EXACT_PREFLIGHT_QUERIES:
+                if norm_sql == "SELECT name FROM sqlite_master WHERE type='table' AND name = ?":
+                    if len(args) != 1 or not isinstance(_extract_hrana_val(args[0]), str):
+                        self._deny("READ_NOT_ALLOWLISTED")
+                else:
+                    if len(args) != 0:
+                        self._deny("READ_NOT_ALLOWLISTED")
+                self._preflight_queries_count += 1
+                return
+
+            # Collision check queries during LIVE-01
+            read_spec = _SYNTHETIC_READ_TEMPLATES.get(norm_sql)
+            if read_spec is not None:
+                table, pk_col, count, allowed_stages = read_spec
+                if "LIVE-01" in allowed_stages and len(args) == count:
+                    raw_arg = str(_extract_hrana_val(args[0]))
+                    entity = next((e for e in self._inventory if e.table == table and e.pk_value == raw_arg), None)
+                    if entity is not None:
+                        self._preflight_collision_checks.add(raw_arg)
+                        self._preflight_queries_count += 1
+                        return
+
+            self._deny("READ_NOT_ALLOWLISTED")
+
+        # Outside LIVE-01: preflight queries and unallowlisted table reads are strictly forbidden.
+        # Only exact allowlisted synthetic read templates matching self._active_stage are permitted.
+        if self._active_stage is None:
+            self._deny("READ_NOT_ALLOWLISTED")
+
+        read_spec = _SYNTHETIC_READ_TEMPLATES.get(norm_sql)
+        if read_spec is None:
+            self._deny("READ_NOT_ALLOWLISTED")
+
+        table, pk_col, count, allowed_stages = read_spec
+        if self._active_stage not in allowed_stages:
+            self._deny("READ_NOT_ALLOWLISTED")
+
+        if len(args) != count:
+            self._deny("READ_NOT_ALLOWLISTED")
+
+        raw_arg = str(_extract_hrana_val(args[0]))
+        if self._active_stage == "LIVE-07" and table == "stories":
+            if (
+                raw_arg != f"synth_story_{self._seal.run_id}_01"
+                and raw_arg != f"synth_story_nonexistent_{self._seal.run_id}"
             ):
                 self._deny("READ_NOT_ALLOWLISTED")
-            return
+        else:
+            entity = next((e for e in self._inventory if e.table == table and e.pk_value == raw_arg), None)
+            if entity is None:
+                self._deny("READ_NOT_ALLOWLISTED")
 
-        if norm_sql in _EXACT_PREFLIGHT_QUERIES:
-            return
-
-        # Scoped read queries on synthetic tables
-        from_matches = re.findall(r"\bFROM\s+([A-Za-z0-9_]+)", upper)
-        join_matches = re.findall(r"\bJOIN\s+([A-Za-z0-9_]+)", upper)
-        tables_in_query = [t.lower() for t in from_matches + join_matches]
-
-        if not tables_in_query or any(t not in _SYNTHETIC_READ_TABLES for t in tables_in_query):
-            self._deny("READ_NOT_ALLOWLISTED")
-
-        target_table = tables_in_query[0]
-        expected_pk_col = _TABLE_PK_COLUMNS.get(target_table)
-        if expected_pk_col is None:
-            self._deny("READ_NOT_ALLOWLISTED")
-
-        # Must contain WHERE predicate on synthetic primary key
-        if not re.search(rf"\bWHERE\b[^\n;]*\b{re.escape(expected_pk_col)}\b\s*=\s*\?", upper, re.IGNORECASE):
-            self._deny("READ_NOT_ALLOWLISTED")
-
-        if not args:
-            self._deny("READ_NOT_ALLOWLISTED")
-
-        raw_arg = _extract_hrana_val(args[0])
-        if not isinstance(raw_arg, str) or not (
-            raw_arg.startswith("synth_")
-            and (self._seal.run_id in raw_arg or any(e.pk_value == raw_arg for e in self._inventory))
-        ):
-            self._deny("READ_NOT_ALLOWLISTED")
+        return
 
     def _is_session_statement_allowed(self, sql: str, args: list[Any]) -> bool:
         """Legacy compatibility check."""

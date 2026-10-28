@@ -861,23 +861,26 @@ class TestPhase5B3GCLiveReadyOperator(unittest.TestCase):
         op._run_live_01()
         op.confirm_human_window(marker="MOCK_ONLY")
 
-        # Simulate active stage LIVE-04 (run_locks), but caller attempts article insert
-        op.security_boundary.record_active_stage("LIVE-04", op._seal.sha256)
-        art_id = f"synth_art_{op.run_id}_01"
-        valid_insert = (
-            "INSERT INTO processed_articles (article_id, canonical_url, title, source, published_at, processed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)"
+        # Active stage is LIVE-02, but caller attempts run_locks mutation (which belongs to LIVE-04)
+        op.security_boundary.record_active_stage("LIVE-02", op._seal.sha256)
+        lock_key = f"synth_lock_{op.run_id}"
+        cas_sql = (
+            "INSERT INTO run_locks (lock_key, worker_id, acquired_at, expires_at, heartbeat_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(lock_key) DO UPDATE SET worker_id = excluded.worker_id, "
+            "acquired_at = excluded.acquired_at, expires_at = excluded.expires_at, "
+            "heartbeat_at = excluded.heartbeat_at "
+            "WHERE expires_at < excluded.acquired_at OR worker_id = excluded.worker_id"
         )
         params = [
-            art_id,
-            f"https://example.com/synth/{op.run_id}/01",
-            f"SYNTH_ARTICLE_{op.run_id}_01",
-            "staging_synth_test",
+            lock_key,
+            f"runner_alpha_{op.run_id}",
             "2026-10-25T15:00:00Z",
+            "2026-10-25T15:05:00Z",
             "2026-10-25T15:00:00Z",
         ]
         with self.assertRaises(MockHranaDenied) as ctx:
-            op.client.execute(valid_insert, params)
+            op.client.execute(cas_sql, params)
         self.assertIn("STAGE_MUTATION_MISMATCH", str(ctx.exception))
         self.assertTrue(op.security_boundary.halted)
 
@@ -975,6 +978,7 @@ class TestPhase5B3GCLiveReadyOperator(unittest.TestCase):
     def test_wire_permits_exact_preflight_and_manifest_scoped_reads(self):
         op = self._make_operator()
         op._create_and_persist_manifest()
+        op.security_boundary.record_active_stage("LIVE-01", op._seal.sha256)
 
         res1 = op.client.execute("SELECT MAX(version) AS ver FROM schema_migrations")
         self.assertIsNotNone(res1.fetchone())
@@ -1119,6 +1123,178 @@ class TestPhase5B3GCLiveReadyOperator(unittest.TestCase):
         with self.assertRaises(MockHranaDenied) as ctx:
             boundary.handle_request(req)
         self.assertIn("REQUEST_CEILING", str(ctx.exception))
+
+    # -------------------------------------------------------------------------
+    # 22. Round 3 Engineering Review Hardening: Attestation & Read Least-Privilege
+    # -------------------------------------------------------------------------
+
+    def test_adversarial_self_issued_attestation_without_preflight_or_human_window_blocked(self):
+        op = self._make_operator()
+        op._create_and_persist_manifest()
+        # op._run_live_01() is NOT called!
+        # op.confirm_human_window() is NOT called!
+        sha = op._seal.sha256
+        boundary = op.security_boundary
+        assert boundary is not None
+
+        # 1. Attacker attempts to forge preflight completion on wire boundary
+        with self.assertRaises(MockHranaDenied) as ctx:
+            boundary.record_preflight_completed(sha)
+        self.assertIn("PREFLIGHT_EVIDENCE_MISSING", str(ctx.exception))
+        boundary.halted = False
+
+        # 2. Attacker attempts to self-issue human window attestation
+        with self.assertRaises(MockHranaDenied) as ctx:
+            boundary.record_human_window_confirmed(op, "MOCK_ONLY", sha)
+        self.assertIn("PREFLIGHT_REQUIRED", str(ctx.exception))
+        boundary.halted = False
+
+        # 3. Attacker attempts to advance active stage to LIVE-02
+        with self.assertRaises(MockHranaDenied) as ctx:
+            boundary.record_active_stage("LIVE-02", sha)
+        self.assertIn("PREFLIGHT_REQUIRED", str(ctx.exception))
+        boundary.halted = False
+
+        # 4. Attacker attempts direct client mutation via op.client.execute()
+        art_id = f"synth_art_{op.run_id}_01"
+        valid_insert = (
+            "INSERT INTO processed_articles (article_id, canonical_url, title, source, published_at, processed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)"
+        )
+        params = [
+            art_id,
+            f"https://example.com/synth/{op.run_id}/01",
+            f"SYNTH_ARTICLE_{op.run_id}_01",
+            "staging_synth_test",
+            "2026-10-25T15:00:00Z",
+            "2026-10-25T15:00:00Z",
+        ]
+        with self.assertRaises(MockHranaDenied) as ctx:
+            op.client.execute(valid_insert, params)
+        self.assertIn("PREFLIGHT_REQUIRED", str(ctx.exception))
+
+        # 5. Verify actual row count before and after: strictly 0
+        cur = self.db.cursor()
+        cur.execute("SELECT COUNT(*) FROM processed_articles WHERE article_id = ?", [art_id])
+        self.assertEqual(cur.fetchone()[0], 0)
+        # Manifest remains preserved on disk
+        self.assertTrue(Path(op.manifest_path).exists())
+
+    def test_out_of_order_stage_activation_blocked(self):
+        op = self._make_operator()
+        op._create_and_persist_manifest()
+        op._run_live_01()
+        op.confirm_human_window(marker="MOCK_ONLY")
+        boundary = op.security_boundary
+        assert boundary is not None
+
+        # Stage index is at 2 (expects LIVE-02). Attempting to jump to LIVE-03 is rejected
+        with self.assertRaises(MockHranaDenied) as ctx:
+            boundary.record_active_stage("LIVE-03", op._seal.sha256)
+        self.assertIn("OUT_OF_ORDER_STAGE", str(ctx.exception))
+        boundary.halted = False
+
+        # Attempting to jump to LIVE-05 is rejected
+        with self.assertRaises(MockHranaDenied) as ctx:
+            boundary.record_active_stage("LIVE-05", op._seal.sha256)
+        self.assertIn("OUT_OF_ORDER_STAGE", str(ctx.exception))
+        boundary.halted = False
+
+    def test_cleanup_reserve_escalation_before_live_08_blocked(self):
+        op = self._make_operator()
+        op._create_and_persist_manifest()
+        boundary = op.security_boundary
+        assert boundary is not None
+
+        # 1. Attempting cleanup escalation before preflight / during LIVE-01
+        with self.assertRaises(MockHranaDenied) as ctx:
+            boundary.set_cleanup_phase()
+        self.assertIn("CLEANUP_RESERVE_ESCALATION", str(ctx.exception))
+        self.assertTrue(boundary.halted)
+
+        # Reset for stage 2 test
+        boundary.halted = False
+        op._run_live_01()
+        op.confirm_human_window(marker="MOCK_ONLY")
+        boundary.record_active_stage("LIVE-02", op._seal.sha256)
+
+        # 2. Attempting cleanup escalation during LIVE-02
+        with self.assertRaises(MockHranaDenied) as ctx:
+            boundary.set_cleanup_phase()
+        self.assertIn("CLEANUP_RESERVE_ESCALATION", str(ctx.exception))
+        self.assertTrue(boundary.halted)
+
+    def test_read_least_privilege_rejects_or_1_equals_1_injection(self):
+        op = self._make_operator()
+        op._create_and_persist_manifest()
+        op._run_live_01()
+        op.confirm_human_window(marker="MOCK_ONLY")
+        op.security_boundary.record_active_stage("LIVE-02", op._seal.sha256)
+
+        story_id = f"synth_story_{op.run_id}_01"
+        injected_query = "SELECT * FROM stories WHERE story_id = ? OR 1=1"
+        with self.assertRaises(MockHranaDenied) as ctx:
+            op.client.execute(injected_query, [story_id])
+        self.assertIn("READ_NOT_ALLOWLISTED", str(ctx.exception))
+        self.assertTrue(op.security_boundary.halted)
+
+    def test_read_least_privilege_rejects_join_cardinality_expansion(self):
+        op = self._make_operator()
+        op._create_and_persist_manifest()
+        op._run_live_01()
+        op.confirm_human_window(marker="MOCK_ONLY")
+        op.security_boundary.record_active_stage("LIVE-02", op._seal.sha256)
+
+        story_id = f"synth_story_{op.run_id}_01"
+        join_query = "SELECT * FROM stories s JOIN processed_articles a ON 1=1 WHERE s.story_id = ?"
+        with self.assertRaises(MockHranaDenied) as ctx:
+            op.client.execute(join_query, [story_id])
+        self.assertIn("READ_NOT_ALLOWLISTED", str(ctx.exception))
+        self.assertTrue(op.security_boundary.halted)
+
+    def test_read_least_privilege_rejects_extra_parameters(self):
+        op = self._make_operator()
+        op._create_and_persist_manifest()
+        op._run_live_01()
+        op.confirm_human_window(marker="MOCK_ONLY")
+        op.security_boundary.record_active_stage("LIVE-02", op._seal.sha256)
+
+        art_id = f"synth_art_{op.run_id}_01"
+        extra_param_query = "SELECT title, source FROM processed_articles WHERE article_id = ? AND 1 = ?"
+        with self.assertRaises(MockHranaDenied) as ctx:
+            op.client.execute(extra_param_query, [art_id, 1])
+        self.assertIn("READ_NOT_ALLOWLISTED", str(ctx.exception))
+        self.assertTrue(op.security_boundary.halted)
+
+    def test_read_least_privilege_rejects_preflight_queries_outside_live_01(self):
+        op = self._make_operator()
+        op._create_and_persist_manifest()
+        op._run_live_01()
+        op.confirm_human_window(marker="MOCK_ONLY")
+        op.security_boundary.record_active_stage("LIVE-02", op._seal.sha256)
+
+        # Attempting preflight delivery status read in LIVE-02
+        with self.assertRaises(MockHranaDenied) as ctx:
+            op.client.execute("SELECT DISTINCT status FROM telegram_delivery_records")
+        self.assertIn("READ_NOT_ALLOWLISTED", str(ctx.exception))
+        op.security_boundary.halted = False
+
+        # Attempting preflight schema version read in LIVE-02
+        with self.assertRaises(MockHranaDenied) as ctx:
+            op.client.execute("SELECT MAX(version) AS ver FROM schema_migrations")
+        self.assertIn("READ_NOT_ALLOWLISTED", str(ctx.exception))
+        op.security_boundary.halted = False
+
+        # Attempting preflight duplicate recipient_chat_id aggregation in LIVE-02
+        agg_query = (
+            "SELECT recipient_chat_id, message_key, COUNT(*) as cnt "
+            "FROM telegram_delivery_records "
+            "GROUP BY recipient_chat_id, message_key "
+            "HAVING COUNT(*) > 1"
+        )
+        with self.assertRaises(MockHranaDenied) as ctx:
+            op.client.execute(agg_query)
+        self.assertIn("READ_NOT_ALLOWLISTED", str(ctx.exception))
 
 
 if __name__ == "__main__":
