@@ -782,8 +782,13 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
                 self.client.close()
 
             # Unlink manifest if and only if strictly CLEAN and session PASSED
-            manifest_preserved = True
-            if self.manifest_path and self.manifest:
+            manifest_persisted = bool(
+                self.manifest_path is not None
+                and self.manifest_path.exists()
+                and self.manifest_path.is_file()
+            )
+            manifest_preserved = False
+            if manifest_persisted and self.manifest:
                 if (
                     session_status == LiveReadyOperatorStatus.PASSED
                     and self.audit_state == AuditOutcomeState.CLEAN
@@ -797,6 +802,20 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             duration = time.perf_counter() - start_time
 
         cleanup_reserve_used = max(0, self.http_requests_total - self.request_cutoff)
+
+        if session_status != LiveReadyOperatorStatus.PASSED or self.audit_state != AuditOutcomeState.CLEAN:
+            if manifest_persisted:
+                recovery_notice = (
+                    "SEPARATE_OPERATOR_REVIEWED_RECOVERY_REQUIRED: Automatic retry or deletion is prohibited; "
+                    "preserved manifest on disk requires a separate, independently reviewed recovery procedure."
+                )
+            else:
+                recovery_notice = (
+                    "SEPARATE_OPERATOR_REVIEWED_RECOVERY_REQUIRED: Automatic retry or deletion is prohibited; "
+                    "no local manifest was persisted to disk before session abort; manual operator investigation is required."
+                )
+        else:
+            recovery_notice = None
 
         return LiveReadyOperatorReport(
             run_id=self.run_id,
@@ -816,12 +835,7 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             lockdown_recorded=self.lockdown_recorded,
             live_execution_refused=self.live_execution_refused,
             security_boundary_active=self.security_boundary is not None,
-            recovery_notice=(
-                "SEPARATE_OPERATOR_REVIEWED_RECOVERY_REQUIRED: Automatic retry or deletion is prohibited; "
-                "preserved manifest on disk requires a separate, independently reviewed recovery procedure."
-                if session_status != LiveReadyOperatorStatus.PASSED or self.audit_state != AuditOutcomeState.CLEAN
-                else None
-            ),
+            recovery_notice=recovery_notice,
         )
 
 

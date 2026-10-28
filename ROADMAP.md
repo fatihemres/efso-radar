@@ -21,15 +21,15 @@
 ## 2026-10-28 Phase 5B.3G-C Live Readiness Wire Contract Checkpoint (Issue #37 Slice A / Draft PR)
 
 Offline wire-contract integration slice implemented and validated against baseline `4cfe02aa23e1600db7531481af87fa8b554b653c`:
-- Full operator -> outbound security boundary -> Hrana mock transport chain exercised with 26 dedicated tests (`tests/test_phase5b3g_c_live_readiness_wire_contract.py`).
-- Compact evidence-backed LIVE-01–08 readiness/gap matrix published in `docs/PHASE5B3G_LIVE_STAGING_RELIABILITY_PLAN.md` Section 5.5 (`IMPLEMENTED`, `OFFLINE TESTED`, `NOT LIVE-WIRED`, `PO GATED`).
-- Early-failure stop contract verified across LIVE-02..07: halts fail-closed, preserves manifest, marks UNKNOWN, closes boundary session permanently (`SESSION_HALTED`), populates explicit `recovery_notice` requiring separate operator-reviewed recovery protocol, and prohibits in-session LIVE-08 cleanup bypasses (zero calls to LIVE-08).
-- Architecture conflict preserved as open design: historical 80-request cutoff transition to LIVE-08 contradicts monotonic stage-index requirements; halts fail-closed without stage bypass.
+- Full operator -> outbound security boundary -> Hrana mock transport chain exercised with 31 dedicated tests (`tests/test_phase5b3g_c_live_readiness_wire_contract.py`).
+- Compact evidence-backed LIVE-01–08 readiness/gap matrix published in `docs/PHASE5B3G_LIVE_STAGING_RELIABILITY_PLAN.md` Section 5.5 (`IMPLEMENTED`, `OFFLINE TESTED`, `NOT LIVE-WIRED`, `PO GATED`), with LIVE-08 reflecting all 5 registered manifest entities (5 attribute checks, 4–5 conditional deletes, 5 audit queries) and distinct statement vs request accounting.
+- Early-failure stop contract verified across LIVE-02..07: halts fail-closed, preserves manifest, marks UNKNOWN, closes boundary session permanently (`SESSION_HALTED`), populates explicit `recovery_notice` requiring separate operator-reviewed recovery protocol, and prohibits in-session LIVE-08 cleanup bypasses (zero calls to LIVE-08). Pre-persistence failure negative test verifies recovery notice accurately reports no local manifest was persisted to disk.
+- Architecture conflict preserved as open design: historical 80-request cutoff transition to LIVE-08 contradicts monotonic stage-index requirements; halts fail-closed without stage bypass (verified for both scaled and nominal 80 cutoff).
 - Wire-level checks: exact HTTPS destination allowlist, non-duplicate JSON keys, payload size <= 16KB, transaction baton state machine including `[{"type": "close"}]` transaction end, monotonic stage sequencing, and read-only least privilege.
-- Server error response modes verified: 500 error, malformed JSON, missing baton on BEGIN, COMMIT timeout.
-- LIVE-08 exact ownership pre-verification, conditional DELETE (affected == 1), and 3-state audit verified.
-- Six unwaived live readiness blockers documented: Windows NTFS owner-private DACL, physical power-loss vs process restart, live transport authorization architecture, remote recovery protocol, manual Block Writes/token proof, and provider commercial policy ($0.00 / 0 TRY).
-- All live staging operations remain **UNAUTHORIZED**; Block Writes remains ON. 26 focused wire-contract tests passing, 60 operator tests passing, 293 passed across all Phase 5B.3G tests, 794 passed across full hermetic suite, Ruff clean.
+- Server error response modes verified: 500 error, malformed JSON, missing baton on BEGIN, COMMIT timeout, truncated Hrana response results.
+- LIVE-08 exact ownership pre-verification across 5 registered entities, conditional DELETE (affected == 1), and 3-state audit verified.
+- Six unwaived live readiness blockers documented: Windows NTFS owner-private DACL, physical power-loss vs process restart, live transport authorization architecture, remote recovery protocol, manual Block Writes/token proof, and provider commercial policy ($0.00 / 0 TRY; reconciled to official free tier figures: 100 DBs, 5GB storage, 500M reads, 10M writes).
+- All live staging operations remain **UNAUTHORIZED**; Block Writes remains ON. 31 focused wire-contract tests passing, 60 operator tests passing, 298 passed across all Phase 5B.3G tests, 799 passed across full hermetic suite, Ruff clean.
 
 ## 2026-10-28 Phase 5B.3G-C Persistent Manifest Foundation Checkpoint (INTEGRATED PR #36)
 

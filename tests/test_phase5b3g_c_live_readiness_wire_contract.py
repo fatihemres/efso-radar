@@ -297,8 +297,8 @@ class TestPhase5B3GCLiveReadinessWireContract(unittest.TestCase):
     # 3. Architecture Conflict Preservation (Historical 80-Request Cutoff)
     # =========================================================================
 
-    def test_historical_80_request_cutoff_conflict_fails_closed_without_cleanup_bypass(self):
-        """Reaching request cutoff (80) fails closed; does not bypass stages to jump to LIVE-08."""
+    def test_scaled_request_cutoff_conflict_fails_closed_without_cleanup_bypass(self):
+        """Scaled test (cutoff=45): reaching request cutoff fails closed; does not bypass stages to jump to LIVE-08."""
         # Lower cutoff to 45 so it trips during LIVE-01 / LIVE-02 transition
         op = self._make_operator(request_cutoff=45, request_ceiling=90, cleanup_reserve=25)
         report = op.run(auto_human_window=True, human_marker="MOCK_ONLY")
@@ -318,6 +318,32 @@ class TestPhase5B3GCLiveReadinessWireContract(unittest.TestCase):
         if op.security_boundary is not None:
             with self.assertRaises(MockHranaDenied):
                 op.security_boundary.set_cleanup_phase()
+
+    def test_nominal_request_cutoff_80_fails_closed_without_cleanup_bypass(self):
+        """Nominal configuration (cutoff=80, reserve=20, ceiling=100) trips at request #80 and halts fail-closed."""
+        def trip_at_80(req: httpx.Request) -> httpx.Response | None:
+            # Advance request_count to 79 right before LIVE-02 dispatches its transaction
+            body = json.loads(req.content.decode("utf-8"))
+            requests = body.get("requests", [])
+            if len(requests) > 1 and requests[0].get("stmt", {}).get("sql") == "BEGIN":
+                self.budget_transport.request_count = 79
+            return None
+
+        self._custom_hook = trip_at_80
+        op = self._make_operator()  # default nominal: ceiling=100, cutoff=80, reserve=20
+        report = op.run(auto_human_window=True, human_marker="MOCK_ONLY")
+
+        self.assertEqual(report.status, LiveReadyOperatorStatus.FAILED)
+        self.assertEqual(report.audit_state, AuditOutcomeState.UNKNOWN)
+        self.assertTrue(report.manifest_preserved)
+        self.assertTrue(Path(report.manifest_path).exists())
+        self.assertIsNotNone(report.recovery_notice)
+        self.assertIn("SEPARATE_OPERATOR_REVIEWED_RECOVERY_REQUIRED", report.recovery_notice)
+        self.assertIn("preserved manifest on disk", report.recovery_notice)
+
+        executed_stages = [st.stage_id for st in report.stages]
+        self.assertNotIn("LIVE-08", executed_stages)
+        self.assertTrue(op.security_boundary._session_closed)
 
     # =========================================================================
     # 4. Outbound Wire Boundary Checks & Protocol Robustness
@@ -512,6 +538,53 @@ class TestPhase5B3GCLiveReadinessWireContract(unittest.TestCase):
         self.assertTrue(Path(report.manifest_path).exists())
         self.assertIsNotNone(report.recovery_notice)
 
+    def test_hrana_truncated_response_results_halts_fail_closed(self):
+        """Server returning fewer results than requested statements halts fail-closed."""
+        def return_truncated_results(req: httpx.Request) -> httpx.Response | None:
+            body = json.loads(req.content.decode("utf-8"))
+            requests = body.get("requests", [])
+            # In LIVE-02, the multi-statement transaction sends 3 requests: BEGIN, INSERT art, INSERT story
+            if len(requests) == 3 and requests[0].get("stmt", {}).get("sql") == "BEGIN":
+                # Return only 1 result with a session baton (fewer than the 3 requests)
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": "trunc-baton-xyz",
+                        "results": [
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "type": "execute",
+                                    "result": {
+                                        "cols": [],
+                                        "rows": [],
+                                        "affected_row_count": 0,
+                                        "last_insert_rowid": None,
+                                    },
+                                },
+                            }
+                        ],
+                    },
+                    request=req,
+                )
+            return None
+
+        self._custom_hook = return_truncated_results
+        op = self._make_operator()
+        report = op.run(auto_human_window=True, human_marker="MOCK_ONLY")
+
+        self.assertEqual(report.status, LiveReadyOperatorStatus.FAILED)
+        self.assertEqual(report.audit_state, AuditOutcomeState.UNKNOWN)
+        self.assertTrue(report.manifest_preserved)
+        self.assertTrue(Path(report.manifest_path).exists())
+        self.assertIsNotNone(report.recovery_notice)
+        self.assertIn("SEPARATE_OPERATOR_REVIEWED_RECOVERY_REQUIRED", report.recovery_notice)
+        self.assertIn("preserved manifest on disk", report.recovery_notice)
+
+        executed_stages = [st.stage_id for st in report.stages]
+        self.assertNotIn("LIVE-08", executed_stages)
+        self.assertTrue(op.security_boundary._session_closed)
+
     # =========================================================================
     # 6. LIVE-08 Ownership, Conditional Delete, and 3-State Audit
     # =========================================================================
@@ -576,9 +649,8 @@ class TestPhase5B3GCLiveReadinessWireContract(unittest.TestCase):
     # 7. Ceilings, Deadlines & Sanitized Diagnostics
     # =========================================================================
 
-    def test_request_ceiling_100_strictly_blocked(self):
-        """Dispatched request #100 is strictly blocked fail-closed."""
-        # Use valid invariants: cutoff=20, cleanup_reserve=20, ceiling=40
+    def test_scaled_request_ceiling_strictly_blocks_at_budget_limit(self):
+        """Scaled test (ceiling=40, cutoff=20): reaching request ceiling is strictly blocked fail-closed."""
         op = self._make_operator(request_ceiling=40, request_cutoff=20, cleanup_reserve=20)
         report = op.run(auto_human_window=True, human_marker="MOCK_ONLY")
 
@@ -587,8 +659,27 @@ class TestPhase5B3GCLiveReadinessWireContract(unittest.TestCase):
         self.assertTrue(report.manifest_preserved)
         self.assertTrue(Path(report.manifest_path).exists())
 
-    def test_session_deadline_exhaustion_strictly_halts_session(self):
-        """Elapsed session deadline (>=120s) strictly halts session fail-closed."""
+    def test_nominal_request_ceiling_100_strictly_blocked(self):
+        """Dispatched request #100 is strictly blocked fail-closed under nominal ceiling=100."""
+        def trip_at_100(req: httpx.Request) -> httpx.Response | None:
+            # Advance request_count to 99 right before LIVE-02 dispatches
+            body = json.loads(req.content.decode("utf-8"))
+            requests = body.get("requests", [])
+            if len(requests) > 1 and requests[0].get("stmt", {}).get("sql") == "BEGIN":
+                self.budget_transport.request_count = 99
+            return None
+
+        self._custom_hook = trip_at_100
+        op = self._make_operator()  # default nominal: ceiling=100, cutoff=80, reserve=20
+        report = op.run(auto_human_window=True, human_marker="MOCK_ONLY")
+
+        self.assertEqual(report.status, LiveReadyOperatorStatus.FAILED)
+        self.assertEqual(report.audit_state, AuditOutcomeState.UNKNOWN)
+        self.assertTrue(report.manifest_preserved)
+        self.assertTrue(Path(report.manifest_path).exists())
+
+    def test_scaled_session_deadline_exhaustion_strictly_halts_session(self):
+        """Scaled test (deadline=20.0s): elapsed session deadline strictly halts session fail-closed."""
         fake_time = 1000.0
 
         def advance_clock():
@@ -606,6 +697,61 @@ class TestPhase5B3GCLiveReadinessWireContract(unittest.TestCase):
         self.assertEqual(report.audit_state, AuditOutcomeState.UNKNOWN)
         self.assertTrue(report.manifest_preserved)
         self.assertTrue(Path(report.manifest_path).exists())
+
+    def test_nominal_session_deadline_120s_exhaustion_halts_session(self):
+        """Elapsed session deadline (>=120.0s) strictly halts session fail-closed under nominal deadline=120.0s."""
+        fake_time = 1000.0
+
+        def advance_clock():
+            nonlocal fake_time
+            return fake_time
+
+        def trip_clock_after_live01(req: httpx.Request) -> httpx.Response | None:
+            nonlocal fake_time
+            body = json.loads(req.content.decode("utf-8"))
+            requests = body.get("requests", [])
+            if len(requests) > 1 and requests[0].get("stmt", {}).get("sql") == "BEGIN":
+                fake_time += 121.0  # Expire 120.0s deadline right before LIVE-02 readbacks
+            return None
+
+        self._custom_hook = trip_clock_after_live01
+        clock_budget_transport = BudgetTrackingTransport(
+            self.raw_transport,
+            ceiling=100,
+            cutoff=80,
+            session_timeout_seconds=120.0,
+            clock=advance_clock,
+        )
+        self.client.transport = clock_budget_transport
+        op = self._make_operator(
+            clock=advance_clock,
+            session_deadline_seconds=120.0,
+        )
+        report = op.run(auto_human_window=True, human_marker="MOCK_ONLY")
+
+        self.assertEqual(report.status, LiveReadyOperatorStatus.FAILED)
+        self.assertEqual(report.audit_state, AuditOutcomeState.UNKNOWN)
+        self.assertTrue(report.manifest_preserved)
+        self.assertTrue(Path(report.manifest_path).exists())
+
+    def test_pre_persistence_failure_recovery_notice_reports_no_persisted_manifest(self):
+        """Failure before manifest persistence reports no manifest on disk and requires manual investigation."""
+        op = self._make_operator()
+
+        def fail_manifest_persistence():
+            raise OSError("Simulated disk error during manifest initialization")
+
+        op._create_and_persist_manifest = fail_manifest_persistence
+        report = op.run(auto_human_window=True, human_marker="MOCK_ONLY")
+
+        self.assertEqual(report.status, LiveReadyOperatorStatus.FAILED)
+        self.assertEqual(report.audit_state, AuditOutcomeState.UNKNOWN)
+        self.assertFalse(report.manifest_preserved)
+        self.assertEqual(report.manifest_path, "")
+        self.assertIsNotNone(report.recovery_notice)
+        self.assertIn("SEPARATE_OPERATOR_REVIEWED_RECOVERY_REQUIRED", report.recovery_notice)
+        self.assertIn("no local manifest was persisted to disk", report.recovery_notice)
+        self.assertNotIn("preserved manifest on disk", report.recovery_notice)
 
     def test_sanitized_errors_leak_zero_sql_or_tokens(self):
         """Error messages and reports leak zero SQL statements, parameter values, or auth tokens."""
