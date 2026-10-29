@@ -1305,10 +1305,10 @@ class TestWindowsManifestDurabilityCrashWindows:
 
     def test_pre_remote_write_durability_gate_blocks_live_on_unproven_fsync(self) -> None:
         """Verify pre-remote-write durability gate blocks live remote writes when directory fsync unproven."""
-        # Hermetic test mode always passes
+        # Hermetic test mode returns an inert assessment without raising; platform_prerequisite_met is never manufactured
         assessment = verify_pre_remote_write_durability_gate(is_hermetic_test=True)
         assert isinstance(assessment, StoragePlatformDurabilityAssessment)
-        assert assessment.platform_prerequisite_met is True
+        assert assessment.platform_prerequisite_met is (sys.platform != "win32")
         assert assessment.manifest_persisted is False
         assert assessment.remote_mutation_authorized is False
 
@@ -1317,20 +1317,20 @@ class TestWindowsManifestDurabilityCrashWindows:
             with pytest.raises(ManifestStoreSecurityError, match="Pre-remote-write durability prerequisite check failed"):
                 verify_pre_remote_write_durability_gate(is_hermetic_test=False)
         else:
-            mock_guar = Mock(platform="linux", fsync_directory_supported=False)
+            mock_guar = Mock(platform="linux", fsync_file_supported=True, fsync_directory_supported=False)
             with pytest.raises(ManifestStoreSecurityError, match="Pre-remote-write durability prerequisite check failed"):
                 verify_pre_remote_write_durability_gate(mock_guar, is_hermetic_test=False)
 
     def test_pre_remote_write_durability_gate_inert_assessment_and_no_authorization(self, tmp_path: Path) -> None:
         """Negative contract: platform prerequisite success does NOT establish manifest presence or remote permission."""
-        # 1. Hermetic assessment check
+        # 1. Hermetic assessment check reflects real platform capabilities without manufacturing success
         assessment_hermetic = verify_pre_remote_write_durability_gate(is_hermetic_test=True)
-        assert assessment_hermetic.platform_prerequisite_met is True
+        assert assessment_hermetic.platform_prerequisite_met is (sys.platform != "win32")
         assert assessment_hermetic.manifest_persisted is False
         assert assessment_hermetic.remote_mutation_authorized is False
 
         # 2. Mocked supported POSIX platform assessment check
-        mock_supported_guar = Mock(platform="linux", fsync_directory_supported=True)
+        mock_supported_guar = Mock(platform="linux", fsync_file_supported=True, fsync_directory_supported=True)
         assessment_posix = verify_pre_remote_write_durability_gate(mock_supported_guar, is_hermetic_test=False)
         assert assessment_posix.platform_prerequisite_met is True
         assert assessment_posix.manifest_persisted is False
@@ -1340,6 +1340,41 @@ class TestWindowsManifestDurabilityCrashWindows:
         test_dir = tmp_path / "prereq_test"
         test_dir.mkdir(parents=True, exist_ok=True)
         assert list(test_dir.iterdir()) == [], "Platform prerequisite assessment must be completely inert and produce zero files"
+
+    def test_pre_remote_write_durability_gate_mock_cases_for_unsupported_platforms(self) -> None:
+        """Regression tests: unsupported file fsync on Linux fails closed, hermetic Windows returns negative assessment."""
+        # Case 1: Linux with directory fsync True but file fsync False
+        mock_linux_no_file_fsync = Mock(platform="linux", fsync_file_supported=False, fsync_directory_supported=True)
+        # Non-hermetic mode must fail closed
+        with pytest.raises(ManifestStoreSecurityError, match="Pre-remote-write durability prerequisite check failed"):
+            verify_pre_remote_write_durability_gate(mock_linux_no_file_fsync, is_hermetic_test=False)
+        # Hermetic mode must return an inert negative assessment, never manufacturing True
+        assessment_linux_no_file = verify_pre_remote_write_durability_gate(mock_linux_no_file_fsync, is_hermetic_test=True)
+        assert assessment_linux_no_file.platform_prerequisite_met is False
+        assert assessment_linux_no_file.fsync_file_supported is False
+        assert assessment_linux_no_file.fsync_directory_supported is True
+        assert assessment_linux_no_file.manifest_persisted is False
+        assert assessment_linux_no_file.remote_mutation_authorized is False
+
+        # Case 2: Windows with file fsync True but directory fsync False
+        mock_win32 = Mock(platform="win32", fsync_file_supported=True, fsync_directory_supported=False)
+        # Non-hermetic mode must fail closed
+        with pytest.raises(ManifestStoreSecurityError, match="Pre-remote-write durability prerequisite check failed"):
+            verify_pre_remote_write_durability_gate(mock_win32, is_hermetic_test=False)
+        # Hermetic mode must return an inert negative assessment, never manufacturing True
+        assessment_win32 = verify_pre_remote_write_durability_gate(mock_win32, is_hermetic_test=True)
+        assert assessment_win32.platform_prerequisite_met is False
+        assert assessment_win32.fsync_file_supported is True
+        assert assessment_win32.fsync_directory_supported is False
+        assert assessment_win32.manifest_persisted is False
+        assert assessment_win32.remote_mutation_authorized is False
+
+        # Case 3: Mocked supported POSIX platform produces positive platform-only assessment, no live authorization
+        mock_posix_ok = Mock(platform="linux", fsync_file_supported=True, fsync_directory_supported=True)
+        assessment_posix_ok = verify_pre_remote_write_durability_gate(mock_posix_ok, is_hermetic_test=True)
+        assert assessment_posix_ok.platform_prerequisite_met is True
+        assert assessment_posix_ok.manifest_persisted is False
+        assert assessment_posix_ok.remote_mutation_authorized is False
 
     def test_crash_window_1_temp_file_creation_failure_leaves_no_artifacts(self, tmp_path: Path) -> None:
         """Window 1: Failure during temp file creation (O_CREAT) leaves no canonical or temp files."""
@@ -1364,7 +1399,7 @@ class TestWindowsManifestDurabilityCrashWindows:
         assert len(temp_files) == 0, "No orphaned temp file should exist"
 
     def test_crash_window_2_short_write_disk_full_fails_closed_and_cleans_temp(self, tmp_path: Path) -> None:
-        """Window 2: Short write / disk full during payload write unlinks temp file, leaves no canonical."""
+        """Window 2: Controlled short write / disk full during payload write unlinks temp file in exception handler, leaves no canonical."""
         store_dir = tmp_path / "store_w2"
         store = HermeticTestManifestStore(store_dir)
         run_id = _generate_valid_run_id("crashw2")

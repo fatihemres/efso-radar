@@ -517,7 +517,7 @@ The offline manifest store candidate verifies fail-closed boundaries across 8 de
 | Window ID | Crash Window Description | Immediate Fault / Trigger | Expected Invariant & Recovery State | Remote Write Authorized? | Automatic Retry Permitted? |
 | --- | --- | --- | --- | :---: | :---: |
 | **WINDOW_1** | Temp file creation failure | `O_CREAT` denied (`EACCES` / `ENOSPC`) | Canonical: `ABSENT`<br>Temp: `CLEANED` (none leaked)<br>Outcome: `FAILED_CLOSED` | **NO** | **NO** |
-| **WINDOW_2** | Short write / disk full during payload write | Incomplete `os.write()` / `ENOSPC` | Canonical: `ABSENT`<br>Temp: `CLEANED` (unlinked immediately)<br>Outcome: `FAILED_CLOSED` | **NO** | **NO** |
+| **WINDOW_2** | Controlled payload write failure or disk full during serialization | Controlled `os.write()` failure / `ENOSPC` (unlinked during exception handling; abrupt process kill mid-write leaving inert temp orphan covered under Window 8) | Canonical: `ABSENT`<br>Temp: `CLEANED` (unlinked in exception handler)<br>Outcome: `FAILED_CLOSED` | **NO** | **NO** |
 | **WINDOW_3** | File content fsync failure | `os.fsync()` failure (`EIO`) | Canonical: `ABSENT`<br>Temp: `CLEANED` (unlinked immediately)<br>Outcome: `FAILED_CLOSED` | **NO** | **NO** |
 | **WINDOW_4** | Pre-publication verification failure | Size or SHA-256 mismatch on temp readback | Canonical: `ABSENT`<br>Temp: `CLEANED` (corrupted temp destroyed)<br>Outcome: `FAILED_CLOSED` | **NO** | **NO** |
 | **WINDOW_5** | Pre-existing target manifest collision | Target manifest already exists on disk | Canonical: `PRESERVED` (unmodified byte-for-byte)<br>Temp: `CLEANED` (unlinked immediately)<br>Outcome: `FAILED_CLOSED` | **NO** | **NO** |
@@ -530,8 +530,8 @@ The offline manifest store candidate verifies fail-closed boundaries across 8 de
 To prevent partial or uncommitted local manifests from authorizing remote database mutations, `PersistentManifestStore` provides an inert platform-prerequisite assessment:
 
 - **Programmatic Assessment:** `verify_pre_remote_write_durability_gate(guarantees, is_hermetic_test) -> StoragePlatformDurabilityAssessment`.
-- **Inert Safety Boundary:** Success of this platform prerequisite check establishes **ONLY** that the host filesystem supports the required file/directory fsync syscalls. It does **NOT** establish that a valid manifest was created, persisted, sealed, or owned, and it **NEVER** grants permission or authorization for remote database operations. Remote live mutations remain permanently disabled in this offline slice.
-- **Fail-Closed Rule:** In non-hermetic execution, the prerequisite check strictly fails closed (`ManifestStoreSecurityError`) if directory-level persistence (`fsync_directory_supported`) is unproven on the operating platform (such as on Windows NTFS).
+- **Inert Safety Boundary:** Success of this platform prerequisite check establishes **ONLY** that the host filesystem supports both file and directory fsync syscalls (with Windows remaining unsupported under the current implementation). It does **NOT** establish that a valid manifest was created, persisted, sealed, or owned, and it **NEVER** grants permission or authorization for remote database operations. Remote live mutations remain permanently disabled in this offline slice.
+- **Fail-Closed Rule:** In non-hermetic execution, the prerequisite check strictly fails closed (`ManifestStoreSecurityError`) if either file-level (`fsync_file_supported`) or directory-level persistence (`fsync_directory_supported`) is unproven on the operating platform (such as on Windows NTFS or Linux missing file fsync). In hermetic test mode, unsupported platforms produce an inert negative assessment (`platform_prerequisite_met=False`) without manufacturing positive capability.
 - **Zero Ambiguity:** Manifest file creation alone or clean process exit alone can **never** be cited as authorization to proceed to live database writes.
 
 #### 6. Product Owner Architectural Decision Gate

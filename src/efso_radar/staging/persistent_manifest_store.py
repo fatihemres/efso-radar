@@ -214,7 +214,7 @@ _CRASH_WINDOW_CONTRACTS: dict[ManifestCrashWindow, CrashWindowContract] = {
     ),
     ManifestCrashWindow.WINDOW_2_PARTIAL_WRITE: CrashWindowContract(
         window=ManifestCrashWindow.WINDOW_2_PARTIAL_WRITE,
-        description="Process crash, disk full (ENOSPC), or short write during payload serialization.",
+        description="Controlled payload write failure or disk full (ENOSPC) during serialization (unlinks partial temp file during exception handling; abrupt process crashes leaving inert temp orphans are covered under Window 8).",
         expected_canonical_state="ABSENT",
         expected_temp_state="CLEANED",
         expected_outcome="FAILED_CLOSED",
@@ -292,6 +292,7 @@ class StoragePlatformDurabilityAssessment:
     """
 
     platform: str
+    fsync_file_supported: bool
     fsync_directory_supported: bool
     platform_prerequisite_met: bool
     manifest_persisted: bool = False
@@ -308,49 +309,53 @@ def verify_pre_remote_write_durability_gate(
 
     IMPORTANT SAFETY BOUNDARY:
     Success of this platform prerequisite check establishes ONLY that the host filesystem
-    supports the required file/directory fsync syscalls. It does NOT establish that a valid
-    manifest was created, persisted, sealed, or owned, and it NEVER grants permission or
-    authorization for remote database operations. Remote live mutations remain permanently
-    disabled in this offline slice.
+    supports both file and directory fsync syscalls (with Windows remaining unsupported under
+    the current implementation). It does NOT establish that a valid manifest was created,
+    persisted, sealed, or owned, and it NEVER grants permission or authorization for remote
+    database operations. Remote live mutations remain permanently disabled in this offline slice.
 
     Under Windows NTFS, parent directory metadata fsync is unproven via Python standard library;
     any non-hermetic remote write attempt must fail closed until an explicit PO architectural decision
     and verified durable mechanism are approved.
     """
-    if is_hermetic_test:
-        plat = guarantees.platform if guarantees else sys.platform
-        dir_sup = guarantees.fsync_directory_supported if guarantees else (sys.platform != "win32")
+    if guarantees is None:
+        guarantees = get_storage_platform_guarantees()
+
+    platform = guarantees.platform
+    file_sup = bool(guarantees.fsync_file_supported)
+    dir_sup = bool(guarantees.fsync_directory_supported)
+    platform_prerequisite_met = (platform != "win32") and file_sup and dir_sup
+
+    if not platform_prerequisite_met:
+        if not is_hermetic_test:
+            raise ManifestStoreSecurityError(
+                f"Pre-remote-write durability prerequisite check failed on platform '{platform}': "
+                f"host filesystem lacks required file or directory fsync support (file_fsync={file_sup}, "
+                f"dir_fsync={dir_sup}). Platform prerequisite not met. Remote mutations strictly blocked."
+            )
         return StoragePlatformDurabilityAssessment(
-            platform=plat,
+            platform=platform,
+            fsync_file_supported=file_sup,
             fsync_directory_supported=dir_sup,
-            platform_prerequisite_met=True,
+            platform_prerequisite_met=False,
             manifest_persisted=False,
             remote_mutation_authorized=False,
             reasons=(
-                "Hermetic test fixture scope only.",
-                "Platform prerequisite check does NOT establish manifest persistence.",
+                "Hermetic test fixture scope; negative assessment returned without raising error.",
+                f"Platform '{platform}' lacks required file/directory fsync durability support.",
                 "Remote database mutations remain permanently unauthorized.",
             ),
         )
 
-    if guarantees is None:
-        guarantees = get_storage_platform_guarantees()
-
-    if not guarantees.fsync_directory_supported or guarantees.platform == "win32":
-        raise ManifestStoreSecurityError(
-            f"Pre-remote-write durability prerequisite check failed on platform '{guarantees.platform}': "
-            "parent directory metadata durability is unproven on disk. Platform prerequisite not met. "
-            "Remote mutations strictly blocked."
-        )
-
     return StoragePlatformDurabilityAssessment(
-        platform=guarantees.platform,
-        fsync_directory_supported=True,
+        platform=platform,
+        fsync_file_supported=file_sup,
+        fsync_directory_supported=dir_sup,
         platform_prerequisite_met=True,
         manifest_persisted=False,
         remote_mutation_authorized=False,
         reasons=(
-            "Host platform supports directory fsync syscalls.",
+            "Host platform supports both file and directory fsync syscalls.",
             "Platform prerequisite met only; manifest persistence and remote mutation are NOT authorized.",
         ),
     )
