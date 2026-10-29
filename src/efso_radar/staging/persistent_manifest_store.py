@@ -241,7 +241,7 @@ _CRASH_WINDOW_CONTRACTS: dict[ManifestCrashWindow, CrashWindowContract] = {
     ),
     ManifestCrashWindow.WINDOW_5_PUBLICATION_COLLISION: CrashWindowContract(
         window=ManifestCrashWindow.WINDOW_5_PUBLICATION_COLLISION,
-        description="Atomic publication race or preexisting target file (no-overwrite collision).",
+        description="Pre-existing target manifest collision (no-overwrite check blocks publication, preserves existing target, cleans temp).",
         expected_canonical_state="PRESERVED",
         expected_temp_state="CLEANED",
         expected_outcome="FAILED_CLOSED",
@@ -250,8 +250,8 @@ _CRASH_WINDOW_CONTRACTS: dict[ManifestCrashWindow, CrashWindowContract] = {
     ),
     ManifestCrashWindow.WINDOW_6_DIRECTORY_DURABILITY_GAP: CrashWindowContract(
         window=ManifestCrashWindow.WINDOW_6_DIRECTORY_DURABILITY_GAP,
-        description="Publication succeeded but directory entry durability is unproven (Windows NTFS gap / POSIX dir fsync failure).",
-        expected_canonical_state="PRESERVED",
+        description="Publication succeeded in memory/cache; directory entry durability across sudden power loss remains unproven (Windows NTFS gap / POSIX dir fsync failure).",
+        expected_canonical_state="PRESERVED",  # State immediately observed post-publication in un-crashed process; power-loss durability unproven
         expected_temp_state="CLEANED",
         expected_outcome="UNCERTAIN_HALT",
         retry_permitted=False,
@@ -268,10 +268,10 @@ _CRASH_WINDOW_CONTRACTS: dict[ManifestCrashWindow, CrashWindowContract] = {
     ),
     ManifestCrashWindow.WINDOW_8_RECOVERY_REOPEN: CrashWindowContract(
         window=ManifestCrashWindow.WINDOW_8_RECOVERY_REOPEN,
-        description="Subprocess crash or unclean termination recovery; reopening store detects state without silent corruption.",
-        expected_canonical_state="PRESERVED",
+        description="Abrupt process termination (SIGKILL / crash) mid-write before publication leaves partial temp file as inert orphan evidence without creating canonical manifest.",
+        expected_canonical_state="ABSENT",
         expected_temp_state="ORPHANED_INERT",
-        expected_outcome="UNCERTAIN_HALT",
+        expected_outcome="FAILED_CLOSED",
         retry_permitted=False,
         remote_write_authorized=False,
     ),
@@ -283,27 +283,77 @@ def get_crash_window_contracts() -> dict[ManifestCrashWindow, CrashWindowContrac
     return dict(_CRASH_WINDOW_CONTRACTS)
 
 
+@dataclass(frozen=True)
+class StoragePlatformDurabilityAssessment:
+    """Read-only assessment of host filesystem durability prerequisites.
+
+    This assessment evaluates platform syscall capabilities only. It does NOT establish
+    manifest creation, persistence, sealing, or ownership, and NEVER authorizes remote mutation.
+    """
+
+    platform: str
+    fsync_directory_supported: bool
+    platform_prerequisite_met: bool
+    manifest_persisted: bool = False
+    remote_mutation_authorized: bool = False
+    reasons: tuple[str, ...] = ()
+
+
 def verify_pre_remote_write_durability_gate(
     guarantees: StoragePlatformGuarantees | None = None,
     *,
     is_hermetic_test: bool = False,
-) -> None:
-    """Enforce testable boundary contract: absence of provable durable ownership blocks all remote mutation.
+) -> StoragePlatformDurabilityAssessment:
+    """Inert platform-prerequisite assessment for host filesystem durability capabilities.
 
-    A success report based on file flush or process restart alone CANNOT authorize LIVE staging.
+    IMPORTANT SAFETY BOUNDARY:
+    Success of this platform prerequisite check establishes ONLY that the host filesystem
+    supports the required file/directory fsync syscalls. It does NOT establish that a valid
+    manifest was created, persisted, sealed, or owned, and it NEVER grants permission or
+    authorization for remote database operations. Remote live mutations remain permanently
+    disabled in this offline slice.
+
     Under Windows NTFS, parent directory metadata fsync is unproven via Python standard library;
     any non-hermetic remote write attempt must fail closed until an explicit PO architectural decision
     and verified durable mechanism are approved.
     """
     if is_hermetic_test:
-        return
+        plat = guarantees.platform if guarantees else sys.platform
+        dir_sup = guarantees.fsync_directory_supported if guarantees else (sys.platform != "win32")
+        return StoragePlatformDurabilityAssessment(
+            platform=plat,
+            fsync_directory_supported=dir_sup,
+            platform_prerequisite_met=True,
+            manifest_persisted=False,
+            remote_mutation_authorized=False,
+            reasons=(
+                "Hermetic test fixture scope only.",
+                "Platform prerequisite check does NOT establish manifest persistence.",
+                "Remote database mutations remain permanently unauthorized.",
+            ),
+        )
+
     if guarantees is None:
         guarantees = get_storage_platform_guarantees()
+
     if not guarantees.fsync_directory_supported or guarantees.platform == "win32":
         raise ManifestStoreSecurityError(
-            f"Pre-remote-write durability gate failed on platform '{guarantees.platform}': "
-            "parent directory metadata durability is unproven on disk. Remote mutations strictly blocked."
+            f"Pre-remote-write durability prerequisite check failed on platform '{guarantees.platform}': "
+            "parent directory metadata durability is unproven on disk. Platform prerequisite not met. "
+            "Remote mutations strictly blocked."
         )
+
+    return StoragePlatformDurabilityAssessment(
+        platform=guarantees.platform,
+        fsync_directory_supported=True,
+        platform_prerequisite_met=True,
+        manifest_persisted=False,
+        remote_mutation_authorized=False,
+        reasons=(
+            "Host platform supports directory fsync syscalls.",
+            "Platform prerequisite met only; manifest persistence and remote mutation are NOT authorized.",
+        ),
+    )
 
 
 def _is_reparse_point(path: Path) -> bool:

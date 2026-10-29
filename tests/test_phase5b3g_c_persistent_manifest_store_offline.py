@@ -41,6 +41,7 @@ from efso_radar.staging.persistent_manifest_store import (
     _publish_file_no_overwrite,
     get_storage_platform_guarantees,
     ManifestCrashWindow,
+    StoragePlatformDurabilityAssessment,
     get_crash_window_contracts,
     verify_pre_remote_write_durability_gate,
 )
@@ -1296,19 +1297,49 @@ class TestWindowsManifestDurabilityCrashWindows:
             assert c.expected_temp_state in ("CLEANED", "ORPHANED_INERT")
             assert c.expected_outcome in ("FAILED_CLOSED", "UNCERTAIN_HALT")
 
+        # Specifically assert Window 8 invariants for pre-publication crash/termination
+        w8 = contracts[ManifestCrashWindow.WINDOW_8_RECOVERY_REOPEN]
+        assert w8.expected_canonical_state == "ABSENT"
+        assert w8.expected_temp_state == "ORPHANED_INERT"
+        assert w8.expected_outcome == "FAILED_CLOSED"
+
     def test_pre_remote_write_durability_gate_blocks_live_on_unproven_fsync(self) -> None:
         """Verify pre-remote-write durability gate blocks live remote writes when directory fsync unproven."""
         # Hermetic test mode always passes
-        verify_pre_remote_write_durability_gate(is_hermetic_test=True)
+        assessment = verify_pre_remote_write_durability_gate(is_hermetic_test=True)
+        assert isinstance(assessment, StoragePlatformDurabilityAssessment)
+        assert assessment.platform_prerequisite_met is True
+        assert assessment.manifest_persisted is False
+        assert assessment.remote_mutation_authorized is False
 
         # In live mode on Windows (or unproven directory fsync), gate fails closed
         if sys.platform == "win32":
-            with pytest.raises(ManifestStoreSecurityError, match="Pre-remote-write durability gate failed"):
+            with pytest.raises(ManifestStoreSecurityError, match="Pre-remote-write durability prerequisite check failed"):
                 verify_pre_remote_write_durability_gate(is_hermetic_test=False)
         else:
             mock_guar = Mock(platform="linux", fsync_directory_supported=False)
-            with pytest.raises(ManifestStoreSecurityError, match="Pre-remote-write durability gate failed"):
+            with pytest.raises(ManifestStoreSecurityError, match="Pre-remote-write durability prerequisite check failed"):
                 verify_pre_remote_write_durability_gate(mock_guar, is_hermetic_test=False)
+
+    def test_pre_remote_write_durability_gate_inert_assessment_and_no_authorization(self, tmp_path: Path) -> None:
+        """Negative contract: platform prerequisite success does NOT establish manifest presence or remote permission."""
+        # 1. Hermetic assessment check
+        assessment_hermetic = verify_pre_remote_write_durability_gate(is_hermetic_test=True)
+        assert assessment_hermetic.platform_prerequisite_met is True
+        assert assessment_hermetic.manifest_persisted is False
+        assert assessment_hermetic.remote_mutation_authorized is False
+
+        # 2. Mocked supported POSIX platform assessment check
+        mock_supported_guar = Mock(platform="linux", fsync_directory_supported=True)
+        assessment_posix = verify_pre_remote_write_durability_gate(mock_supported_guar, is_hermetic_test=False)
+        assert assessment_posix.platform_prerequisite_met is True
+        assert assessment_posix.manifest_persisted is False
+        assert assessment_posix.remote_mutation_authorized is False
+
+        # 3. Verify that calling the gate did NOT create any files or grant filesystem mutations
+        test_dir = tmp_path / "prereq_test"
+        test_dir.mkdir(parents=True, exist_ok=True)
+        assert list(test_dir.iterdir()) == [], "Platform prerequisite assessment must be completely inert and produce zero files"
 
     def test_crash_window_1_temp_file_creation_failure_leaves_no_artifacts(self, tmp_path: Path) -> None:
         """Window 1: Failure during temp file creation (O_CREAT) leaves no canonical or temp files."""
@@ -1396,8 +1427,8 @@ class TestWindowsManifestDurabilityCrashWindows:
         temp_files = list(store_dir.glob(".tmp_manifest_*"))
         assert len(temp_files) == 0, "Corrupted temporary file must be destroyed"
 
-    def test_crash_window_5_publication_collision_strictly_preserves_target_and_cleans_temp(self, tmp_path: Path) -> None:
-        """Window 5: Publication race / preexisting target blocks overwrite, preserves target, cleans temp."""
+    def test_crash_window_5_preexisting_target_collision_preserves_canonical_and_cleans_temp(self, tmp_path: Path) -> None:
+        """Window 5: Pre-existing target collision blocks overwrite, preserves target, cleans temp."""
         store_dir = tmp_path / "store_w5"
         store = HermeticTestManifestStore(store_dir)
         run_id = _generate_valid_run_id("crashw5")
@@ -1428,7 +1459,7 @@ class TestWindowsManifestDurabilityCrashWindows:
             assert guarantees.fsync_directory_supported is False
             with pytest.raises(ManifestStoreSecurityError, match="Windows NTFS platform cannot programmatically verify DACL/ACL"):
                 guarantees.verify_platform_policy(is_hermetic_test=False)
-            with pytest.raises(ManifestStoreSecurityError, match="Pre-remote-write durability gate failed"):
+            with pytest.raises(ManifestStoreSecurityError, match="Pre-remote-write durability prerequisite check failed"):
                 verify_pre_remote_write_durability_gate(guarantees, is_hermetic_test=False)
         else:
             with patch("os.fsync", side_effect=[None, OSError(errno.EIO, "Directory fsync failed")]):
@@ -1465,14 +1496,15 @@ class TestWindowsManifestDurabilityCrashWindows:
         temp_files = list(store_dir.glob(".tmp_manifest_*"))
         assert len(temp_files) == 0, "No temporary files should remain"
 
-    def test_crash_window_8_subprocess_termination_recovery_simulation(self, tmp_path: Path) -> None:
-        """Window 8: Abrupt test-owned subprocess termination mid-write leaves no corrupt canonical file."""
+    def test_crash_window_8_subprocess_termination_inert_orphan_simulation(self, tmp_path: Path) -> None:
+        """Window 8: Abrupt test-owned subprocess termination mid-write leaves inert temp orphan and no canonical file."""
         store_dir = tmp_path / "store_w8"
         store = HermeticTestManifestStore(store_dir)
         run_id = _generate_valid_run_id("crashw8")
 
-        # Write out standalone python script to avoid Windows cmdline escaping quirks
+        # Write out standalone python script simulating subprocess that crashes mid-write before publication
         script_file = tmp_path / "crash_writer.py"
+        partial_payload = b'{"run_id": "' + run_id.encode("utf-8") + b'", "partial": true'
         script_code = (
             "import sys\n"
             "import time\n"
@@ -1480,7 +1512,7 @@ class TestWindowsManifestDurabilityCrashWindows:
             f"store_dir = Path({str(store_dir.resolve())!r})\n"
             "store_dir.mkdir(parents=True, exist_ok=True)\n"
             f"temp_file = store_dir / '.tmp_manifest_{run_id}_abort.tmp'\n"
-            f"temp_file.write_bytes(b'{{\"run_id\": \"{run_id}\", \"partial\": true')\n"
+            f"temp_file.write_bytes({partial_payload!r})\n"
             "sys.stdout.write('READY\\n')\n"
             "sys.stdout.flush()\n"
             "time.sleep(60)\n"
@@ -1499,6 +1531,7 @@ class TestWindowsManifestDurabilityCrashWindows:
                 err = proc.stderr.read()
                 proc.kill()
                 raise AssertionError(f"Subprocess failed to start: stdout={line!r}, stderr={err!r}")
+            # Simulate abrupt process crash/termination mid-write before publication
             proc.kill()
             proc.wait(timeout=5)
         finally:
@@ -1506,9 +1539,28 @@ class TestWindowsManifestDurabilityCrashWindows:
                 proc.kill()
                 proc.wait()
 
+        # 1. Canonical manifest for crashed run must be strictly ABSENT
         target_path = store.get_manifest_path(run_id)
-        assert not target_path.exists(), "Target manifest must not exist after crashed write"
+        assert not target_path.exists(), "Target canonical manifest must not exist after crashed write"
 
+        # 2. Crashed run's partial temp file must be PRESERVED on disk as inert orphan evidence (not silently unlinked)
+        temp_file = store_dir / f".tmp_manifest_{run_id}_abort.tmp"
+        assert temp_file.exists(), "Orphaned partial temp file must remain on disk for inspection"
+        assert temp_file.read_bytes() == partial_payload, "Orphaned temp payload must match partial write"
+
+        # 3. Loading the crashed run fails closed
+        with pytest.raises(ManifestStoreError, match="not found"):
+            store.load_manifest(run_id)
+
+        # 4. Invariants match Window 8 contract
+        w8_contract = get_crash_window_contracts()[ManifestCrashWindow.WINDOW_8_RECOVERY_REOPEN]
+        assert w8_contract.expected_canonical_state == "ABSENT"
+        assert w8_contract.expected_temp_state == "ORPHANED_INERT"
+        assert w8_contract.expected_outcome == "FAILED_CLOSED"
+        assert w8_contract.retry_permitted is False
+        assert w8_contract.remote_write_authorized is False
+
+        # 5. Subsequent independent persist for a new run succeeds cleanly without being corrupted by the orphan
         new_run_id = _generate_valid_run_id("crashw8clean")
         new_manifest = _create_sample_manifest(new_run_id)
         new_target = store.save_manifest(new_manifest)
@@ -1516,3 +1568,6 @@ class TestWindowsManifestDurabilityCrashWindows:
 
         loaded_manifest, _ = store.load_manifest(new_run_id)
         assert loaded_manifest.run_id == new_run_id
+
+        # 6. Verify original crashed orphan is still preserved and was not touched by the new save
+        assert temp_file.exists(), "Original crashed orphan file must not be modified or deleted by subsequent saves"
