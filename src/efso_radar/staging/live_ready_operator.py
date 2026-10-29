@@ -108,6 +108,7 @@ class LiveReadyOperatorReport(BaseModel):
     lockdown_recorded: bool = False
     live_execution_refused: bool = True
     security_boundary_active: bool = True
+    recovery_notice: Optional[str] = None
 
     def summary(self) -> str:
         lines = [
@@ -130,6 +131,8 @@ class LiveReadyOperatorReport(BaseModel):
         for st in self.stages:
             st_res = "PASS" if st.success else "FAIL"
             lines.append(f"  [{st_res}] {st.stage_id}: {st.name} ({st.http_requests_used} calls, {st.duration_seconds:.3f}s)")
+        if self.recovery_notice:
+            lines.append(f"Recovery Notice: {self.recovery_notice}")
         if self.errors:
             lines.append("Errors:")
             for err in self.errors:
@@ -612,6 +615,10 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
                     )
 
             # 8c: Independent 3-State Audit
+            if self.simulate_audit_failure:
+                self.audit_state = AuditOutcomeState.UNKNOWN
+                raise TursoClientError("Simulated transport failure during audit verification query")
+
             residual_found = False
             for ent in self.manifest.registered_entities:
                 tbl = ent["table"]
@@ -746,15 +753,29 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
         except Exception as exc:
             # Sanitized error capturing: never echo SQL or tokens
             err_code = f"OPERATOR_GATE_FAILURE: {type(exc).__name__}"
-            if "DEADLINE" in str(exc) or "SESSION_DEADLINE" in str(exc):
+            exc_str = str(exc)
+            if (
+                "DEADLINE" in exc_str
+                or "SESSION_DEADLINE" in exc_str
+                or "SESSION_TIMEOUT" in exc_str
+                or "elapsed deadline" in exc_str
+            ):
                 err_code = "OPERATOR_GATE_FAILURE: SESSION_DEADLINE_EXCEEDED"
-            elif "REQUEST_CEILING" in str(exc):
+            elif (
+                "REQUEST_CEILING" in exc_str
+                or "BUDGET_EXHAUSTED" in exc_str
+                or "hard request ceiling" in exc_str
+            ):
                 err_code = "OPERATOR_GATE_FAILURE: REQUEST_CEILING_EXCEEDED"
-            elif "CLEANUP_RESERVE" in str(exc):
+            elif (
+                "CLEANUP_RESERVE" in exc_str
+                or "TEST_CUTOFF" in exc_str
+                or "test step cutoff" in exc_str
+            ):
                 err_code = "OPERATOR_GATE_FAILURE: CLEANUP_RESERVE_EXHAUSTED"
-            elif "OWNERSHIP_MISMATCH" in str(exc):
+            elif "OWNERSHIP_MISMATCH" in exc_str:
                 err_code = "OPERATOR_GATE_FAILURE: OWNERSHIP_MISMATCH_HALT"
-            elif "HUMAN_WINDOW" in str(exc):
+            elif "HUMAN_WINDOW" in exc_str:
                 err_code = "OPERATOR_GATE_FAILURE: HUMAN_WINDOW_REQUIRED"
             errors.append(err_code)
             session_status = LiveReadyOperatorStatus.FAILED
@@ -775,8 +796,13 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
                 self.client.close()
 
             # Unlink manifest if and only if strictly CLEAN and session PASSED
-            manifest_preserved = True
-            if self.manifest_path and self.manifest:
+            manifest_persisted = bool(
+                self.manifest_path is not None
+                and self.manifest_path.exists()
+                and self.manifest_path.is_file()
+            )
+            manifest_preserved = False
+            if manifest_persisted and self.manifest:
                 if (
                     session_status == LiveReadyOperatorStatus.PASSED
                     and self.audit_state == AuditOutcomeState.CLEAN
@@ -790,6 +816,20 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             duration = time.perf_counter() - start_time
 
         cleanup_reserve_used = max(0, self.http_requests_total - self.request_cutoff)
+
+        if session_status != LiveReadyOperatorStatus.PASSED or self.audit_state != AuditOutcomeState.CLEAN:
+            if manifest_persisted:
+                recovery_notice = (
+                    "SEPARATE_OPERATOR_REVIEWED_RECOVERY_REQUIRED: Automatic retry or deletion is prohibited; "
+                    "preserved manifest on disk requires a separate, independently reviewed recovery procedure."
+                )
+            else:
+                recovery_notice = (
+                    "SEPARATE_OPERATOR_REVIEWED_RECOVERY_REQUIRED: Automatic retry or deletion is prohibited; "
+                    "no local manifest was persisted to disk before session abort; manual operator investigation is required."
+                )
+        else:
+            recovery_notice = None
 
         return LiveReadyOperatorReport(
             run_id=self.run_id,
@@ -809,6 +849,7 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             lockdown_recorded=self.lockdown_recorded,
             live_execution_refused=self.live_execution_refused,
             security_boundary_active=self.security_boundary is not None,
+            recovery_notice=recovery_notice,
         )
 
 

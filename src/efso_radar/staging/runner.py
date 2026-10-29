@@ -600,6 +600,7 @@ class HermeticStagingTransport(httpx.BaseTransport):
         fail_on_commit_status: Optional[int] = None,
         fail_on_stmt_idx: Optional[int] = None,
         fail_stmt_code: str = "SQLITE_CONSTRAINT",
+        custom_response_hook: Optional[Callable[[httpx.Request], Optional[httpx.Response]]] = None,
     ):
         self.conn = conn
         self.fail_on_commit_timeout = fail_on_commit_timeout
@@ -607,12 +608,18 @@ class HermeticStagingTransport(httpx.BaseTransport):
         self.fail_on_commit_status = fail_on_commit_status
         self.fail_on_stmt_idx = fail_on_stmt_idx
         self.fail_stmt_code = fail_stmt_code
+        self.custom_response_hook = custom_response_hook
 
         self.session_counter = 0
         self.active_batons: set[str] = set()
         self.in_transaction: dict[str, bool] = {}
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
+        if self.custom_response_hook is not None:
+            hook_res = self.custom_response_hook(request)
+            if hook_res is not None:
+                return hook_res
+
         try:
             body = json.loads(request.content.decode("utf-8"))
         except Exception:

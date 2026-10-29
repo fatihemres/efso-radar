@@ -2,14 +2,25 @@
 
 **Verified snapshot date:** 2026-10-28 (GitHub inspection; NOT a live status feed)
 **Canonical repository:** [fatihemres/efso-radar](https://github.com/fatihemres/efso-radar)
-**Baseline inspected:** `main` at `1530f8340c37e3952b02a8edd56c6b5857845044` (PR #35 integrated).
+**Baseline inspected:** `main` at `4cfe02aa23e1600db7531481af87fa8b554b653c` (PR #36 integrated).
 
 ## Product & implementation
 Efso Radar supplies selective Turkish/global entertainment-news discovery and editorial decision support for Efso Magazin; it does not automatically publish Instagram posts. Python 3.11/3.12 project with modular RSS discovery, multi-source parsing, deduplication/story memory, Gemini integration, Telegram formatting/delivery, SQLite and Turso Hrana v2 repositories, orchestration, encrypted backup primitives and offline staging test runner. Full architectural detail: [Architecture](docs/ARCHITECTURE.md).
 
 **Version ambiguity:** Historical Phase 4 closure and ADR call `v0.4.0` an anchor; actual `src/efso_radar/__init__.py` declares `__version__ = "2.0.0"`. No GitHub Releases were returned on inspection. Treat public stable release identity as **unreconciled**, not 2.0.0 or v0.4.0 by assumption. See [Release Policy](docs/RELEASE_POLICY.md).
 
-## Latest operational checkpoint — Phase 5B.3G-C Persistent Manifest Foundation (2026-10-28 — Remediated Candidate, Round 3)
+## Latest operational checkpoint — Phase 5B.3G-C Live Readiness Wire Contract (Issue #37 Slice A, 2026-10-28)
+
+- **Main baseline:** `4cfe02aa23e1600db7531481af87fa8b554b653c` (following PR #36 squash merge; post-merge CI #40684333627 completed 4/4 PASS).
+- **Candidate implementation:** Wire contract integration hardening across `src/efso_radar/staging/runner.py` (hermetic response hook injection), `hrana_outbound_guard.py` (baton close transaction end handling), and `live_ready_operator.py` (`recovery_notice` tracking conditioning on actual manifest disk presence, and simulated audit failure support).
+- **Tested with dedicated wire-contract test suite (`tests/test_phase5b3g_c_live_readiness_wire_contract.py`):** 31 passed in 5.50s; 298 passed in Phase 5B.3G full suite; 799 passed in full hermetic suite; Ruff clean.
+- **LIVE-01–08 Readiness / Gap Matrix:** Reconciled in `docs/PHASE5B3G_LIVE_STAGING_RELIABILITY_PLAN.md` Section 5.5, distinguishing `IMPLEMENTED`, `OFFLINE TESTED`, `NOT LIVE-WIRED`, and `PO GATED`, with LIVE-08 updated to reflect all 5 registered manifest entities (5 attribute checks, 4–5 conditional deletes, 5 audit queries).
+- **Early-failure stop contract:** Failures in LIVE-02..07 halt fail-closed, preserve the manifest on disk, set audit state to `UNKNOWN`, permanently close the security boundary session (`SESSION_HALTED`), populate an explicit `recovery_notice` requiring a separate operator-reviewed recovery protocol, and prohibit in-session LIVE-08 cleanup bypasses. If failure occurs before manifest persistence, the recovery notice accurately reports that no local manifest was persisted to disk.
+- **Architecture conflict preserved as open design:** The historical 80-request cutoff transition to LIVE-08 contradicts monotonic stage-index requirements (`_stage_sequence_index == 8`). When cutoff is hit during test stages (verified with causal assertions for both scaled and nominal 80 cutoff, 100 ceiling, and 120s deadline), execution halts fail-closed (`CLEANUP_RESERVE_EXHAUSTED` / `TEST_CUTOFF`), retains the manifest, and rejects early `set_cleanup_phase()`, requiring separate operator recovery.
+- **Six open live blockers documented:** Windows NTFS owner-private DACL, physical power-loss vs process restart, live transport authorization architecture, remote recovery protocol, manual Block Writes/token proof, and provider commercial policy ($0.00 / 0 TRY; reconciled to official free tier figures: 100 DBs, 5GB storage, 500M reads, 10M writes; paid Developer tier clarified).
+- **Hard runtime restrictions maintained:** Strictly $0.00 / 0 TRY spend, no real Turso network connection, no credentials created, Block Writes remains ON.
+
+## Historical operational checkpoint — Phase 5B.3G-C Persistent Manifest Foundation (INTEGRATED PR #36, 2026-10-28)
 
 - **Main baseline:** `1530f8340c37e3952b02a8edd56c6b5857845044` (PR #35 integrated).
 - **Candidate implementation:** `PersistentManifestStore` and `HermeticTestManifestStore` (`src/efso_radar/staging/persistent_manifest_store.py`), plus extended `OfflineManifestSeal` supporting configured persistent roots (`src/efso_radar/staging/manifest_seal.py`).

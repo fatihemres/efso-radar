@@ -1000,6 +1000,7 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
             if parts in (
                 [{"type": "execute", "stmt": {"sql": "COMMIT"}}, {"type": "close"}],
                 [{"type": "execute", "stmt": {"sql": "ROLLBACK"}}, {"type": "close"}],
+                [{"type": "close"}],
             ):
                 return "transaction_end"
             # Transaction step
