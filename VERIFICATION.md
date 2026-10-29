@@ -2,6 +2,24 @@
 
 **Checkpoint:** 2026-10-29. This ledger separates direct GitHub CI evidence, implementation-agent local runs, historical pilot acceptance and missing validations. Earlier dated reviewer entries retain their original scope. Evidence is not a release certificate.
 
+## 2026-10-29 Issue #43 — Windows manifest durability crash-window contract candidate
+
+Isolated worktree/branch `feat/issue-43-windows-durability-contract`, baseline `e428eb8b71bd79ba63b6ffe8b2b41dd4f732da9e` (verified `main` with PR #42 integrated). Implementation-agent local evidence is separate from independent review and exact-head CI; no PO acceptance or live activation is claimed.
+
+- Existing Windows environment reused: Python 3.12.10, pytest 9.1.1, Ruff 0.13.3; no dependency installation/upgrade.
+- Durability evidence hierarchy strictly delineated: (a) process restart, (b) test-owned subprocess termination, (c) mocked failure/crash windows, (d) physical reboot, (e) sudden power loss. Simulated test passes at levels (a)–(c) do NOT prove physical reboot (d) or power loss (e) durability.
+- Authoritative Microsoft documentation analysis: cited Microsoft Learn for `MoveFileExW`, noting it guarantees flushing only for cross-volume copy moves and states the flag has no effect if `MOVEFILE_DELAY_UNTIL_REBOOT` is specified (same-volume directory metadata durability across physical power loss is unproven by this source / requires further evidence); cited `FlushFileBuffers`, noting it requires `GENERIC_WRITE` access and administrator privileges for volume-level flush, with unprivileged directory flushes commonly failing / unsupported in standard Python environments; qualified SQLite WAL mode with `synchronous=FULL` (versus `NORMAL`) as a candidate design with remaining device-level write cache assumptions.
+- Implemented `ManifestCrashWindow` enum, `CrashWindowContract` dataclass, `StoragePlatformDurabilityAssessment` (including `fsync_file_supported` and `fsync_directory_supported`), `_CRASH_WINDOW_CONTRACTS`, `get_crash_window_contracts()`, and `verify_pre_remote_write_durability_gate()` in `src/efso_radar/staging/persistent_manifest_store.py`.
+- Reconciled Window 2 (controlled write failure / ENOSPC unlinking during exception handling vs abrupt process kill in Window 8) and Window 8 contract: pre-publication subprocess crash/termination mid-write leaves partial temp file as inert orphan evidence while canonical manifest is strictly absent, outcome `FAILED_CLOSED`.
+- Implemented 12 deterministic offline crash window tests in `TestWindowsManifestDurabilityCrashWindows` in `tests/test_phase5b3g_c_persistent_manifest_store_offline.py` covering Windows 1–8: temp creation failure, controlled partial write/disk full, file fsync failure, pre-publication hash mismatch, pre-existing target collision, Windows directory durability gap, post-publication readback failure (preserve canonical, no retry, state UNKNOWN), abrupt subprocess termination mid-write before publication (inert partial temp orphan preserved, canonical absent), negative contract test proving platform prerequisite success does NOT establish manifest presence or authorize remote mutation, and mock regression cases for unsupported platforms (Linux missing file fsync, Windows missing directory fsync) and supported POSIX.
+- Focused test results:
+  - `pytest tests/test_phase5b3g_c_persistent_manifest_store_offline.py -k TestWindowsManifestDurabilityCrashWindows -v`: **12 passed, 46 deselected in 1.69s**.
+  - `pytest tests/test_phase5b3g_c_persistent_manifest_store_offline.py -v`: **55 passed, 3 skipped in 3.30s** (all 3 skips are non-elevated Windows symlink tests).
+  - `pytest tests/test_phase5b3g_c_windows_dacl_evidence_offline.py -v`: **135 passed in 2.71s**.
+- Full hermetic suite: `pytest tests -q`: **1081 passed, 18 skipped, 276 subtests passed in 115.73s**, Windows Python 3.12.10.
+- Ruff checks: `ruff check --target-version py311 --select E9,F63,F7,F82 src scripts tests` and default Ruff on modified files: **PASS**.
+- Hard constraints preserved: strictly $0.00 / 0 TRY spend, Turso Block Writes ON, tokens revoked, no network/live connections, no operational files touched, no live persistent storage enabled, no physical reboot simulated. STOP for independent review and explicit PO approval.
+
 ## 2026-10-29 Issue #41 — Offline Windows DACL evidence candidate
 
 Isolated worktree/branch `codex/issue-41-windows-dacl-evidence`, refreshed `main` `22090a54b6fca42146b0fadb39134dbf0694fce7` (PR #40 integrated). Implementation-agent local evidence is separate from independent review and exact-head CI; no PO acceptance or live activation is claimed.

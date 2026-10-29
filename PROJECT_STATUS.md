@@ -1,10 +1,24 @@
 # Efso Radar — Project Checkpoint
 
-**Verified snapshot date:** 2026-10-29 (Issue #41 onboarding; NOT a live status feed)
+**Verified snapshot date:** 2026-10-29 (Issue #43 durability contract onboarding; NOT a live status feed)
 **Canonical repository:** [fatihemres/efso-radar](https://github.com/fatihemres/efso-radar)
-**Baseline inspected:** refreshed `origin/main` at `22090a54b6fca42146b0fadb39134dbf0694fce7` (PR #40 integrated). Earlier checkpoints below retain their dated baselines.
+**Baseline inspected:** refreshed `origin/main` at `e428eb8b71bd79ba63b6ffe8b2b41dd4f732da9e` (PR #42 integrated). Earlier checkpoints below retain their dated baselines.
 
-## Issue #41 — Windows DACL offline evidence candidate (2026-10-29)
+## Issue #43 — Windows manifest durability crash-window contract candidate (2026-10-29)
+
+- **IMPLEMENTED / NOT INTEGRATED / NOT PO ACCEPTED:** strictly offline Windows manifest durability crash-window contract and fault-injection matrix.
+- Enforces an explicit 5-level durability evidence hierarchy: (a) process restart, (b) test-owned subprocess termination, (c) mocked failure/crash windows, (d) physical reboot, and (e) sudden hardware power loss. Explicit non-proof contract: passing offline tests at levels (a)–(c) does NOT prove physical reboot or power-loss resilience (d)–(e).
+- Evaluates Windows NTFS publication strategies against Microsoft Learn documentation: notes that official `MoveFileExW` documentation specifies flushing only for cross-volume copy moves and states the flag has no effect if `MOVEFILE_DELAY_UNTIL_REBOOT` is specified (same-volume metadata durability across physical power loss is unproven by this source / requires further evidence); notes that directory `FlushFileBuffers` requires `GENERIC_WRITE` access and administrator privileges for volume-level flush, with unprivileged directory flushes commonly failing / unsupported in standard Python environments; qualifies SQLite WAL mode with `synchronous=FULL` (versus `NORMAL`) as a candidate design with remaining device-level write cache assumptions.
+- Introduces `ManifestCrashWindow` enum, `CrashWindowContract` dataclass, `StoragePlatformDurabilityAssessment`, and `verify_pre_remote_write_durability_gate()` which provides an inert platform-prerequisite assessment. It strictly fails closed on Windows or whenever directory or file fsync is unproven (returning an inert negative assessment in hermetic test mode without manufacturing capability), and explicitly establishes that platform prerequisite success does NOT prove manifest existence, persistence, or ownership, and NEVER authorizes remote mutations.
+- Reconciles Window 2 (controlled write failure / ENOSPC unlinking in exception handling vs abrupt process kill in Window 8) and Window 8 contract: pre-publication subprocess crash/termination mid-write leaves partial temp file as inert orphan evidence while canonical manifest is strictly absent, outcome `FAILED_CLOSED`.
+- Defines clear PO architectural options: Option 1 (maintain POSIX-only live manifest store, keep Windows offline-only), Option 2 (transition to embedded SQLite WAL manifest store candidate design), or Option 3 (explicit PO staging-only waiver for Windows directory fsync). Antigravity does not choose or silently implement any live backend option.
+- **Local focused evidence:** Windows Python 3.12.10: 55 passed / 3 skipped in `test_phase5b3g_c_persistent_manifest_store_offline.py` (including all 12 crash window tests in `TestWindowsManifestDurabilityCrashWindows`); 135 passed in `test_phase5b3g_c_windows_dacl_evidence_offline.py`.
+- **Full hermetic suite:** 1081 passed, 18 skipped, 276 subtests passed on Windows Python 3.12.10.
+- All live staging operations remain strictly unauthorized; Turso Block Writes remains ON; $0.00 / 0 TRY hard ceiling preserved. STOP for independent ChatGPT re-review and explicit PO approval.
+
+## Issue #41 — Windows DACL offline evidence (2026-10-29; INTEGRATED in PR #42)
+
+*(Addendum 2026-10-29: PR #42 subsequently integrated into main at commit e428eb8b71bd79ba63b6ffe8b2b41dd4f732da9e; dated candidate text below retained for historical provenance.)*
 
 - **IMPLEMENTED / NOT INTEGRATED / NOT PO ACCEPTED:** a pure bounded DACL policy plus explicitly invoked read-only native inspector for an active pytest fixture directory. Public reports expose only status/reason codes and provenance; no paths, personal SIDs, raw ACEs, descriptor hashes or exception text. `POLICY_MATCH` is a narrow snapshot pattern for review, with live storage and durability fields permanently false.
 - Native inspection uses existing standard-library `ctypes` and read-only Windows APIs. It rejects UNC/device/nonfixed drives before fixture metadata access, requires NTFS, checks reparse/identity/descriptor/token drift, and never sets permissions or reads file contents. No new dependency. Conservative deny/inheritance/privileged-principal handling and residual TOCTOU limits are documented in [plan §5.7](docs/PHASE5B3G_LIVE_STAGING_RELIABILITY_PLAN.md#57-issue-41--windows-ntfs-dacl-offline-evidence-and-threat-model-2026-10-29).
