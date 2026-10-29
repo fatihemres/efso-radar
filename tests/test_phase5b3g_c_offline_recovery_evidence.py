@@ -398,6 +398,45 @@ def test_canonical_manifest_validation_reused(fixture, change):
 
 
 @pytest.mark.parametrize(
+    "field,unsafe_value",
+    [
+        ("table", "unauthorized_" + SECRET),
+        ("pk_value", "synth_radar_cron_" + SECRET),
+    ],
+    ids=["unauthorized-table", "forbidden-primary-key"],
+)
+def test_canonical_permission_denials_return_sanitized_invalid_unknown(
+    fixture, field, unsafe_value, caplog
+):
+    original = fixture.path.read_bytes()
+    data = json.loads(original)
+    data["registered_entities"][0][field] = unsafe_value
+    # Prove these inputs reach the canonical PermissionError paths, rather than
+    # an earlier JSON/type/seal rejection that could mask the regression.
+    with pytest.raises(PermissionError):
+        PerRunOwnershipManifest.validate_payload(data)
+    raw = json.dumps(data).encode()
+    result = fixture.review(
+        manifest_bytes=raw, sealed_sha256=hashlib.sha256(raw).hexdigest()
+    )
+    assert result.manifest_evidence == ManifestEvidence.INVALID
+    assert result.decision == ReviewDecision.UNKNOWN
+    assert len(result.entities) == 5
+    assert [r.entity for r in result.entities] == sorted(
+        create_default_manifest_entities(RUN_ID),
+        key=lambda entity: entity.cleanup_dependency_order,
+    )
+    assert all(r.evidence == EntityEvidence.UNOBSERVED for r in result.entities)
+    assert all(r.observed_count is None for r in result.entities)
+    for output in (result.model_dump_json(), caplog.text):
+        assert unsafe_value not in output
+        assert SECRET not in output
+        assert "radar_cron" not in output
+        assert "PermissionError" not in output
+    assert fixture.path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
     "field,value",
     [("version", True), ("version", "1"), ("cleanup_dependency_order", "2")],
 )

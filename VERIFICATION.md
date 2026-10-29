@@ -2,6 +2,17 @@
 
 **Checkpoint:** 2026-10-29. This ledger separates direct GitHub CI evidence, implementation-agent local runs, historical pilot acceptance and missing validations. Earlier dated reviewer entries retain their original scope. Evidence is not a release certificate.
 
+## 2026-10-29 PR #40 — Independent-review P1 remediation
+
+[Independent review](https://github.com/fatihemres/efso-radar/pull/40#issuecomment-6491034639) required changes at `0d22044f134617d9d8ed82ffa94ad7ba9d9cdfd3`. Same Issue #39 branch and draft PR; no merge or acceptance claimed.
+
+- The manifest-validation boundary now catches the canonical validator's expected `PermissionError` alongside its existing validation exceptions and returns the existing sanitized `INVALID` / `UNKNOWN` report. No broad exception catch, canonical-validator change or unrelated refactor.
+- Two SHA-matched adversarial cases (secret-like unauthorized table; forbidden `pk_value` containing `radar_cron`) first reproduced the uncaught error: **2 failed, 83 deselected** before the fix. Both prove the canonical `PermissionError` path, then assert five exact canonical `UNOBSERVED` entities, no counts, no raw input/exception text in output or logs, byte-for-byte source-fixture preservation and no classifier file/network/DB calls.
+- Focused command: `PYTHONPATH=src venv/Scripts/python.exe -m pytest tests/test_phase5b3g_c_offline_recovery_evidence.py -q --basetemp <fresh-test-owned-pytest-root>`: **85 passed, no skips/deselections in 5.13s**, Windows Python 3.12.10, existing environment reused.
+- Ruff baseline command `ruff check --target-version py311 --select E9,F63,F7,F82 src scripts tests`, default Ruff on the two affected Python files and `git diff --check`: **PASS**.
+- Full hermetic command: `PYTHONPATH=src venv/Scripts/python.exe <temporary-audit-harness> tests -v -rs --basetemp <fresh-test-owned-pytest-root>`: **873 passed, 18 skipped, 0 deselected, 276 subtests passed in 132.00s**, Windows Python 3.12.10. The same temporary audit guards described below blocked real socket connect/DNS and operational `data/`/`.env` reads. Fourteen skips require private historical evidence; four reflect local Windows symlink privileges. Exact-head CI evidence belongs to the updated draft PR and final remediation report.
+- Safety boundaries unchanged: no real Turso/RSS/Gemini/Telegram, operational `.env`/`data/`/real manifest access, credentials, Block Writes changes, recovery/deletion, paid activity, release or activation. STOP for independent re-review and separate PO merge approval; parent #13 remains open.
+
 ## 2026-10-29 Issue #39 — Agent local offline evidence
 
 Baseline refreshed from GitHub: `origin/main` `1da9b9604e67377ee873cc235583c6ba42842970` (PR #38). Candidate branch: `codex/issue-39-offline-recovery-evidence`. These are implementation-agent observations; independent review and PO acceptance remain pending.

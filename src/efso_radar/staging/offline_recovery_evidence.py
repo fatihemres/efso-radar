@@ -237,7 +237,7 @@ def review_recovery_evidence(
         manifest = PerRunOwnershipManifest.validate_payload(payload)
         if manifest.run_id != safe_run:
             raise ValueError("Run mismatch")
-    except (ValueError, TypeError, RecursionError):
+    except (ValueError, TypeError, RecursionError, PermissionError):
         reasons.append("Local manifest payload failed canonical validation.")
         return report(ManifestEvidence.INVALID, ReviewDecision.UNKNOWN)
     try:
