@@ -15,7 +15,7 @@ import pytest
 from pydantic import ValidationError
 
 from efso_radar.staging import windows_dacl_evidence as policy
-from efso_radar.staging._windows_dacl_reader import _parse_acl
+from efso_radar.staging._windows_dacl_reader import _copy_bounded, _copy_sid, _parse_acl
 from efso_radar.staging import _windows_dacl_reader as reader
 from efso_radar.staging.persistent_manifest_store import (
     HermeticTestFixtureScope,
@@ -499,3 +499,313 @@ def test_real_windows_fixture_probe_is_read_only_and_sanitized(tmp_path):
     # A default inherited fixture ACL may be UNVERIFIABLE/INSECURE. Never mutate
     # it to manufacture POLICY_MATCH, or infer operator-host isolation from it.
     assert json.loads(result.model_dump_json())["live_storage_authorized"] is False
+
+
+def test_zero_mask_allow_ace_never_produces_policy_match():
+    # Owner with mask == 0 alone
+    res = review(snapshot(aces=(ace(OWNER, mask=0),)))
+    assert res.status == policy.EvidenceStatus.UNVERIFIABLE
+    assert policy.Reason.UNSUPPORTED_MASK in res.reasons
+    assert policy.Reason.OWNER_ACCESS_UNPROVEN in res.reasons
+
+    # Owner with valid mask + additional owner ACE with mask == 0
+    res2 = review(
+        snapshot(
+            aces=(
+                ace(OWNER, mask=policy.FILE_ALL_ACCESS),
+                ace(OWNER, mask=0),
+            )
+        )
+    )
+    assert res2.status == policy.EvidenceStatus.UNVERIFIABLE
+    assert policy.Reason.UNSUPPORTED_MASK in res2.reasons
+
+    # Foreign with mask == 0: MUST be classified INSECURE with FOREIGN_ALLOW and UNSUPPORTED_MASK
+    res3 = review(
+        snapshot(
+            aces=(
+                ace(OWNER, mask=policy.FILE_ALL_ACCESS),
+                ace(OTHER, mask=0),
+            )
+        )
+    )
+    assert res3.status == policy.EvidenceStatus.INSECURE
+    assert policy.Reason.FOREIGN_ALLOW in res3.reasons
+    assert policy.Reason.UNSUPPORTED_MASK in res3.reasons
+
+    # Privileged with mask == 0: UNVERIFIABLE with PRIVILEGED_POLICY_UNDECIDED and UNSUPPORTED_MASK
+    res4 = review(
+        snapshot(
+            aces=(
+                ace(OWNER, mask=policy.FILE_ALL_ACCESS),
+                ace(policy._sid(5, 18), mask=0),
+            )
+        )
+    )
+    assert res4.status == policy.EvidenceStatus.UNVERIFIABLE
+    assert policy.Reason.PRIVILEGED_POLICY_UNDECIDED in res4.reasons
+    assert policy.Reason.UNSUPPORTED_MASK in res4.reasons
+
+
+@pytest.mark.parametrize(
+    "sid",
+    [
+        policy._sid(5, 18),  # Local System
+        policy._sid(5, 19),  # Local Service
+        policy._sid(5, 20),  # Network Service
+        policy._sid(5, 32, 544),  # Builtin Administrators
+        policy._sid(5, 32, 545),  # Builtin Users
+        policy._sid(5, 32, 546),  # Builtin Guests
+        policy._sid(5, 80, 12345, 67890),  # NT SERVICE\* (Virtual service account)
+        policy._sid(5, 82, 12345, 67890),  # IIS AppPool\*
+        policy._sid(1, 0),  # NULL SID
+        policy._sid(1, 1, 0),  # Everyone
+        policy._sid(3, 0),  # Creator Owner
+        policy._sid(3, 4),  # Owner Rights
+        policy._sid(5, 21, 100, 200, 300, 501),  # Domain Guest (RID 501)
+        policy._sid(5, 21, 100, 200, 300, 502),  # KRBTGT (RID 502)
+        policy._sid(5, 21, 100, 200, 300, 512),  # Domain Admins (RID 512)
+        policy._sid(5, 21, 100, 200, 300, 513),  # Domain Users (RID 513)
+        policy._sid(5, 21, 100, 200, 300, 514),  # Domain Guests (RID 514)
+        policy._sid(5, 21, 100, 200, 300, 553),  # RAS and IAS Servers (RID 553)
+        bytes([1, 0, 0, 0, 0, 0, 0, 5]),  # Zero subauthority SID S-1-5
+    ],
+    ids=[
+        "system",
+        "local-service",
+        "network-service",
+        "builtin-admins",
+        "builtin-users",
+        "builtin-guests",
+        "nt-service",
+        "iis-apppool",
+        "null-sid",
+        "everyone",
+        "creator-owner",
+        "owner-rights",
+        "rid-501-guest",
+        "rid-502-krbtgt",
+        "rid-512-domain-admins",
+        "rid-513-domain-users",
+        "rid-514-domain-guests",
+        "rid-553-ras-servers",
+        "zero-subauthorities",
+    ],
+)
+def test_unsupported_current_user_and_token_contexts(sid):
+    assert policy._supported_individual_user_sid(sid) is False
+    res = review(snapshot(current_user_sid=sid, owner_sid=sid, aces=(ace(sid),)))
+    assert res.status == policy.EvidenceStatus.UNVERIFIABLE
+    assert res.reasons == (policy.Reason.TOKEN_CONTEXT_UNSUPPORTED,)
+
+
+@pytest.mark.parametrize(
+    "sid",
+    [
+        policy._sid(5, 21, 100, 200, 300, 1001),  # Local/Domain SAM user RID 1001
+        policy._sid(5, 21, 100, 200, 300, 1000),  # First custom RID 1000
+        policy._sid(5, 21, 100, 200, 300, 500),  # Builtin Administrator user account RID 500
+        policy._sid(12, 1, 12345, 67890, 11111, 22222),  # Azure AD / Entra ID user
+    ],
+    ids=["local-sam-1001", "local-sam-1000", "admin-user-500", "azure-ad-user"],
+)
+def test_supported_individual_user_sids(sid):
+    assert policy._supported_individual_user_sid(sid) is True
+    res = review(snapshot(current_user_sid=sid, owner_sid=sid, aces=(ace(sid),)))
+    assert res.status == policy.EvidenceStatus.POLICY_MATCH
+    assert res.reasons == (policy.Reason.SNAPSHOT_MATCH,)
+
+
+@pytest.mark.parametrize("flag", [0x20, 0x40, 0x80, 0x20 | 0x10])
+def test_foreign_allow_preserved_even_with_unsupported_ace_flags(flag):
+    # Foreign ACE with CRITICAL_ACE_FLAG (0x20) or other unknown flags
+    foreign_ace = ace(OTHER, mask=1, flags=flag)
+    res = review(snapshot(aces=(ace(), foreign_ace)))
+    assert res.status == policy.EvidenceStatus.INSECURE
+    assert policy.Reason.FOREIGN_ALLOW in res.reasons
+    assert policy.Reason.UNSUPPORTED_ACE in res.reasons
+
+
+def test_dacl_review_coherence_validator():
+    with pytest.raises(ValidationError, match="at least one reason code"):
+        policy.DaclReview(status=policy.EvidenceStatus.UNVERIFIABLE, reasons=())
+
+    with pytest.raises(
+        ValidationError, match="POLICY_MATCH review must contain exactly"
+    ):
+        policy.DaclReview(
+            status=policy.EvidenceStatus.POLICY_MATCH,
+            reasons=(policy.Reason.SNAPSHOT_MATCH, policy.Reason.UNSUPPORTED_MASK),
+            provenance="WINDOWS_TEST_FIXTURE",
+        )
+
+    with pytest.raises(ValidationError, match="cannot have NOT_COLLECTED provenance"):
+        policy.DaclReview(
+            status=policy.EvidenceStatus.POLICY_MATCH,
+            reasons=(policy.Reason.SNAPSHOT_MATCH,),
+            provenance="NOT_COLLECTED",
+        )
+
+    with pytest.raises(
+        ValidationError, match="Non-matching review cannot contain SNAPSHOT_MATCH"
+    ):
+        policy.DaclReview(
+            status=policy.EvidenceStatus.UNVERIFIABLE,
+            reasons=(policy.Reason.SNAPSHOT_MATCH,),
+        )
+
+    with pytest.raises(
+        ValidationError,
+        match="INSECURE review must contain at least one insecure reason code",
+    ):
+        policy.DaclReview(
+            status=policy.EvidenceStatus.INSECURE,
+            reasons=(policy.Reason.UNSUPPORTED_MASK,),
+        )
+
+    with pytest.raises(
+        ValidationError, match="UNVERIFIABLE review cannot contain insecure reason codes"
+    ):
+        policy.DaclReview(
+            status=policy.EvidenceStatus.UNVERIFIABLE,
+            reasons=(policy.Reason.FOREIGN_ALLOW,),
+        )
+
+
+@pytest.mark.parametrize(
+    "raw_path",
+    [
+        "C:relative",
+        "C:dir/file",
+        r"C:dirile",
+        r"C:	est\..\escape",
+        r"C:\..\escape",
+        r"D:\path\.\..\other",
+        r"\.\C:\device",
+    ],
+    ids=[
+        "drive-relative",
+        "drive-relative-slash",
+        "drive-relative-backslash",
+        "dotdot-traversal",
+        "dotdot-root",
+        "dotdot-nested",
+        "device-path",
+    ],
+)
+def test_rooted_path_validation_rejects_relative_drive_and_traversal(raw_path):
+    with pytest.raises(policy._InspectionFailure) as exc:
+        reader.require_local_fixed_drive(PureWindowsPath(raw_path))
+    assert exc.value.reason == policy.Reason.UNSUPPORTED_FILESYSTEM
+
+
+def test_zero_volume_rejected():
+    res = review(snapshot(identity_before=(0, 1, 2), identity_after=(0, 1, 2)))
+    assert res.status == policy.EvidenceStatus.UNVERIFIABLE
+    assert policy.Reason.TIME_OF_CHECK_DRIFT in res.reasons
+
+
+def test_parse_acl_with_padded_basic_ace():
+    sub_count = OWNER[1]
+    sid_len = 8 + 4 * sub_count
+    normal_ace_size = 8 + sid_len
+    padded_ace_size = normal_ace_size + 4  # 4-byte padding at end of basic ACE
+    ace_bytes = (
+        struct.pack("<BBHI", 0, 0, padded_ace_size, policy.FILE_ALL_ACCESS)
+        + OWNER
+        + b"\x00\x00\x00\x00"
+    )
+    acl = struct.pack("<BBHHH", 2, 0, 8 + len(ace_bytes), 1, 0) + ace_bytes
+    parsed = _parse_acl(acl)
+    assert len(parsed) == 1
+    assert parsed[0].sid == OWNER
+    assert parsed[0].mask == policy.FILE_ALL_ACCESS
+    assert parsed[0].ace_type == 0
+    assert parsed[0].flags == 0
+
+
+def test_parse_acl_adversarial_malformed_sids():
+    # Basic ACE where sub_count indicates SID length exceeding ACE length
+    # ACE length = 20, but sub_count = 5 (needs 28 bytes for SID -> 8 + 28 = 36 bytes)
+    malformed_ace = struct.pack("<BBHI", 0, 0, 20, policy.FILE_ALL_ACCESS) + bytes([1, 5, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0])
+    acl = struct.pack("<BBHHH", 2, 0, 8 + len(malformed_ace), 1, 0) + malformed_ace
+    with pytest.raises(ValueError, match="Truncated basic ACE SID"):
+        _parse_acl(acl)
+
+    # Basic ACE with 0 subauthorities
+    zero_sub_sid = bytes([1, 0, 0, 0, 0, 0, 0, 5])
+    zero_sub_ace = struct.pack("<BBHI", 0, 0, 16, policy.FILE_ALL_ACCESS) + zero_sub_sid
+    acl2 = struct.pack("<BBHHH", 2, 0, 8 + len(zero_sub_ace), 1, 0) + zero_sub_ace
+    with pytest.raises(ValueError, match="Invalid basic ACE SID"):
+        _parse_acl(acl2)
+
+
+def test_copy_bounded_and_copy_sid_memory_bounds_safety():
+    buffer = b"\x01\x05\x00\x00\x00\x00\x00\x05\x15\x00\x00\x00" + b"\x01" * 16
+    # Use ctypes buffer for actual safe memory reading
+    import ctypes
+    c_buf = ctypes.create_string_buffer(buffer)
+    addr = ctypes.addressof(c_buf)
+    size = len(buffer)
+
+    # Valid bounded copy
+    assert _copy_bounded(addr, 8, addr, size) == buffer[:8]
+
+    # Null address
+    with pytest.raises(ValueError, match="Metadata pointer out of bounds"):
+        _copy_bounded(0, 4, addr, size)
+
+    # Negative length
+    with pytest.raises(ValueError, match="Metadata pointer out of bounds"):
+        _copy_bounded(addr, -1, addr, size)
+
+    # Address < base
+    with pytest.raises(ValueError, match="Metadata pointer out of bounds"):
+        _copy_bounded(addr - 1, 4, addr, size)
+
+    # Address + length > base + size
+    with pytest.raises(ValueError, match="Metadata pointer out of bounds"):
+        _copy_bounded(addr, size + 1, addr, size)
+
+    # Valid copy_sid
+    assert _copy_sid(addr, addr, size) == buffer
+
+    # copy_sid with invalid revision (revision = 2)
+    bad_rev_buf = ctypes.create_string_buffer(b"\x02\x01\x00\x00\x00\x00\x00\x05\x01\x00\x00\x00")
+    with pytest.raises(ValueError, match="Invalid SID layout"):
+        _copy_sid(ctypes.addressof(bad_rev_buf), ctypes.addressof(bad_rev_buf), len(bad_rev_buf))
+
+    # copy_sid with 0 subauthorities
+    zero_sub_buf = ctypes.create_string_buffer(b"\x01\x00\x00\x00\x00\x00\x00\x05")
+    with pytest.raises(ValueError, match="Invalid SID layout"):
+        _copy_sid(ctypes.addressof(zero_sub_buf), ctypes.addressof(zero_sub_buf), len(zero_sub_buf))
+
+    # copy_sid with > 15 subauthorities (e.g. 16)
+    sixteen_sub_buf = ctypes.create_string_buffer(b"\x01\x10\x00\x00\x00\x00\x00\x05")
+    with pytest.raises(ValueError, match="Invalid SID layout"):
+        _copy_sid(ctypes.addressof(sixteen_sub_buf), ctypes.addressof(sixteen_sub_buf), len(sixteen_sub_buf))
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="Actual Win32 fixture probe requires Windows"
+)
+def test_real_windows_fixture_probe_detects_volume_and_inode_drift(tmp_path):
+    with HermeticTestFixtureScope(tmp_path):
+        st = tmp_path.stat()
+        real_dev = st.st_dev & 0xFFFFFFFF
+        real_ino = st.st_ino
+        # Inode drift
+        with pytest.raises(policy._InspectionFailure) as ino_drift:
+            reader.read_fixture_snapshot(
+                tmp_path, expected_inode=real_ino + 1, expected_dev=real_dev
+            )
+        assert ino_drift.value.reason == policy.Reason.TIME_OF_CHECK_DRIFT
+
+        # Volume drift
+        with pytest.raises(policy._InspectionFailure) as dev_drift:
+            reader.read_fixture_snapshot(
+                tmp_path,
+                expected_inode=real_ino,
+                expected_dev=(real_dev + 1) & 0xFFFFFFFF,
+            )
+        assert dev_drift.value.reason == policy.Reason.TIME_OF_CHECK_DRIFT

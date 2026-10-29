@@ -11,7 +11,7 @@ from enum import Enum
 import sys
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, StringConstraints, ValidationError
+from pydantic import BaseModel, Field, StringConstraints, ValidationError, model_validator
 
 from efso_radar.staging.persistent_manifest_store import (
     HermeticTestFixtureScope,
@@ -31,9 +31,6 @@ def _sid(authority: int, *subauthorities: int) -> bytes:
 
 
 _PRIVILEGED = frozenset((_sid(5, 18), _sid(5, 32, 544)))
-_UNSUPPORTED_CURRENT = _PRIVILEGED | frozenset(
-    (_sid(1, 0), _sid(5, 11), _sid(5, 32, 545), _sid(5, 7), _sid(5, 19), _sid(5, 20))
-)
 
 
 class EvidenceStatus(str, Enum):
@@ -124,6 +121,37 @@ class DaclReview(_Frozen):
     live_storage_authorized: Literal[False] = False
     durability_verified: Literal[False] = False
 
+    @model_validator(mode="after")
+    def _validate_review_coherence(self) -> DaclReview:
+        if not self.reasons:
+            raise ValueError("Review must contain at least one reason code.")
+        if self.status == EvidenceStatus.POLICY_MATCH:
+            if self.reasons != (Reason.SNAPSHOT_MATCH,):
+                raise ValueError(
+                    "POLICY_MATCH review must contain exactly (Reason.SNAPSHOT_MATCH,)."
+                )
+            if self.provenance == "NOT_COLLECTED":
+                raise ValueError("POLICY_MATCH cannot have NOT_COLLECTED provenance.")
+        else:
+            if Reason.SNAPSHOT_MATCH in self.reasons:
+                raise ValueError("Non-matching review cannot contain SNAPSHOT_MATCH.")
+            insecure_reasons = {
+                Reason.OWNER_MISMATCH,
+                Reason.MISSING_DACL,
+                Reason.NULL_DACL,
+                Reason.FOREIGN_ALLOW,
+            }
+            has_insecure = bool(insecure_reasons.intersection(self.reasons))
+            if self.status == EvidenceStatus.INSECURE and not has_insecure:
+                raise ValueError(
+                    "INSECURE review must contain at least one insecure reason code."
+                )
+            if self.status == EvidenceStatus.UNVERIFIABLE and has_insecure:
+                raise ValueError(
+                    "UNVERIFIABLE review cannot contain insecure reason codes."
+                )
+        return self
+
 
 def _unverifiable(reason: Reason) -> DaclReview:
     return DaclReview(status=EvidenceStatus.UNVERIFIABLE, reasons=(reason,))
@@ -138,11 +166,43 @@ class _InspectionFailure(Exception):
 def _valid_sid(value: bytes | None) -> bool:
     return (
         value is not None
-        and len(value) >= 8
+        and len(value) >= 12
         and value[0] == 1
-        and value[1] <= 15
+        and 1 <= value[1] <= 15
         and len(value) == 8 + 4 * value[1]
     )
+
+
+def _supported_individual_user_sid(sid: bytes | None) -> bool:
+    """Check if SID matches supported individual local, domain, or AzureAD user profile.
+
+    Separates parser validity from strict policy support. Rejects service accounts
+    (SYSTEM, LocalService, NetworkService, NT SERVICE/*), virtual accounts, built-in
+    groups (Administrators, Users, Guests, Backup Operators), domain groups (Domain
+    Admins/Users/Guests), placeholder SIDs (CREATOR OWNER, OWNER RIGHTS, NULL SID),
+    and well-known non-individual RIDs (501: Guest, 502: KRBTGT).
+    """
+    if not _valid_sid(sid):
+        return False
+    assert sid is not None
+    sub_count = sid[1]
+    authority = int.from_bytes(sid[2:8], "big")
+    subauthorities = [
+        int.from_bytes(sid[8 + 4 * i : 12 + 4 * i], "little")
+        for i in range(sub_count)
+    ]
+    # Standard Windows Local or Domain SAM/AD Account: S-1-5-21-<d1>-<d2>-<d3>-<rid>
+    if authority == 5 and sub_count == 5 and subauthorities[0] == 21:
+        rid = subauthorities[4]
+        # Reject well-known non-individual domain RIDs
+        # 501: Guest, 502: KRBTGT, 512-527: Domain Groups, 553: RAS/IAS Servers
+        if rid in {501, 502, 553} or (512 <= rid <= 527):
+            return False
+        return True
+    # Azure AD / Entra ID User Account: S-1-12-1-<sub1>-<sub2>-<sub3>-<sub4>
+    if authority == 12 and sub_count == 5 and subauthorities[0] == 1:
+        return True
+    return False
 
 
 def review_dacl_snapshot(snapshot: DaclSnapshot) -> DaclReview:
@@ -164,6 +224,7 @@ def review_dacl_snapshot(snapshot: DaclSnapshot) -> DaclReview:
         return _unverifiable(Reason.REPARSE_POINT)
     if (
         snapshot.identity_before != snapshot.identity_after
+        or not snapshot.identity_before[0]
         or not any(snapshot.identity_before[1:])
         or snapshot.descriptor_before != snapshot.descriptor_after
         or not snapshot.context_stable
@@ -172,7 +233,7 @@ def review_dacl_snapshot(snapshot: DaclSnapshot) -> DaclReview:
     if (
         snapshot.token_elevated
         or snapshot.impersonating
-        or snapshot.current_user_sid in _UNSUPPORTED_CURRENT
+        or not _supported_individual_user_sid(snapshot.current_user_sid)
     ):
         return _unverifiable(Reason.TOKEN_CONTEXT_UNSUPPORTED)
     if not _valid_sid(snapshot.current_user_sid) or not _valid_sid(snapshot.owner_sid):
@@ -195,26 +256,29 @@ def review_dacl_snapshot(snapshot: DaclSnapshot) -> DaclReview:
         unknown.append(Reason.INHERITANCE_UNVERIFIED)
     owner_mask = 0
     for ace in snapshot.aces:
-        if ace.ace_type not in (0, 1) or ace.flags & ~0x1F:
+        if ace.ace_type not in (0, 1):
             unknown.append(Reason.UNSUPPORTED_ACE)
             continue
         if not _valid_sid(ace.sid):
             unknown.append(Reason.UNSUPPORTED_ACE)
             continue
+        if ace.flags & ~0x1F:
+            unknown.append(Reason.UNSUPPORTED_ACE)
         if ace.flags & 0x1C:  # inherited, inherit-only, no-propagate
             unknown.append(Reason.INHERITANCE_UNVERIFIED)
         if ace.ace_type == 1:
             unknown.append(Reason.DENY_SEMANTICS_UNSUPPORTED)
-        elif ace.mask:
+        else:
             if ace.sid != snapshot.current_user_sid:
                 if ace.sid in _PRIVILEGED:
                     unknown.append(Reason.PRIVILEGED_POLICY_UNDECIDED)
                 else:
                     insecure.append(Reason.FOREIGN_ALLOW)
-            elif ace.mask & ~FILE_ALL_ACCESS:
-                unknown.append(Reason.UNSUPPORTED_MASK)
-            elif not ace.flags & 0x08:
+            elif not (ace.flags & 0x08):
                 owner_mask |= ace.mask
+
+            if not ace.mask or (ace.mask & ~FILE_ALL_ACCESS):
+                unknown.append(Reason.UNSUPPORTED_MASK)
     if owner_mask != FILE_ALL_ACCESS:
         unknown.append(Reason.OWNER_ACCESS_UNPROVEN)
     reasons = tuple(dict.fromkeys(insecure + unknown))
@@ -236,11 +300,17 @@ def inspect_test_fixture_dacl(scope: HermeticTestFixtureScope) -> DaclReview:
     """
 
     def unavailable(reason: Reason) -> DaclReview:
-        return _unverifiable(reason).model_copy(update={"provenance": "NOT_COLLECTED"})
+        return DaclReview(
+            status=EvidenceStatus.UNVERIFIABLE,
+            reasons=(reason,),
+            provenance="NOT_COLLECTED",
+        )
 
     def native_failure(reason: Reason) -> DaclReview:
-        return _unverifiable(reason).model_copy(
-            update={"provenance": "WINDOWS_TEST_FIXTURE"}
+        return DaclReview(
+            status=EvidenceStatus.UNVERIFIABLE,
+            reasons=(reason,),
+            provenance="WINDOWS_TEST_FIXTURE",
         )
 
     if (
@@ -259,8 +329,10 @@ def inspect_test_fixture_dacl(scope: HermeticTestFixtureScope) -> DaclReview:
         require_local_fixed_drive(root)
         if HermeticTestFixtureScope._validate_fixture_root(root) != root:
             return unavailable(Reason.FIXTURE_SCOPE_REJECTED)
-        expected_inode = root.stat(follow_symlinks=False).st_ino
-        if not expected_inode:
+        st_before = root.stat(follow_symlinks=False)
+        expected_dev = st_before.st_dev & 0xFFFFFFFF
+        expected_inode = st_before.st_ino
+        if not expected_dev or not expected_inode:
             return unavailable(Reason.TIME_OF_CHECK_DRIFT)
     except _InspectionFailure as exc:
         return unavailable(exc.reason)
@@ -269,10 +341,13 @@ def inspect_test_fixture_dacl(scope: HermeticTestFixtureScope) -> DaclReview:
     try:
         from efso_radar.staging._windows_dacl_reader import read_fixture_snapshot
 
-        snapshot = read_fixture_snapshot(root, expected_inode=expected_inode)
+        snapshot = read_fixture_snapshot(
+            root, expected_dev=expected_dev, expected_inode=expected_inode
+        )
         if HermeticTestFixtureScope._validate_fixture_root(root) != root:
             return native_failure(Reason.TIME_OF_CHECK_DRIFT)
-        if root.stat(follow_symlinks=False).st_ino != expected_inode:
+        st_after = root.stat(follow_symlinks=False)
+        if (st_after.st_dev & 0xFFFFFFFF) != expected_dev or st_after.st_ino != expected_inode:
             return native_failure(Reason.TIME_OF_CHECK_DRIFT)
         if (
             not scope._entered

@@ -31,19 +31,43 @@ READ_ONLY_DIRECTORY_FLAGS = 0x02200000  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
 
 
 def require_local_fixed_drive(path: Path) -> None:
-    """Reject UNC/device/network paths before any fixture filesystem metadata I/O."""
+    """Reject UNC/device/relative/network paths before any fixture filesystem metadata I/O."""
+    drive = getattr(path, "drive", "")
+    root = getattr(path, "root", "")
+    parts = getattr(path, "parts", ())
     if (
-        len(path.drive) != 2
-        or path.drive[1] != ":"
-        or not path.drive[0].isascii()
-        or not path.drive[0].isalpha()
+        len(drive) != 2
+        or drive[1] != ":"
+        or not drive[0].isascii()
+        or not drive[0].isalpha()
+        or root != "\\"
+        or not getattr(path, "is_absolute", lambda: False)()
+        or ".." in parts
     ):
         raise _InspectionFailure(Reason.UNSUPPORTED_FILESYSTEM)
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     drive_type = kernel.GetDriveTypeW
     drive_type.restype, drive_type.argtypes = w.UINT, [w.LPCWSTR]
-    if drive_type(path.drive + "\\") != 3:
+    if drive_type(drive + "\\") != 3:
         raise _InspectionFailure(Reason.UNSUPPORTED_FILESYSTEM)
+
+
+def _copy_bounded(address: int, length: int, base: int, size: int) -> bytes:
+    if (
+        not address
+        or length < 0
+        or address < base
+        or address + length > base + size
+    ):
+        raise ValueError("Metadata pointer out of bounds")
+    return ctypes.string_at(address, length)
+
+
+def _copy_sid(address: int, base: int, size: int) -> bytes:
+    head = _copy_bounded(address, 8, base, size)
+    if head[0] != 1 or not (1 <= head[1] <= 15):
+        raise ValueError("Invalid SID layout")
+    return _copy_bounded(address, 8 + 4 * head[1], base, size)
 
 
 def _parse_acl(raw: bytes) -> tuple[AceEvidence, ...]:
@@ -66,7 +90,11 @@ def _parse_acl(raw: bytes) -> tuple[AceEvidence, ...]:
             if length < 16:
                 raise ValueError("Truncated basic ACE")
             mask = struct.unpack_from("<I", raw, offset + 4)[0]
-            sid = raw[offset + 8 : offset + length]
+            sub_count = raw[offset + 9]
+            sid_len = 8 + 4 * sub_count
+            if 8 + sid_len > length:
+                raise ValueError("Truncated basic ACE SID")
+            sid = raw[offset + 8 : offset + 8 + sid_len]
             if not _valid_sid(sid):
                 raise ValueError("Invalid basic ACE SID")
         aces.append(AceEvidence(ace_type=kind, flags=flags, mask=mask, sid=sid))
@@ -74,7 +102,9 @@ def _parse_acl(raw: bytes) -> tuple[AceEvidence, ...]:
     return tuple(aces)
 
 
-def read_fixture_snapshot(path: Path, *, expected_inode: int) -> DaclSnapshot:
+def read_fixture_snapshot(
+    path: Path, *, expected_inode: int, expected_dev: int = 0
+) -> DaclSnapshot:
     """Read directory metadata twice through a handle, then recheck path binding.
 
     OPEN_EXISTING + READ_CONTROL/FILE_READ_ATTRIBUTES only. Sharing is not a
@@ -187,21 +217,8 @@ def read_fixture_snapshot(path: Path, *, expected_inode: int) -> DaclSnapshot:
         if not ok:
             raise OSError("Read-only metadata inspection failed")
 
-    def copy_bounded(address: int, length: int, base: int, size: int) -> bytes:
-        if (
-            not address
-            or length < 0
-            or address < base
-            or address + length > base + size
-        ):
-            raise ValueError("Metadata pointer out of bounds")
-        return ctypes.string_at(address, length)
-
-    def copy_sid(address: int, base: int, size: int) -> bytes:
-        head = copy_bounded(address, 8, base, size)
-        if head[0] != 1 or head[1] > 15:
-            raise ValueError("Invalid SID layout")
-        return copy_bounded(address, 8 + 4 * head[1], base, size)
+    copy_bounded = _copy_bounded
+    copy_sid = _copy_sid
 
     def token():
         handle = w.HANDLE()
@@ -257,12 +274,12 @@ def read_fixture_snapshot(path: Path, *, expected_inode: int) -> DaclSnapshot:
         require(info_fn(handle, ctypes.byref(info)))
         if info.attributes & 0x400:
             raise _InspectionFailure(Reason.REPARSE_POINT)
-        if not info.attributes & 0x10:
+        if not (info.attributes & 0x10):
             raise ValueError("Fixture is not a directory")
         return info.volume, info.index_high, info.index_low
 
     def descriptor(handle):
-        owner, dacl, sd = ptr(), ptr(), ptr()
+        owner, sd = ptr(), ptr()
         try:
             require(
                 security(
@@ -271,45 +288,52 @@ def read_fixture_snapshot(path: Path, *, expected_inode: int) -> DaclSnapshot:
                     5,
                     ctypes.byref(owner),
                     None,
-                    ctypes.byref(dacl),
+                    None,
                     None,
                     ctypes.byref(sd),
                 )
                 == 0
             )
             require(valid_sd(sd))
+            control, revision = w.WORD(), w.DWORD()
+            require(get_control(sd, ctypes.byref(control), ctypes.byref(revision)))
+            # Enforce self-relative format (SE_SELF_RELATIVE = 0x8000) and standard revision 1
+            # before any memory bounds arithmetic or raw buffer copy.
+            if not (control.value & 0x8000) or revision.value != 1:
+                raise ValueError("Unsupported or non-self-relative security descriptor layout")
             size = sd_length(sd)
             if not 20 <= size <= MAX_DESCRIPTOR_BYTES:
                 raise ValueError("Descriptor out of bounds")
             raw = copy_bounded(sd.value, size, sd.value, size)
+            dacl_ptr = ptr()
             present, defaulted = w.BOOL(), w.BOOL()
             require(
                 get_dacl(
                     sd,
                     ctypes.byref(present),
-                    ctypes.byref(dacl),
+                    ctypes.byref(dacl_ptr),
                     ctypes.byref(defaulted),
                 )
             )
-            control, revision = w.WORD(), w.DWORD()
-            require(get_control(sd, ctypes.byref(control), ctypes.byref(revision)))
             aces = ()
-            if dacl.value:
-                header = copy_bounded(dacl.value, 8, sd.value, size)
+            if present.value and dacl_ptr.value:
+                header = copy_bounded(dacl_ptr.value, 8, sd.value, size)
                 acl_size = int.from_bytes(header[2:4], "little")
-                aces = _parse_acl(copy_bounded(dacl.value, acl_size, sd.value, size))
+                aces = _parse_acl(copy_bounded(dacl_ptr.value, acl_size, sd.value, size))
             owner_sid = copy_sid(owner.value, sd.value, size) if owner.value else None
             return (
                 owner_sid,
                 bool(present.value),
-                bool(present.value and not dacl.value),
+                bool(present.value and not dacl_ptr.value),
                 bool(control.value & 0x1000),
                 aces,
                 hashlib.sha256(raw).digest(),
             )
         finally:
             if sd.value:
-                require(not local_free(sd))
+                to_free = sd.value
+                sd.value = None
+                require(not local_free(ctypes.c_void_p(to_free)))
 
     if drive_type(path.drive + "\\") != 3:
         raise _InspectionFailure(Reason.UNSUPPORTED_FILESYSTEM)
@@ -318,12 +342,14 @@ def read_fixture_snapshot(path: Path, *, expected_inode: int) -> DaclSnapshot:
         before = identity(handle)
         if expected_inode != (before[1] << 32 | before[2]):
             raise _InspectionFailure(Reason.TIME_OF_CHECK_DRIFT)
+        if expected_dev and (expected_dev & 0xFFFFFFFF) != before[0]:
+            raise _InspectionFailure(Reason.TIME_OF_CHECK_DRIFT)
         name = ctypes.create_unicode_buffer(32)
         flags = w.DWORD()
         require(
             volume(handle, None, 0, None, None, ctypes.byref(flags), name, len(name))
         )
-        if name.value != "NTFS" or not flags.value & 8:
+        if name.value != "NTFS" or not (flags.value & 8):
             raise _InspectionFailure(Reason.UNSUPPORTED_FILESYSTEM)
         first = descriptor(handle)
         second = descriptor(handle)
@@ -331,6 +357,8 @@ def read_fixture_snapshot(path: Path, *, expected_inode: int) -> DaclSnapshot:
             raise _InspectionFailure(Reason.TIME_OF_CHECK_DRIFT)
         with opened() as rebound:
             after = identity(rebound)
+            if after != before:
+                raise _InspectionFailure(Reason.TIME_OF_CHECK_DRIFT)
     user_after = token()
     return DaclSnapshot(
         current_user_sid=user_before[0],
@@ -344,7 +372,7 @@ def read_fixture_snapshot(path: Path, *, expected_inode: int) -> DaclSnapshot:
         reparse_point=False,
         token_elevated=user_before[1],
         impersonating=user_before[2],
-        context_stable=(user_before == user_after and first == second),
+        context_stable=(user_before == user_after and first == second and before == after),
         identity_before=before,
         identity_after=after,
         descriptor_before=first[5],
