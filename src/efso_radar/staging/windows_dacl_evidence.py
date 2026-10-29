@@ -180,7 +180,21 @@ def _supported_individual_user_sid(sid: bytes | None) -> bool:
     (SYSTEM, LocalService, NetworkService, NT SERVICE/*), virtual accounts, built-in
     groups (Administrators, Users, Guests, Backup Operators), domain groups (Domain
     Admins/Users/Guests), placeholder SIDs (CREATOR OWNER, OWNER RIGHTS, NULL SID),
-    and well-known non-individual RIDs (501: Guest, 502: KRBTGT).
+    and well-known non-individual or system-managed RIDs:
+    - RIDs < 500 (reserved / invalid SAM account RIDs)
+    - 501: Guest
+    - 502: KRBTGT
+    - 503: DefaultAccount (Default System Managed Account - DSMA)
+    - 504: WDAGUtilityAccount (Windows Defender Application Guard)
+    - 512-527: Domain Groups (Domain Admins, Domain Users, Domain Guests, etc.)
+    - 553: RAS and IAS Servers
+
+    RID 500 (Administrator user account) is preserved as an explicit policy choice.
+
+    Note: SID shape alone cannot prove an account is an interactive human user (e.g.
+    local Windows service accounts such as WSIAccount or other software accounts may
+    receive RID >= 1000). This helper is a conservative structural filter, not an
+    operational identity attestation.
     """
     if not _valid_sid(sid):
         return False
@@ -194,9 +208,13 @@ def _supported_individual_user_sid(sid: bytes | None) -> bool:
     # Standard Windows Local or Domain SAM/AD Account: S-1-5-21-<d1>-<d2>-<d3>-<rid>
     if authority == 5 and sub_count == 5 and subauthorities[0] == 21:
         rid = subauthorities[4]
-        # Reject well-known non-individual domain RIDs
-        # 501: Guest, 502: KRBTGT, 512-527: Domain Groups, 553: RAS/IAS Servers
-        if rid in {501, 502, 553} or (512 <= rid <= 527):
+        # Conservative lower bound: RIDs below 500 are reserved/invalid for SAM accounts
+        if rid < 500:
+            return False
+        # Reject well-known non-individual or system-managed domain and local RIDs:
+        # 501: Guest, 502: KRBTGT, 503: DefaultAccount, 504: WDAGUtilityAccount,
+        # 512-527: Domain Groups, 553: RAS/IAS Servers
+        if rid in {501, 502, 503, 504, 553} or (512 <= rid <= 527):
             return False
         return True
     # Azure AD / Entra ID User Account: S-1-12-1-<sub1>-<sub2>-<sub3>-<sub4>

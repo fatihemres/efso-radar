@@ -15,7 +15,7 @@ import pytest
 from pydantic import ValidationError
 
 from efso_radar.staging import windows_dacl_evidence as policy
-from efso_radar.staging._windows_dacl_reader import _copy_bounded, _copy_sid, _parse_acl
+from efso_radar.staging._windows_dacl_reader import _copy_bounded, _copy_sid, _parse_acl, _read_handle_descriptor
 from efso_radar.staging import _windows_dacl_reader as reader
 from efso_radar.staging.persistent_manifest_store import (
     HermeticTestFixtureScope,
@@ -562,8 +562,12 @@ def test_zero_mask_allow_ace_never_produces_policy_match():
         policy._sid(1, 1, 0),  # Everyone
         policy._sid(3, 0),  # Creator Owner
         policy._sid(3, 4),  # Owner Rights
+        policy._sid(5, 21, 100, 200, 300, 0),    # Reserved / low RID 0
+        policy._sid(5, 21, 100, 200, 300, 499),  # Reserved / low RID 499 (< 500)
         policy._sid(5, 21, 100, 200, 300, 501),  # Domain Guest (RID 501)
         policy._sid(5, 21, 100, 200, 300, 502),  # KRBTGT (RID 502)
+        policy._sid(5, 21, 100, 200, 300, 503),  # DefaultAccount / DSMA (RID 503)
+        policy._sid(5, 21, 100, 200, 300, 504),  # WDAGUtilityAccount (RID 504)
         policy._sid(5, 21, 100, 200, 300, 512),  # Domain Admins (RID 512)
         policy._sid(5, 21, 100, 200, 300, 513),  # Domain Users (RID 513)
         policy._sid(5, 21, 100, 200, 300, 514),  # Domain Guests (RID 514)
@@ -583,8 +587,12 @@ def test_zero_mask_allow_ace_never_produces_policy_match():
         "everyone",
         "creator-owner",
         "owner-rights",
+        "rid-0-reserved",
+        "rid-499-low-reserved",
         "rid-501-guest",
         "rid-502-krbtgt",
+        "rid-503-default-account",
+        "rid-504-wdag-utility-account",
         "rid-512-domain-admins",
         "rid-513-domain-users",
         "rid-514-domain-guests",
@@ -809,3 +817,209 @@ def test_real_windows_fixture_probe_detects_volume_and_inode_drift(tmp_path):
                 expected_dev=(real_dev + 1) & 0xFFFFFFFF,
             )
         assert dev_drift.value.reason == policy.Reason.TIME_OF_CHECK_DRIFT
+
+
+def test_win32_descriptor_fault_injection_security_info_failure():
+    WIN = hasattr(reader.ctypes, "WINFUNCTYPE")
+    CB = reader.ctypes.WINFUNCTYPE if WIN else reader.ctypes.CFUNCTYPE
+    ptr = reader.ctypes.c_void_p
+    out_ptr = reader.ctypes.POINTER(ptr)
+    w = reader.w
+    SEC_PROTO = CB(w.DWORD, w.HANDLE, reader.ctypes.c_int, w.DWORD, out_ptr, out_ptr, out_ptr, out_ptr, out_ptr)
+    FREE_PROTO = CB(ptr, ptr)
+
+    freed = []
+    def sec_fail(h, t, info, p_owner, p_grp, p_dacl, p_sacl, p_sd):
+        return 5  # ERROR_ACCESS_DENIED
+
+    def free_rec(p):
+        freed.append(p)
+        return None
+
+    with pytest.raises(OSError, match="Read-only metadata inspection failed"):
+        _read_handle_descriptor(
+            1,
+            security_fn=SEC_PROTO(sec_fail),
+            valid_sd_fn=Mock(),
+            get_control_fn=Mock(),
+            sd_length_fn=Mock(),
+            get_dacl_fn=Mock(),
+            local_free_fn=FREE_PROTO(free_rec),
+        )
+    assert freed == []  # LocalFree never called because pointer was not allocated
+
+
+def test_win32_descriptor_fault_injection_non_self_relative_or_invalid_revision():
+    WIN = hasattr(reader.ctypes, "WINFUNCTYPE")
+    CB = reader.ctypes.WINFUNCTYPE if WIN else reader.ctypes.CFUNCTYPE
+    ptr = reader.ctypes.c_void_p
+    out_ptr = reader.ctypes.POINTER(ptr)
+    w = reader.w
+    SEC_PROTO = CB(w.DWORD, w.HANDLE, reader.ctypes.c_int, w.DWORD, out_ptr, out_ptr, out_ptr, out_ptr, out_ptr)
+    VALID_PROTO = CB(w.BOOL, ptr)
+    CONTROL_PROTO = CB(w.BOOL, ptr, reader.ctypes.POINTER(w.WORD), reader.ctypes.POINTER(w.DWORD))
+    FREE_PROTO = CB(ptr, ptr)
+
+    sd_buf = reader.ctypes.create_string_buffer(32)
+    sd_addr = reader.ctypes.addressof(sd_buf)
+    freed = []
+
+    def sec_ok(h, t, info, p_owner, p_grp, p_dacl, p_sacl, p_sd):
+        p_sd.contents.value = sd_addr
+        return 0
+
+    def free_rec(p):
+        freed.append(p)
+        return None
+
+    # 1. Non-self-relative control (control.value & 0x8000 == 0)
+    def control_not_sr(sd, p_ctrl, p_rev):
+        p_ctrl.contents.value = 0  # Missing SE_SELF_RELATIVE
+        p_rev.contents.value = 1
+        return True
+
+    with pytest.raises(
+        ValueError, match="Unsupported or non-self-relative security descriptor layout"
+    ):
+        _read_handle_descriptor(
+            1,
+            security_fn=SEC_PROTO(sec_ok),
+            valid_sd_fn=VALID_PROTO(lambda sd: True),
+            get_control_fn=CONTROL_PROTO(control_not_sr),
+            sd_length_fn=Mock(),
+            get_dacl_fn=Mock(),
+            local_free_fn=FREE_PROTO(free_rec),
+        )
+    assert len(freed) == 1
+    assert freed[0] == sd_addr  # LocalFree guaranteed on layout failure
+
+    # 2. Invalid revision (revision != 1)
+    freed.clear()
+    def control_bad_rev(sd, p_ctrl, p_rev):
+        p_ctrl.contents.value = 0x8000
+        p_rev.contents.value = 2  # Not revision 1
+        return True
+
+    with pytest.raises(
+        ValueError, match="Unsupported or non-self-relative security descriptor layout"
+    ):
+        _read_handle_descriptor(
+            1,
+            security_fn=SEC_PROTO(sec_ok),
+            valid_sd_fn=VALID_PROTO(lambda sd: True),
+            get_control_fn=CONTROL_PROTO(control_bad_rev),
+            sd_length_fn=Mock(),
+            get_dacl_fn=Mock(),
+            local_free_fn=FREE_PROTO(free_rec),
+        )
+    assert len(freed) == 1
+    assert freed[0] == sd_addr
+
+
+def test_win32_descriptor_fault_injection_absent_dacl_stale_pointer_safety():
+    WIN = hasattr(reader.ctypes, "WINFUNCTYPE")
+    CB = reader.ctypes.WINFUNCTYPE if WIN else reader.ctypes.CFUNCTYPE
+    ptr = reader.ctypes.c_void_p
+    out_ptr = reader.ctypes.POINTER(ptr)
+    w = reader.w
+    SEC_PROTO = CB(w.DWORD, w.HANDLE, reader.ctypes.c_int, w.DWORD, out_ptr, out_ptr, out_ptr, out_ptr, out_ptr)
+    VALID_PROTO = CB(w.BOOL, ptr)
+    CONTROL_PROTO = CB(w.BOOL, ptr, reader.ctypes.POINTER(w.WORD), reader.ctypes.POINTER(w.DWORD))
+    LEN_PROTO = CB(w.DWORD, ptr)
+    DACL_PROTO = CB(w.BOOL, ptr, reader.ctypes.POINTER(w.BOOL), out_ptr, reader.ctypes.POINTER(w.BOOL))
+    FREE_PROTO = CB(ptr, ptr)
+
+    sd_buf = reader.ctypes.create_string_buffer(32)
+    sd_addr = reader.ctypes.addressof(sd_buf)
+    freed = []
+
+    def sec_ok(h, t, info, p_owner, p_grp, p_dacl, p_sacl, p_sd):
+        p_sd.contents.value = sd_addr
+        return 0
+
+    def control_ok(sd, p_ctrl, p_rev):
+        p_ctrl.contents.value = 0x8000
+        p_rev.contents.value = 1
+        return True
+
+    # Absent DACL: present = 0, but dacl_ptr has stale address (0xdeadbeef)
+    def dacl_absent(sd, p_present, p_dacl, p_defaulted):
+        p_present.contents.value = 0
+        p_dacl.contents.value = 0xdeadbeef
+        p_defaulted.contents.value = 0
+        return True
+
+    def free_rec(p):
+        freed.append(p)
+        return None
+
+    result = _read_handle_descriptor(
+        1,
+        security_fn=SEC_PROTO(sec_ok),
+        valid_sd_fn=VALID_PROTO(lambda sd: True),
+        get_control_fn=CONTROL_PROTO(control_ok),
+        sd_length_fn=LEN_PROTO(lambda sd: 32),
+        get_dacl_fn=DACL_PROTO(dacl_absent),
+        local_free_fn=FREE_PROTO(free_rec),
+    )
+    # Stale pointer 0xdeadbeef was safely ignored without dereference
+    owner_sid, present, is_null, protected, aces, digest = result
+    assert present is False
+    assert is_null is False
+    assert aces == ()
+    assert len(freed) == 1
+    assert freed[0] == sd_addr
+
+
+def test_win32_descriptor_fault_injection_null_dacl():
+    WIN = hasattr(reader.ctypes, "WINFUNCTYPE")
+    CB = reader.ctypes.WINFUNCTYPE if WIN else reader.ctypes.CFUNCTYPE
+    ptr = reader.ctypes.c_void_p
+    out_ptr = reader.ctypes.POINTER(ptr)
+    w = reader.w
+    SEC_PROTO = CB(w.DWORD, w.HANDLE, reader.ctypes.c_int, w.DWORD, out_ptr, out_ptr, out_ptr, out_ptr, out_ptr)
+    VALID_PROTO = CB(w.BOOL, ptr)
+    CONTROL_PROTO = CB(w.BOOL, ptr, reader.ctypes.POINTER(w.WORD), reader.ctypes.POINTER(w.DWORD))
+    LEN_PROTO = CB(w.DWORD, ptr)
+    DACL_PROTO = CB(w.BOOL, ptr, reader.ctypes.POINTER(w.BOOL), out_ptr, reader.ctypes.POINTER(w.BOOL))
+    FREE_PROTO = CB(ptr, ptr)
+
+    sd_buf = reader.ctypes.create_string_buffer(32)
+    sd_addr = reader.ctypes.addressof(sd_buf)
+    freed = []
+
+    def sec_ok(h, t, info, p_owner, p_grp, p_dacl, p_sacl, p_sd):
+        p_sd.contents.value = sd_addr
+        return 0
+
+    def control_ok(sd, p_ctrl, p_rev):
+        p_ctrl.contents.value = 0x8000
+        p_rev.contents.value = 1
+        return True
+
+    # NULL DACL: present = 1, dacl_ptr = NULL (None/0)
+    def dacl_null(sd, p_present, p_dacl, p_defaulted):
+        p_present.contents.value = 1
+        p_dacl.contents.value = None
+        p_defaulted.contents.value = 0
+        return True
+
+    def free_rec(p):
+        freed.append(p)
+        return None
+
+    result = _read_handle_descriptor(
+        1,
+        security_fn=SEC_PROTO(sec_ok),
+        valid_sd_fn=VALID_PROTO(lambda sd: True),
+        get_control_fn=CONTROL_PROTO(control_ok),
+        sd_length_fn=LEN_PROTO(lambda sd: 32),
+        get_dacl_fn=DACL_PROTO(dacl_null),
+        local_free_fn=FREE_PROTO(free_rec),
+    )
+    owner_sid, present, is_null, protected, aces, digest = result
+    assert present is True
+    assert is_null is True
+    assert aces == ()
+    assert len(freed) == 1
+    assert freed[0] == sd_addr

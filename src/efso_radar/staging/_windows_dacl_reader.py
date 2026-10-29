@@ -102,6 +102,77 @@ def _parse_acl(raw: bytes) -> tuple[AceEvidence, ...]:
     return tuple(aces)
 
 
+def _read_handle_descriptor(
+    handle: int | ctypes.c_void_p,
+    *,
+    security_fn,
+    valid_sd_fn,
+    get_control_fn,
+    sd_length_fn,
+    get_dacl_fn,
+    local_free_fn,
+) -> tuple[bytes | None, bool, bool, bool, tuple[AceEvidence, ...], bytes]:
+    ptr = ctypes.c_void_p
+    owner, sd = ptr(), ptr()
+    try:
+        if (
+            security_fn(
+                handle,
+                1,
+                5,
+                ctypes.byref(owner),
+                None,
+                None,
+                None,
+                ctypes.byref(sd),
+            )
+            != 0
+        ):
+            raise OSError("Read-only metadata inspection failed")
+        if not valid_sd_fn(sd):
+            raise OSError("Read-only metadata inspection failed")
+        control, revision = w.WORD(), w.DWORD()
+        if not get_control_fn(sd, ctypes.byref(control), ctypes.byref(revision)):
+            raise OSError("Read-only metadata inspection failed")
+        # Enforce self-relative format (SE_SELF_RELATIVE = 0x8000) and standard revision 1
+        # before any memory bounds arithmetic or raw buffer copy.
+        if not (control.value & 0x8000) or revision.value != 1:
+            raise ValueError("Unsupported or non-self-relative security descriptor layout")
+        size = sd_length_fn(sd)
+        if not 20 <= size <= MAX_DESCRIPTOR_BYTES:
+            raise ValueError("Descriptor out of bounds")
+        raw = _copy_bounded(sd.value, size, sd.value, size)
+        dacl_ptr = ptr()
+        present, defaulted = w.BOOL(), w.BOOL()
+        if not get_dacl_fn(
+            sd,
+            ctypes.byref(present),
+            ctypes.byref(dacl_ptr),
+            ctypes.byref(defaulted),
+        ):
+            raise OSError("Read-only metadata inspection failed")
+        aces = ()
+        if present.value and dacl_ptr.value:
+            header = _copy_bounded(dacl_ptr.value, 8, sd.value, size)
+            acl_size = int.from_bytes(header[2:4], "little")
+            aces = _parse_acl(_copy_bounded(dacl_ptr.value, acl_size, sd.value, size))
+        owner_sid = _copy_sid(owner.value, sd.value, size) if owner.value else None
+        return (
+            owner_sid,
+            bool(present.value),
+            bool(present.value and not dacl_ptr.value),
+            bool(control.value & 0x1000),
+            aces,
+            hashlib.sha256(raw).digest(),
+        )
+    finally:
+        if sd.value:
+            to_free = sd.value
+            sd.value = None
+            if local_free_fn(ctypes.c_void_p(to_free)):
+                raise OSError("Read-only metadata inspection failed")
+
+
 def read_fixture_snapshot(
     path: Path, *, expected_inode: int, expected_dev: int = 0
 ) -> DaclSnapshot:
@@ -217,8 +288,7 @@ def read_fixture_snapshot(
         if not ok:
             raise OSError("Read-only metadata inspection failed")
 
-    copy_bounded = _copy_bounded
-    copy_sid = _copy_sid
+
 
     def token():
         handle = w.HANDLE()
@@ -235,7 +305,7 @@ def read_fixture_snapshot(
             buffer = ctypes.create_string_buffer(needed.value)
             require(token_info(handle, 1, buffer, needed.value, ctypes.byref(needed)))
             address = ctypes.cast(buffer, out_ptr).contents.value
-            user = copy_sid(address, ctypes.addressof(buffer), ctypes.sizeof(buffer))
+            user = _copy_sid(address, ctypes.addressof(buffer), ctypes.sizeof(buffer))
             elevated = w.DWORD()
             require(
                 token_info(
@@ -279,61 +349,15 @@ def read_fixture_snapshot(
         return info.volume, info.index_high, info.index_low
 
     def descriptor(handle):
-        owner, sd = ptr(), ptr()
-        try:
-            require(
-                security(
-                    handle,
-                    1,
-                    5,
-                    ctypes.byref(owner),
-                    None,
-                    None,
-                    None,
-                    ctypes.byref(sd),
-                )
-                == 0
-            )
-            require(valid_sd(sd))
-            control, revision = w.WORD(), w.DWORD()
-            require(get_control(sd, ctypes.byref(control), ctypes.byref(revision)))
-            # Enforce self-relative format (SE_SELF_RELATIVE = 0x8000) and standard revision 1
-            # before any memory bounds arithmetic or raw buffer copy.
-            if not (control.value & 0x8000) or revision.value != 1:
-                raise ValueError("Unsupported or non-self-relative security descriptor layout")
-            size = sd_length(sd)
-            if not 20 <= size <= MAX_DESCRIPTOR_BYTES:
-                raise ValueError("Descriptor out of bounds")
-            raw = copy_bounded(sd.value, size, sd.value, size)
-            dacl_ptr = ptr()
-            present, defaulted = w.BOOL(), w.BOOL()
-            require(
-                get_dacl(
-                    sd,
-                    ctypes.byref(present),
-                    ctypes.byref(dacl_ptr),
-                    ctypes.byref(defaulted),
-                )
-            )
-            aces = ()
-            if present.value and dacl_ptr.value:
-                header = copy_bounded(dacl_ptr.value, 8, sd.value, size)
-                acl_size = int.from_bytes(header[2:4], "little")
-                aces = _parse_acl(copy_bounded(dacl_ptr.value, acl_size, sd.value, size))
-            owner_sid = copy_sid(owner.value, sd.value, size) if owner.value else None
-            return (
-                owner_sid,
-                bool(present.value),
-                bool(present.value and not dacl_ptr.value),
-                bool(control.value & 0x1000),
-                aces,
-                hashlib.sha256(raw).digest(),
-            )
-        finally:
-            if sd.value:
-                to_free = sd.value
-                sd.value = None
-                require(not local_free(ctypes.c_void_p(to_free)))
+        return _read_handle_descriptor(
+            handle,
+            security_fn=security,
+            valid_sd_fn=valid_sd,
+            get_control_fn=get_control,
+            sd_length_fn=sd_length,
+            get_dacl_fn=get_dacl,
+            local_free_fn=local_free,
+        )
 
     if drive_type(path.drive + "\\") != 3:
         raise _InspectionFailure(Reason.UNSUPPORTED_FILESYSTEM)
