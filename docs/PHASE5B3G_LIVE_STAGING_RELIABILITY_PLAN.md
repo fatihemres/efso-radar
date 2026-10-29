@@ -618,7 +618,7 @@ CREATE TABLE IF NOT EXISTS durable_recovery_state (
 ```
 
 **Architectural Evaluation & Constraints:**
-1. **Namespace & Ownership Collision:** In LIVE-06 and LIVE-08, `durable_recovery_state` is already utilized as a *synthetic test entity* (`synth_state_{run_id}_01`). In LIVE-08, automated cleanup deletes registered synthetic targets, including rows in `durable_recovery_state`. Utilizing this table simultaneously as the operational cross-runner journal creates an immediate lifecycle conflict: automated cleanup could delete the recovery journal before the session outcome is confirmed.
+1. **Namespace & Ownership Collision:** In LIVE-06 and LIVE-08, `durable_recovery_state` is already utilized as a *synthetic test entity* (`synth_stage_{run_id}::current`). In LIVE-08, automated cleanup deletes registered synthetic targets, including rows in `durable_recovery_state`. Utilizing this table simultaneously as the operational cross-runner journal creates an immediate lifecycle conflict: automated cleanup could delete the recovery journal before the session outcome is confirmed.
 2. **Schema Isolation Limits:** The schema was designed for sequential batch processing, lacking dedicated columns for cryptographic manifest seals, multi-entity target inventories, runner identity fencing, and intent-vs-effect state machines.
 3. **Transaction Isolation:** Inserting journal records into the same table used for synthetic test assertions risks query cross-talk during preflight collision scans (LIVE-01) and audit queries (LIVE-08).
 4. **Strict Boundary:** Schema v6 table semantics must NOT be altered, migrated, or wired to remote Turso writes without a separate, explicit PO architectural decision.
@@ -631,8 +631,9 @@ Before any cross-runner live recovery mechanism can be implemented, the Product 
   Restrict live staging execution strictly to an owner-operated persistent Linux workstation. GitHub Actions remains strictly hermetic/offline. Avoids all remote journal complexity and schema migrations.
 - **Option B: Dedicated Remote Ownership Journal Table (Schema v7 Migration).**
   Design and migrate a dedicated, isolated table (e.g. `staging_run_journal`) with explicit fencing tokens, cryptographic digests, and separate lifecycle management outside synthetic test targets. Requires PO approval and schema version bump.
-- **Option C: Single-Transaction Atomic Batching (Hrana Pipeline Transaction).**
-  Enclose both the intent record and the entity mutations within a single Hrana v2 pipeline transaction (`BEGIN`, intent insert, effect inserts, `COMMIT`), eliminating the two-transaction failure window. Requires wire protocol redesign and PO approval.
+- **Option C: Single-Transaction Atomic Batching (Hrana Pipeline Transaction Coupling).**
+  Enclose both the intent record and the entity mutations within a single Hrana v2 pipeline transaction (`BEGIN`, intent insert, effect inserts, `COMMIT`), eliminating the two-transaction failure window.
+  *Note on Complementary Relationship with Option B:* Option C addresses transaction-level atomic coupling, but is not a standalone solution for Runner B discovering Runner A's run ID or inspecting residual records after Runner A's ephemeral runner VM is decommissioned. Runner B still requires a discoverable, provider-persistent journal store (Option B). Furthermore, even a combined pipeline transaction can suffer an ambiguous COMMIT on the wire, requiring discovery and manual reconciliation. Options B and C are therefore potentially **complementary**, not mutually exclusive standalone alternatives.
 
 > [!NOTE]
 > Antigravity does **not** choose, assume, or silently implement any live backend option. Live writes remain permanently blocked.

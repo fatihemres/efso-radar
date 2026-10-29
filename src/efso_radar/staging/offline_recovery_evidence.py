@@ -362,6 +362,15 @@ def review_recovery_evidence(
 # ---------------------------------------------------------------------------
 
 
+_RUNNER_ID_REGEX = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+_CANONICAL_STAGES = frozenset({
+    "LIVE_01", "LIVE_02", "LIVE_03", "LIVE_04",
+    "LIVE_05", "LIVE_06", "LIVE_07", "LIVE_08",
+    "LIVE-01", "LIVE-02", "LIVE-03", "LIVE-04",
+    "LIVE-05", "LIVE-06", "LIVE-07", "LIVE-08",
+})
+
+
 class CrossRunnerJournalStatus(str, Enum):
     """Inert status enumeration for a candidate remote run ownership journal entry."""
 
@@ -374,11 +383,14 @@ class CrossRunnerJournalStatus(str, Enum):
 
 
 class CrossRunnerProvenance(str, Enum):
-    """Provenance classifier for cross-runner observation inputs."""
+    """Provenance classifier for cross-runner observation inputs.
+
+    Restricted strictly to offline simulations and unverified candidate inputs.
+    Authenticated remote evidence cannot be issued by this offline caller-controlled path.
+    """
 
     HERMETIC_SIMULATION = "HERMETIC_SIMULATION"
     UNVERIFIED_CANDIDATE = "UNVERIFIED_CANDIDATE"
-    AUTHENTICATED_REMOTE = "AUTHENTICATED_REMOTE"
 
 
 class CrossRunnerJournalEntry(_FrozenModel):
@@ -404,6 +416,7 @@ class CrossRunnerReview(_FrozenModel):
     Permanent safety boundaries:
     - remote_state is always 'UNKNOWN'
     - action is always 'MANUAL_REVIEW_ONLY'
+    - Reasons contain fixed, sanitized messages; raw untrusted IDs/payloads are never echoed.
     - Never grants remote execution permission, cleanup SQL, or automatic retry.
     """
 
@@ -436,16 +449,20 @@ def review_cross_runner_recovery_evidence(
 
     Evaluates:
     - Unique run and runner identity boundaries
+    - Canonical 5-entity target inventory binding
+    - Valid stage and commit state coherence
     - Intent-before-effect sequencing vs ambiguous COMMIT on intent registration
     - Ambiguous effect commits with acknowledged intent
     - Conflicting runner ownership
     - Runner A crash / Runner B subsequent review
-    - Replay attempts of committed/aborted runs
+    - Offline evaluation of caller-flagged re-execution attempts
     - Missing, corrupted, or unreadable journal entries
     - Incomplete or contradictory observations
 
     Guarantees:
-    - Caller-supplied hash alone is never ownership proof.
+    - Caller-supplied hash and typed acknowledgement are unverified assertions, not proof.
+    - Authenticated remote provenance is never issued from this offline caller path.
+    - Untrusted foreign identifiers and raw keys are never echoed into serializable review reasons.
     - Missing or corrupted journal never authorizes mutations, cleanup, or CLEAN.
     - All outcomes are inert review records; remote_state remains 'UNKNOWN' and
       action remains 'MANUAL_REVIEW_ONLY'.
@@ -454,6 +471,16 @@ def review_cross_runner_recovery_evidence(
         expected_run_id
         if type(expected_run_id) is str and RUN_ID_REGEX.fullmatch(expected_run_id)
         else None
+    )
+    safe_runner = (
+        reviewing_runner_id
+        if type(reviewing_runner_id) is str and _RUNNER_ID_REGEX.fullmatch(reviewing_runner_id)
+        else "INVALID_RUNNER_ID"
+    )
+    safe_provenance = (
+        CrossRunnerProvenance.HERMETIC_SIMULATION
+        if provenance == CrossRunnerProvenance.HERMETIC_SIMULATION
+        else CrossRunnerProvenance.UNVERIFIED_CANDIDATE
     )
     reasons: list[str] = [
         "Cross-runner recovery evidence evaluated under offline inert safety contract; "
@@ -468,8 +495,8 @@ def review_cross_runner_recovery_evidence(
         all_reasons = tuple(reasons + extra_reasons)
         return CrossRunnerReview(
             run_id=safe_run,
-            reviewing_runner_id=str(reviewing_runner_id),
-            provenance=provenance,
+            reviewing_runner_id=safe_runner,
+            provenance=safe_provenance,
             journal_status=j_status,
             decision=decision,
             reasons=all_reasons,
@@ -479,14 +506,14 @@ def review_cross_runner_recovery_evidence(
         return report(
             CrossRunnerJournalStatus.ABSENT,
             ReviewDecision.UNKNOWN,
-            ["Expected run_id is noncanonical or malformed."],
+            ["Expected run ID is noncanonical or malformed."],
         )
 
-    if not reviewing_runner_id or not isinstance(reviewing_runner_id, str):
+    if safe_runner == "INVALID_RUNNER_ID":
         return report(
             CrossRunnerJournalStatus.ABSENT,
             ReviewDecision.UNKNOWN,
-            ["Reviewing runner_id is invalid or empty."],
+            ["Reviewing runner ID is invalid, empty or noncanonical."],
         )
 
     # 1. Missing journal entry
@@ -532,33 +559,107 @@ def review_cross_runner_recovery_evidence(
             ],
         )
 
-    # 4. Run ID mismatch on journal entry
+    # 4. Identity validation on journal entry
     if journal_entry.run_id != safe_run:
         return report(
             journal_entry.status,
             ReviewDecision.OWNERSHIP_MISMATCH_HALT,
             [
-                f"Journal run_id '{journal_entry.run_id}' does not match expected run_id '{safe_run}'.",
+                "Journal run ID does not match expected canonical run ID; cross-runner ownership mismatch.",
                 "Cross-runner ownership mismatch; execution halted.",
             ],
         )
 
-    # 5. Attempted replay of an already committed or aborted run
+    if not _RUNNER_ID_REGEX.fullmatch(journal_entry.runner_id):
+        return report(
+            journal_entry.status,
+            ReviewDecision.UNKNOWN,
+            [
+                "Journal entry runner ID is invalid or noncanonical.",
+            ],
+        )
+
+    if journal_entry.intent_stage not in _CANONICAL_STAGES:
+        return report(
+            journal_entry.status,
+            ReviewDecision.UNKNOWN,
+            [
+                "Journal intent stage is noncanonical or unsupported.",
+            ],
+        )
+
+    if (
+        journal_entry.status == CrossRunnerJournalStatus.INTENT_RECORDED
+        and journal_entry.journal_commit_state == CommitState.NOT_REPORTED
+    ):
+        return report(
+            journal_entry.status,
+            ReviewDecision.UNKNOWN,
+            [
+                "Journal intent recorded without reported commit state; unproven durability.",
+            ],
+        )
+
+    # 5. Canonical Target Inventory Validation (P2-1)
+    inventory = create_default_manifest_entities(safe_run)
+    expected_target_set = {f"{e.table}:{e.pk_value}" for e in inventory}
+    actual_target_list = journal_entry.target_entities
+    actual_target_set = set(actual_target_list)
+
+    if len(actual_target_list) == 0:
+        return report(
+            journal_entry.status,
+            ReviewDecision.UNKNOWN,
+            [
+                "Journal target inventory is empty; canonical five registered entities required.",
+            ],
+        )
+
+    if len(actual_target_list) != len(actual_target_set):
+        return report(
+            journal_entry.status,
+            ReviewDecision.UNKNOWN,
+            [
+                "Journal target inventory contains duplicate entries; canonical five entities required.",
+            ],
+        )
+
+    if not actual_target_set.issubset(expected_target_set):
+        return report(
+            journal_entry.status,
+            ReviewDecision.OWNERSHIP_MISMATCH_HALT,
+            [
+                "Journal target inventory contains foreign or unregistered entities; cross-runner ownership mismatch.",
+            ],
+        )
+
+    if len(actual_target_set) != len(expected_target_set):
+        return report(
+            journal_entry.status,
+            ReviewDecision.UNKNOWN,
+            [
+                "Journal target inventory is incomplete; exactly five canonical registered entities required.",
+            ],
+        )
+
+    # 6. Offline evaluation of caller-flagged re-execution attempts (P3)
     if attempted_replay or (
         journal_entry.status in (CrossRunnerJournalStatus.EFFECT_COMMITTED, CrossRunnerJournalStatus.ABORTED)
-        and journal_entry.runner_id == reviewing_runner_id
+        and journal_entry.runner_id == safe_runner
     ):
         return report(
             journal_entry.status,
             ReviewDecision.OWNERSHIP_MISMATCH_HALT,
             [
-                f"Attempted replay of run '{safe_run}' with terminal journal status '{journal_entry.status.value}'.",
-                "Replaying previous run IDs is strictly prohibited to prevent duplicate mutations.",
+                "Attempted re-execution or replay of run with terminal journal status; operation halted.",
+                "Replay evaluation is an offline classification of caller-flagged re-execution; not a live distributed fencing system.",
             ],
         )
 
-    # 6. Evaluate snapshot entity observations if provided
-    extra_reasons: list[str] = []
+    # 7. Evaluate snapshot entity observations if provided
+    extra_reasons: list[str] = [
+        "Journal checksum and acknowledgement status represent unverified caller-supplied assertions; not independently authenticated."
+    ]
     has_mismatch = False
     has_owned = False
     has_uncertain = False
@@ -570,7 +671,6 @@ def review_cross_runner_recovery_evidence(
             )
             has_uncertain = True
 
-        inventory = create_default_manifest_entities(safe_run)
         keys = {(e.table, e.pk_column, e.pk_value) for e in inventory}
         observed_keys = set()
 
@@ -578,7 +678,7 @@ def review_cross_runner_recovery_evidence(
             key = (obs.table, obs.pk_column, obs.pk_value)
             observed_keys.add(key)
             if key not in keys:
-                extra_reasons.append(f"Observation on unexpected entity: {key}.")
+                extra_reasons.append("Observation on unexpected entity identity; evidence is outside canonical registered inventory.")
                 has_uncertain = True
                 continue
 
@@ -586,7 +686,7 @@ def review_cross_runner_recovery_evidence(
             rev = _classify(matching_entity, obs)
 
             if rev.evidence == EntityEvidence.OWNERSHIP_MISMATCH:
-                extra_reasons.append(f"Foreign ownership marker detected on {obs.table}:{obs.pk_value}.")
+                extra_reasons.append("Foreign ownership marker detected in entity observation; cross-runner ownership mismatch.")
                 has_mismatch = True
             elif rev.evidence == EntityEvidence.PRESENT_OWNED:
                 has_owned = True
@@ -598,16 +698,14 @@ def review_cross_runner_recovery_evidence(
                 EntityEvidence.CONTRADICTORY,
                 EntityEvidence.DUPLICATE_CARDINALITY,
             ):
-                extra_reasons.append(f"Observation uncertainty on {obs.table}:{obs.pk_value} ({rev.evidence.value}).")
+                extra_reasons.append("Entity observation query uncertainty detected (failed, unavailable, ambiguous or contradictory).")
                 has_uncertain = True
 
         if len(observed_keys) < len(keys):
-            extra_reasons.append(
-                f"Incomplete observations: observed {len(observed_keys)} of {len(keys)} registered entities."
-            )
+            extra_reasons.append("Incomplete observations: not all canonical registered entities were observed.")
             has_uncertain = True
 
-    # 7. Runner A lost / Runner B review decision synthesis
+    # 8. Runner A lost / Runner B review decision synthesis
     if has_mismatch:
         return report(journal_entry.status, ReviewDecision.OWNERSHIP_MISMATCH_HALT, extra_reasons)
 
@@ -618,7 +716,7 @@ def review_cross_runner_recovery_evidence(
     if journal_entry.status == CrossRunnerJournalStatus.INTENT_RECORDED:
         if has_owned:
             extra_reasons.append(
-                "Journal indicates INTENT_RECORDED and owned entity rows were observed; "
+                "Journal indicates INTENT_RECORDED and owned entity rows observed; "
                 "Runner A may have crashed before effect acknowledgment or cleanup."
             )
             return report(journal_entry.status, ReviewDecision.RESIDUAL, extra_reasons)
