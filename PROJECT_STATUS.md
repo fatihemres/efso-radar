@@ -1,10 +1,19 @@
 # Efso Radar — Project Checkpoint
 
-**Verified snapshot date:** 2026-10-29 (Issue #39 onboarding; NOT a live status feed)
+**Verified snapshot date:** 2026-10-29 (Issue #41 onboarding; NOT a live status feed)
 **Canonical repository:** [fatihemres/efso-radar](https://github.com/fatihemres/efso-radar)
-**Baseline inspected:** refreshed `origin/main` at `1da9b9604e67377ee873cc235583c6ba42842970` (PR #38 integrated). Earlier checkpoints below retain their dated baselines.
+**Baseline inspected:** refreshed `origin/main` at `22090a54b6fca42146b0fadb39134dbf0694fce7` (PR #40 integrated). Earlier checkpoints below retain their dated baselines.
 
-## Issue #39 — Offline orphan evidence review candidate (2026-10-29)
+## Issue #41 — Windows DACL offline evidence candidate (2026-10-29)
+
+- **IMPLEMENTED / NOT INTEGRATED / NOT PO ACCEPTED:** a pure bounded DACL policy plus explicitly invoked read-only native inspector for an active pytest fixture directory. Public reports expose only status/reason codes and provenance; no paths, personal SIDs, raw ACEs, descriptor hashes or exception text. `POLICY_MATCH` is a narrow snapshot pattern for review, with live storage and durability fields permanently false.
+- Native inspection uses existing standard-library `ctypes` and read-only Windows APIs. It rejects UNC/device/nonfixed drives before fixture metadata access, requires NTFS, checks reparse/identity/descriptor/token drift, and never sets permissions or reads file contents. No new dependency. Conservative deny/inheritance/privileged-principal handling and residual TOCTOU limits are documented in [plan §5.7](docs/PHASE5B3G_LIVE_STAGING_RELIABILITY_PLAN.md#57-issue-41--windows-ntfs-dacl-offline-evidence-and-threat-model-2026-10-29).
+- **Local focused evidence:** Windows Python 3.12.10, 129 passed / 3 skipped / 0 deselected (86 new DACL tests plus existing persistence regressions). Native coverage reads only a pytest-owned directory and checks fixture contents remain unchanged; no ACL was modified. [Verification](VERIFICATION.md) records full-suite/CI evidence and limits.
+- All three existing Windows live-deny gates remain unconditional, and manifest ownership, publication, no-overwrite, no-delete and recovery behavior are unchanged. Owner-host ACL attestation, directory fsync/power-loss proof, real transport/recovery, Block Writes/token evidence and account-specific $0 proof remain open. Parent #13 stays open; STOP at independent ChatGPT review and selective Argon review, then separate PO merge decision.
+
+## Historical pre-integration Issue #39 — Offline orphan evidence candidate (2026-10-29)
+
+PR #40 subsequently integrated at `22090a54b6fca42146b0fadb39134dbf0694fce7`; the candidate-era evidence below is retained as dated history, not current integration status.
 
 - **IMPLEMENTED / NOT INTEGRATED / NOT PO ACCEPTED:** `offline_recovery_evidence.py` classifies bounded synthetic snapshots against the canonical five-entity manifest, including the tentative rollback article. The existing manifest validator now exposes its pure payload check; historical recovery CLI/store report fields and `OFFLINE_VALIDATION_PASSED` behavior remain unchanged.
 - The inert JSON review model records `HERMETIC_SIMULATION`, exact synthetic identities/ownership markers and dependency order, per-entity evidence, uncertainties and manual checks. Remote state is always `UNKNOWN`; all-absent evidence requires review. Ambiguous COMMIT, incomplete queries, contradictory atomic peers and malformed evidence never authorize cleanup. No file/database/network interface, cleanup SQL, deletion, retry or remote adapter is added.

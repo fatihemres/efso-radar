@@ -13,8 +13,8 @@ across Windows and Linux.
 Platform limitations:
 - Windows NTFS does not support directory fsync via Python standard library;
   parent directory metadata durability cannot be synchronously flushed.
-- Windows NTFS DACL/ACL owner validation is not natively supported by Python
-  standard library; live persistent store cannot be safely initialized on Windows.
+- Windows DACL inspection is limited to offline test fixtures; owner-host live
+  attestation is not implemented and live persistent storage remains disabled.
 - True reboot and power-loss durability depend on host storage hardware, write
   caches, and operating system guarantees; in-process re-instantiation simulates
   store reopening, not physical power-loss or host reboot.
@@ -120,7 +120,7 @@ class StoragePlatformGuarantees:
             if self.platform == "win32":
                 raise ManifestStoreSecurityError(
                     "Windows NTFS platform cannot programmatically verify DACL/ACL owner-private "
-                    "isolation via Python standard library; live persistent store cannot be authorized."
+                    "for live storage from offline fixture evidence; live persistent store cannot be authorized."
                 )
             if not self.fsync_directory_supported:
                 raise ManifestStoreSecurityError(
@@ -148,9 +148,8 @@ def get_storage_platform_guarantees() -> StoragePlatformGuarantees:
                     "cannot be synchronously flushed to persistent media."
                 ),
                 (
-                    "Windows NTFS DACL/ACL verification is not natively supported by Python standard "
-                    "library (requires pywin32/win32security); persistent store directory cannot "
-                    "programmatically verify owner-private ACL isolation on Windows."
+                    "Windows NTFS DACL/ACL live attestation remains unimplemented; standalone "
+                    "read-only test-fixture inspection cannot authorize owner-host storage."
                 ),
                 (
                     "POSIX file ownership (UID) and permission mode bits (0700/0600) are not natively "
@@ -368,8 +367,8 @@ def _validate_store_directory(
     # Windows DACL/ACL verification blocker check for live production mode
     if sys.platform == "win32" and not is_hermetic_test:
         raise ManifestStoreSecurityError(
-            "Windows NTFS DACL/ACL verification is not natively supported by Python standard library; "
-            "live persistent manifest store initialization on Windows is blocked pending ACL enforcement primitives."
+            "Windows NTFS DACL/ACL verification for live storage remains unimplemented; "
+            "offline fixture evidence cannot authorize persistent manifest store initialization on Windows."
         )
 
     # Check symlinks and reparse points across ancestors

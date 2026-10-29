@@ -2,6 +2,17 @@
 
 **Checkpoint:** 2026-10-29. This ledger separates direct GitHub CI evidence, implementation-agent local runs, historical pilot acceptance and missing validations. Earlier dated reviewer entries retain their original scope. Evidence is not a release certificate.
 
+## 2026-10-29 Issue #41 — Offline Windows DACL evidence candidate
+
+Isolated worktree/branch `codex/issue-41-windows-dacl-evidence`, refreshed `main` `22090a54b6fca42146b0fadb39134dbf0694fce7` (PR #40 integrated). Implementation-agent local evidence is separate from independent review and exact-head CI; no PO acceptance or live activation is claimed.
+
+- Existing Windows environment reused: Python 3.12.10, pytest 9.1.1, Ruff 0.13.3; no dependency installation/upgrade.
+- Focused command: `PYTHONPATH=src venv/Scripts/python.exe -m pytest tests/test_phase5b3g_c_windows_dacl_evidence_offline.py tests/test_phase5b3g_c_persistent_manifest_store_offline.py -q --basetemp <fresh-owned-root>`: **129 passed, 3 skipped, 0 deselected in 4.37s**. This includes 86 new DACL cases and existing persistent-store regression cases. All three skips are existing Windows symlink-privilege cases. The new native probe actually collected two security-descriptor samples from one pytest-owned directory, checked unchanged fixture contents and a wrong-identity rejection, and did not set ACLs or inspect operational paths.
+- Covered synthetic null/missing/empty/contradictory DACL, explicit/inherited/child-only broad grants, deny/allow order, SYSTEM/admin exception ambiguity, service/elevated/impersonated contexts, owner mismatch, unknown/object/callback ACEs, masks/flags/SID and buffer bounds, native exception redaction, unsupported filesystems, UNC/device/mapped-network paths, reparse/path rejection, identity/descriptor/context drift and inactive scope. A synthetic `POLICY_MATCH` leaves constructor, platform policy, live-write and deletion restrictions unchanged. Linux safely reports unsupported platform; its real native probe is explicitly skipped.
+- Ruff baseline (`ruff check --target-version py311 --select E9,F63,F7,F82 src scripts tests`) and default Ruff on all three new Python files: **PASS**.
+- Final full command: `PYTHONPATH=src venv/Scripts/python.exe <temporary-audit-harness> tests -v -rs --basetemp <fresh-owned-root>`: **1020 passed, 18 skipped, 0 deselected, 276 subtests passed in 132.99s**, Windows Python 3.12.10. The harness invokes `pytest.main` with repository imports, hides historical operational-evidence availability, and audit-blocks real socket connect/DNS and operational `data/`/`.env` access. Fourteen skips require private historical evidence and four are local Windows symlink-privilege limits. Exact-head Linux 3.11/3.12 and hosted Windows 3.12 CI SHA/run/log evidence is delivered in the draft PR and task report.
+- Not proven: owner-host ACL isolation, child/ancestor ACLs, race freedom or protection from hostile same-user/privileged code, physical reboot/power loss, Windows directory fsync, live transport/recovery, token/Block Writes status or account-specific $0 billing. No ACL mutation, operational file read, credentials, network/provider operation, paid service or release. STOP for independent review; #13 remains open.
+
 ## 2026-10-29 PR #40 — Consolidated Argon review remediation
 
 [Reconciled Argon findings](https://github.com/fatihemres/efso-radar/pull/40#issuecomment-6491952303) apply to reviewed HEAD `3b41c8ce2aa19f4227dd44ac6c5bcf844fcbf866`. Same branch and draft PR; independent re-review and PO approval remain pending.
