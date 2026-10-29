@@ -23,9 +23,10 @@
 
 Offline editorial quality scorecard and benchmark self-oracle disclaimer implemented in `src/efso_radar/ai/benchmark.py` and `VERIFICATION.md`:
 - Formally distinguished synthetic rule conformance from genuinely measured editorial quality across all 6 news pipeline stages.
-- Outward benchmark report in `src/efso_radar/ai/benchmark.py` now explicitly displays `SYNTHETIC_RULE_VALIDATION`, `PREDICTIONS_DERIVED_FROM_EXPECTED_LABELS`, and `NOT_MEASURED_MODEL_ACCURACY`.
-- Added regression test `test_offline_benchmark_report_explicitly_disclaims_real_model_accuracy` in `tests/test_editorial_intelligence.py`.
-- Established operational scorecard in `VERIFICATION.md` defining 6 measurable metrics (Editorial Precision, Recall@K, Duplicate Leakage, Update False Positives, Rumor Safety Veto, Digest Cadence) with unmeasured fields marked `NOT MEASURED` and thresholds left as `PO TO SET`.
+- Outward benchmark report in `src/efso_radar/ai/benchmark.py` dynamically displays `prediction_source` (`PREDICTIONS_DERIVED_FROM_EXPECTED_LABELS` vs `CALLER_SUPPLIED_PREDICTIONS`) alongside `SYNTHETIC_RULE_VALIDATION` and `NOT_MEASURED_MODEL_ACCURACY`.
+- Added regression tests in `tests/test_editorial_intelligence.py` asserting these disclaimers for both default self-oracle and caller-supplied prediction modes.
+- Established operational scorecard in `VERIFICATION.md` defining 6 measurable metrics (Editorial Precision, Recall@K, Duplicate Leakage, Update False Positives, Rumor Safety Veto, Digest Cadence) with unmeasured operational fields marked `NOT MEASURED` and thresholds left as `PO TO SET`.
+- Clarified 00:00–08:30 Europe/Istanbul quiet hours, 3-hour SCAN_ONLY (8/day) vs 3 daily digest slots (09:30, 15:30, 21:30), max 5-item ceiling (no minimum), and multi-tier scoring paths (`breaking_alert_min_score=92`, `min_score=82`, `digest_min_score=78`, `<78` silent).
 - Documented single next quality gate recommendation: owner-controlled small blind evaluation sample of 50-100 real news items, strictly distinct from staging transport Issue #13.
 - Verification: 17 passed in `test_editorial_intelligence.py`; 17 passed in `test_news_discovery.py`; 12 passed / 3 skipped in `test_calibration_phase3c.py`.
 

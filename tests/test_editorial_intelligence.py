@@ -401,6 +401,34 @@ class TestEditorialIntelligence(unittest.TestCase):
         self.assertIn("PREDICTIONS_DERIVED_FROM_EXPECTED_LABELS", report)
         self.assertIn("NOT_MEASURED_MODEL_ACCURACY", report)
 
+    def test_offline_benchmark_report_with_caller_supplied_predictions(self):
+        """Caller-supplied predictions are labeled dynamically and not described as derived from expected labels."""
+        evaluator = OfflineBenchmarkEvaluator()
+        caller_pick = EditorialPickSchema(
+            article_ids=[evaluator.items[0].article_id],
+            score=85,
+            kind="NEW",
+            verification_status="REPUTABLE_REPORTING",
+            parent_story_id="",
+            development_tr="",
+            headline_tr="Caller supplied headline",
+            cover_title_tr="COVER",
+            caption_idea_tr="Caption",
+            why_efso_tr="Why Efso",
+            uncertainties_tr="",
+            suggested_format="POST",
+            category="YERLI",
+        )
+        metrics = evaluator.run_evaluation(predicted_picks=[caller_pick])
+
+        self.assertEqual(metrics.prediction_source, "CALLER_SUPPLIED_PREDICTIONS")
+        self.assertEqual(metrics.model_accuracy_status, "NOT_MEASURED_MODEL_ACCURACY")
+
+        report = metrics.summary()
+        self.assertIn("CALLER_SUPPLIED_PREDICTIONS", report)
+        self.assertNotIn("PREDICTIONS_DERIVED_FROM_EXPECTED_LABELS", report)
+        self.assertIn("NOT_MEASURED_MODEL_ACCURACY", report)
+
     def test_backlog_recovery_when_article_drops_off_rss(self):
         """Articles deprioritized in run 1 survive in backlog even if dropped from RSS in run 2."""
         titles = [

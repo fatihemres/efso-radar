@@ -10,13 +10,17 @@
 - Key objective achieved: formally distinguished synthetic rule conformance from genuinely measured editorial quality across all 6 news pipeline stages (RSS parsing/filter, candidate prioritization & backlog, same-event clustering vs divergent events, NEW/UPDATE/DUPLICATE/IGNORE safety gates, Telegram digest filtering & scheduling, and human editorial usefulness).
 - Corrected misleading benchmark accuracy claims:
   - Formally documented that `OfflineBenchmarkEvaluator` in `src/efso_radar/ai/benchmark.py` defaults to `simulate_model_decisions()`, which derives each predicted kind and score directly from fixture expected labels (`(item.expected_score_min + item.expected_score_max) // 2` and `item.expected_kind`).
-  - Outward benchmark reports now explicitly identify `evaluation_kind="SYNTHETIC_RULE_VALIDATION"`, `prediction_source="PREDICTIONS_DERIVED_FROM_EXPECTED_LABELS"`, and `model_accuracy_status="NOT_MEASURED_MODEL_ACCURACY"`.
-  - Added dedicated regression test `test_offline_benchmark_report_explicitly_disclaims_real_model_accuracy` in `tests/test_editorial_intelligence.py` asserting these disclaimers and verifying self-oracle origin is never misreported as independent model accuracy.
+  - Outward benchmark reports now dynamically identify `prediction_source` (`PREDICTIONS_DERIVED_FROM_EXPECTED_LABELS` vs `CALLER_SUPPLIED_PREDICTIONS`) alongside `evaluation_kind="SYNTHETIC_RULE_VALIDATION"` and `model_accuracy_status="NOT_MEASURED_MODEL_ACCURACY"`, ensuring caller-supplied predictions are never described as derived from expected labels.
+  - Added dedicated regression tests in `tests/test_editorial_intelligence.py` asserting these disclaimers for both default self-oracle runs and caller-supplied prediction runs.
   - Preserved historical 42-item vertical fixture (`tests/fixtures/editorial_benchmark.json`) and existing rule conformance test intact.
-- Established operational product acceptance scorecard in `VERIFICATION.md` proposing 6 measurable metrics with exact numerator/denominator formulas and sampling modes, reporting unmeasured fields as `NOT MEASURED`, and leaving target thresholds explicitly as `PO TO SET`.
+- Established operational product acceptance scorecard in `VERIFICATION.md` proposing 6 measurable metrics with exact numerator/denominator formulas and sampling modes:
+  - Corrected quiet hours to 00:00–08:30 Europe/Istanbul, distinguished 3-hour SCAN_ONLY cadence (8/day) from the 3 daily editorial digest slots (09:30, 15:30, 21:30 Europe/Istanbul), and removed any implied minimum item count (`max_items_per_digest=5` is an upper ceiling).
+  - Clarified multi-tier scoring paths (`breaking_alert_min_score=92`, `min_score=82`, `digest_min_score=78`, `<78` silent).
+  - Formulated shadow vs live denominators for editorial precision and required an independently labeled event universe for recall@K.
+  - Replaced unsubstantiated 100% operational figures with `NOT MEASURED (live operational rate)` while referencing exact offline fixture passes, keeping targets strictly `PO TO SET`.
 - Identified one decision-ready recommendation for the next quality evaluation gate: an owner-conducted small blind evaluation cohort of 50-100 real news items labeled by @efsomagazin's editor, strictly distinguished from staging transport Issue #13 and requiring separate PO authorization.
 - **Local focused evidence:** Windows Python 3.12.10: 17 passed in `test_editorial_intelligence.py`; 17 passed in `test_news_discovery.py`; 12 passed / 3 skipped in `test_calibration_phase3c.py`.
-- **Full hermetic suite:** 1101 passed, 18 skipped, 276 subtests passed in 158.84s on Windows Python 3.12.10.
+- **Full hermetic suite:** 1102 passed, 18 skipped, 276 subtests passed in 117.42s on Windows Python 3.12.10.
 - All live staging, RSS, Gemini, Telegram, Turso, or cloud operations remain strictly unauthorized; Turso Block Writes remains ON; $0.00 / 0 TRY hard ceiling preserved. STOP for independent review and explicit PO approval.
 
 ## Issue #45 — Cross-runner ownership & recovery architecture contract candidate (2026-10-29; INTEGRATED in PR #46)

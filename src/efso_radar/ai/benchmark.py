@@ -13,18 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from efso_radar.ai.client import is_headline_too_similar
 from efso_radar.ai.schemas import EditorialPickSchema
-from efso_radar.domain import (
-    Article,
-    EditorialAssessment,
-    EditorialKind,
-    Market,
-    Story,
-    StoryCategory,
-    VerificationStatus,
-    utc_now,
-)
+from efso_radar.domain import Article, Story, StoryCategory
 
 logger = logging.getLogger("efso-radar.ai.benchmark")
 
@@ -82,17 +72,32 @@ class SyntheticRuleValidationMetrics:
     model_accuracy_status: str = "NOT_MEASURED_MODEL_ACCURACY"
 
     def summary(self) -> str:
+        source_tag = f"  [{self.prediction_source}]"
+        source_tag_line = f"{source_tag:<66}"
+        if len(source_tag_line) > 66:
+            source_tag_line = source_tag
+
+        if self.prediction_source == "PREDICTIONS_DERIVED_FROM_EXPECTED_LABELS":
+            source_note = [
+                "In default offline evaluation, predictions are self-oracle picks  ",
+                "derived from expected fixture labels, NOT independent model picks.",
+            ]
+        else:
+            source_note = [
+                "Predictions were supplied by caller/external input and evaluated  ",
+                "against curated synthetic fixtures without live model inference.  ",
+            ]
+
         lines = [
             "==================================================================",
             "  EFSO RADAR -- SYNTHETIC_RULE_VALIDATION CONFORMANCE REPORT       ",
             "  [Deterministic Scenario Testing -- NOT Live Gemini Model Metrics]",
-            "  [PREDICTIONS_DERIVED_FROM_EXPECTED_LABELS]                      ",
+            source_tag_line,
             "  [NOT_MEASURED_MODEL_ACCURACY -- Live Model Performance Unproven] ",
             "==================================================================",
             "NOTE: This report validates application-level gating rules and    ",
             "threshold logic against curated synthetic fixtures.               ",
-            "In default offline evaluation, predictions are self-oracle picks  ",
-            "derived from expected fixture labels, NOT independent model picks.",
+            *source_note,
             "Real editorial precision and recall remain NOT MEASURED.          ",
             "------------------------------------------------------------------",
             f"Evaluation Kind             : {self.evaluation_kind}",
