@@ -18,6 +18,12 @@
 | Follow-on cloud cutover & unattended operations | Cloud parity, backups, zero-cost controls, human editorial recipient tests, PO release decision | Existing Phase 5 architecture; future issue required | **DISCOVERY / NOT AUTHORIZED** |
 | Rights and distribution | Review third-party origins and decide visibility/distribution | [Issue #17](https://github.com/fatihemres/efso-radar/issues/17) | **IN PROGRESS (AUDIT)** |
 
+## 2026-10-29 Issue #39 — Offline orphan evidence review
+
+Candidate implementation follows integrated PR #38 (`main` `1da9b9604e67377ee873cc235583c6ba42842970`). A pure classifier and inert operator review model cover the canonical five identities, full ownership proof, missing/invalid manifests, ambiguous transactions and adversarial query evidence. Status: **IMPLEMENTED / LOCAL OFFLINE TESTED / NOT INTEGRATED / INDEPENDENT REVIEW AND PO ACCEPTANCE PENDING**. [Verification evidence](VERIFICATION.md); [contract](docs/PHASE5B3G_LIVE_STAGING_RELIABILITY_PLAN.md#56-issue-39--offline-orphan-evidence-review-contract-2026-10-29).
+
+This advances the offline evidence contract only. Parent #13 remains open. Separate work is still required for remote recovery, operator-host Windows DACL, physical power-loss guarantees, live Hrana transport, Block Writes/token control and account-specific $0 billing proof. No remote operation, release or activation is authorized. STOP at independent review; PO retains squash-merge authority.
+
 ## 2026-10-28 Phase 5B.3G-C Live Readiness Wire Contract Checkpoint (Issue #37 Slice A / Draft PR)
 
 Offline wire-contract integration slice implemented and validated against baseline `4cfe02aa23e1600db7531481af87fa8b554b653c`:

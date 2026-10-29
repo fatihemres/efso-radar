@@ -89,7 +89,7 @@ CLEANUP_RESERVE_REQUESTS = 20
 SESSION_TIMEOUT_SECONDS = 120.0
 PER_OPERATION_TIMEOUT_SECONDS = 15.0
 
-RUN_ID_REGEX = re.compile(r"^run_\d{8}T\d{6}Z_[a-f0-9]{12}$")
+RUN_ID_REGEX = re.compile(r"\Arun_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{12}\Z")
 
 DISALLOWED_LIVE_FLAGS = frozenset({
     "--live",
@@ -336,6 +336,11 @@ class PerRunOwnershipManifest(BaseModel):
         except Exception as exc:
             raise ValueError(f"Manifest corrupt or invalid JSON ({type(exc).__name__})") from None
 
+        return cls.validate_payload(data)
+
+    @classmethod
+    def validate_payload(cls, data: Any) -> PerRunOwnershipManifest:
+        """Validate an already decoded inventory without filesystem or network I/O."""
         if not isinstance(data, dict):
             raise ValueError("Manifest root must be a JSON object.")
 
