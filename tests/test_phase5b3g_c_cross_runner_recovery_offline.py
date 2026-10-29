@@ -522,3 +522,37 @@ class TestCrossRunnerOwnershipRecoveryContract:
         assert review.decision == ReviewDecision.UNKNOWN
         assert review.reviewing_runner_id == "INVALID_RUNNER_ID"
         assert secret_runner_id not in review.model_dump_json()
+
+    def test_valid_format_runner_id_secret_never_leaked_into_serialized_report(self) -> None:
+        """P2: Valid-format runner ID (e.g. bearer token) is kept private and never serialized into review report."""
+        run_id = _valid_run_id("validfmt")
+        secret_runner_id = "SECRET_BEARER_TOKEN_9876543210"
+
+        # 1. Review with valid-format secret runner ID produces fixed role label in report
+        entry = _sample_journal_entry(
+            run_id=run_id,
+            runner_id="runner_original",
+            status=CrossRunnerJournalStatus.EFFECT_COMMITTED,
+        )
+        review = review_cross_runner_recovery_evidence(
+            expected_run_id=run_id,
+            reviewing_runner_id=secret_runner_id,
+            journal_entry=entry,
+        )
+        assert review.reviewing_runner_id == "VALIDATED_RECOVERY_RUNNER"
+        assert secret_runner_id not in review.model_dump_json(), "Valid-format secret runner ID must not leak into serialized report"
+
+        # 2. Replay classification still correctly compares internal raw runner ID
+        replay_entry = _sample_journal_entry(
+            run_id=run_id,
+            runner_id=secret_runner_id,
+            status=CrossRunnerJournalStatus.EFFECT_COMMITTED,
+        )
+        replay_review = review_cross_runner_recovery_evidence(
+            expected_run_id=run_id,
+            reviewing_runner_id=secret_runner_id,
+            journal_entry=replay_entry,
+        )
+        assert replay_review.decision == ReviewDecision.OWNERSHIP_MISMATCH_HALT
+        assert replay_review.reviewing_runner_id == "VALIDATED_RECOVERY_RUNNER"
+        assert secret_runner_id not in replay_review.model_dump_json(), "Secret runner ID must not leak even on replay halt"

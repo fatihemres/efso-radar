@@ -416,6 +416,8 @@ class CrossRunnerReview(_FrozenModel):
     Permanent safety boundaries:
     - remote_state is always 'UNKNOWN'
     - action is always 'MANUAL_REVIEW_ONLY'
+    - reviewing_runner_id is a fixed non-sensitive role label ("VALIDATED_RECOVERY_RUNNER" or "INVALID_RUNNER_ID");
+      raw caller-controlled runner IDs are never serialized into review reports.
     - Reasons contain fixed, sanitized messages; raw untrusted IDs/payloads are never echoed.
     - Never grants remote execution permission, cleanup SQL, or automatic retry.
     """
@@ -463,6 +465,7 @@ def review_cross_runner_recovery_evidence(
     - Caller-supplied hash and typed acknowledgement are unverified assertions, not proof.
     - Authenticated remote provenance is never issued from this offline caller path.
     - Untrusted foreign identifiers and raw keys are never echoed into serializable review reasons.
+    - Raw caller-controlled runner IDs are never serialized into review reports; a fixed role label is emitted.
     - Missing or corrupted journal never authorizes mutations, cleanup, or CLEAN.
     - All outcomes are inert review records; remote_state remains 'UNKNOWN' and
       action remains 'MANUAL_REVIEW_ONLY'.
@@ -495,7 +498,11 @@ def review_cross_runner_recovery_evidence(
         all_reasons = tuple(reasons + extra_reasons)
         return CrossRunnerReview(
             run_id=safe_run,
-            reviewing_runner_id=safe_runner,
+            reviewing_runner_id=(
+                "INVALID_RUNNER_ID"
+                if safe_runner == "INVALID_RUNNER_ID"
+                else "VALIDATED_RECOVERY_RUNNER"
+            ),
             provenance=safe_provenance,
             journal_status=j_status,
             decision=decision,

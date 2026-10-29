@@ -28,9 +28,9 @@ Offline cross-runner ownership and recovery architecture contract implemented in
 - Evaluated Schema v6 `durable_recovery_state` table: identified namespace/lifecycle collision with LIVE-06 synthetic targets and LIVE-08 cleanup deletion, schema isolation constraints, and query cross-talk risks.
 - Aligned LIVE-06 synthetic key to `synth_stage_{run_id}::current` in plan §5.9.5 and clarified that Option B (shared durable journal) and Option C (atomic batching) are potentially complementary rather than mutually exclusive.
 - Pure inert contract models: `CrossRunnerJournalEntry`, `CrossRunnerJournalStatus`, `CrossRunnerReview`, and `review_cross_runner_recovery_evidence()` with permanent `remote_state="UNKNOWN"` and `action="MANUAL_REVIEW_ONLY"`.
-- Remediation fixes: strict 5-entity canonical target inventory validation, removal of caller-controlled `AUTHENTICATED_REMOTE` provenance, sanitized fixed-string review reasons preventing secret token or identifier leakage, and clarified offline replay evaluation wording.
+- Remediation fixes: strict 5-entity canonical target inventory validation, removal of caller-controlled `AUTHENTICATED_REMOTE` provenance, sanitized fixed-string review reasons preventing secret token or identifier leakage, valid-format runner ID redaction via fixed sentinel role label (`VALIDATED_RECOVERY_RUNNER`), and clarified offline replay evaluation wording.
 - PO architectural options documented: Option A (persistent-host staging only), Option B (dedicated remote journal table with Schema v7 migration), Option C (single-transaction atomic batching). Live writes remain permanently blocked.
-- Verification: 18 passed in `test_phase5b3g_c_cross_runner_recovery_offline.py`; full hermetic suite 1099 passed, 18 skipped, 276 subtests passed.
+- Verification: 19 passed in `test_phase5b3g_c_cross_runner_recovery_offline.py`; full hermetic suite 1100 passed, 18 skipped, 276 subtests passed.
 
 ## 2026-10-29 Issue #41 — Windows DACL offline evidence (INTEGRATED in PR #42)
 
