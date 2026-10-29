@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from efso_radar.ai.schemas import EditorialPickSchema
-from efso_radar.domain import Article, Story, StoryCategory
+from efso_radar.domain import Article, Market, Story, StoryCategory
 
 logger = logging.getLogger("efso-radar.ai.benchmark")
 
