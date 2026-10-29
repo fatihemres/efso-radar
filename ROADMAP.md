@@ -1,6 +1,6 @@
 # Efso Radar — Roadmap and Acceptance Gates
 
-**Snapshot 2026-10-28** — roadmap records intent, not permission for live execution. Status meanings and quality gates: [Engineering Governance](docs/ENGINEERING_GOVERNANCE.md). PO alone closes milestones.
+**Snapshot 2026-10-29** — roadmap records intent, not permission for live execution. Status meanings and quality gates: [Engineering Governance](docs/ENGINEERING_GOVERNANCE.md). PO alone closes milestones.
 
 | Milestone | Scope & acceptance target | Evidence | Current classification |
 | --- | --- | --- | --- |
@@ -14,11 +14,19 @@
 | Phase 5B.3F | Hermetic reliability/concurrency and recovery validation | [PR #12](https://github.com/fatihemres/efso-radar/pull/12), [Issue #11](https://github.com/fatihemres/efso-radar/issues/11) | **INTEGRATED / OFFLINE VERIFIED** |
 | Phase 5B.3G-A | Controlled live staging *specification*, without live execution | [PR #14](https://github.com/fatihemres/efso-radar/pull/14) | **INTEGRATED (DESIGN)** |
 | Phase 5B.3G-B | Hermetic eight-step mock staging runner, strict safety barriers | [PR #16](https://github.com/fatihemres/efso-radar/pull/16) | **INTEGRATED / OFFLINE VERIFIED** |
-| Phase 5B.3G-C | Controlled Turso staging reliability session, operator safeguards, manifest store & wire contract | [Issue #13](https://github.com/fatihemres/efso-radar/issues/13), [Issue #37](https://github.com/fatihemres/efso-radar/issues/37), [plan](docs/PHASE5B3G_LIVE_STAGING_RELIABILITY_PLAN.md) | **PR #35 & #36 INTEGRATED / WIRE CONTRACT SLICE CANDIDATE (OFFLINE ONLY)** |
+| Phase 5B.3G-C | Controlled staging safeguards, manifest store, offline recovery and DACL evidence | [Issue #13](https://github.com/fatihemres/efso-radar/issues/13), [Issue #41](https://github.com/fatihemres/efso-radar/issues/41), [plan](docs/PHASE5B3G_LIVE_STAGING_RELIABILITY_PLAN.md) | **PR #35/#36/#38/#40 INTEGRATED (OFFLINE) / ISSUE #41 CANDIDATE / LIVE BLOCKED** |
 | Follow-on cloud cutover & unattended operations | Cloud parity, backups, zero-cost controls, human editorial recipient tests, PO release decision | Existing Phase 5 architecture; future issue required | **DISCOVERY / NOT AUTHORIZED** |
 | Rights and distribution | Review third-party origins and decide visibility/distribution | [Issue #17](https://github.com/fatihemres/efso-radar/issues/17) | **IN PROGRESS (AUDIT)** |
 
-## 2026-10-29 Issue #39 — Offline orphan evidence review
+## 2026-10-29 Issue #41 — Windows DACL offline evidence
+
+Candidate implementation on isolated branch `codex/issue-41-windows-dacl-evidence`, based on refreshed `main` `22090a54b6fca42146b0fadb39134dbf0694fce7`. Pure conservative policy, bounded read-only Win32 fixture inspection and sanitized reports are implemented; 129 focused local tests passed / 3 skipped, including actual test-owned Windows fixture metadata collection. [Contract/threat model](docs/PHASE5B3G_LIVE_STAGING_RELIABILITY_PLAN.md#57-issue-41--windows-ntfs-dacl-offline-evidence-and-threat-model-2026-10-29); [verification](VERIFICATION.md). No dependencies, permission mutation, arbitrary-path inspector or live-store integration added.
+
+Status: **IMPLEMENTED / LOCAL OFFLINE VERIFIED / NOT INTEGRATED / INDEPENDENT REVIEW PENDING**. `POLICY_MATCH` is not a capability or live ACL attestation. Owner-host ACLs, child/ancestor ACL guarantees, residual TOCTOU, Windows directory fsync and power-loss proof remain unresolved; transport/recovery, token/Block Writes and account-specific $0 proof remain separately gated. #13 remains open. STOP for independent ChatGPT and selective Argon review, then explicit PO squash-merge approval; no release or activation.
+
+## Historical pre-integration 2026-10-29 Issue #39 — Offline orphan evidence review
+
+PR #40 later integrated at `22090a54b6fca42146b0fadb39134dbf0694fce7`; the candidate checkpoint below retains its original evidence and scope.
 
 Candidate implementation follows integrated PR #38 (`main` `1da9b9604e67377ee873cc235583c6ba42842970`). A pure classifier and inert operator review model cover the canonical five identities, full ownership proof, missing/invalid manifests, ambiguous transactions and adversarial query evidence. Status: **IMPLEMENTED / LOCAL OFFLINE TESTED / NOT INTEGRATED / INDEPENDENT REVIEW AND PO ACCEPTANCE PENDING**. [Verification evidence](VERIFICATION.md); [contract](docs/PHASE5B3G_LIVE_STAGING_RELIABILITY_PLAN.md#56-issue-39--offline-orphan-evidence-review-contract-2026-10-29).
 
