@@ -418,6 +418,27 @@ Live Turso staging execution remains strictly unauthorized. The following techni
 
 ---
 
+### 5.6. Issue #39 — Offline orphan evidence review contract (2026-10-29)
+
+**Candidate implementation, not live recovery or PO acceptance.** `staging/offline_recovery_evidence.py` provides `review_recovery_evidence(expected_run_id=..., manifest_bytes=..., sealed_sha256=..., snapshot=...)`. The caller supplies only test-owned manifest bytes, the previously captured `OfflineManifestSeal.sha256`, and a typed `HermeticSnapshot`; the classifier performs no I/O. The existing canonical `PerRunOwnershipManifest.validate_payload` is shared with file validation, avoiding a second inventory/schema. The new byte boundary additionally rejects coercion and duplicate JSON keys. No existing `--recover-manifest` or persistent-store report fields change.
+
+Snapshot bounds: at most five observations, each bound to an exact canonical table/PK column/PK value, at most two rows per observation, at most three projected PK/ownership columns, column names up to 64 characters and values up to 512. Inputs are mock observations, not authenticated remote proof. A caller-supplied digest is an integrity comparison, not an ownership, durable-storage or authorization certificate. The pure function cannot validate filesystem ownership/existence itself: missing bytes are reported as missing evidence; file safety stays with the existing owned fixture store/seal boundary. No path, transport, repository, callback, credentials or arbitrary query text is accepted.
+
+| Evidence | Entity classification / review result |
+| --- | --- |
+| Successful mock query, zero rows | `ABSENT_IN_SIMULATION`; all five absent => `REVIEW_REQUIRED`, never proof of rollback or remote absence |
+| Exactly one row, exact PK and every canonical ownership marker | `PRESENT_OWNED`; consistent remnants => simulated `RESIDUAL` |
+| Wrong PK/ownership marker | `OWNERSHIP_MISMATCH` / `OWNERSHIP_MISMATCH_HALT`; raw mismatched values never appear in the report |
+| Missing projected fields, absent observation, unknown identity or malformed snapshot | `INCOMPLETE` / `UNOBSERVED` or rejected evidence; overall `UNKNOWN` |
+| Duplicate rows or observations | `DUPLICATE_CARDINALITY`; overall `UNKNOWN` |
+| Failed, unavailable or ambiguous query | Explicit query evidence; overall `UNKNOWN`; failure plus rows is contradictory |
+| Missing, seal-changed or invalid local bytes | `MISSING`, `TAMPERED` or `INVALID`; overall `UNKNOWN`, five canonical identities remain unobserved when the expected run ID is valid |
+| Contradictory LIVE-02 atomic peers, acknowledged COMMIT without both owned peers, or ambiguous COMMIT | `UNKNOWN`; no retry; tentative rollback article is always included and its unexpected presence is called out |
+
+The return value is a read-only `RecoveryReview` model, serializable with `model_dump_json(indent=2)`. It includes the safe exact run ID, five canonical entities in stable dependency order (including expected ownership markers), per-entity classifications/counts, fixed `HERMETIC_SIMULATION` provenance, uncertainties and inert manual checks. It omits paths, raw manifest metadata, raw observed values, exception messages, DB URLs, private IDs, bearer tokens and SQL. `remote_state` is always `UNKNOWN`; `action` is always `MANUAL_REVIEW_ONLY`. Its distinct decision enum has no `CLEAN` member and grants no capability to the store, operator or outbound guard. `PersistentManifestStore.delete_manifest_if_clean` remains fail-closed, including caller-supplied `CLEAN`. Source bytes are never modified, deleted or retried, including failures. This is a misuse guardrail, not protection against hostile Python code in the same process.
+
+Validation: 83 new adversarial hermetic tests on Windows Python 3.12.10; full-suite/CI details in [VERIFICATION](../VERIFICATION.md). No remote recovery, Windows operator-host DACL, physical power-loss guarantee, live Hrana transport, Block Writes/token control or account-specific $0 billing proof is implemented by this slice. The six blockers in §5.5 remain open. #13 is not closed. STOP for independent review and separate PO squash-merge approval; no live operation is authorized.
+
 ## 6. Separation of Software Cleanup vs. Manual Dashboard Operations
 
 Software-level execution and cloud platform administration must never be conflated. Software cannot guarantee third-party cloud dashboard settings or token revocations:

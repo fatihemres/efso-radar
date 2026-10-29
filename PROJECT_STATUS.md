@@ -1,8 +1,16 @@
 # Efso Radar — Project Checkpoint
 
-**Verified snapshot date:** 2026-10-28 (GitHub inspection; NOT a live status feed)
+**Verified snapshot date:** 2026-10-29 (Issue #39 onboarding; NOT a live status feed)
 **Canonical repository:** [fatihemres/efso-radar](https://github.com/fatihemres/efso-radar)
-**Baseline inspected:** `main` at `4cfe02aa23e1600db7531481af87fa8b554b653c` (PR #36 integrated).
+**Baseline inspected:** refreshed `origin/main` at `1da9b9604e67377ee873cc235583c6ba42842970` (PR #38 integrated). Earlier checkpoints below retain their dated baselines.
+
+## Issue #39 — Offline orphan evidence review candidate (2026-10-29)
+
+- **IMPLEMENTED / NOT INTEGRATED / NOT PO ACCEPTED:** `offline_recovery_evidence.py` classifies bounded synthetic snapshots against the canonical five-entity manifest, including the tentative rollback article. The existing manifest validator now exposes its pure payload check; historical recovery CLI/store report fields and `OFFLINE_VALIDATION_PASSED` behavior remain unchanged.
+- The inert JSON review model records `HERMETIC_SIMULATION`, exact synthetic identities/ownership markers and dependency order, per-entity evidence, uncertainties and manual checks. Remote state is always `UNKNOWN`; all-absent evidence requires review. Ambiguous COMMIT, incomplete queries, contradictory atomic peers and malformed evidence never authorize cleanup. No file/database/network interface, cleanup SQL, deletion, retry or remote adapter is added.
+- **Local evidence:** 83 new adversarial tests passed on Windows Python 3.12.10 using existing dependencies. Full-suite and exact-head CI evidence are recorded in [VERIFICATION](VERIFICATION.md).
+- **Unwaived prerequisites:** remote recovery, operator-host Windows DACL, physical power-loss guarantees, live Hrana transport, Block Writes/token control and account-specific $0 billing proof remain unimplemented/unverified by this slice. Parent #13 stays open. Operational `.env`, `data/` and real manifests are outside scope; no live operation is authorized or performed.
+- **STOP:** draft PR for independent ChatGPT engineering/security/QA review (optional Argon review), followed by separate PO merge decision. No merge, release or activation.
 
 ## Product & implementation
 Efso Radar supplies selective Turkish/global entertainment-news discovery and editorial decision support for Efso Magazin; it does not automatically publish Instagram posts. Python 3.11/3.12 project with modular RSS discovery, multi-source parsing, deduplication/story memory, Gemini integration, Telegram formatting/delivery, SQLite and Turso Hrana v2 repositories, orchestration, encrypted backup primitives and offline staging test runner. Full architectural detail: [Architecture](docs/ARCHITECTURE.md).

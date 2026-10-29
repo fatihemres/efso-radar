@@ -1,6 +1,20 @@
 # Efso Radar — Verification Ledger
 
-**Checkpoint:** 2026-10-28. This ledger separates direct GitHub CI evidence, agent-reported local runs, historical pilot acceptance and missing validations. **No tests were run by ChatGPT against a local clone for this documentation task.** Evidence is not a release certificate.
+**Checkpoint:** 2026-10-29. This ledger separates direct GitHub CI evidence, implementation-agent local runs, historical pilot acceptance and missing validations. Earlier dated reviewer entries retain their original scope. Evidence is not a release certificate.
+
+## 2026-10-29 Issue #39 — Agent local offline evidence
+
+Baseline refreshed from GitHub: `origin/main` `1da9b9604e67377ee873cc235583c6ba42842970` (PR #38). Candidate branch: `codex/issue-39-offline-recovery-evidence`. These are implementation-agent observations; independent review and PO acceptance remain pending.
+
+- Existing environment reused: Windows, Python **3.12.10**, pytest **9.1.1**, Ruff **0.13.3**; no dependency installation or upgrade.
+- Focused command: `$env:PYTHONPATH='src'; C:/Dev/EfsoRadar/venv/Scripts/python.exe -m pytest tests/test_phase5b3g_c_offline_recovery_evidence.py -q --basetemp <fresh-test-owned-pytest-root>`: **83 passed**, no skips/deselections, 6.09s.
+- Coverage includes all five exact entities/attributes/order, both valid lock workers, all absent, LIVE-02–07 stage-shaped remnants in real in-memory Schema v6, partial atomic peers, acknowledged-but-absent/ambiguous COMMIT, query failures/unavailability/ambiguity, duplicate rows/observations, missing proof, invalid types, duplicate JSON fields, altered seal, missing/corrupt/oversized manifests and serialization redaction. Each classifier call is guarded against filesystem/SQLite/socket/HTTP use and verifies source-fixture bytes remain unchanged.
+- Historical `recover_manifest_offline` and persistent-store report fields and offline audit state remain unchanged; caller-supplied `CLEAN` still cannot delete a persistent manifest. No operational files or real manifests are used.
+- The first complete network-blocked run exposed an existing unmocked RSS call in `test_radar_cli_scan_only_mode` (870 passed, 1 failed, 18 skipped). The network audit blocked it before contact. That test now supplies a deterministic successful empty discovery fixture; its focused network-blocked rerun passed (1 test, 2.85s). No production discovery behavior changed.
+- Final full command: `$env:PYTHONPATH='src'; C:/Dev/EfsoRadar/venv/Scripts/python.exe <temporary-audit-harness> tests -v -rs --basetemp <fresh-test-owned-pytest-root>`: **871 passed, 18 skipped, 0 deselected, 276 subtests passed in 134.13s**. The temporary harness ran `pytest.main` with the repository import path, hid operational-file availability from historical-evidence tests, and audit-blocked operational `data/`/`.env` file reads plus real socket connect/DNS. Fourteen skips require private historical evidence; four are Windows symlink-privilege limitations. No dependency changes or live scripts were used.
+- Ruff: `venv/Scripts/ruff.exe check --target-version py311 --select E9,F63,F7,F82 src scripts tests` and default `ruff check` on both new Python files: **PASS**. Python 3.11 syntax parsing also passed; runtime 3.11 validation belongs to CI, not this local 3.12 report. `git diff --check` passed.
+- GitHub Actions Linux 3.11/3.12, hosted Windows 3.12 and static-safety are a separate exact-HEAD gate. Their immutable SHA, run URL and directly inspected results are delivered in the draft PR and task report; local results do not imply CI success or independent reviewer acceptance.
+- Not established: remote recovery, Windows operator-host DACL, physical power-loss guarantees, live Hrana transport, Block Writes/token control or account-specific $0 billing proof. No live action was performed. STOP for independent review; #13 remains open.
 
 ## Current independently checked evidence
 

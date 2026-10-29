@@ -336,6 +336,11 @@ class PerRunOwnershipManifest(BaseModel):
         except Exception as exc:
             raise ValueError(f"Manifest corrupt or invalid JSON ({type(exc).__name__})") from None
 
+        return cls.validate_payload(data)
+
+    @classmethod
+    def validate_payload(cls, data: Any) -> PerRunOwnershipManifest:
+        """Validate an already decoded inventory without filesystem or network I/O."""
         if not isinstance(data, dict):
             raise ValueError("Manifest root must be a JSON object.")
 
