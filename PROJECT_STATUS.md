@@ -1,10 +1,27 @@
 # Efso Radar — Project Checkpoint
 
-**Verified snapshot date:** 2026-10-29 (Issue #45 cross-runner recovery contract candidate; NOT a live status feed)
+**Verified snapshot date:** 2026-10-29 (Issue #47 editorial quality scorecard candidate; NOT a live status feed)
 **Canonical repository:** [fatihemres/efso-radar](https://github.com/fatihemres/efso-radar)
-**Baseline inspected:** refreshed `origin/main` at `93f66dfcfc40c11ddadbcf02ef71126182e62a8f` (PR #44 integrated). Earlier checkpoints below retain their dated baselines.
+**Baseline inspected:** refreshed `origin/main` at `589cf85045f73463515d8912205d82e0194f1501` (PR #46 integrated). Earlier checkpoints below retain their dated baselines.
 
-## Issue #45 — Cross-runner ownership & recovery architecture contract candidate (2026-10-29)
+## Issue #47 — Editorial product acceptance scorecard candidate (2026-10-29)
+
+- **IMPLEMENTED / NOT INTEGRATED / NOT PO ACCEPTED:** strictly offline editorial product acceptance scorecard and benchmark self-oracle disclaimer.
+- Key objective achieved: formally distinguished synthetic rule conformance from genuinely measured editorial quality across all 6 news pipeline stages (RSS parsing/filter, candidate prioritization & backlog, same-event clustering vs divergent events, NEW/UPDATE/DUPLICATE/IGNORE safety gates, Telegram digest filtering & scheduling, and human editorial usefulness).
+- Corrected misleading benchmark accuracy claims:
+  - Formally documented that `OfflineBenchmarkEvaluator` in `src/efso_radar/ai/benchmark.py` defaults to `simulate_model_decisions()`, which derives each predicted kind and score directly from fixture expected labels (`(item.expected_score_min + item.expected_score_max) // 2` and `item.expected_kind`).
+  - Outward benchmark reports now explicitly identify `evaluation_kind="SYNTHETIC_RULE_VALIDATION"`, `prediction_source="PREDICTIONS_DERIVED_FROM_EXPECTED_LABELS"`, and `model_accuracy_status="NOT_MEASURED_MODEL_ACCURACY"`.
+  - Added dedicated regression test `test_offline_benchmark_report_explicitly_disclaims_real_model_accuracy` in `tests/test_editorial_intelligence.py` asserting these disclaimers and verifying self-oracle origin is never misreported as independent model accuracy.
+  - Preserved historical 42-item vertical fixture (`tests/fixtures/editorial_benchmark.json`) and existing rule conformance test intact.
+- Established operational product acceptance scorecard in `VERIFICATION.md` proposing 6 measurable metrics with exact numerator/denominator formulas and sampling modes, reporting unmeasured fields as `NOT MEASURED`, and leaving target thresholds explicitly as `PO TO SET`.
+- Identified one decision-ready recommendation for the next quality evaluation gate: an owner-conducted small blind evaluation cohort of 50-100 real news items labeled by @efsomagazin's editor, strictly distinguished from staging transport Issue #13 and requiring separate PO authorization.
+- **Local focused evidence:** Windows Python 3.12.10: 17 passed in `test_editorial_intelligence.py`; 17 passed in `test_news_discovery.py`; 12 passed / 3 skipped in `test_calibration_phase3c.py`.
+- **Full hermetic suite:** 1101 passed, 18 skipped, 276 subtests passed in 158.84s on Windows Python 3.12.10.
+- All live staging, RSS, Gemini, Telegram, Turso, or cloud operations remain strictly unauthorized; Turso Block Writes remains ON; $0.00 / 0 TRY hard ceiling preserved. STOP for independent review and explicit PO approval.
+
+## Issue #45 — Cross-runner ownership & recovery architecture contract candidate (2026-10-29; INTEGRATED in PR #46)
+
+*(Addendum 2026-10-29: PR #46 subsequently integrated into main at commit 589cf85045f73463515d8912205d82e0194f1501; post-merge main CI #40945829461 4/4 PASS; dated candidate text below retained for historical provenance.)*
 
 - **IMPLEMENTED / NOT INTEGRATED / NOT PO ACCEPTED:** strictly offline cross-runner ownership and recovery architecture contract and independent review remediation.
 - Distinguishes persistent-host staging (Mode a) from ephemeral GitHub Actions automation (Mode b). Formally documents why local SQLite WAL, workspace/temp files, or Actions artifacts alone do not provide crash-safe cross-runner ownership (destroyed with VM; asynchronous/non-transactional).

@@ -2,7 +2,64 @@
 
 **Checkpoint:** 2026-10-29. This ledger separates direct GitHub CI evidence, implementation-agent local runs, historical pilot acceptance and missing validations. Earlier dated reviewer entries retain their original scope. Evidence is not a release certificate.
 
-## 2026-10-29 Issue #45 — Cross-runner ownership and recovery architecture contract candidate
+## 2026-10-29 Issue #47 — Editorial Product Acceptance Scorecard (Offline Quality Audit)
+
+Isolated worktree/branch `feat/issue-47-editorial-scorecard`, baseline `589cf85045f73463515d8912205d82e0194f1501` (verified `main` with PR #46 integrated). Implementation-agent local evidence is separate from independent review and exact-head CI; no PO acceptance or live activation is claimed.
+
+- Existing Windows environment reused: Python 3.12.10, pytest 9.1.1, Ruff 0.13.3; no dependency installation/upgrade.
+- Key objective achieved: distinguished synthetic rule conformance from genuinely measured editorial quality across the entire news discovery, triage, and digest pipeline.
+- Corrected misleading benchmark accuracy claims:
+  - Formally documented that `OfflineBenchmarkEvaluator` in `src/efso_radar/ai/benchmark.py` defaults to `simulate_model_decisions()`, which derives each predicted kind and score directly from fixture expected labels (`(item.expected_score_min + item.expected_score_max) // 2` and `item.expected_kind`).
+  - Outward benchmark reports now explicitly identify `evaluation_kind="SYNTHETIC_RULE_VALIDATION"`, `prediction_source="PREDICTIONS_DERIVED_FROM_EXPECTED_LABELS"` (or `"CALLER_SUPPLIED_PREDICTIONS"`), and `model_accuracy_status="NOT_MEASURED_MODEL_ACCURACY"`.
+  - Added dedicated regression test `test_offline_benchmark_report_explicitly_disclaims_real_model_accuracy` in `tests/test_editorial_intelligence.py` asserting these disclaimers and verifying self-oracle origin is never misreported as independent model accuracy.
+  - Preserved historical 42-item vertical fixture (`tests/fixtures/editorial_benchmark.json`) and existing rule conformance test intact.
+
+### 1. Evidence Inventory & Quality Classification Audit
+
+| Pipeline Subsystem | Focus & Scope | Existing Test Evidence / Code Path | Quality Classification | What is Verified vs. What Remains Unmeasured |
+| :--- | :--- | :--- | :--- | :--- |
+| **(a) RSS Parsing & Pre-Filtering** | Feed parsing, XML sanitization, publisher categorization, Turkish char normalization, macro/sports exclusion | `tests/test_news_discovery.py` (`TestFeedParser`, `TestNewsRelevancePrefilter`), `src/efso_radar/sources/` | **VERIFIED RULE CONTRACT** | **Verified:** Deterministic XML parsing (RSS 2.0, Atom, Google News), date format parsing, and keyword allow/block rules on mock strings.<br>**Unmeasured:** Real-world feed noise, RSS feed drops, source drift, and live publisher uptime/availability. |
+| **(b) Candidate Prioritization & Backlog** | Priority scoring formula, publisher tier weights, image bonus, top-K selection, backlog persistence | `tests/test_news_discovery.py` (`test_candidate_prioritization_signals`), `tests/test_editorial_intelligence.py` (`test_backlog_recovery_when_article_drops_off_rss`), `src/efso_radar/deduplication/engine.py` | **VERIFIED RULE CONTRACT** | **Verified:** Priority formula arithmetic, top-K cutoff sorting, and recovery of deprioritized candidates from SQLite backlog in subsequent runs.<br>**Unmeasured:** Real breaking-news recall@K (whether genuinely important viral stories like Harry Styles dance fall below AI cutoff). |
+| **(c) Same-Event Clustering vs. Divergent Events** | Distinguishing duplicate reporting from new events for the same celebrity; token overlap; entity extraction | `tests/test_editorial_intelligence.py` (`test_semantic_matching_distinguishes_different_events_same_celebrity`), `src/efso_radar/deduplication/engine.py` | **VERIFIED RULE CONTRACT** | **Verified:** Deterministic token Jaccard similarity and event concept divergence on hand-crafted Turkish test pairs.<br>**Unmeasured:** Duplicate leakage across 5+ competing Turkish outlets with divergent phrasing or multi-hour publication delays. |
+| **(d) NEW/UPDATE/DUPLICATE/IGNORE Safety Gates** | AI schema transformation, score acceptance threshold (>=82), fabricated candidate ID veto, rumor caution, fabricated quote veto | `tests/test_editorial_intelligence.py` (`test_high_scoring_editorial_approval...`, `test_factual_grounding_...`, `test_unverified_rumor_...`), `src/efso_radar/ai/client.py` | **VERIFIED RULE CONTRACT** (Logic) / **SIMULATED OUTPUT** (Benchmark) | **Verified:** Pydantic schema validation, threshold gating, and sensitive tragedy/rumor vetoes on mocked inputs.<br>**Simulated:** 42-item benchmark uses self-oracle synthetic predictions.<br>**Unmeasured:** Live Gemini model classification precision and hallucination rates on raw unstructured web text. |
+| **(e) Telegram Digest Filtering & Scheduling** | 3-hour scan cadence, 3 daily digest windows, quiet hours queue preservation (23:00-08:00), message format limits (<4096 chars), per-digest cap | `tests/test_quiet_hours_queue.py`, `tests/test_phase3c2d_contract.py`, `src/efso_radar/notifications/formatters.py` | **VERIFIED RULE CONTRACT** / **HISTORIC PILOT** | **Verified:** Scheduling math, queue state transitions, message length formatting, and cap enforcement in SQLite tests.<br>**Historic:** Early manual Telegram bot pilot (Phase 4).<br>**Unmeasured:** Recipient editor satisfaction, digest readability, and timeliness in unattended live production. |
+| **(f) Human Editorial Usefulness** | Alignment with @efsomagazin's editorial voice (18-35 Turkish youth, viral visual culture, DM-shareable entertainment news) | `docs/editorial_review_guide.md`, `tests/test_calibration_phase3c.py` (Phase 3C-2A), `docs/PHASE4_CLOSURE.md` | **HISTORIC PILOT** (50 items) / **UNMEASURED REAL QUALITY** | **Historic Pilot:** 50 real candidates labeled once by owner in Phase 3C (private `data/` CSV).<br>**Simulated:** 20-item holdout in `phase3c2b_eval.py` is constructed synthetic scenarios (`CONSTRUCTED_REGRESSION_SCENARIOS`).<br>**Unmeasured:** Ongoing production editorial precision, real-world recall, and actual editorial time saved. |
+
+### 2. Operational Product Acceptance Scorecard Proposal (NOT a PO Decision)
+
+The following operational scorecard defines measurable product quality metrics with exact mathematical formulations, sampling modes, current measured values, and target thresholds. All targets remain **PO TO SET**; no target or value is fabricated.
+
+| Metric Name | Measurable Definition (Formula) | Sampling & Evaluation Mode | Measured Value in Repository | Proposed Target Threshold |
+| :--- | :--- | :--- | :--- | :--- |
+| **Editorial Suggestion Precision** | $\frac{\text{Accepted Suggestions by Editor (`APPROVE` or `IMPORTANT_UPDATE`)}}{\text{Total Dispatched Suggestions}}$ | Blinded human evaluation of live/shadow notification stream over a 7-day evaluation window | **NOT MEASURED** *(Synthetic 42-item benchmark reports 100% via self-oracle; live model precision unmeasured)* | **PO TO SET** *(e.g., $\ge 80\%$ to prevent notification fatigue)* |
+| **Missed-Important-Story Recall@K** | $\frac{\text{Major Viral/Pop Culture Stories Captured in Top-K AI Batch}}{\text{Total Significant Entertainment Events Covered by Target Outlets}}$ | Retrospective comparison of top-K AI batch (e.g. K=55) against full daily coverage across Turkish (Kelebek, Habertürk) and Global (Variety, TMZ) feeds | **NOT MEASURED** *(Historical calibration noted viral items like Harry Styles dance falling to backlog N)* | **PO TO SET** *(e.g., $\ge 90\%$ for Turkish pop culture; $\ge 75\%$ for global viral)* |
+| **Same-Event Duplicate Leakage Rate** | $\frac{\text{Dispatched Notifications Covering an Already Alerted Event (without new facts)}}{\text{Total Dispatched Notifications}}$ | Rolling 48-hour story window audit tracking cross-publisher syndication | **NOT MEASURED** *(Synthetic test pairs pass 100%; real cross-outlet duplicate rate unmeasured)* | **PO TO SET** *(e.g., $\le 5\%$ duplicate leakage)* |
+| **Meaningful-Update False Positive Rate** | $\frac{\text{Alerts Dispatched as `UPDATE` that Merely Paraphrase Existing Headline}}{\text{Total Dispatched `UPDATE` Alerts}}$ | Chronological story evolution audit checking whether subsequent updates add material verified developments | **NOT MEASURED** *(Rule engine catches verbatim headline repeats; paraphrased competing coverage unmeasured)* | **PO TO SET** *(e.g., $\le 10\%$ false update rate)* |
+| **Sensitive-Content / Rumor Safety Veto Compliance** | $\frac{\text{High-Risk Allegations (Arrest, Death, Tragedy, Defamation) Correctly Vetoed}}{\text{Total High-Risk Unverified Candidate Stories Encountered}}$ | Adversarial negative fixture testing + continuous shadow audit of high-risk keywords | **100% VERIFIED RULE CONTRACT** *(on synthetic negative fixtures; live unconstrained model compliance unmeasured)* | **100% Hard Safety Invariant** *(Zero tolerance for unverified tragedy/legal defamation)* |
+| **Digest Cadence & Notification Cap Compliance** | $\frac{\text{Digest Runs Complying with 3-Hour Cadence and Max Cap (3-5 Items)}}{\text{Total Scheduled Digest Windows}}$ | Automated orchestrator execution log audit | **100% VERIFIED RULE CONTRACT** *(in hermetic SQLite tests; live unattended cron unmeasured)* | **100% Operational Invariant** *(Max 3-5 items per digest window)* |
+
+### 3. Decision-Ready Recommendation for Next Quality Evaluation Gate
+
+**Recommended Next Step:** Conduct a **Separate, Small, Owner-Controlled Blind Evaluation Cohort**
+- **Scope:** Collect a discrete sample of 50–100 real candidates over 3–5 consecutive days from active RSS feeds.
+- **Blinding:** Candidate articles are stripped of model predictions and priority scores. The @efsomagazin human editor assigns one of the 5 canonical decisions (`APPROVE`, `REJECT`, `TOO_WEAK`, `DUPLICATE`, `IMPORTANT_UPDATE`) and brief optional notes using the criteria in `docs/editorial_review_guide.md`.
+- **Analysis:** Compare human ground-truth labels against (a) candidate prioritization ranking (evaluating Recall@K and identifying backlog priority inversions) and (b) Gemini model predictions (evaluating real-world Precision, Recall, and F1).
+- **Explicit PO Gate:** This quality evaluation requires a separate, explicit PO authorization before any live RSS scraping or external Gemini API invocation. It is strictly orthogonal to staging wire reliability (Issue #13).
+- **Constraint:** No new architecture, no automated continuous pipelines, and no dependency additions.
+
+### 4. Verification & Focused Test Results
+
+- `pytest tests/test_editorial_intelligence.py -v`: **17 passed in 3.85s**.
+- `pytest tests/test_news_discovery.py -v`: **17 passed in 0.81s**.
+- `pytest tests/test_calibration_phase3c.py -v`: **12 passed, 3 skipped in 2.50s**.
+- Full hermetic suite: `pytest tests -q`: **1101 passed, 18 skipped, 276 subtests passed in 158.84s**, Windows Python 3.12.10.
+- Ruff checks: `ruff check --target-version py311 --select E9,F63,F7,F82 src scripts tests` and default Ruff on modified files: **PASS**.
+- Hard constraints preserved: strictly $0.00 / 0 TRY spend, Turso Block Writes ON, tokens revoked, zero live RSS, Gemini, Telegram, Turso, or network calls; no private calibration CSV or operational file touched; no new dependency, ranking threshold modification, or architecture redesign. STOP for independent review and explicit PO approval.
+
+
+## 2026-10-29 Issue #45 — Cross-runner ownership and recovery architecture contract candidate (INTEGRATED in PR #46)
+
+*(Addendum 2026-10-29: PR #46 subsequently integrated into main at commit 589cf85045f73463515d8912205d82e0194f1501; post-merge main CI #40945829461 4/4 PASS; dated candidate text below retained for historical provenance.)*
 
 Isolated worktree/branch `feat/issue-45-cross-runner-recovery-contract`, baseline `93f66dfcfc40c11ddadbcf02ef71126182e62a8f` (verified `main` with PR #44 integrated). Implementation-agent local evidence is separate from independent review and exact-head CI; no PO acceptance or live activation is claimed.
 

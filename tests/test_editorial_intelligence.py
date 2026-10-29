@@ -387,6 +387,20 @@ class TestEditorialIntelligence(unittest.TestCase):
         self.assertAlmostEqual(metrics.duplicate_accuracy, 1.0, places=2)
         self.assertAlmostEqual(metrics.update_recognition_rate, 1.0, places=2)
 
+    def test_offline_benchmark_report_explicitly_disclaims_real_model_accuracy(self):
+        """Benchmark report explicitly disclaims independent accuracy and labels self-oracle origin."""
+        evaluator = OfflineBenchmarkEvaluator()
+        metrics = evaluator.run_evaluation()
+
+        self.assertEqual(metrics.evaluation_kind, "SYNTHETIC_RULE_VALIDATION")
+        self.assertEqual(metrics.prediction_source, "PREDICTIONS_DERIVED_FROM_EXPECTED_LABELS")
+        self.assertEqual(metrics.model_accuracy_status, "NOT_MEASURED_MODEL_ACCURACY")
+
+        report = metrics.summary()
+        self.assertIn("SYNTHETIC_RULE_VALIDATION", report)
+        self.assertIn("PREDICTIONS_DERIVED_FROM_EXPECTED_LABELS", report)
+        self.assertIn("NOT_MEASURED_MODEL_ACCURACY", report)
+
     def test_backlog_recovery_when_article_drops_off_rss(self):
         """Articles deprioritized in run 1 survive in backlog even if dropped from RSS in run 2."""
         titles = [

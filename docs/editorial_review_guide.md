@@ -84,3 +84,12 @@ Zorunlu olmamakla birlikte, özellikle sınırda kaldığınız veya algoritman�
 ## 6. Sonraki Adım
 
 CSV dosyasındaki 50 satırı doldurduktan sonra dosyayı kaydedip bildirmeniz yeterlidir. Bu etiketler, Faz 3C-2'de yapay zekanın editorial karar motorunu prompt ve kural seviyesinde kalibre etmek için altın referans veri seti (ground truth) olarak kullanılacaktır.
+
+---
+
+## 7. Editoryal Kalite Kabul Metrikleri ve Kural Ayrımı (Issue #47 Notu)
+
+Efso Radar'ın çevrimdışı test paketindeki %100 sentetik kural uygunluğu (rule conformance), canlı Gemini modelinin veya gerçek haber akışının editoryal başarısı anlamına **gelmemektedir**:
+- `tests/fixtures/editorial_benchmark.json` (42 madde): Sentetik kural doğrulama senaryolarıdır; model tahminleri beklenen etiketlerden simüle edilir (`PREDICTIONS_DERIVED_FROM_EXPECTED_LABELS`).
+- Gerçek editoryal kabul: @efsomagazin insan editörünün kör değerlendirmesine dayalı ayrı bir örneklem gerektirir.
+- Detaylı operasyonel metrik tanımları, ölçülen ve ölçülmeyen kalite alanları için bkz. [VERIFICATION.md](../VERIFICATION.md).
