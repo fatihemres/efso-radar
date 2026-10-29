@@ -15,6 +15,7 @@ from pydantic import ValidationError
 
 from efso_radar.repositories.schema import get_all_init_statements
 from efso_radar.staging.manifest_seal import MAX_MANIFEST_BYTES, OfflineManifestSeal
+from efso_radar.staging.offline_write_intent import OfflineWriteIntentBuilder
 from efso_radar.staging.offline_recovery_evidence import (
     CommitState,
     EntityEvidence,
@@ -167,10 +168,119 @@ def test_exact_inventory_ownership_attributes_rollback_and_dependency_order(
     expected = sorted(
         create_default_manifest_entities(RUN_ID),
         key=lambda e: e.cleanup_dependency_order,
+        reverse=True,
     )
     assert [r.entity for r in result.entities] == expected
     assert all(r.evidence == EntityEvidence.PRESENT_OWNED for r in result.entities)
     assert any(r.entity.pk_value.endswith("_02_rollback") for r in result.entities)
+
+
+def test_review_order_matches_established_cleanup_intents(fixture):
+    result = fixture.review(observations())
+    assert [r.entity.cleanup_dependency_order for r in result.entities] == [
+        2,
+        2,
+        1,
+        1,
+        1,
+    ]
+    assert [r.entity.pk_value for r in result.entities] == [
+        f"synth_art_{RUN_ID}_01",
+        f"synth_art_{RUN_ID}_02_rollback",
+        f"synth_story_{RUN_ID}_01",
+        f"synth_lock_{RUN_ID}",
+        f"synth_stage_{RUN_ID}::current",
+    ]
+    intents = OfflineWriteIntentBuilder(fixture.seal).conditional_cleanup()
+    assert [r.entity.pk_value for r in result.entities] == [i.args[0] for i in intents]
+
+
+@pytest.mark.parametrize("index", range(5))
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "missing",
+        "extra",
+        "row-first",
+        "row-last",
+        "observation-first",
+        "observation-last",
+    ],
+)
+def test_observed_foreign_marker_precedes_incomplete_and_duplicate_evidence(
+    fixture, index, shape, caplog
+):
+    obs = observations(range(5))
+    owned = obs[index]
+    row = dict(owned.rows[0])
+    marker = next(k for k in row if k != owned.pk_column)
+    row[marker] = SECRET
+    if shape in ("missing", "extra"):
+        # Keep the existing three-column bound even when adding an extra column.
+        if shape == "missing" or len(row) == 3:
+            other = next(
+                (k for k in row if k not in (marker, owned.pk_column)), owned.pk_column
+            )
+            row.pop(other)
+        if shape == "extra":
+            row["extra"] = "unexpected"
+    foreign = owned.model_copy(update={"rows": (row,)})
+    if shape.startswith("row-"):
+        rows = (row, owned.rows[0]) if shape == "row-first" else (owned.rows[0], row)
+        obs[index] = owned.model_copy(update={"rows": rows})
+    elif shape.startswith("observation-"):
+        pair = [foreign, owned] if shape == "observation-first" else [owned, foreign]
+        obs = [o for i, o in enumerate(obs) if i != index][:3] + pair
+    else:
+        obs[index] = foreign
+    result = fixture.review(obs)
+    assert result.decision == ReviewDecision.OWNERSHIP_MISMATCH_HALT
+    assert by_key(result)[owned.pk_value] == EntityEvidence.OWNERSHIP_MISMATCH
+    assert SECRET not in result.model_dump_json() and SECRET not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "query", [QueryState.FAILED, QueryState.UNAVAILABLE, QueryState.AMBIGUOUS]
+)
+@pytest.mark.parametrize("shape", ["extra", "rows", "observations"])
+def test_unconfirmed_foreign_values_are_not_ownership_proof(
+    fixture, query, shape, caplog
+):
+    obs = observations(range(5))
+    owned = obs[3]
+    row = {**owned.rows[0], "worker_id": SECRET}
+    if shape == "extra":
+        row["extra"] = "unexpected"
+    failed = owned.model_copy(
+        update={"query_state": query, "rows": (row, row) if shape == "rows" else (row,)}
+    )
+    if shape == "observations":
+        obs = [*obs[:3], failed, owned]
+    else:
+        obs[3] = failed
+    result = fixture.review(obs)
+    assert result.decision == ReviewDecision.UNKNOWN
+    assert EntityEvidence.OWNERSHIP_MISMATCH not in by_key(result).values()
+    assert SECRET not in result.model_dump_json() and SECRET not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "query", [QueryState.FAILED, QueryState.UNAVAILABLE, QueryState.AMBIGUOUS]
+)
+@pytest.mark.parametrize("foreign_first", [False, True])
+def test_observed_mismatch_survives_duplicate_unconfirmed_observation(
+    fixture, query, foreign_first
+):
+    obs = observations(range(5))
+    owned = obs[3]
+    foreign = owned.model_copy(
+        update={"rows": ({**owned.rows[0], "worker_id": SECRET},)}
+    )
+    failed = owned.model_copy(update={"query_state": query})
+    pair = [foreign, failed] if foreign_first else [failed, foreign]
+    result = fixture.review([*obs[:3], *pair])
+    assert result.decision == ReviewDecision.OWNERSHIP_MISMATCH_HALT
+    assert by_key(result)[owned.pk_value] == EntityEvidence.OWNERSHIP_MISMATCH
 
 
 @pytest.mark.parametrize(
@@ -425,6 +535,7 @@ def test_canonical_permission_denials_return_sanitized_invalid_unknown(
     assert [r.entity for r in result.entities] == sorted(
         create_default_manifest_entities(RUN_ID),
         key=lambda entity: entity.cleanup_dependency_order,
+        reverse=True,
     )
     assert all(r.evidence == EntityEvidence.UNOBSERVED for r in result.entities)
     assert all(r.observed_count is None for r in result.entities)
@@ -505,20 +616,104 @@ def test_snapshot_validation_bounds_and_wrong_seal(fixture):
         assert fixture.review(snapshot=snapshot).decision == ReviewDecision.UNKNOWN
 
 
-def test_raw_manifest_metadata_is_never_in_review_artifact(fixture):
+@pytest.mark.parametrize(
+    "created_at",
+    [
+        SECRET,
+        "not-a-timestamp",
+        "2026-02-30T09:00:00Z",
+        "2026-10-29T09:00:00",
+        "2026-10-29",
+        "2026-10-29T09:00:00+24:00",
+        STAMP + "\n",
+        "２０２６-10-29T09:00:00Z",
+        STAMP + SECRET,
+        "x" * 513,
+    ],
+    ids=[
+        "secret",
+        "malformed",
+        "calendar",
+        "naive",
+        "date-only",
+        "offset",
+        "newline",
+        "unicode",
+        "contaminated",
+        "oversized",
+    ],
+)
+def test_malformed_manifest_metadata_is_invalid_and_never_emitted(
+    fixture, created_at, caplog
+):
     data = json.loads(fixture.path.read_bytes())
-    data["created_at"] = SECRET
+    data["created_at"] = created_at
     raw = json.dumps(data).encode()
     digest = hashlib.sha256(raw).hexdigest()
     snapshot = HermeticSnapshot(
         manifest_sha256=digest, observations=tuple(observations())
     )
-    assert (
-        fixture.review(
-            manifest_bytes=raw, sealed_sha256=digest, snapshot=snapshot
-        ).decision
-        == ReviewDecision.REVIEW_REQUIRED
+    result = fixture.review(manifest_bytes=raw, sealed_sha256=digest, snapshot=snapshot)
+    assert result.manifest_evidence == ManifestEvidence.INVALID
+    assert result.decision == ReviewDecision.UNKNOWN
+    assert created_at not in result.model_dump_json() and created_at not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "created_at",
+    [STAMP, "2026-10-29T09:00:00.123456+00:00", "2026-10-29T12:00:00+03:00"],
+)
+def test_valid_timezone_aware_manifest_timestamps_remain_accepted(fixture, created_at):
+    data = json.loads(fixture.path.read_bytes())
+    data["created_at"] = created_at
+    raw = json.dumps(data).encode()
+    digest = hashlib.sha256(raw).hexdigest()
+    snapshot = HermeticSnapshot(
+        manifest_sha256=digest, observations=tuple(observations())
     )
+    result = fixture.review(manifest_bytes=raw, sealed_sha256=digest, snapshot=snapshot)
+    assert result.manifest_evidence == ManifestEvidence.VALID
+    assert result.decision == ReviewDecision.REVIEW_REQUIRED
+
+
+@pytest.mark.parametrize(
+    "bad_run",
+    [
+        RUN_ID.replace("2026", "２０２６", 1),
+        RUN_ID.replace("2026", "٢٠٢٦", 1),
+        RUN_ID + "\n",
+    ],
+    ids=["fullwidth", "arabic", "newline"],
+)
+def test_noncanonical_run_ids_rejected_by_manifest_and_classifier_boundaries(
+    fixture, bad_run
+):
+    manifest = PerRunOwnershipManifest(
+        run_id=bad_run,
+        created_at=STAMP,
+        registered_entities=create_default_manifest_entities(bad_run),
+    )
+    raw = manifest.model_dump_json().encode()
+    with pytest.raises(ValueError):
+        PerRunOwnershipManifest.validate_payload(json.loads(raw))
+    candidate = fixture.store.root_dir / "invalid-id.json"
+    candidate.write_bytes(raw)
+    with pytest.raises(ValueError):
+        PerRunOwnershipManifest.load_and_validate(candidate)
+    with pytest.raises(ValueError):
+        manifest.save_atomic(fixture.store.root_dir)
+    with pytest.raises(ValueError):
+        fixture.store.get_manifest_path(bad_run)
+    for expected_run in (RUN_ID, bad_run):
+        result = fixture.review(
+            expected_run_id=expected_run,
+            manifest_bytes=raw,
+            sealed_sha256=hashlib.sha256(raw).hexdigest(),
+        )
+        assert result.manifest_evidence == ManifestEvidence.INVALID
+        assert result.decision == ReviewDecision.UNKNOWN
+        assert bad_run not in result.model_dump_json()
+    assert candidate.read_bytes() == raw
 
 
 def test_historical_reports_and_deletion_boundary_remain_unchanged(fixture):

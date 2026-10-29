@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from datetime import datetime
 from enum import Enum
 from typing import Annotated, Literal
 
@@ -77,6 +78,11 @@ class ManifestEvidence(str, Enum):
 _Text = Annotated[str, StringConstraints(max_length=512)]
 _Column = Annotated[str, StringConstraints(max_length=64)]
 _Row = Annotated[dict[_Column, _Text], Field(max_length=3)]
+# Bounded ASCII ISO-8601 profile (20-32 characters), with calendar validation below.
+_CREATED_AT_RE = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})"
+)
 
 
 class EntityObservation(_FrozenModel):
@@ -144,6 +150,26 @@ def _classify(entity: RegisteredEntity, observation: EntityObservation) -> Entit
             }[observation.query_state]
         )
         return EntityReview(entity=entity, evidence=evidence)
+    # A directly observed foreign canonical value takes precedence over missing
+    # columns and duplicate rows. Unconfirmed query results never reach this check.
+    expected = {entity.pk_column: entity.pk_value}
+    expected.update(
+        {
+            ("worker_id" if k == "worker_ids" else k): v
+            for k, v in entity.expected_attributes.items()
+        }
+    )
+    if any(
+        (row[k] not in value if isinstance(value, list) else row[k] != value)
+        for row in rows
+        for k, value in expected.items()
+        if k in row
+    ):
+        return EntityReview(
+            entity=entity,
+            evidence=EntityEvidence.OWNERSHIP_MISMATCH,
+            observed_count=len(rows),
+        )
     if len(rows) > 1:
         return EntityReview(
             entity=entity,
@@ -156,20 +182,9 @@ def _classify(entity: RegisteredEntity, observation: EntityObservation) -> Entit
             evidence=EntityEvidence.ABSENT_IN_SIMULATION,
             observed_count=0,
         )
-    # Derive ownership columns from the canonical manifest, including either lock worker.
-    attrs = entity.expected_attributes
-    expected = {entity.pk_column: entity.pk_value}
-    expected.update(
-        {("worker_id" if k == "worker_ids" else k): v for k, v in attrs.items()}
-    )
     row = rows[0]
     if set(row) != set(expected):
         evidence = EntityEvidence.INCOMPLETE
-    elif any(
-        row[k] not in v if isinstance(v, list) else row[k] != v
-        for k, v in expected.items()
-    ):
-        evidence = EntityEvidence.OWNERSHIP_MISMATCH
     else:
         evidence = EntityEvidence.PRESENT_OWNED
     return EntityReview(entity=entity, evidence=evidence, observed_count=1)
@@ -197,7 +212,9 @@ def review_recovery_evidence(
     inventory = create_default_manifest_entities(safe_run) if safe_run else []
     reviews = tuple(
         EntityReview(entity=e, evidence=EntityEvidence.UNOBSERVED)
-        for e in sorted(inventory, key=lambda e: e.cleanup_dependency_order)
+        for e in sorted(
+            inventory, key=lambda e: e.cleanup_dependency_order, reverse=True
+        )
     )
     reasons = [
         "Remote state and rollback are unverified; local absence is simulation only."
@@ -235,6 +252,11 @@ def review_recovery_evidence(
         # retain their historical parsing behavior and fields.
         PerRunOwnershipManifest.model_validate(payload, strict=True)
         manifest = PerRunOwnershipManifest.validate_payload(payload)
+        if (
+            not _CREATED_AT_RE.fullmatch(manifest.created_at)
+            or datetime.fromisoformat(manifest.created_at).utcoffset() is None
+        ):
+            raise ValueError("Invalid manifest timestamp")
         if manifest.run_id != safe_run:
             raise ValueError("Run mismatch")
     except (ValueError, TypeError, RecursionError, PermissionError):
@@ -263,14 +285,21 @@ def review_recovery_evidence(
     for review in reviews:
         entity = review.entity
         found = observations.get((entity.table, entity.pk_column, entity.pk_value), [])
-        if len(found) > 1:
+        classified = [_classify(entity, obs) for obs in found]
+        mismatch = next(
+            (r for r in classified if r.evidence == EntityEvidence.OWNERSHIP_MISMATCH),
+            None,
+        )
+        if mismatch is not None:
+            results.append(mismatch)
+        elif len(found) > 1:
             results.append(
                 EntityReview(
                     entity=entity, evidence=EntityEvidence.DUPLICATE_CARDINALITY
                 )
             )
         elif found:
-            results.append(_classify(entity, found[0]))
+            results.append(classified[0])
         else:
             results.append(review)
     reviews = tuple(results)

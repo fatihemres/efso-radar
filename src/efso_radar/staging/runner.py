@@ -89,7 +89,7 @@ CLEANUP_RESERVE_REQUESTS = 20
 SESSION_TIMEOUT_SECONDS = 120.0
 PER_OPERATION_TIMEOUT_SECONDS = 15.0
 
-RUN_ID_REGEX = re.compile(r"^run_\d{8}T\d{6}Z_[a-f0-9]{12}$")
+RUN_ID_REGEX = re.compile(r"\Arun_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{12}\Z")
 
 DISALLOWED_LIVE_FLAGS = frozenset({
     "--live",

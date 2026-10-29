@@ -384,8 +384,11 @@ class TestPhase5B1ScanOnlyPipeline(unittest.TestCase):
         with patch(
             "efso_radar.sources.multi_source.MultiSourceDiscoveryEngine.fetch_candidates",
             return_value=([], 1),
+        ), patch(
+            "efso_radar.config.Settings.from_env",
+            side_effect=AssertionError("Hermetic CLI test must not load operational environment"),
         ), self.assertLogs("efso-radar", level="INFO") as log_capture:
-            radar.run(dry_run=True, scan_only=True)
+            radar.run(dry_run=True, scan_only=True, settings=self.settings)
 
         log_output = "\n".join(log_capture.output)
         self.assertIn("=== EFSO RADAR SCAN-ONLY SUMMARY ===", log_output)

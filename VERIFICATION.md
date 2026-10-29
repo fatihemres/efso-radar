@@ -2,6 +2,17 @@
 
 **Checkpoint:** 2026-10-29. This ledger separates direct GitHub CI evidence, implementation-agent local runs, historical pilot acceptance and missing validations. Earlier dated reviewer entries retain their original scope. Evidence is not a release certificate.
 
+## 2026-10-29 PR #40 — Consolidated Argon review remediation
+
+[Reconciled Argon findings](https://github.com/fatihemres/efso-radar/pull/40#issuecomment-6491952303) apply to reviewed HEAD `3b41c8ce2aa19f4227dd44ac6c5bcf844fcbf866`. Same branch and draft PR; independent re-review and PO approval remain pending.
+
+- Directly `OBSERVED` foreign canonical values now retain ownership-mismatch halt precedence across incomplete/extra columns, duplicate rows and duplicate observations. Failed/unavailable/ambiguous query rows stay unconfirmed. The inert report uses descending `[2, 2, 1, 1, 1]`, checked against hard-coded expected identities and `OfflineWriteIntentBuilder.conditional_cleanup()` without dispatching intents.
+- Shared canonical run-ID regex rejects Unicode digits and trailing newlines at payload/load/save/store-path/classifier boundaries. Only the new byte boundary adds bounded ASCII, calendar-valid, timezone-aware timestamp validation; historical store timestamp behavior is unchanged. The scan-only test retains mocked discovery, passes `self.settings` and raises if `Settings.from_env()` is called.
+- Before implementation, the targeted new assertions reproduced **45 failures, 116 deliberately deselected cases** (no live/environment access). After implementation, Windows Python 3.12.10 focused command `PYTHONPATH=src venv/Scripts/python.exe -m pytest tests/test_phase5b3g_c_offline_recovery_evidence.py tests/test_phase5b1_scan_only.py::TestPhase5B1ScanOnlyPipeline::test_radar_cli_scan_only_mode -q --basetemp <fresh-owned-root>`: **147 passed, 0 skipped, 0 deselected in 6.13s**. This is **146 total classifier cases**, up from 85, plus one scan-only case; not 147 newly added tests. All classifier calls retain no-I/O, source-byte preservation and sanitized-artifact checks.
+- Ruff baseline (`ruff check --target-version py311 --select E9,F63,F7,F82 src scripts tests`) and default Ruff on the classifier and its tests: **PASS**.
+- Full hermetic command `PYTHONPATH=src venv/Scripts/python.exe <temporary-audit-harness> tests -v -rs --basetemp <fresh-owned-root>`: **934 passed, 18 skipped, 0 deselected, 276 subtests passed in 124.66s**, Windows Python 3.12.10. Network and operational-file audit guards remained active; 14 skips require private historical evidence and four reflect local Windows symlink privileges. Exact-head hosted Linux 3.11/3.12 and Windows 3.12 results are delivered in draft PR #40 and the final report. Older entries below are dated evidence, not current focused counts.
+- No remote CLEAN, deletion, retry, live Turso/provider call, operational file access, credentials, Block Writes changes, paid activity or release is authorized or performed. STOP for final independent re-review and separate PO approval; parent #13 remains open.
+
 ## 2026-10-29 PR #40 — Independent-review P1 remediation
 
 [Independent review](https://github.com/fatihemres/efso-radar/pull/40#issuecomment-6491034639) required changes at `0d22044f134617d9d8ed82ffa94ad7ba9d9cdfd3`. Same Issue #39 branch and draft PR; no merge or acceptance claimed.
