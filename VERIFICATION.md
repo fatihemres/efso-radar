@@ -2,7 +2,55 @@
 
 **Checkpoint:** 2026-10-29. This ledger separates direct GitHub CI evidence, implementation-agent local runs, historical pilot acceptance and missing validations. Earlier dated reviewer entries retain their original scope. Evidence is not a release certificate.
 
-## 2026-10-29 Issue #43 — Windows manifest durability crash-window contract candidate
+## 2026-10-29 Issue #45 — Cross-runner ownership and recovery architecture contract candidate
+
+Isolated worktree/branch `feat/issue-45-cross-runner-recovery-contract`, baseline `93f66dfcfc40c11ddadbcf02ef71126182e62a8f` (verified `main` with PR #44 integrated). Implementation-agent local evidence is separate from independent review and exact-head CI; no PO acceptance or live activation is claimed.
+
+- Existing Windows environment reused: Python 3.12.10, pytest 9.1.1, Ruff 0.13.3; no dependency installation/upgrade.
+- Operational mode distinction formally established: Mode (a) controlled one-off staging on persistent Linux host vs. Mode (b) unattended automation on ephemeral GitHub-hosted Actions runners.
+- Documented why local SQLite WAL, workspace/temp files, or Actions artifacts alone do not provide cross-runner durability (destroyed with runner VM; asynchronous/non-transactional).
+- Candidate provider-persistent run ownership journal architecture specified: intent-before-effect sequencing (`INTENT_RECORDED` -> effect -> `EFFECT_COMMITTED` / `ABORTED`).
+- Formalized the two-transaction decoupling impossibility: intent registration is itself a remote network operation subject to ambiguous COMMITs; separate transactions cannot guarantee atomic durability without 2PC or single-transaction batching.
+- Evaluated Schema v6 `durable_recovery_state` table: identified namespace/lifecycle collision with LIVE-06 synthetic targets and LIVE-08 cleanup deletion, schema isolation constraints, and query cross-talk risks.
+- Implemented pure, inert typed evidence contract (`CrossRunnerJournalEntry`, `CrossRunnerJournalStatus`, `CrossRunnerReview`, `review_cross_runner_recovery_evidence()`) in `src/efso_radar/staging/offline_recovery_evidence.py`.
+- Implemented 19 deterministic offline contract tests in `TestCrossRunnerOwnershipRecoveryContract` in `tests/test_phase5b3g_c_cross_runner_recovery_offline.py` covering:
+  - Missing journal fails closed to UNKNOWN / MANUAL_REVIEW_ONLY
+  - Ambiguous journal COMMIT halts to UNKNOWN / blocks effect
+  - Journal ACK with ambiguous effect COMMIT remains UNKNOWN
+  - Conflicting owner / run ID mismatch halts with OWNERSHIP_MISMATCH_HALT
+  - Runner A lost / Runner B review preserves inert MANUAL_REVIEW_ONLY (RESIDUAL or UNKNOWN)
+  - Attempted replay of committed/aborted run rejected with OWNERSHIP_MISMATCH_HALT
+  - Unreadable or corrupted journal fails closed to UNKNOWN
+  - Incomplete observations fail closed to UNKNOWN
+  - Caller-supplied hash alone never grants remote authorization
+  - Noncanonical/invalid inputs fail closed
+  - P2-1: Empty target inventory fails closed to UNKNOWN
+  - P2-1: Foreign target inventory halts with OWNERSHIP_MISMATCH_HALT
+  - P2-1: Incomplete target inventory fails closed to UNKNOWN
+  - P2-1: Duplicate target inventory fails closed to UNKNOWN
+  - P2-1: Noncanonical/unsupported intent stage fails closed to UNKNOWN
+  - P2-1: Intent recorded with unreported commit state fails closed to UNKNOWN
+  - P2-2: Sentinel secret-like tokens in observations or foreign IDs are never echoed in model_dump_json()
+  - P2-2: Malformed or secret-like reviewing runner ID is sanitized and fails closed without leakage
+  - P2: Valid-format runner ID secret (e.g. bearer token) is kept private, emitting fixed sentinel role label (`VALIDATED_RECOVERY_RUNNER`) in `CrossRunnerReview` without leakage
+- Remediation enhancements:
+  - P2-1: Strict 5-entity canonical target inventory validation and stage/commit consistency checking.
+  - P2-2: Removed caller-controlled `AUTHENTICATED_REMOTE` provenance; sanitized report reasons with fixed string constants.
+  - P2-2 final: Redacted valid-format runner IDs in serialized reports via fixed sentinel label (`VALIDATED_RECOVERY_RUNNER`), while retaining the internal validated runner ID for replay/equality classification.
+  - P2-3: Corrected LIVE-06 synthetic key in plan §5.9.5 and clarified complementary relationship of Option B and Option C in §5.9.6 and ERD-017.
+  - P3: Clarified offline replay contract evaluation semantics.
+- Focused test results:
+  - `pytest tests/test_phase5b3g_c_cross_runner_recovery_offline.py -v`: **19 passed in 1.04s**.
+  - `pytest tests/test_phase5b3g_c_offline_recovery_evidence.py -v`: **146 passed in 6.29s**.
+  - `pytest tests/test_phase5b3g_c_persistent_manifest_store_offline.py -v`: **55 passed, 3 skipped in 3.30s**.
+  - `pytest tests/test_phase5b3g_c_windows_dacl_evidence_offline.py -v`: **135 passed in 2.71s**.
+- Full hermetic suite: `pytest tests -q`: **1100 passed, 18 skipped, 276 subtests passed in 134.44s**, Windows Python 3.12.10.
+- Ruff checks: `ruff check --target-version py311 --select E9,F63,F7,F82 src scripts tests` and default Ruff on modified files: **PASS**.
+- Hard constraints preserved: strictly $0.00 / 0 TRY spend, Turso Block Writes ON, tokens revoked, zero live/network connections, no operational files touched, no schema migration, no persistence backend chosen or implemented. STOP for independent review and explicit PO approval.
+
+## 2026-10-29 Issue #43 — Windows manifest durability crash-window contract (INTEGRATED in PR #44)
+
+*(Addendum 2026-10-29: PR #44 subsequently integrated into main at commit 93f66dfcfc40c11ddadbcf02ef71126182e62a8f; post-merge main CI #40932592589 4/4 PASS; dated candidate text below retained for historical provenance.)*
 
 Isolated worktree/branch `feat/issue-43-windows-durability-contract`, baseline `e428eb8b71bd79ba63b6ffe8b2b41dd4f732da9e` (verified `main` with PR #42 integrated). Implementation-agent local evidence is separate from independent review and exact-head CI; no PO acceptance or live activation is claimed.
 

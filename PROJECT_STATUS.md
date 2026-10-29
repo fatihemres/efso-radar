@@ -1,10 +1,29 @@
 # Efso Radar — Project Checkpoint
 
-**Verified snapshot date:** 2026-10-29 (Issue #43 durability contract onboarding; NOT a live status feed)
+**Verified snapshot date:** 2026-10-29 (Issue #45 cross-runner recovery contract candidate; NOT a live status feed)
 **Canonical repository:** [fatihemres/efso-radar](https://github.com/fatihemres/efso-radar)
-**Baseline inspected:** refreshed `origin/main` at `e428eb8b71bd79ba63b6ffe8b2b41dd4f732da9e` (PR #42 integrated). Earlier checkpoints below retain their dated baselines.
+**Baseline inspected:** refreshed `origin/main` at `93f66dfcfc40c11ddadbcf02ef71126182e62a8f` (PR #44 integrated). Earlier checkpoints below retain their dated baselines.
 
-## Issue #43 — Windows manifest durability crash-window contract candidate (2026-10-29)
+## Issue #45 — Cross-runner ownership & recovery architecture contract candidate (2026-10-29)
+
+- **IMPLEMENTED / NOT INTEGRATED / NOT PO ACCEPTED:** strictly offline cross-runner ownership and recovery architecture contract and independent review remediation.
+- Distinguishes persistent-host staging (Mode a) from ephemeral GitHub Actions automation (Mode b). Formally documents why local SQLite WAL, workspace/temp files, or Actions artifacts alone do not provide crash-safe cross-runner ownership (destroyed with VM; asynchronous/non-transactional).
+- Establishes candidate provider-persistent run ownership journal architecture with intent-before-effect sequencing (`INTENT_RECORDED` -> effect -> `EFFECT_COMMITTED` / `ABORTED`).
+- Formalizes the two-transaction impossibility window: intent registration is itself a remote network operation subject to ambiguous COMMITs; separate intent and effect transactions cannot guarantee atomic durability without 2PC or single-transaction batching.
+- Evaluates Schema v6 `durable_recovery_state` table as a candidate journal backend: identifies critical namespace/lifecycle collision (LIVE-06 synthetic target vs LIVE-08 cleanup deletion), schema isolation constraints, and query cross-talk risks. Aligned LIVE-06 synthetic key to `synth_stage_{run_id}::current` in plan §5.9.5 and clarified that Option B (shared durable journal) and Option C (atomic batching) are potentially complementary rather than mutually exclusive.
+- Implemented pure, inert typed evidence contract (`CrossRunnerJournalEntry`, `CrossRunnerJournalStatus`, `CrossRunnerReview`, `review_cross_runner_recovery_evidence()`) in `src/efso_radar/staging/offline_recovery_evidence.py`.
+- **Remediated safety boundaries (PR #46 review & final micro-remediation):**
+  - P2-1: Strict canonical target inventory validation (exact 5 registered entities required; empty, duplicate, or incomplete inventory fails closed to `UNKNOWN`; foreign entities halt with `OWNERSHIP_MISMATCH_HALT`). Validates journal stage and commit state consistency.
+  - P2-2: Removed caller-controlled `AUTHENTICATED_REMOTE` provenance (restricted to `HERMETIC_SIMULATION` and `UNVERIFIED_CANDIDATE`). Sanitized report output using fixed message constants without string interpolation of untrusted IDs, keys, or attributes. Valid-format caller-controlled runner IDs (e.g. bearer tokens matching regex) are retained internally for equality/replay checks but never serialized into `CrossRunnerReview` (replaced with fixed non-sensitive sentinel `"VALIDATED_RECOVERY_RUNNER"` or `"INVALID_RUNNER_ID"`); negative tests verify sentinel secret tokens never appear in serialized JSON.
+  - P2-3: Corrected LIVE-06 synthetic state key in plan §5.9.5 and clarified complementary relationship of Option B and Option C in §5.9.6 and ERD-017.
+  - P3: Clarified replay evaluation as an offline contract classification of caller-flagged re-execution attempts rather than a live distributed fencing system.
+- **Local focused evidence:** Windows Python 3.12.10: 19 passed in `test_phase5b3g_c_cross_runner_recovery_offline.py`; 146 passed in `test_phase5b3g_c_offline_recovery_evidence.py`; 55 passed / 3 skipped in `test_phase5b3g_c_persistent_manifest_store_offline.py`; 135 passed in `test_phase5b3g_c_windows_dacl_evidence_offline.py`.
+- **Full hermetic suite:** 1100 passed, 18 skipped, 276 subtests passed on Windows Python 3.12.10.
+- All live staging operations remain strictly unauthorized; Turso Block Writes remains ON; $0.00 / 0 TRY hard ceiling preserved. STOP for independent review and explicit PO approval.
+
+## Issue #43 — Windows manifest durability crash-window contract (2026-10-29; INTEGRATED in PR #44)
+
+*(Addendum 2026-10-29: PR #44 subsequently integrated into main at commit 93f66dfcfc40c11ddadbcf02ef71126182e62a8f; post-merge main CI #40932592589 4/4 PASS; dated candidate text below retained for historical provenance.)*
 
 - **IMPLEMENTED / NOT INTEGRATED / NOT PO ACCEPTED:** strictly offline Windows manifest durability crash-window contract and fault-injection matrix.
 - Enforces an explicit 5-level durability evidence hierarchy: (a) process restart, (b) test-owned subprocess termination, (c) mocked failure/crash windows, (d) physical reboot, and (e) sudden hardware power loss. Explicit non-proof contract: passing offline tests at levels (a)–(c) does NOT prove physical reboot or power-loss resilience (d)–(e).

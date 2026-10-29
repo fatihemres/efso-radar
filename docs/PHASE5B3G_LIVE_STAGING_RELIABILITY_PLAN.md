@@ -550,6 +550,96 @@ Before any live staging mutation can be authorized on Windows, the Product Owner
 
 ---
 
+### 5.9. Issue #45 — Cross-Runner Ownership & Recovery Architecture Contract (2026-10-29)
+
+**Candidate engineering policy and cross-runner recovery contract; NOT live staging authorization or backend selection.**
+
+#### 1. Operational Mode Distinction: Persistent-Host Staging vs. Ephemeral Actions Automation
+
+A critical distinction must be drawn between controlled one-off staging and unattended scheduled operations:
+
+- **Mode (a) — Controlled One-Off Staging on a Stable, Owner-Managed Persistent Host:**
+  - Operates on a dedicated, stable Linux host where local manifest persistence is achieved via POSIX 0700 file permissions and directory metadata fsync (`os.fsync(dir_fd)`).
+  - Survives local application crashes because the local filesystem remains intact on disk.
+  - If a crash or ambiguous COMMIT occurs, the human operator directly inspects the local manifest and performs controlled offline recovery on that exact machine.
+  - **Limitation:** Does NOT solve cross-machine recovery, runner handoffs, or unattended cloud automation.
+- **Mode (b) — Ephemeral GitHub-Hosted Actions Runners for Unattended Automation:**
+  - GitHub-hosted runners (`ubuntu-latest`, `windows-latest`) are ephemeral virtual machines provisioned on demand for a single job and decommissioned immediately upon completion or abortion.
+  - Any local filesystem artifact, temporary directory, or in-memory state vanishes upon VM teardown.
+  - Subsequent scheduled or triggered jobs execute on entirely separate, isolated VM instances with zero access to the previous runner's local disk.
+  - **Limitation:** A local manifest or local lockfile on Runner A is completely inaccessible to Runner B during crash recovery.
+
+#### 2. Why Local Mechanisms & Actions Artifacts Do Not Solve Cross-Runner Ownership
+
+Local durability strategies and standard CI artifacts cannot provide crash-safe cross-runner ownership:
+
+1. **Local SQLite WAL:** SQLite Write-Ahead Logging (`PRAGMA journal_mode=WAL`, `PRAGMA synchronous=FULL`) provides crash durability across process failures *on a single host*. In an ephemeral Actions runner, the database, WAL file, and shared-memory files reside on the runner's ephemeral disk and evaporate upon VM termination.
+2. **Workspace & OS Temp Files:** Local manifest JSON files in `/tmp` or the repository workspace are lost when the runner instance is decommissioned.
+3. **GitHub Actions Artifacts:** Actions artifacts are uploaded asynchronously by post-job steps. If a runner crashes abruptly (VM termination, timeout, hard abort, kernel panic, or runner cancellation), artifact upload steps never execute. Furthermore, artifacts are eventually consistent, non-transactional, and cannot be synchronously inspected mid-run by parallel or recovering runners.
+
+#### 3. Candidate Architecture: Provider-Persistent Run Ownership Journal (Inert Contract)
+
+To support unattended cross-runner recovery, ownership state must be persisted in a shared, provider-level storage mechanism accessible to subsequent runners:
+
+- **Intent-Before-Effect Ordering:**
+  1. **Phase 1 (Intent Registration):** Runner writes an intent record (`INTENT_RECORDED`) to the remote journal specifying its unique canonical `run_id`, `runner_id`, intent stage (`LIVE_02`, etc.), and registered target entity identities.
+  2. **Phase 2 (Effect Mutation):** Only after intent is durably acknowledged does the runner dispatch mutation statements.
+  3. **Phase 3 (Effect Confirmation):** Upon verified completion, the runner updates the journal status to `EFFECT_COMMITTED` (or `ABORTED` on handled failure).
+
+#### 4. The Two-Transaction Decoupling Problem & Remote Intent Vulnerability
+
+A fundamental distributed systems constraint governs remote intent registration:
+
+> [!CRITICAL]
+> **Intent Registration is Itself a Remote Network Operation:**
+> The journal intent insert is subject to network drops, gateway timeouts, HTTP 500/502/504 errors, and **ambiguous COMMITs**. It cannot simply be assumed durable.
+>
+> **The Two-Transaction Impossibility Window:**
+> If intent registration and entity effect mutations are separate transactions, an atomic guarantee between intent and effect is impossible without two-phase commit (2PC) or single-transaction atomic batching. A runner can experience:
+> 1. Ambiguous intent COMMIT: The runner cannot know whether the intent was recorded on the provider; mutations must strictly NOT proceed.
+> 2. Acknowledged intent + Ambiguous effect COMMIT: The intent was recorded, but the effect transaction outcome is uncertain.
+> 3. Acknowledged intent + Runner Crash: Runner A terminates after intent registration; Runner B finds an intent record with no corresponding committed effect rows.
+
+#### 5. Evaluation of Schema v6 `durable_recovery_state` as Candidate Journal Table
+
+The existing Schema v6 table `durable_recovery_state` was inspected as a candidate journal backend:
+
+```sql
+CREATE TABLE IF NOT EXISTS durable_recovery_state (
+    state_key TEXT PRIMARY KEY,
+    stage TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    batch_id TEXT,
+    last_processed_id TEXT,
+    state_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+```
+
+**Architectural Evaluation & Constraints:**
+1. **Namespace & Ownership Collision:** In LIVE-06 and LIVE-08, `durable_recovery_state` is already utilized as a *synthetic test entity* (`synth_stage_{run_id}::current`). In LIVE-08, automated cleanup deletes registered synthetic targets, including rows in `durable_recovery_state`. Utilizing this table simultaneously as the operational cross-runner journal creates an immediate lifecycle conflict: automated cleanup could delete the recovery journal before the session outcome is confirmed.
+2. **Schema Isolation Limits:** The schema was designed for sequential batch processing, lacking dedicated columns for cryptographic manifest seals, multi-entity target inventories, runner identity fencing, and intent-vs-effect state machines.
+3. **Transaction Isolation:** Inserting journal records into the same table used for synthetic test assertions risks query cross-talk during preflight collision scans (LIVE-01) and audit queries (LIVE-08).
+4. **Strict Boundary:** Schema v6 table semantics must NOT be altered, migrated, or wired to remote Turso writes without a separate, explicit PO architectural decision.
+
+#### 6. Product Owner Architectural Decision Gate (Options)
+
+Before any cross-runner live recovery mechanism can be implemented, the Product Owner must decide:
+
+- **Option A: Persistent-Host Staging Only (Keep GitHub Actions Offline-Only).**
+  Restrict live staging execution strictly to an owner-operated persistent Linux workstation. GitHub Actions remains strictly hermetic/offline. Avoids all remote journal complexity and schema migrations.
+- **Option B: Dedicated Remote Ownership Journal Table (Schema v7 Migration).**
+  Design and migrate a dedicated, isolated table (e.g. `staging_run_journal`) with explicit fencing tokens, cryptographic digests, and separate lifecycle management outside synthetic test targets. Requires PO approval and schema version bump.
+- **Option C: Single-Transaction Atomic Batching (Hrana Pipeline Transaction Coupling).**
+  Enclose both the intent record and the entity mutations within a single Hrana v2 pipeline transaction (`BEGIN`, intent insert, effect inserts, `COMMIT`), eliminating the two-transaction failure window.
+  *Note on Complementary Relationship with Option B:* Option C addresses transaction-level atomic coupling, but is not a standalone solution for Runner B discovering Runner A's run ID or inspecting residual records after Runner A's ephemeral runner VM is decommissioned. Runner B still requires a discoverable, provider-persistent journal store (Option B). Furthermore, even a combined pipeline transaction can suffer an ambiguous COMMIT on the wire, requiring discovery and manual reconciliation. Options B and C are therefore potentially **complementary**, not mutually exclusive standalone alternatives.
+
+> [!NOTE]
+> Antigravity does **not** choose, assume, or silently implement any live backend option. Live writes remain permanently blocked.
+
+---
+
 ## 6. Separation of Software Cleanup vs. Manual Dashboard Operations
 
 Software-level execution and cloud platform administration must never be conflated. Software cannot guarantee third-party cloud dashboard settings or token revocations:

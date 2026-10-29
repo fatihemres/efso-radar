@@ -14,9 +14,23 @@
 | Phase 5B.3F | Hermetic reliability/concurrency and recovery validation | [PR #12](https://github.com/fatihemres/efso-radar/pull/12), [Issue #11](https://github.com/fatihemres/efso-radar/issues/11) | **INTEGRATED / OFFLINE VERIFIED** |
 | Phase 5B.3G-A | Controlled live staging *specification*, without live execution | [PR #14](https://github.com/fatihemres/efso-radar/pull/14) | **INTEGRATED (DESIGN)** |
 | Phase 5B.3G-B | Hermetic eight-step mock staging runner, strict safety barriers | [PR #16](https://github.com/fatihemres/efso-radar/pull/16) | **INTEGRATED / OFFLINE VERIFIED** |
-| Phase 5B.3G-C | Controlled staging safeguards, manifest store, offline recovery, DACL evidence and durability contract | [Issue #13](https://github.com/fatihemres/efso-radar/issues/13), [Issue #41](https://github.com/fatihemres/efso-radar/issues/41), [Issue #43](https://github.com/fatihemres/efso-radar/issues/43), [plan](docs/PHASE5B3G_LIVE_STAGING_RELIABILITY_PLAN.md) | **PR #35/#36/#38/#40/#42 INTEGRATED (OFFLINE) / ISSUE #43 CANDIDATE (PR #44 DRAFT) / LIVE BLOCKED** |
+| Phase 5B.3G-C | Controlled staging safeguards, manifest store, offline recovery, DACL evidence, durability and cross-runner recovery contract | [Issue #13](https://github.com/fatihemres/efso-radar/issues/13), [Issue #41](https://github.com/fatihemres/efso-radar/issues/41), [Issue #43](https://github.com/fatihemres/efso-radar/issues/43), [Issue #45](https://github.com/fatihemres/efso-radar/issues/45), [plan](docs/PHASE5B3G_LIVE_STAGING_RELIABILITY_PLAN.md) | **PR #35/#36/#38/#40/#42/#44 INTEGRATED (OFFLINE) / ISSUE #45 CANDIDATE / LIVE BLOCKED** |
 | Follow-on cloud cutover & unattended operations | Cloud parity, backups, zero-cost controls, human editorial recipient tests, PO release decision | Existing Phase 5 architecture; future issue required | **DISCOVERY / NOT AUTHORIZED** |
 | Rights and distribution | Review third-party origins and decide visibility/distribution | [Issue #17](https://github.com/fatihemres/efso-radar/issues/17) | **IN PROGRESS (AUDIT)** |
+
+## 2026-10-29 Phase 5B.3G-C Cross-Runner Ownership & Recovery Architecture Contract Checkpoint (Issue #45)
+
+Offline cross-runner ownership and recovery architecture contract implemented in `src/efso_radar/staging/offline_recovery_evidence.py` with deterministic contract tests (`TestCrossRunnerOwnershipRecoveryContract` in `tests/test_phase5b3g_c_cross_runner_recovery_offline.py`):
+- Operational mode distinction: Mode (a) controlled one-off staging on persistent Linux host vs. Mode (b) unattended automation on ephemeral GitHub-hosted Actions runners.
+- Documented why local SQLite WAL, workspace/temp files, or Actions artifacts alone do not provide cross-runner durability (destroyed with runner VM; asynchronous/non-transactional).
+- Provider-persistent run ownership journal candidate architecture: intent-before-effect sequencing (`INTENT_RECORDED` -> effect -> `EFFECT_COMMITTED` / `ABORTED`).
+- Formalized the two-transaction decoupling impossibility: intent registration is itself a remote network operation subject to ambiguous COMMITs; separate transactions cannot guarantee atomic durability without 2PC or single-transaction batching.
+- Evaluated Schema v6 `durable_recovery_state` table: identified namespace/lifecycle collision with LIVE-06 synthetic targets and LIVE-08 cleanup deletion, schema isolation constraints, and query cross-talk risks.
+- Aligned LIVE-06 synthetic key to `synth_stage_{run_id}::current` in plan §5.9.5 and clarified that Option B (shared durable journal) and Option C (atomic batching) are potentially complementary rather than mutually exclusive.
+- Pure inert contract models: `CrossRunnerJournalEntry`, `CrossRunnerJournalStatus`, `CrossRunnerReview`, and `review_cross_runner_recovery_evidence()` with permanent `remote_state="UNKNOWN"` and `action="MANUAL_REVIEW_ONLY"`.
+- Remediation fixes: strict 5-entity canonical target inventory validation, removal of caller-controlled `AUTHENTICATED_REMOTE` provenance, sanitized fixed-string review reasons preventing secret token or identifier leakage, valid-format runner ID redaction via fixed sentinel role label (`VALIDATED_RECOVERY_RUNNER`), and clarified offline replay evaluation wording.
+- PO architectural options documented: Option A (persistent-host staging only), Option B (dedicated remote journal table with Schema v7 migration), Option C (single-transaction atomic batching). Live writes remain permanently blocked.
+- Verification: 19 passed in `test_phase5b3g_c_cross_runner_recovery_offline.py`; full hermetic suite 1100 passed, 18 skipped, 276 subtests passed.
 
 ## 2026-10-29 Issue #41 — Windows DACL offline evidence (INTEGRATED in PR #42)
 
@@ -66,7 +80,9 @@ Persistent manifest store foundation implemented under `PersistentManifestStore`
 - Architectural inconsistency documented: noted the contradiction between the historical 80-request cutoff automatic LIVE-08 transition and PR #35's strict monotonic stage sequence, proposing safe policy (no automatic cleanup on early failure; retain manifest fail-closed; separate controlled recovery).
 - All live staging operations remain **UNAUTHORIZED**; Block Writes remains ON. 43 focused store tests passing (3 skipped on Windows due to unprivileged symlink creation; 46 total), 267 passed across all Phase 5B.3G tests, 768 passed across full hermetic suite, Ruff clean, GitHub Actions CI run 40681304111 clean across all 4 matrix jobs. Ready for independent review.
 
-## 2026-10-29 Phase 5B.3G-C Windows Manifest Durability Crash-Window Contract Checkpoint (Issue #43)
+## 2026-10-29 Phase 5B.3G-C Windows Manifest Durability Crash-Window Contract Checkpoint (Issue #43; INTEGRATED in PR #44)
+
+*(Addendum 2026-10-29: PR #44 subsequently integrated into main at commit 93f66dfcfc40c11ddadbcf02ef71126182e62a8f; post-merge main CI #40932592589 4/4 PASS; dated candidate text below retained for historical provenance.)*
 
 Offline Windows manifest durability crash-window contract implemented in `src/efso_radar/staging/persistent_manifest_store.py` with full deterministic fault-injection matrix (`TestWindowsManifestDurabilityCrashWindows` in `tests/test_phase5b3g_c_persistent_manifest_store_offline.py`):
 - Explicit evidence hierarchy established: (a) process restart, (b) test-owned subprocess termination, (c) mocked crash windows, (d) physical machine reboot, (e) sudden hardware power loss. Passing (a)–(c) does NOT prove (d)–(e).
