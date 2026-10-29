@@ -1,8 +1,19 @@
 # Efso Radar — Project Checkpoint
 
-**Verified snapshot date:** 2026-10-29 (Issue #41 onboarding; NOT a live status feed)
+**Verified snapshot date:** 2026-10-29 (Issue #43 durability contract onboarding; NOT a live status feed)
 **Canonical repository:** [fatihemres/efso-radar](https://github.com/fatihemres/efso-radar)
-**Baseline inspected:** refreshed `origin/main` at `22090a54b6fca42146b0fadb39134dbf0694fce7` (PR #40 integrated). Earlier checkpoints below retain their dated baselines.
+**Baseline inspected:** refreshed `origin/main` at `e428eb8b71bd79ba63b6ffe8b2b41dd4f732da9e` (PR #42 integrated). Earlier checkpoints below retain their dated baselines.
+
+## Issue #43 — Windows manifest durability crash-window contract candidate (2026-10-29)
+
+- **IMPLEMENTED / NOT INTEGRATED / NOT PO ACCEPTED:** strictly offline Windows manifest durability crash-window contract and fault-injection matrix.
+- Enforces an explicit 5-level durability evidence hierarchy: (a) process restart, (b) test-owned subprocess termination, (c) mocked failure/crash windows, (d) physical reboot, and (e) sudden hardware power loss. Explicit non-proof contract: passing offline tests at levels (a)–(c) does NOT prove physical reboot or power-loss resilience (d)–(e).
+- Evaluates Windows NTFS publication strategies against Microsoft Learn documentation: highlights that `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` (0x08) has no effect on same-volume moves, and directory `FlushFileBuffers` returns `ERROR_ACCESS_DENIED` on Windows NTFS.
+- Introduces `ManifestCrashWindow` enum, `CrashWindowContract` dataclass, and `verify_pre_remote_write_durability_gate()` which programmatically fails closed in live mode on Windows or whenever directory fsync is unproven, preventing uncommitted local manifests from authorizing remote mutations.
+- Defines clear PO architectural options: Option 1 (maintain POSIX-only live manifest store, keep Windows offline-only), Option 2 (transition to embedded SQLite WAL manifest store), or Option 3 (explicit PO staging-only waiver for Windows directory fsync). Antigravity does not choose or silently implement any live backend option.
+- **Local focused evidence:** Windows Python 3.12.10: 53 passed / 3 skipped in `test_phase5b3g_c_persistent_manifest_store_offline.py` (including all 10 new crash window tests in `TestWindowsManifestDurabilityCrashWindows`); 135 passed in `test_phase5b3g_c_windows_dacl_evidence_offline.py`.
+- **Full hermetic suite:** 1079 passed, 18 skipped, 276 subtests passed in 127.50s on Windows Python 3.12.10.
+- All live staging operations remain strictly unauthorized; Turso Block Writes remains ON; $0.00 / 0 TRY hard ceiling preserved. STOP for independent ChatGPT re-review and explicit PO approval.
 
 ## Issue #41 — Windows DACL offline evidence candidate (2026-10-29)
 

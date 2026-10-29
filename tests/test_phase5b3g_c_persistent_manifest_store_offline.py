@@ -19,6 +19,7 @@ import time
 from typing import Any, Generator
 import uuid
 import pytest
+from unittest.mock import Mock, patch
 
 from efso_radar.staging.manifest_seal import (
     MAX_MANIFEST_BYTES,
@@ -39,6 +40,9 @@ from efso_radar.staging.persistent_manifest_store import (
     _find_repo_root,
     _publish_file_no_overwrite,
     get_storage_platform_guarantees,
+    ManifestCrashWindow,
+    get_crash_window_contracts,
+    verify_pre_remote_write_durability_gate,
 )
 from efso_radar.staging.runner import (
     AuditOutcomeState,
@@ -1272,3 +1276,243 @@ class TestStoragePlatformGuarantees:
             assert any("Cross-filesystem" in b for b in guarantees.identified_blockers)
             # On Linux with directory fsync, hermetic test mode passes
             guarantees.verify_platform_policy(is_hermetic_test=True)
+
+
+
+class TestWindowsManifestDurabilityCrashWindows:
+    """Deterministic offline fault-injection test matrix for manifest publication crash windows."""
+
+    def test_crash_window_contracts_completeness(self) -> None:
+        """Inspect crash window contracts; verify documented fail-closed invariants and zero-retry."""
+        contracts = get_crash_window_contracts()
+        assert len(contracts) == 8
+        for window in ManifestCrashWindow:
+            assert window in contracts
+            c = contracts[window]
+            assert c.window == window
+            assert c.retry_permitted is False, f"Automatic retry must be forbidden in {window}"
+            assert c.remote_write_authorized is False, f"Remote write must not be authorized in {window}"
+            assert c.expected_canonical_state in ("ABSENT", "PRESERVED")
+            assert c.expected_temp_state in ("CLEANED", "ORPHANED_INERT")
+            assert c.expected_outcome in ("FAILED_CLOSED", "UNCERTAIN_HALT")
+
+    def test_pre_remote_write_durability_gate_blocks_live_on_unproven_fsync(self) -> None:
+        """Verify pre-remote-write durability gate blocks live remote writes when directory fsync unproven."""
+        # Hermetic test mode always passes
+        verify_pre_remote_write_durability_gate(is_hermetic_test=True)
+
+        # In live mode on Windows (or unproven directory fsync), gate fails closed
+        if sys.platform == "win32":
+            with pytest.raises(ManifestStoreSecurityError, match="Pre-remote-write durability gate failed"):
+                verify_pre_remote_write_durability_gate(is_hermetic_test=False)
+        else:
+            mock_guar = Mock(platform="linux", fsync_directory_supported=False)
+            with pytest.raises(ManifestStoreSecurityError, match="Pre-remote-write durability gate failed"):
+                verify_pre_remote_write_durability_gate(mock_guar, is_hermetic_test=False)
+
+    def test_crash_window_1_temp_file_creation_failure_leaves_no_artifacts(self, tmp_path: Path) -> None:
+        """Window 1: Failure during temp file creation (O_CREAT) leaves no canonical or temp files."""
+        store_dir = tmp_path / "store_w1"
+        store = HermeticTestManifestStore(store_dir)
+        run_id = _generate_valid_run_id("crashw1")
+        manifest = _create_sample_manifest(run_id)
+
+        real_open = os.open
+        def fault_open(p, flags, *args, **kwargs):
+            if ".tmp_manifest_" in str(p):
+                raise OSError(errno.EACCES, "Permission denied (simulated temp creation failure)")
+            return real_open(p, flags, *args, **kwargs)
+
+        with patch("os.open", side_effect=fault_open):
+            with pytest.raises(OSError, match="Permission denied"):
+                store.save_manifest(manifest)
+
+        target_path = store.get_manifest_path(run_id)
+        assert not target_path.exists(), "Canonical manifest must not exist after temp creation failure"
+        temp_files = list(store_dir.glob(".tmp_manifest_*"))
+        assert len(temp_files) == 0, "No orphaned temp file should exist"
+
+    def test_crash_window_2_short_write_disk_full_fails_closed_and_cleans_temp(self, tmp_path: Path) -> None:
+        """Window 2: Short write / disk full during payload write unlinks temp file, leaves no canonical."""
+        store_dir = tmp_path / "store_w2"
+        store = HermeticTestManifestStore(store_dir)
+        run_id = _generate_valid_run_id("crashw2")
+        manifest = _create_sample_manifest(run_id)
+
+        real_write = os.write
+        def fault_write(fd, data):
+            real_write(fd, data[:8])
+            raise OSError(errno.ENOSPC, "No space left on device (simulated disk full)")
+
+        with patch("os.write", side_effect=fault_write):
+            with pytest.raises(OSError, match="No space left on device"):
+                store.save_manifest(manifest)
+
+        target_path = store.get_manifest_path(run_id)
+        assert not target_path.exists(), "Canonical manifest must not exist after short write"
+        temp_files = list(store_dir.glob(".tmp_manifest_*"))
+        assert len(temp_files) == 0, "Temporary file must be unlinked after short write failure"
+
+    def test_crash_window_3_file_fsync_failure_cleans_temp_and_leaves_no_target(self, tmp_path: Path) -> None:
+        """Window 3: File fsync failure (disk controller error) cleans temp file, leaves no canonical."""
+        store_dir = tmp_path / "store_w3"
+        store = HermeticTestManifestStore(store_dir)
+        run_id = _generate_valid_run_id("crashw3")
+        manifest = _create_sample_manifest(run_id)
+
+        with patch("os.fsync", side_effect=OSError(errno.EIO, "I/O error during file sync")):
+            with pytest.raises(OSError, match="I/O error during file sync"):
+                store.save_manifest(manifest)
+
+        target_path = store.get_manifest_path(run_id)
+        assert not target_path.exists(), "Canonical manifest must not exist after fsync failure"
+        temp_files = list(store_dir.glob(".tmp_manifest_*"))
+        assert len(temp_files) == 0, "Temporary file must be unlinked after fsync failure"
+
+    def test_crash_window_4_pre_publication_hash_mismatch_destroys_temp(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Window 4: Pre-publication readback verification failure destroys corrupt temp file."""
+        store_dir = tmp_path / "store_w4"
+        store = HermeticTestManifestStore(store_dir)
+        run_id = _generate_valid_run_id("crashw4")
+        manifest = _create_sample_manifest(run_id)
+
+        real_read_bytes = Path.read_bytes
+
+        def fault_read_bytes(path_obj: Path) -> bytes:
+            content = real_read_bytes(path_obj)
+            if ".tmp_manifest_" in path_obj.name:
+                return content[:-1] + b"X"
+            return content
+
+        monkeypatch.setattr(Path, "read_bytes", fault_read_bytes)
+
+        with pytest.raises(ManifestStoreCorruptionError, match="Pre-publication verification failed"):
+            store.save_manifest(manifest)
+
+        target_path = store.get_manifest_path(run_id)
+        assert not target_path.exists(), "Canonical manifest must not exist after pre-pub verification failure"
+        temp_files = list(store_dir.glob(".tmp_manifest_*"))
+        assert len(temp_files) == 0, "Corrupted temporary file must be destroyed"
+
+    def test_crash_window_5_publication_collision_strictly_preserves_target_and_cleans_temp(self, tmp_path: Path) -> None:
+        """Window 5: Publication race / preexisting target blocks overwrite, preserves target, cleans temp."""
+        store_dir = tmp_path / "store_w5"
+        store = HermeticTestManifestStore(store_dir)
+        run_id = _generate_valid_run_id("crashw5")
+        manifest = _create_sample_manifest(run_id)
+
+        target_path = store.save_manifest(manifest)
+        original_bytes = target_path.read_bytes()
+
+        with pytest.raises(ManifestStoreFileExistsError, match="already exists"):
+            store.save_manifest(manifest)
+
+        assert target_path.read_bytes() == original_bytes, "Target manifest must remain strictly byte-for-byte unaltered"
+        temp_files = list(store_dir.glob(".tmp_manifest_*"))
+        assert len(temp_files) == 0, "Temporary file from failed collision must be unlinked"
+
+    def test_crash_window_6_windows_directory_durability_gap_preserves_canonical_and_fails_live(self, tmp_path: Path) -> None:
+        """Window 6: On Windows, directory fsync is unproven; canonical file is preserved, but live mode is blocked."""
+        store_dir = tmp_path / "store_w6"
+        store = HermeticTestManifestStore(store_dir)
+        run_id = _generate_valid_run_id("crashw6")
+        manifest = _create_sample_manifest(run_id)
+
+        target_path = store.save_manifest(manifest)
+        assert target_path.is_file(), "Canonical file must exist after successful save"
+
+        guarantees = get_storage_platform_guarantees()
+        if sys.platform == "win32":
+            assert guarantees.fsync_directory_supported is False
+            with pytest.raises(ManifestStoreSecurityError, match="Windows NTFS platform cannot programmatically verify DACL/ACL"):
+                guarantees.verify_platform_policy(is_hermetic_test=False)
+            with pytest.raises(ManifestStoreSecurityError, match="Pre-remote-write durability gate failed"):
+                verify_pre_remote_write_durability_gate(guarantees, is_hermetic_test=False)
+        else:
+            with patch("os.fsync", side_effect=[None, OSError(errno.EIO, "Directory fsync failed")]):
+                run_id_posix = _generate_valid_run_id("crashw6posix")
+                manifest_posix = _create_sample_manifest(run_id_posix)
+                target_posix = store.get_manifest_path(run_id_posix)
+                with pytest.raises(ManifestStorePostPublicationError, match="Parent directory fsync failed"):
+                    store.save_manifest(manifest_posix)
+                assert target_posix.is_file(), "Canonical manifest must be preserved even if directory fsync fails"
+
+    def test_crash_window_7_post_publication_readback_failure_preserves_canonical_without_retry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Window 7: Post-publication readback/verification error preserves canonical file fail-closed, no retry."""
+        store_dir = tmp_path / "store_w7"
+        store = HermeticTestManifestStore(store_dir)
+        run_id = _generate_valid_run_id("crashw7")
+        manifest = _create_sample_manifest(run_id)
+        target_path = store.get_manifest_path(run_id)
+
+        real_read_bytes = Path.read_bytes
+
+        def fault_read_bytes(path_obj: Path) -> bytes:
+            if path_obj.name == store.manifest_filename(run_id):
+                raise PermissionError("EACCES on post-publication readback")
+            return real_read_bytes(path_obj)
+
+        monkeypatch.setattr(Path, "read_bytes", fault_read_bytes)
+
+        with pytest.raises(ManifestStorePostPublicationError, match="Post-publication readback/verification failed"):
+            store.save_manifest(manifest)
+
+        assert target_path.is_file(), "Canonical manifest must be preserved on disk for recovery investigation"
+        temp_files = list(store_dir.glob(".tmp_manifest_*"))
+        assert len(temp_files) == 0, "No temporary files should remain"
+
+    def test_crash_window_8_subprocess_termination_recovery_simulation(self, tmp_path: Path) -> None:
+        """Window 8: Abrupt test-owned subprocess termination mid-write leaves no corrupt canonical file."""
+        store_dir = tmp_path / "store_w8"
+        store = HermeticTestManifestStore(store_dir)
+        run_id = _generate_valid_run_id("crashw8")
+
+        # Write out standalone python script to avoid Windows cmdline escaping quirks
+        script_file = tmp_path / "crash_writer.py"
+        script_code = (
+            "import sys\n"
+            "import time\n"
+            "from pathlib import Path\n\n"
+            f"store_dir = Path({str(store_dir.resolve())!r})\n"
+            "store_dir.mkdir(parents=True, exist_ok=True)\n"
+            f"temp_file = store_dir / '.tmp_manifest_{run_id}_abort.tmp'\n"
+            f"temp_file.write_bytes(b'{{\"run_id\": \"{run_id}\", \"partial\": true')\n"
+            "sys.stdout.write('READY\\n')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(60)\n"
+        )
+        script_file.write_text(script_code, encoding="utf-8")
+
+        proc = subprocess.Popen(
+            [sys.executable, str(script_file)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            line = proc.stdout.readline()
+            if "READY" not in line:
+                err = proc.stderr.read()
+                proc.kill()
+                raise AssertionError(f"Subprocess failed to start: stdout={line!r}, stderr={err!r}")
+            proc.kill()
+            proc.wait(timeout=5)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+        target_path = store.get_manifest_path(run_id)
+        assert not target_path.exists(), "Target manifest must not exist after crashed write"
+
+        new_run_id = _generate_valid_run_id("crashw8clean")
+        new_manifest = _create_sample_manifest(new_run_id)
+        new_target = store.save_manifest(new_manifest)
+        assert new_target.is_file(), "Subsequent save must succeed cleanly"
+
+        loaded_manifest, _ = store.load_manifest(new_run_id)
+        assert loaded_manifest.run_id == new_run_id

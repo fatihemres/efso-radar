@@ -473,6 +473,82 @@ Reports contain only `POLICY_MATCH` / `INSECURE` / `UNVERIFIABLE`, fixed reason 
 7. Win32 descriptor fault-injection tests (`test_win32_descriptor_fault_injection_*`) deterministically verify `_read_handle_descriptor` error paths: `GetSecurityInfo` API failure (no leak, `LocalFree` not called), non-self-relative and invalid revision layout detection (`LocalFree` guaranteed on error), absent DACL with stale non-null out-pointer safety (no invalid memory dereference), and NULL DACL handling. Native thread/process token retrieval and OS handle creation boundaries remain standard Win32 ctypes calls and are acknowledged as nonblocking operational limits rather than fully emulated.
 8. Local evidence updated: 178 focused tests passed / 3 skipped / 0 deselected on Windows Python 3.12.10 (49 net additional adversarial test cases over the initial 129). Full suite: 1069 passed, 18 skipped, 276 subtests passed. [VERIFICATION](../VERIFICATION.md) and the draft PR distinguish local evidence from exact-head Linux/Windows CI. STOP for independent ChatGPT review and selective Argon adversarial review, then separate explicit PO squash-merge approval. No merge, ACL change, live activation, cloud contact or release is authorized.
 
+### 5.8. Issue #43 — Windows manifest durability crash-window contract (2026-10-29)
+
+**Candidate engineering policy and fault-injection matrix; NOT physical durability certification, live-storage authorization, or PO acceptance.**
+
+#### 1. Explicit Durability Evidence Hierarchy
+
+Durability claims must respect a strict, transparent evidence hierarchy. Lower levels of evidence do not imply or prove higher levels:
+
+1. **Level (a) — Process Restart:** Normal, clean interpreter exit where all buffers and open descriptors are flushed, followed by subsequent startup loading persisted state from disk.
+2. **Level (b) — Test-Owned Subprocess Termination:** Abrupt, ungraceful process termination (`kill()` / `TerminateProcess` / `SIGKILL`) mid-write, verifying that partial/uncommitted writes leave no corrupt canonical manifest or ambiguous state.
+3. **Level (c) — Mocked Failure / Crash Windows:** Deterministic fault injection simulating exact OS/filesystem failure points (disk full, controller I/O error, pre-publication corruption, name collision, unproven directory sync, post-publication readback failure) across Windows 1–8.
+4. **Level (d) — Physical Machine Reboot:** Operating system shutdown or restart where the OS kernel flushes dirty page cache buffers to non-volatile controller queues before CPU halt.
+5. **Level (e) — Sudden Hardware Power Loss:** Catastrophic hardware power interruption where power ceases instantaneously, exposing volatile drive DRAM write caches and in-flight controller transactions.
+
+> [!CRITICAL]
+> **Non-Proof Contract:** Deterministic simulation of Levels (a), (b), and (c) within the offline test suite **does NOT prove or guarantee resilience at Levels (d) or (e)**. Passing offline crash-window tests must never be described, represented, or conflated as proof of physical power-loss or machine-reboot durability.
+
+#### 2. Physical Storage & Hardware Assumptions
+
+Physical crash resilience on commodity hardware depends on low-level controller and filesystem behaviors that cannot be guaranteed by user-space application code alone:
+
+- **SSD Volatile Write Caching:** Modern consumer-grade NVMe/SATA SSDs frequently acknowledge write operations (`FlushFileBuffers` or write commands) as soon as data resides in the drive's volatile on-board DRAM cache. Without hardware Power Loss Protection (PLP) capacitors found in enterprise datacenter drives, sudden power loss causes dirty volatile cache lines to evaporate, even if the OS kernel believed data was committed.
+- **NTFS Journaling vs. User Data:** The NTFS Metadata Journal (`$LogFile` and USN Journal) guarantees filesystem metadata consistency (preventing filesystem structure corruption or raw volume inconsistency), but does **NOT** guarantee that user data stream contents or directory-entry modifications are flushed to non-volatile media synchronously without explicit flush operations.
+- **Privilege & Platform Constraints on Directory Fsync:** Calling `FlushFileBuffers` on directory handles returns `ERROR_ACCESS_DENIED` on Windows NTFS. CPython's `os.fsync(dir_fd)` explicitly fails on Windows directory descriptors. Volume-level flushing (`\\.\C:`) requires Administrator privileges, unavailable to standard unprivileged staging processes.
+- **External Storage & Virtualization:** Storage over mapped networks, SMB/NFS mounts, USB drives, or virtualized hypervisor disks (e.g., WSL2 or hypervisor virtual disks) may silently discard or buffer write-through flags unless explicitly configured for synchronous write-through durability.
+
+#### 3. Comparison of Windows Publication Strategies
+
+We evaluate four primary strategies for publishing atomic, crash-durable manifest files on Windows NTFS using authoritative Microsoft documentation:
+
+| Strategy | Mechanism | Microsoft Learn Reference | Durability & Platform Limitations |
+| --- | --- | --- | --- |
+| **Strategy A (Current Baseline)** | Write temporary file -> `os.fsync(temp_fd)` -> Atomic no-overwrite publish via Win32 `MoveFileWithProgressW` (Windows) / `renameat2(RENAME_NOREPLACE)` (POSIX) -> Post-publication verification. | [MoveFileWithProgressW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefilewithprogressw) | **Directory Metadata Crash Gap:** File contents are synced to disk via `os.fsync()`, but the containing directory link is subject to Windows NTFS lazy cache manager flush (up to several seconds). Sudden power loss before directory flush can leave the canonical manifest missing or unlinked. |
+| **Strategy B (MoveFileExW with MOVEFILE_WRITE_THROUGH)** | Publish file using Win32 `MoveFileExW` passing `MOVEFILE_WRITE_THROUGH` (0x00000008). | [MoveFileExW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw) | **Zero Effect on Same-Volume Moves:** Microsoft Learn explicitly documents: *"This flag has no effect if the move operation is within the same volume."* Because atomic publication strictly requires source and destination to reside on the same volume to avoid copy-delete semantics, `MOVEFILE_WRITE_THROUGH` does **NOT** flush directory metadata on NTFS. |
+| **Strategy C (Directory Handle FlushFileBuffers)** | Open directory handle and call `FlushFileBuffers(hDirectory)`. | [FlushFileBuffers](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers) | **Access Denied:** Microsoft Learn documents that calling `FlushFileBuffers` on a directory handle returns `ERROR_ACCESS_DENIED` (5). CPython's `os.fsync(dir_fd)` fails on Windows. Flushes at the volume level (`\\.\X:`) require Administrator privileges, which violates least-privilege execution. |
+| **Strategy D (Transactional WAL Store / SQLite Backend)** | Delegate atomic publication and crash-recovery journaling to an embedded engine (e.g., SQLite WAL mode with `synchronous=FULL` or `NORMAL`). | [SQLite WAL](https://www.sqlite.org/wal.html) | **Cross-Platform Resilience:** Replaces filesystem-level atomic rename and directory fsync dependencies with database-managed write-ahead logging and recovery rollback. Requires an architectural decision and PO approval before implementation. |
+
+#### 4. Deterministic Crash Window Fault-Injection Matrix (Windows 1–8)
+
+The offline manifest store candidate verifies fail-closed boundaries across 8 deterministic crash windows:
+
+| Window ID | Crash Window Description | Immediate Fault / Trigger | Expected Invariant & Recovery State | Remote Write Authorized? | Automatic Retry Permitted? |
+| --- | --- | --- | --- | :---: | :---: |
+| **WINDOW_1** | Temp file creation failure | `O_CREAT` denied (`EACCES` / `ENOSPC`) | Canonical: `ABSENT`<br>Temp: `CLEANED` (none leaked)<br>Outcome: `FAILED_CLOSED` | **NO** | **NO** |
+| **WINDOW_2** | Short write / disk full during payload write | Incomplete `os.write()` / `ENOSPC` | Canonical: `ABSENT`<br>Temp: `CLEANED` (unlinked immediately)<br>Outcome: `FAILED_CLOSED` | **NO** | **NO** |
+| **WINDOW_3** | File content fsync failure | `os.fsync()` failure (`EIO`) | Canonical: `ABSENT`<br>Temp: `CLEANED` (unlinked immediately)<br>Outcome: `FAILED_CLOSED` | **NO** | **NO** |
+| **WINDOW_4** | Pre-publication verification failure | Size or SHA-256 mismatch on temp readback | Canonical: `ABSENT`<br>Temp: `CLEANED` (corrupted temp destroyed)<br>Outcome: `FAILED_CLOSED` | **NO** | **NO** |
+| **WINDOW_5** | Publication collision / race condition | Target manifest already exists on disk | Canonical: `PRESERVED` (unmodified byte-for-byte)<br>Temp: `CLEANED` (unlinked immediately)<br>Outcome: `FAILED_CLOSED` | **NO** | **NO** |
+| **WINDOW_6** | Windows directory durability gap | Directory entry fsync unsupported/unproven | Canonical: `PRESERVED`<br>Temp: `CLEANED`<br>Outcome: `UNCERTAIN_HALT` | **NO** (Blocks LIVE) | **NO** |
+| **WINDOW_7** | Post-publication readback/verification failure | `OSError` / permission error on canonical readback | Canonical: `PRESERVED`<br>Temp: `CLEANED`<br>Outcome: `UNCERTAIN_HALT` | **NO** | **NO** |
+| **WINDOW_8** | Abrupt process termination mid-write | `kill()` / `TerminateProcess` mid-payload | Canonical: `ABSENT`<br>Temp: `ORPHANED_INERT` (inert, ignored)<br>Outcome: `FAILED_CLOSED` | **NO** | **NO** |
+
+#### 5. Testable Boundary Contract: Pre-Remote-Write Durability Gate
+
+To prevent partial or uncommitted local manifests from authorizing remote database mutations, `PersistentManifestStore` enforces a formal pre-remote-write durability gate:
+
+- **Programmatic Gate:** `verify_pre_remote_write_durability_gate(guarantees, is_hermetic_test)`.
+- **Fail-Closed Rule:** Live remote mutation is strictly blocked (`ManifestStoreSecurityError`) if directory-level persistence (`fsync_directory_supported`) is unproven on the operating platform. On Windows NTFS, this gate permanently blocks live write authorization while permitting offline hermetic test fixtures.
+- **Zero Ambiguity:** Manifest file creation alone or clean process exit alone can **never** be cited as authorization to proceed to live database writes.
+
+#### 6. Product Owner Architectural Decision Gate
+
+Before any live staging mutation can be authorized on Windows, the Product Owner must explicitly select and approve one of the following architectural options:
+
+- **Option 1: Maintain POSIX-Only Live Manifest Store; Keep Windows Offline-Only.**
+  Live staging runs are restricted strictly to Linux hosts where directory fsync (`os.fsync(dir_fd)`) and POSIX 0700 file ownership are proven. Windows remains an offline development and hermetic test environment. Requires 0 new runtime code or dependencies.
+- **Option 2: Transition to Embedded SQLite WAL Manifest Store.**
+  Replace flat-file JSON publication with a local SQLite database using WAL mode (`PRAGMA journal_mode=WAL`, `PRAGMA synchronous=FULL`). SQLite manages atomic transaction commits and Windows NTFS crash recovery internally. Eliminates custom atomic rename and directory fsync limitations across both Windows and POSIX. Requires an architectural redesign and PO approval.
+- **Option 3: Explicit PO Staging-Only Waiver for Windows Directory Fsync.**
+  The Product Owner explicitly authorizes staging execution on Windows while acknowledging and accepting the residual risk: a sudden host machine reboot or power loss within the multi-second NTFS lazy-flush window could result in an unlinked manifest, requiring manual dashboard cleanup. Production use remains strictly prohibited.
+
+> [!NOTE]
+> Antigravity does **not** choose, assume, or silently implement any live backend option. Live writes remain permanently blocked.
+
+---
+
 ## 6. Separation of Software Cleanup vs. Manual Dashboard Operations
 
 Software-level execution and cloud platform administration must never be conflated. Software cannot guarantee third-party cloud dashboard settings or token revocations:

@@ -22,6 +22,7 @@ Platform limitations:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from datetime import datetime, timezone
 import errno
 import hashlib
@@ -173,6 +174,136 @@ def get_storage_platform_guarantees() -> StoragePlatformGuarantees:
             ),
         ],
     )
+
+
+class ManifestCrashWindow(str, Enum):
+    """Formal taxonomy of critical failure windows during manifest persistence."""
+
+    WINDOW_1_TEMP_CREATION = "WINDOW_1_TEMP_CREATION"
+    WINDOW_2_PARTIAL_WRITE = "WINDOW_2_PARTIAL_WRITE"
+    WINDOW_3_FILE_FSYNC = "WINDOW_3_FILE_FSYNC"
+    WINDOW_4_PRE_PUBLICATION_VERIFY = "WINDOW_4_PRE_PUBLICATION_VERIFY"
+    WINDOW_5_PUBLICATION_COLLISION = "WINDOW_5_PUBLICATION_COLLISION"
+    WINDOW_6_DIRECTORY_DURABILITY_GAP = "WINDOW_6_DIRECTORY_DURABILITY_GAP"
+    WINDOW_7_POST_PUBLICATION_VERIFY = "WINDOW_7_POST_PUBLICATION_VERIFY"
+    WINDOW_8_RECOVERY_REOPEN = "WINDOW_8_RECOVERY_REOPEN"
+
+
+@dataclass(frozen=True)
+class CrashWindowContract:
+    """Documented invariants and fail-closed outcomes per crash window."""
+
+    window: ManifestCrashWindow
+    description: str
+    expected_canonical_state: str  # "ABSENT" | "PRESERVED"
+    expected_temp_state: str       # "CLEANED" | "ORPHANED_INERT"
+    expected_outcome: str          # "FAILED_CLOSED" | "UNCERTAIN_HALT"
+    retry_permitted: bool = False
+    remote_write_authorized: bool = False
+
+
+_CRASH_WINDOW_CONTRACTS: dict[ManifestCrashWindow, CrashWindowContract] = {
+    ManifestCrashWindow.WINDOW_1_TEMP_CREATION: CrashWindowContract(
+        window=ManifestCrashWindow.WINDOW_1_TEMP_CREATION,
+        description="Failure before or during temporary file creation (O_CREAT / permission / descriptor exhaustion).",
+        expected_canonical_state="ABSENT",
+        expected_temp_state="CLEANED",
+        expected_outcome="FAILED_CLOSED",
+        retry_permitted=False,
+        remote_write_authorized=False,
+    ),
+    ManifestCrashWindow.WINDOW_2_PARTIAL_WRITE: CrashWindowContract(
+        window=ManifestCrashWindow.WINDOW_2_PARTIAL_WRITE,
+        description="Process crash, disk full (ENOSPC), or short write during payload serialization.",
+        expected_canonical_state="ABSENT",
+        expected_temp_state="CLEANED",
+        expected_outcome="FAILED_CLOSED",
+        retry_permitted=False,
+        remote_write_authorized=False,
+    ),
+    ManifestCrashWindow.WINDOW_3_FILE_FSYNC: CrashWindowContract(
+        window=ManifestCrashWindow.WINDOW_3_FILE_FSYNC,
+        description="File fsync failure flushing dirty buffer cache pages to drive media.",
+        expected_canonical_state="ABSENT",
+        expected_temp_state="CLEANED",
+        expected_outcome="FAILED_CLOSED",
+        retry_permitted=False,
+        remote_write_authorized=False,
+    ),
+    ManifestCrashWindow.WINDOW_4_PRE_PUBLICATION_VERIFY: CrashWindowContract(
+        window=ManifestCrashWindow.WINDOW_4_PRE_PUBLICATION_VERIFY,
+        description="Pre-publication readback verification failure (torn write or hash mismatch on temp file).",
+        expected_canonical_state="ABSENT",
+        expected_temp_state="CLEANED",
+        expected_outcome="FAILED_CLOSED",
+        retry_permitted=False,
+        remote_write_authorized=False,
+    ),
+    ManifestCrashWindow.WINDOW_5_PUBLICATION_COLLISION: CrashWindowContract(
+        window=ManifestCrashWindow.WINDOW_5_PUBLICATION_COLLISION,
+        description="Atomic publication race or preexisting target file (no-overwrite collision).",
+        expected_canonical_state="PRESERVED",
+        expected_temp_state="CLEANED",
+        expected_outcome="FAILED_CLOSED",
+        retry_permitted=False,
+        remote_write_authorized=False,
+    ),
+    ManifestCrashWindow.WINDOW_6_DIRECTORY_DURABILITY_GAP: CrashWindowContract(
+        window=ManifestCrashWindow.WINDOW_6_DIRECTORY_DURABILITY_GAP,
+        description="Publication succeeded but directory entry durability is unproven (Windows NTFS gap / POSIX dir fsync failure).",
+        expected_canonical_state="PRESERVED",
+        expected_temp_state="CLEANED",
+        expected_outcome="UNCERTAIN_HALT",
+        retry_permitted=False,
+        remote_write_authorized=False,
+    ),
+    ManifestCrashWindow.WINDOW_7_POST_PUBLICATION_VERIFY: CrashWindowContract(
+        window=ManifestCrashWindow.WINDOW_7_POST_PUBLICATION_VERIFY,
+        description="Post-publication readback, integrity check, or hash mismatch failure on canonical file.",
+        expected_canonical_state="PRESERVED",
+        expected_temp_state="CLEANED",
+        expected_outcome="UNCERTAIN_HALT",
+        retry_permitted=False,
+        remote_write_authorized=False,
+    ),
+    ManifestCrashWindow.WINDOW_8_RECOVERY_REOPEN: CrashWindowContract(
+        window=ManifestCrashWindow.WINDOW_8_RECOVERY_REOPEN,
+        description="Subprocess crash or unclean termination recovery; reopening store detects state without silent corruption.",
+        expected_canonical_state="PRESERVED",
+        expected_temp_state="ORPHANED_INERT",
+        expected_outcome="UNCERTAIN_HALT",
+        retry_permitted=False,
+        remote_write_authorized=False,
+    ),
+}
+
+
+def get_crash_window_contracts() -> dict[ManifestCrashWindow, CrashWindowContract]:
+    """Return immutable dictionary of failure window invariants and safety contracts."""
+    return dict(_CRASH_WINDOW_CONTRACTS)
+
+
+def verify_pre_remote_write_durability_gate(
+    guarantees: StoragePlatformGuarantees | None = None,
+    *,
+    is_hermetic_test: bool = False,
+) -> None:
+    """Enforce testable boundary contract: absence of provable durable ownership blocks all remote mutation.
+
+    A success report based on file flush or process restart alone CANNOT authorize LIVE staging.
+    Under Windows NTFS, parent directory metadata fsync is unproven via Python standard library;
+    any non-hermetic remote write attempt must fail closed until an explicit PO architectural decision
+    and verified durable mechanism are approved.
+    """
+    if is_hermetic_test:
+        return
+    if guarantees is None:
+        guarantees = get_storage_platform_guarantees()
+    if not guarantees.fsync_directory_supported or guarantees.platform == "win32":
+        raise ManifestStoreSecurityError(
+            f"Pre-remote-write durability gate failed on platform '{guarantees.platform}': "
+            "parent directory metadata durability is unproven on disk. Remote mutations strictly blocked."
+        )
 
 
 def _is_reparse_point(path: Path) -> bool:

@@ -2,6 +2,23 @@
 
 **Checkpoint:** 2026-10-29. This ledger separates direct GitHub CI evidence, implementation-agent local runs, historical pilot acceptance and missing validations. Earlier dated reviewer entries retain their original scope. Evidence is not a release certificate.
 
+## 2026-10-29 Issue #43 — Windows manifest durability crash-window contract candidate
+
+Isolated worktree/branch `feat/issue-43-windows-durability-contract`, baseline `e428eb8b71bd79ba63b6ffe8b2b41dd4f732da9e` (verified `main` with PR #42 integrated). Implementation-agent local evidence is separate from independent review and exact-head CI; no PO acceptance or live activation is claimed.
+
+- Existing Windows environment reused: Python 3.12.10, pytest 9.1.1, Ruff 0.13.3; no dependency installation/upgrade.
+- Durability evidence hierarchy strictly delineated: (a) process restart, (b) test-owned subprocess termination, (c) mocked failure/crash windows, (d) physical reboot, (e) sudden power loss. Simulated test passes at levels (a)–(c) do NOT prove physical reboot (d) or power loss (e) durability.
+- Authoritative Microsoft documentation analysis: cited Microsoft Learn demonstrating that `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` (0x08) has no effect on same-volume moves, and directory `FlushFileBuffers` returns `ERROR_ACCESS_DENIED`.
+- Implemented `ManifestCrashWindow` enum, `CrashWindowContract` dataclass, `_CRASH_WINDOW_CONTRACTS`, `get_crash_window_contracts()`, and `verify_pre_remote_write_durability_gate()` in `src/efso_radar/staging/persistent_manifest_store.py`.
+- Implemented 10 deterministic offline crash window tests in `TestWindowsManifestDurabilityCrashWindows` in `tests/test_phase5b3g_c_persistent_manifest_store_offline.py` covering Windows 1–8: temp creation failure, partial write/disk full, file fsync failure, pre-publication hash mismatch, publication collision, Windows directory durability gap, post-publication readback failure (preserve canonical, no retry, state UNKNOWN), and abrupt subprocess termination mid-write.
+- Focused test results:
+  - `pytest tests/test_phase5b3g_c_persistent_manifest_store_offline.py -k TestWindowsManifestDurabilityCrashWindows -v`: **10 passed, 46 deselected in 1.55s**.
+  - `pytest tests/test_phase5b3g_c_persistent_manifest_store_offline.py -v`: **53 passed, 3 skipped in 4.47s** (all 3 skips are non-elevated Windows symlink tests).
+  - `pytest tests/test_phase5b3g_c_windows_dacl_evidence_offline.py -v`: **135 passed in 2.71s**.
+- Full hermetic suite: `pytest tests -q`: **1079 passed, 18 skipped, 276 subtests passed in 127.50s**, Windows Python 3.12.10.
+- Ruff checks: `ruff check --target-version py311 --select E9,F63,F7,F82 src scripts tests` and default Ruff on modified files: **PASS**.
+- Hard constraints preserved: strictly $0.00 / 0 TRY spend, Turso Block Writes ON, tokens revoked, no network/live connections, no operational files touched, no live persistent storage enabled, no physical reboot simulated. STOP for independent review and explicit PO approval.
+
 ## 2026-10-29 Issue #41 — Offline Windows DACL evidence candidate
 
 Isolated worktree/branch `codex/issue-41-windows-dacl-evidence`, refreshed `main` `22090a54b6fca42146b0fadb39134dbf0694fce7` (PR #40 integrated). Implementation-agent local evidence is separate from independent review and exact-head CI; no PO acceptance or live activation is claimed.

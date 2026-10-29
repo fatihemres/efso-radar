@@ -64,6 +64,17 @@ Persistent manifest store foundation implemented under `PersistentManifestStore`
 - Architectural inconsistency documented: noted the contradiction between the historical 80-request cutoff automatic LIVE-08 transition and PR #35's strict monotonic stage sequence, proposing safe policy (no automatic cleanup on early failure; retain manifest fail-closed; separate controlled recovery).
 - All live staging operations remain **UNAUTHORIZED**; Block Writes remains ON. 43 focused store tests passing (3 skipped on Windows due to unprivileged symlink creation; 46 total), 267 passed across all Phase 5B.3G tests, 768 passed across full hermetic suite, Ruff clean, GitHub Actions CI run 40681304111 clean across all 4 matrix jobs. Ready for independent review.
 
+## 2026-10-29 Phase 5B.3G-C Windows Manifest Durability Crash-Window Contract Checkpoint (Issue #43)
+
+Offline Windows manifest durability crash-window contract implemented in `src/efso_radar/staging/persistent_manifest_store.py` with full deterministic fault-injection matrix (`TestWindowsManifestDurabilityCrashWindows` in `tests/test_phase5b3g_c_persistent_manifest_store_offline.py`):
+- Explicit evidence hierarchy established: (a) process restart, (b) test-owned subprocess termination, (c) mocked crash windows, (d) physical machine reboot, (e) sudden hardware power loss. Passing (a)–(c) does NOT prove (d)–(e).
+- Hardware assumptions documented: volatile SSD write caching (lack of PLP on consumer SSDs), NTFS metadata journaling vs. user data streams, and lack of unprivileged directory fsync on Windows NTFS.
+- Analysis of publication strategies with Microsoft Learn citations: `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` (0x08) has no effect on same-volume moves; directory `FlushFileBuffers` returns `ERROR_ACCESS_DENIED`; volume flushes require Administrator privileges.
+- 8 deterministic crash windows verified: temp creation failure (O_CREAT), payload short write/ENOSPC, file content fsync failure, pre-publication readback/hash verification failure, publication collision/race condition, Windows directory durability gap, post-publication readback failure (manifest preserved, no retry, state UNKNOWN), and abrupt test-owned subprocess termination.
+- Pre-remote-write durability gate (`verify_pre_remote_write_durability_gate`): live mutations strictly fail closed if directory-level persistence is unproven.
+- PO architectural decision options presented (Option 1: POSIX-only live / Windows offline; Option 2: SQLite WAL manifest store; Option 3: PO staging-only waiver). Live writes remain permanently blocked.
+- Verification: 53 passed / 3 skipped in store tests (10 new crash window tests); full hermetic suite 1079 passed, 18 skipped, 276 subtests passed.
+
 ## 2026-10-28 Phase 5B.3G-C Live-Ready Operator Preparation Checkpoint (INTEGRATED PR #35)
 
 Operator safeguards integrated into `main` at `1530f8340c37e3952b02a8edd56c6b5857845044` (PR #35 merged).
