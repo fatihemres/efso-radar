@@ -783,7 +783,9 @@ class DeduplicationEngine:
                 non_ent_b = {t for t in cluster_event_tokens[idx] if t not in entity_word_tokens and not t.startswith("_evt_")}
                 non_entity_overlap = calculate_token_overlap(non_ent_a, non_ent_b)
 
-                if disjoint_named_entities:
+                if conflicting_affinity_entities or conflicting_person_names:
+                    is_same_event = False
+                elif disjoint_named_entities:
                     # Articles naming completely different people/entities only merge on near-exact title match (e.g. minor typo)
                     is_same_event = char_sim >= 0.92
                 else:

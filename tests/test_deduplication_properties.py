@@ -326,3 +326,79 @@ def test_property_cluster_inventory_consistency(selected_indices: list[int]):
         assert len(collected_ids) == len(input_ids), "Total partitioned IDs must match input count"
         assert set(collected_ids) == set(input_ids), "Every input article must be present in exactly one cluster"
         assert len(collected_ids) == len(set(collected_ids)), "No article ID may appear in multiple clusters"
+
+# ============================================================================
+# 5. Joint Events with Different Headlined Participants (Positive Co-Mention)
+# ============================================================================
+
+JOINT_EVENT_SCENARIOS = [
+    (
+        "{p1} Yalı Çapkını yeni sezon galasında kırmızı halıda",
+        "{p1} ve {p2} yeni sezon galasında birlikte poz verdi.",
+        "{p2} Yalı Çapkını yeni sezon galasında kırmızı halıda",
+        "{p2} ve {p1} galada hayranlarıyla buluştu.",
+        ("Afra Saraçoğlu", "Mert Ramazan Demir"),
+    ),
+    (
+        "{p1} Comic-Con panelinde Deadpool & Wolverine sürprizini açıkladı",
+        "{p1} ve {p2} sahnede hayranların sorularını yanıtladı.",
+        "{p2} Comic-Con panelinde Deadpool & Wolverine sürprizini açıkladı",
+        "{p2} ve {p1} sahnede bir araya gelerek yeni filmi tanıttı.",
+        ("Ryan Reynolds", "Hugh Jackman"),
+    ),
+    (
+        "{p1} ve {p2} Venedik Film Festivali'nde el ele kırmızı halıda",
+        "İkili festival kapsamında yeni filmlerinin galasında boy gösterdi.",
+        "{p2} ile {p1} Venedik Film Festivali kırmızı halısında kameralara poz verdi",
+        "Festivalde birlikte görüntülenen çift dikkatleri üzerine çekti.",
+        ("Dua Lipa", "Callum Turner"),
+    ),
+]
+
+
+@HYPOTHESIS_SETTINGS
+@given(
+    scenario=st.sampled_from(JOINT_EVENT_SCENARIOS),
+)
+def test_property_joint_event_different_headlined_participants_cluster(
+    scenario: tuple[str, str, str, str, tuple[str, str]],
+):
+    """
+    Property: Two publishers reporting the exact same joint event where different
+    participants are headlined or co-mentioned in title/snippet must cluster together
+    and not be falsely separated due to different co-mentioned people.
+    """
+    t1_tmpl, s1_tmpl, t2_tmpl, s2_tmpl, (p1, p2) = scenario
+    t1 = t1_tmpl.format(p1=p1, p2=p2)
+    s1 = s1_tmpl.format(p1=p1, p2=p2)
+    t2 = t2_tmpl.format(p1=p1, p2=p2)
+    s2 = s2_tmpl.format(p1=p1, p2=p2)
+
+    with tempfile.TemporaryDirectory() as td:
+        engine, _ = _create_engine_with_temp_repo(td)
+
+        a1 = Article.create(
+            t1,
+            "https://outlet-alpha.example.com/joint-event-1",
+            "Outlet Alpha",
+            FIXED_NOW,
+            snippet=s1,
+        )
+        a2 = Article.create(
+            t2,
+            "https://outlet-beta.example.com/joint-event-2",
+            "Outlet Beta",
+            FIXED_NOW,
+            snippet=s2,
+        )
+
+        results = engine.filter_fresh_candidates([a1, a2])
+
+        assert len(results) == 1, (
+            f"Joint event false-split: expected 1 cluster for co-mentioned participants {p1} and {p2}, "
+            f"got {len(results)}. Titles: {t1!r} vs {t2!r}"
+        )
+        assert engine.last_clusters_count == 1
+        cluster_ids = results[0].raw_metadata.get("cluster_article_ids", [])
+        assert a1.id in cluster_ids
+        assert a2.id in cluster_ids
