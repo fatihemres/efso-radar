@@ -130,6 +130,109 @@ class TestDeduplication(unittest.TestCase):
         candidates = self.engine.filter_fresh_candidates([event_a, event_b])
         self.assertEqual(len(candidates), 2)
 
+    def test_distinct_platform_streaming_guides_never_merge_issue_50(self):
+        """Regression test for Issue #50:
+        Distinct streaming catalog guides (Netflix vs Disney+) sharing boilerplate phrasing
+        ('What to Watch on ... in November 2026') must NOT collapse into one cluster.
+        """
+        netflix_guide = Article.create(
+            "What to Watch on Netflix in November 2026",
+            "https://variety.com/feature/whats-on-netflix-movies-shows-1203517873/",
+            "Variety",
+            self.now,
+            snippet="A complete guide to movies, TV shows and original series coming to Netflix in November 2026.",
+        )
+        disney_guide = Article.create(
+            "What to Watch on Disney+ in November 2026",
+            "https://variety.com/feature/whats-on-disney-plus-movies-shows-1203517874/",
+            "Variety",
+            self.now,
+            snippet="A complete guide to movies, TV shows and original series coming to Disney+ in November 2026.",
+        )
+
+        candidates = self.engine.filter_fresh_candidates([netflix_guide, disney_guide])
+
+        # Must remain TWO separate candidate clusters
+        self.assertEqual(
+            len(candidates),
+            2,
+            f"Expected 2 separate candidate clusters, but got {len(candidates)}. "
+            f"Articles falsely merged: {[c.title for c in candidates]}",
+        )
+        netflix_rep = next(c for c in candidates if "Netflix" in c.title)
+        disney_rep = next(c for c in candidates if "Disney+" in c.title)
+
+        self.assertEqual(netflix_rep.raw_metadata.get("cluster_size", 1), 1)
+        self.assertEqual(netflix_rep.raw_metadata.get("cluster_article_ids"), [netflix_guide.id])
+        self.assertEqual(disney_rep.raw_metadata.get("cluster_size", 1), 1)
+        self.assertEqual(disney_rep.raw_metadata.get("cluster_article_ids"), [disney_guide.id])
+
+    def test_same_platform_streaming_guide_rephrasings_still_merge(self):
+        """Positive control: Same platform (Netflix) guide published across two outlets
+        covering the identical monthly catalog event must continue clustering together.
+        """
+        outlet_a = Article.create(
+            "What to Watch on Netflix in November 2026",
+            "https://variety.com/feature/whats-on-netflix-movies-shows-1203517873/",
+            "Variety",
+            self.now,
+            snippet="A complete guide to movies, TV shows and original series coming to Netflix in November 2026.",
+        )
+        outlet_b = Article.create(
+            "New on Netflix in November 2026: Movies and Shows to Stream",
+            "https://hollywoodreporter.com/tv/tv-news/new-on-netflix-november-2026-123456/",
+            "The Hollywood Reporter",
+            self.now,
+            snippet="Here is everything arriving on Netflix streaming in November 2026.",
+        )
+
+        candidates = self.engine.filter_fresh_candidates([outlet_a, outlet_b])
+
+        # Must collapse into ONE candidate cluster
+        self.assertEqual(len(candidates), 1)
+        cluster_rep = candidates[0]
+        self.assertEqual(cluster_rep.raw_metadata.get("cluster_size"), 2)
+        self.assertEqual(set(cluster_rep.raw_metadata.get("cluster_article_ids")), {outlet_a.id, outlet_b.id})
+        self.assertEqual(set(cluster_rep.raw_metadata.get("cluster_publishers")), {"Variety", "The Hollywood Reporter"})
+
+
+    def test_stale_batch_diagnostic_distinct_entities_remain_separate(self):
+        """Diagnostic negative controls from Issue #50 (Arzu Okay vs Meral Zeren; İzzet Yıldızhan vs Güllü):
+        Distinct persons sharing Turkish headline idioms ('Son Hali Gündem Oldu' or legal terms)
+        must remain separate clusters.
+        """
+        # Pair 1: Arzu Okay vs Meral Zeren
+        arzu = Article.create(
+            "Yeşilçam'ın İddialı Sahneleriyle Meşhur Yıldızı Arzu Okay'ın Son Hali Gündem Oldu!",
+            "https://haber.com/arzu-okay",
+            "Gazete A",
+            self.now,
+        )
+        meral = Article.create(
+            "Salako'nun Emine'si Meral Zeren'in Son Hali Gündem Oldu",
+            "https://haber.com/meral-zeren",
+            "Gazete B",
+            self.now,
+        )
+        c_yesilcam = self.engine.filter_fresh_candidates([arzu, meral])
+        self.assertEqual(len(c_yesilcam), 2)
+
+        # Pair 2: İzzet Yıldızhan vs Güllü
+        izzet = Article.create(
+            "İzzet Yıldızhan hakkında beraat kararı verildi: Dava sonuçlandı",
+            "https://haber.com/izzet-yildizhan",
+            "Haber 1",
+            self.now,
+        )
+        gullu = Article.create(
+            "Güllü davasında gerekçeli karar açıklandı",
+            "https://haber.com/gullu",
+            "Haber 2",
+            self.now,
+        )
+        c_legal = self.engine.filter_fresh_candidates([izzet, gullu])
+        self.assertEqual(len(c_legal), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

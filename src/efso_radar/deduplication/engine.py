@@ -272,6 +272,16 @@ def extract_key_tokens(title: str) -> set[str]:
     return tokens
 
 
+CALENDAR_MONTHS: set[str] = {
+    # English
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+    # Turkish
+    "ocak", "subat", "mart", "nisan", "mayis", "haziran",
+    "temmuz", "agustos", "eylul", "ekim", "kasim", "aralik",
+}
+
+
 def extract_proper_name_bigrams(text: str) -> set[str]:
     """Extract capitalized proper-name bigrams (e.g. 'Sezen Taş' -> 'sezen tas') from raw text."""
     bigrams: set[str] = set()
@@ -280,10 +290,15 @@ def extract_proper_name_bigrams(text: str) -> set[str]:
         "unlu", "meshur", "populer", "genc", "usta", "guzel", "yakisikli",
         "ikinci", "birinci", "yeni", "eski", "son", "ilk", "buyuk", "flas",
         "sonra", "once", "kattan", "duserek", "hayatini", "kaybeden",
+        "gundem", "oldu",
     }
     for w1, w2 in matches:
+        if any(c.isdigit() for c in w1) or any(c.isdigit() for c in w2):
+            continue
         a1 = _ascii_norm(_strip_tr_possessive(w1))
         a2 = _ascii_norm(_strip_tr_possessive(w2))
+        if a1 in CALENDAR_MONTHS or a2 in CALENDAR_MONTHS:
+            continue
         if a1 not in generic_starters and a2 not in generic_starters and a1 not in STOP_WORDS and a2 not in STOP_WORDS:
             bigrams.add(f"{a1} {a2}")
     return bigrams
@@ -687,8 +702,8 @@ class DeduplicationEngine:
                 non_entity_overlap = calculate_token_overlap(non_ent_a, non_ent_b)
 
                 if disjoint_named_entities:
-                    # Two articles naming completely different people/entities only merge on near-exact title match
-                    is_same_event = char_sim >= 0.85
+                    # Articles naming completely different people/entities must not merge
+                    is_same_event = False
                 else:
                     is_same_event = (
                         (title_overlap >= similarity_threshold and (not shared_entities or non_entity_overlap >= 0.25))
