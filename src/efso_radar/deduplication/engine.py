@@ -30,7 +30,7 @@ STOP_WORDS: set[str] = {
     "ve", "ile", "bir", "bu", "şu", "o", "da", "de", "için", "olan", "the",
     "a", "an", "in", "on", "at", "to", "for", "of", "and", "is", "are", "göre",
     "with", "from", "that", "this", "after", "over", "into", "about", "as", "by",
-    "sonra", "önce", "kadar", "gibi", "daha", "çok", "yeni", "ilk", "son",
+    "sonra", "önce", "kadar", "gibi", "daha", "çok", "yeni", "ilk", "son", "new",
     "haber", "haberi", "haberleri", "detaylı", "detayli", "detay", "magazin",
     "özeti", "ozeti", "özet", "ozet",
 }
@@ -272,20 +272,73 @@ def extract_key_tokens(title: str) -> set[str]:
     return tokens
 
 
+CALENDAR_MONTHS: set[str] = {
+    # English
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+    # Turkish
+    "ocak", "subat", "mart", "nisan", "mayis", "haziran",
+    "temmuz", "agustos", "eylul", "ekim", "kasim", "aralik",
+}
+
+GENERIC_HEADLINE_WORDS: set[str] = {
+    "what", "watch", "where", "when", "who", "why", "how",
+    "guide", "everything", "best", "every", "top", "all",
+    "coming", "leaving", "streaming", "stream", "movies", "shows",
+    "series", "films", "season", "episode", "release", "releases",
+    "here", "full", "list", "lineup", "schedule", "dates", "date",
+    "tv", "video", "photos", "photo", "exclusive", "first", "look", "new",
+}
+
+
 def extract_proper_name_bigrams(text: str) -> set[str]:
-    """Extract capitalized proper-name bigrams (e.g. 'Sezen Taş' -> 'sezen tas') from raw text."""
+    """Extract capitalized proper-name bigrams and individual proper nouns from raw text."""
+    chunks = re.split(r"[:!?;,\.\n\(\)\[\]\"“”/]+", text)
     bigrams: set[str] = set()
-    matches = re.findall(r"\b([A-ZÇĞİÖŞÜ][a-zçğıöşü]{2,})\s+([A-ZÇĞİÖŞÜa-z0-9çğıöşü]{2,})\b", text)
     generic_starters = {
         "unlu", "meshur", "populer", "genc", "usta", "guzel", "yakisikli",
         "ikinci", "birinci", "yeni", "eski", "son", "ilk", "buyuk", "flas",
         "sonra", "once", "kattan", "duserek", "hayatini", "kaybeden",
+        "gundem", "oldu", "hali", "sir", "dr", "prof", "lady", "lord", "new",
     }
-    for w1, w2 in matches:
-        a1 = _ascii_norm(_strip_tr_possessive(w1))
-        a2 = _ascii_norm(_strip_tr_possessive(w2))
-        if a1 not in generic_starters and a2 not in generic_starters and a1 not in STOP_WORDS and a2 not in STOP_WORDS:
-            bigrams.add(f"{a1} {a2}")
+    for chunk in chunks:
+        words = re.findall(r"\b[A-Za-zÇĞİÖŞÜa-zçğıöşü0-9\'-]+\b", chunk)
+        for i in range(len(words) - 1):
+            w1, w2 = words[i], words[i + 1]
+            if not (w1 and w1[0].isupper() and w2 and w2[0].isupper()):
+                continue
+            if len(w1) < 2 or len(w2) < 2:
+                continue
+            if any(c.isdigit() for c in w1) or any(c.isdigit() for c in w2):
+                continue
+            a1 = _ascii_norm(_strip_tr_possessive(w1))
+            a2 = _ascii_norm(_strip_tr_possessive(w2))
+            if a1 in CALENDAR_MONTHS or a2 in CALENDAR_MONTHS:
+                continue
+            if (
+                a1 not in generic_starters
+                and a2 not in generic_starters
+                and a1 not in STOP_WORDS
+                and a2 not in STOP_WORDS
+                and a1 not in GENERIC_HEADLINE_WORDS
+                and a2 not in GENERIC_HEADLINE_WORDS
+            ):
+                bigrams.add(f"{a1} {a2}")
+
+    all_words = re.findall(r"\b[A-Za-zÇĞİÖŞÜa-zçğıöşü0-9\'-]+\b", text)
+    bigram_words = {tok for bg in bigrams for tok in bg.split()}
+    for w in all_words:
+        if not (w and w[0].isupper()):
+            continue
+        if len(w) < 3 or any(c.isdigit() for c in w):
+            continue
+        a = _ascii_norm(_strip_tr_possessive(w))
+        if a in bigram_words:
+            continue
+        if a in CALENDAR_MONTHS or a in STOP_WORDS or a in generic_starters or a in GENERIC_HEADLINE_WORDS:
+            continue
+        bigrams.add(a)
+
     return bigrams
 
 
@@ -658,12 +711,14 @@ class DeduplicationEngine:
         cluster_title_tokens: list[set[str]] = []
         cluster_event_tokens: list[set[str]] = []
         cluster_entities: list[set[str]] = []
+        cluster_affinity_entities: list[set[str]] = []
 
         for article in fresh_unprocessed:
             t_tokens = extract_key_tokens(article.title)
             e_tokens = extract_article_event_tokens(article)
             full_context = f"{article.title} {article.snippet or ''} {extract_url_slug_text(article.canonical_url or article.url or '')}"
-            ents = set(find_matched_affinity_entities(full_context)) | extract_proper_name_bigrams(f"{article.title} {article.snippet or ''}")
+            aff_entities = set(find_matched_affinity_entities(full_context))
+            ents = aff_entities | extract_proper_name_bigrams(f"{article.title}. {article.snippet or ''}")
             matched_cluster_idx = -1
 
             for idx in range(len(clusters)):
@@ -674,21 +729,63 @@ class DeduplicationEngine:
                 ).ratio()
 
                 shared_entities = ents & cluster_entities[idx]
-                disjoint_named_entities = bool(ents) and bool(cluster_entities[idx]) and not shared_entities
+
+                # Check conflicting multiword person names sharing a token (e.g. "Ryan Reynolds" vs "Ryan Gosling")
+                multi_a = {e for e in ents if len(e.split()) >= 2}
+                multi_b = {e for e in cluster_entities[idx] if len(e.split()) >= 2}
+                shared_multi = multi_a & multi_b
+                shared_multi_tokens = {tok for sm in shared_multi for tok in sm.split()}
+                conflicting_person_names = False
+                for ma in multi_a:
+                    words_a = set(ma.split())
+                    for mb in multi_b:
+                        if ma != mb:
+                            words_b = set(mb.split())
+                            shared_words = words_a & words_b
+                            # Shared name token is not conflicting if it belongs to a full identity shared by both
+                            if shared_words & shared_multi_tokens:
+                                continue
+                            diff_a = words_a - words_b
+                            diff_b = words_b - words_a
+                            if shared_words and diff_a and diff_b:
+                                if ma not in multi_b and mb not in multi_a:
+                                    conflicting_person_names = True
+                                    break
+                    if conflicting_person_names:
+                        break
+
+                # Check shared individual name tokens to avoid false disjoint classification on partial name matches
+                ent_toks_a = {tok for e in ents for tok in e.split() if len(tok) >= 3}
+                ent_toks_b = {tok for e in cluster_entities[idx] for tok in e.split() if len(tok) >= 3}
+                shared_name_tokens = ent_toks_a & ent_toks_b
+
+                # Check conflicting high-affinity entities (e.g. Netflix vs Disney+)
+                conflicting_affinity_entities = bool(aff_entities) and bool(cluster_affinity_entities[idx]) and not (aff_entities & cluster_affinity_entities[idx])
+
+                disjoint_named_entities = (
+                    conflicting_affinity_entities
+                    or conflicting_person_names
+                    or (
+                        bool(ents)
+                        and bool(cluster_entities[idx])
+                        and not shared_entities
+                        and not shared_name_tokens
+                    )
+                )
                 shared_semantic_tags = {t for t in (e_tokens & cluster_event_tokens[idx]) if t.startswith("_evt_")}
 
                 # Compute non-entity event token overlap so sharing only a celebrity's name
                 # across two unrelated stories does not inflate event_overlap.
                 entity_word_tokens: set[str] = set()
-                for ent_name in shared_entities:
+                for ent_name in (shared_entities | shared_name_tokens):
                     entity_word_tokens.update(extract_key_tokens(ent_name))
                 non_ent_a = {t for t in e_tokens if t not in entity_word_tokens and not t.startswith("_evt_")}
                 non_ent_b = {t for t in cluster_event_tokens[idx] if t not in entity_word_tokens and not t.startswith("_evt_")}
                 non_entity_overlap = calculate_token_overlap(non_ent_a, non_ent_b)
 
                 if disjoint_named_entities:
-                    # Two articles naming completely different people/entities only merge on near-exact title match
-                    is_same_event = char_sim >= 0.85
+                    # Articles naming completely different people/entities only merge on near-exact title match (e.g. minor typo)
+                    is_same_event = char_sim >= 0.92
                 else:
                     is_same_event = (
                         (title_overlap >= similarity_threshold and (not shared_entities or non_entity_overlap >= 0.25))
@@ -706,11 +803,13 @@ class DeduplicationEngine:
                 cluster_title_tokens[matched_cluster_idx].update(t_tokens)
                 cluster_event_tokens[matched_cluster_idx].update(e_tokens)
                 cluster_entities[matched_cluster_idx].update(ents)
+                cluster_affinity_entities[matched_cluster_idx].update(aff_entities)
             else:
                 clusters.append([article])
                 cluster_title_tokens.append(set(t_tokens))
                 cluster_event_tokens.append(set(e_tokens))
                 cluster_entities.append(set(ents))
+                cluster_affinity_entities.append(set(aff_entities))
 
         # Select the best canonical representative for each cluster (preferring clear subject + event headline)
         representatives: list[Article] = []
