@@ -234,5 +234,66 @@ class TestDeduplication(unittest.TestCase):
         self.assertEqual(len(c_legal), 2)
 
 
+    def test_honorific_prefix_same_person_still_merges_patrick_stewart(self):
+        """Regression test for P2-1:
+        Articles reporting the same event with an honorific/prefix ('Sir Patrick Stewart' vs 'Patrick Stewart')
+        must collapse into one cluster even if heuristic bigram extraction yields 'sir patrick' vs 'patrick stewart'.
+        """
+        art_sir = Article.create(
+            "Sir Patrick Stewart hayatını kaybetti",
+            "https://haber.com/sir-patrick-stewart-vefat",
+            "Haber A",
+            self.now,
+            snippet="Usta oyuncu Sir Patrick Stewart 86 yaşında yaşamını yitirdi.",
+        )
+        art_plain = Article.create(
+            "Patrick Stewart hayatını kaybetti",
+            "https://haber.com/patrick-stewart-vefat",
+            "Haber B",
+            self.now,
+            snippet="Hollywood'un efsane ismi Patrick Stewart hayatını kaybetti.",
+        )
+
+        candidates = self.engine.filter_fresh_candidates([art_sir, art_plain])
+        self.assertEqual(
+            len(candidates),
+            1,
+            f"Expected 1 merged cluster for Patrick Stewart, but got {len(candidates)}: {[c.title for c in candidates]}",
+        )
+        self.assertEqual(candidates[0].raw_metadata.get("cluster_size"), 2)
+        self.assertEqual(set(candidates[0].raw_metadata.get("cluster_article_ids")), {art_sir.id, art_plain.id})
+
+    def test_unrecognized_streaming_platforms_never_merge_hulu_vs_peacock(self):
+        """Regression test for P2-2:
+        Monthly streaming catalog guides for distinct unrecognized platforms (Hulu vs Peacock)
+        must NOT collapse into one cluster despite high boilerplate template similarity.
+        """
+        hulu_guide = Article.create(
+            "What to Watch on Hulu in November 2026",
+            "https://variety.com/feature/whats-on-hulu-movies-shows-1203517875/",
+            "Variety",
+            self.now,
+            snippet="A complete guide to movies, TV shows and original series coming to Hulu in November 2026.",
+        )
+        peacock_guide = Article.create(
+            "What to Watch on Peacock in November 2026",
+            "https://variety.com/feature/whats-on-peacock-movies-shows-1203517876/",
+            "Variety",
+            self.now,
+            snippet="A complete guide to movies, TV shows and original series coming to Peacock in November 2026.",
+        )
+
+        candidates = self.engine.filter_fresh_candidates([hulu_guide, peacock_guide])
+        self.assertEqual(
+            len(candidates),
+            2,
+            f"Expected 2 separate candidate clusters for Hulu and Peacock, but got {len(candidates)}: {[c.title for c in candidates]}",
+        )
+        hulu_rep = next(c for c in candidates if "Hulu" in c.title)
+        peacock_rep = next(c for c in candidates if "Peacock" in c.title)
+        self.assertEqual(hulu_rep.raw_metadata.get("cluster_size", 1), 1)
+        self.assertEqual(peacock_rep.raw_metadata.get("cluster_size", 1), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
