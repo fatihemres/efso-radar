@@ -30,7 +30,7 @@ STOP_WORDS: set[str] = {
     "ve", "ile", "bir", "bu", "şu", "o", "da", "de", "için", "olan", "the",
     "a", "an", "in", "on", "at", "to", "for", "of", "and", "is", "are", "göre",
     "with", "from", "that", "this", "after", "over", "into", "about", "as", "by",
-    "sonra", "önce", "kadar", "gibi", "daha", "çok", "yeni", "ilk", "son",
+    "sonra", "önce", "kadar", "gibi", "daha", "çok", "yeni", "ilk", "son", "new",
     "haber", "haberi", "haberleri", "detaylı", "detayli", "detay", "magazin",
     "özeti", "ozeti", "özet", "ozet",
 }
@@ -287,7 +287,7 @@ GENERIC_HEADLINE_WORDS: set[str] = {
     "coming", "leaving", "streaming", "stream", "movies", "shows",
     "series", "films", "season", "episode", "release", "releases",
     "here", "full", "list", "lineup", "schedule", "dates", "date",
-    "tv", "video", "photos", "photo", "exclusive", "first", "look",
+    "tv", "video", "photos", "photo", "exclusive", "first", "look", "new",
 }
 
 
@@ -299,7 +299,7 @@ def extract_proper_name_bigrams(text: str) -> set[str]:
         "unlu", "meshur", "populer", "genc", "usta", "guzel", "yakisikli",
         "ikinci", "birinci", "yeni", "eski", "son", "ilk", "buyuk", "flas",
         "sonra", "once", "kattan", "duserek", "hayatini", "kaybeden",
-        "gundem", "oldu", "hali", "sir", "dr", "prof", "lady", "lord",
+        "gundem", "oldu", "hali", "sir", "dr", "prof", "lady", "lord", "new",
     }
     for chunk in chunks:
         words = re.findall(r"\b[A-Za-zÇĞİÖŞÜa-zçğıöşü0-9\'-]+\b", chunk)
@@ -711,12 +711,14 @@ class DeduplicationEngine:
         cluster_title_tokens: list[set[str]] = []
         cluster_event_tokens: list[set[str]] = []
         cluster_entities: list[set[str]] = []
+        cluster_affinity_entities: list[set[str]] = []
 
         for article in fresh_unprocessed:
             t_tokens = extract_key_tokens(article.title)
             e_tokens = extract_article_event_tokens(article)
             full_context = f"{article.title} {article.snippet or ''} {extract_url_slug_text(article.canonical_url or article.url or '')}"
-            ents = set(find_matched_affinity_entities(full_context)) | extract_proper_name_bigrams(f"{article.title}. {article.snippet or ''}")
+            aff_entities = set(find_matched_affinity_entities(full_context))
+            ents = aff_entities | extract_proper_name_bigrams(f"{article.title}. {article.snippet or ''}")
             matched_cluster_idx = -1
 
             for idx in range(len(clusters)):
@@ -757,8 +759,12 @@ class DeduplicationEngine:
                 ent_toks_b = {tok for e in cluster_entities[idx] for tok in e.split() if len(tok) >= 3}
                 shared_name_tokens = ent_toks_a & ent_toks_b
 
+                # Check conflicting high-affinity entities (e.g. Netflix vs Disney+)
+                conflicting_affinity_entities = bool(aff_entities) and bool(cluster_affinity_entities[idx]) and not (aff_entities & cluster_affinity_entities[idx])
+
                 disjoint_named_entities = (
-                    conflicting_person_names
+                    conflicting_affinity_entities
+                    or conflicting_person_names
                     or (
                         bool(ents)
                         and bool(cluster_entities[idx])
@@ -797,11 +803,13 @@ class DeduplicationEngine:
                 cluster_title_tokens[matched_cluster_idx].update(t_tokens)
                 cluster_event_tokens[matched_cluster_idx].update(e_tokens)
                 cluster_entities[matched_cluster_idx].update(ents)
+                cluster_affinity_entities[matched_cluster_idx].update(aff_entities)
             else:
                 clusters.append([article])
                 cluster_title_tokens.append(set(t_tokens))
                 cluster_event_tokens.append(set(e_tokens))
                 cluster_entities.append(set(ents))
+                cluster_affinity_entities.append(set(aff_entities))
 
         # Select the best canonical representative for each cluster (preferring clear subject + event headline)
         representatives: list[Article] = []

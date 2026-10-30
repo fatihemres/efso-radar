@@ -357,5 +357,64 @@ class TestDeduplication(unittest.TestCase):
         self.assertEqual(pine_rep.raw_metadata.get("cluster_size", 1), 1)
 
 
+    def test_distinct_platform_new_on_catalog_templates_never_merge_issue_50_review(self):
+        """Regression test for Issue #50 review finding:
+        'New on Netflix in November 2026' vs 'New on Disney+ in November 2026'
+        must NOT merge despite the headline starting with common template word 'New'.
+        Also verifies unrecognized platforms (Hulu vs Peacock) with 'New on...' stay separate.
+        """
+        netflix_guide = Article.create(
+            "New on Netflix in November 2026",
+            "https://variety.com/2026/film/news/new-on-netflix-november-2026-123",
+            "Variety",
+            self.now,
+            snippet="Every movie and show coming to Netflix in November 2026.",
+        )
+        disney_guide = Article.create(
+            "New on Disney+ in November 2026",
+            "https://variety.com/2026/film/news/new-on-disney-plus-november-2026-456",
+            "Variety",
+            self.now,
+            snippet="Every movie and show coming to Disney+ in November 2026.",
+        )
+
+        candidates = self.engine.filter_fresh_candidates([netflix_guide, disney_guide])
+        self.assertEqual(
+            len(candidates),
+            2,
+            f"Expected 2 separate candidate clusters for Netflix and Disney+, but got {len(candidates)}: {[c.title for c in candidates]}",
+        )
+        netflix_rep = next(c for c in candidates if "Netflix" in c.title)
+        disney_rep = next(c for c in candidates if "Disney+" in c.title)
+        self.assertEqual(netflix_rep.raw_metadata.get("cluster_size", 1), 1)
+        self.assertEqual(disney_rep.raw_metadata.get("cluster_size", 1), 1)
+
+        # Unrecognized platforms with 'New on...' template
+        hulu_guide = Article.create(
+            "New on Hulu in November 2026",
+            "https://variety.com/2026/film/news/new-on-hulu-november-2026-789",
+            "Variety",
+            self.now,
+            snippet="Every movie and show coming to Hulu in November 2026.",
+        )
+        peacock_guide = Article.create(
+            "New on Peacock in November 2026",
+            "https://variety.com/2026/film/news/new-on-peacock-november-2026-101",
+            "Variety",
+            self.now,
+            snippet="Every movie and show coming to Peacock in November 2026.",
+        )
+        unrecognized_candidates = self.engine.filter_fresh_candidates([hulu_guide, peacock_guide])
+        self.assertEqual(
+            len(unrecognized_candidates),
+            2,
+            f"Expected 2 separate candidate clusters for Hulu and Peacock, but got {len(unrecognized_candidates)}: {[c.title for c in unrecognized_candidates]}",
+        )
+        hulu_rep = next(c for c in unrecognized_candidates if "Hulu" in c.title)
+        peacock_rep = next(c for c in unrecognized_candidates if "Peacock" in c.title)
+        self.assertEqual(hulu_rep.raw_metadata.get("cluster_size", 1), 1)
+        self.assertEqual(peacock_rep.raw_metadata.get("cluster_size", 1), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
