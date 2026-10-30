@@ -26,9 +26,9 @@ Offline editorial quality scorecard and benchmark self-oracle disclaimer impleme
 - Outward benchmark report in `src/efso_radar/ai/benchmark.py` dynamically displays `prediction_source` (`PREDICTIONS_DERIVED_FROM_EXPECTED_LABELS` vs `CALLER_SUPPLIED_PREDICTIONS`) alongside `SYNTHETIC_RULE_VALIDATION` and `NOT_MEASURED_MODEL_ACCURACY`.
 - Added regression tests in `tests/test_editorial_intelligence.py` asserting these disclaimers for both default self-oracle and caller-supplied prediction modes.
 - Established operational scorecard in `VERIFICATION.md` defining 6 measurable metrics (Editorial Precision, Recall@K, Duplicate Leakage, Update False Positives, Rumor Safety Veto, Digest Cadence) with unmeasured operational fields marked `NOT MEASURED` and thresholds left as `PO TO SET`.
-- Clarified 00:00–08:30 Europe/Istanbul quiet hours, 3-hour SCAN_ONLY (8/day) vs 3 daily digest slots (09:30, 15:30, 21:30), max 5-item ceiling (no minimum), and multi-tier scoring paths (`breaking_alert_min_score=92`, `min_score=82`, `digest_min_score=78`, `<78` silent).
+- Clarified 00:00–08:30 Europe/Istanbul quiet hours, 3-hour SCAN_ONLY (8/day) vs 3 daily digest slots (09:30, 15:30, 21:30), max 5-item ceiling (no minimum), and reconciled scoring and dispatch routing with actual code paths in `ai/client.py` and `ai/calibration.py` (path-dependent on disposition, verification, strategy, quiet hours and caps; no universal score-band mapping).
 - Documented single next quality gate recommendation: owner-controlled small blind evaluation sample of 50-100 real news items, strictly distinct from staging transport Issue #13.
-- Verification: 17 passed in `test_editorial_intelligence.py`; 17 passed in `test_news_discovery.py`; 12 passed / 3 skipped in `test_calibration_phase3c.py`.
+- Verification: 18 passed in `test_editorial_intelligence.py`; 17 passed in `test_news_discovery.py`; 12 passed / 3 skipped in `test_calibration_phase3c.py`.
 
 ## 2026-10-29 Phase 5B.3G-C Cross-Runner Ownership & Recovery Architecture Contract Checkpoint (Issue #45; INTEGRATED in PR #46)
 

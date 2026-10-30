@@ -15,11 +15,11 @@
   - Preserved historical 42-item vertical fixture (`tests/fixtures/editorial_benchmark.json`) and existing rule conformance test intact.
 - Established operational product acceptance scorecard in `VERIFICATION.md` proposing 6 measurable metrics with exact numerator/denominator formulas and sampling modes:
   - Corrected quiet hours to 00:00–08:30 Europe/Istanbul, distinguished 3-hour SCAN_ONLY cadence (8/day) from the 3 daily editorial digest slots (09:30, 15:30, 21:30 Europe/Istanbul), and removed any implied minimum item count (`max_items_per_digest=5` is an upper ceiling).
-  - Clarified multi-tier scoring paths (`breaking_alert_min_score=92`, `min_score=82`, `digest_min_score=78`, `<78` silent).
+  - Reconciled score and notification routing descriptions with actual code in `src/efso_radar/ai/client.py` and `src/efso_radar/ai/calibration.py`: clarified that routing is path-dependent (model pick filtering at `min_score=82`, disposition-based digest routing, and `breaking_alert_min_score=92` under HYBRID strategy with quiet-hours/cap constraints) rather than a universal score-band policy, removed nonexistent `notifications/planner.py` reference, and noted threshold harmonization remains a separate PO decision.
   - Formulated shadow vs live denominators for editorial precision and required an independently labeled event universe for recall@K.
   - Replaced unsubstantiated 100% operational figures with `NOT MEASURED (live operational rate)` while referencing exact offline fixture passes, keeping targets strictly `PO TO SET`.
 - Identified one decision-ready recommendation for the next quality evaluation gate: an owner-conducted small blind evaluation cohort of 50-100 real news items labeled by @efsomagazin's editor, strictly distinguished from staging transport Issue #13 and requiring separate PO authorization.
-- **Local focused evidence:** Windows Python 3.12.10: 17 passed in `test_editorial_intelligence.py`; 17 passed in `test_news_discovery.py`; 12 passed / 3 skipped in `test_calibration_phase3c.py`.
+- **Local focused evidence:** Windows Python 3.12.10: 18 passed in `test_editorial_intelligence.py`; 17 passed in `test_news_discovery.py`; 12 passed / 3 skipped in `test_calibration_phase3c.py`.
 - **Full hermetic suite:** 1102 passed, 18 skipped, 276 subtests passed in 117.42s on Windows Python 3.12.10.
 - All live staging, RSS, Gemini, Telegram, Turso, or cloud operations remain strictly unauthorized; Turso Block Writes remains ON; $0.00 / 0 TRY hard ceiling preserved. STOP for independent review and explicit PO approval.
 
