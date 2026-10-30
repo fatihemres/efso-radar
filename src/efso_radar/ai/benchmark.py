@@ -13,18 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from efso_radar.ai.client import is_headline_too_similar
 from efso_radar.ai.schemas import EditorialPickSchema
-from efso_radar.domain import (
-    Article,
-    EditorialAssessment,
-    EditorialKind,
-    Market,
-    Story,
-    StoryCategory,
-    VerificationStatus,
-    utc_now,
-)
+from efso_radar.domain import Article, Market, Story, StoryCategory
 
 logger = logging.getLogger("efso-radar.ai.benchmark")
 
@@ -77,16 +67,42 @@ class SyntheticRuleValidationMetrics:
     duplicate_accuracy: float
     update_recognition_rate: float
     vertical_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
+    evaluation_kind: str = "SYNTHETIC_RULE_VALIDATION"
+    prediction_source: str = "PREDICTIONS_DERIVED_FROM_EXPECTED_LABELS"
+    model_accuracy_status: str = "NOT_MEASURED_MODEL_ACCURACY"
 
     def summary(self) -> str:
+        source_tag = f"  [{self.prediction_source}]"
+        source_tag_line = f"{source_tag:<66}"
+        if len(source_tag_line) > 66:
+            source_tag_line = source_tag
+
+        if self.prediction_source == "PREDICTIONS_DERIVED_FROM_EXPECTED_LABELS":
+            source_note = [
+                "In default offline evaluation, predictions are self-oracle picks  ",
+                "derived from expected fixture labels, NOT independent model picks.",
+            ]
+        else:
+            source_note = [
+                "Predictions were supplied by caller/external input and evaluated  ",
+                "against curated synthetic fixtures without live model inference.  ",
+            ]
+
         lines = [
             "==================================================================",
-            "  EFSO RADAR — SYNTHETIC RULE-VALIDATION CONFORMANCE REPORT       ",
-            "  [Deterministic Scenario Testing — NOT Live Gemini Model Metrics]",
+            "  EFSO RADAR -- SYNTHETIC_RULE_VALIDATION CONFORMANCE REPORT       ",
+            "  [Deterministic Scenario Testing -- NOT Live Gemini Model Metrics]",
+            source_tag_line,
+            "  [NOT_MEASURED_MODEL_ACCURACY -- Live Model Performance Unproven] ",
             "==================================================================",
             "NOTE: This report validates application-level gating rules and    ",
-            "threshold logic against curated synthetic fixtures. Live model    ",
-            "editorial quality will be calibrated in Phase 3C via owner labels.",
+            "threshold logic against curated synthetic fixtures.               ",
+            *source_note,
+            "Real editorial precision and recall remain NOT MEASURED.          ",
+            "------------------------------------------------------------------",
+            f"Evaluation Kind             : {self.evaluation_kind}",
+            f"Prediction Source           : {self.prediction_source}",
+            f"Model Accuracy Status       : {self.model_accuracy_status}",
             "------------------------------------------------------------------",
             f"Synthetic Test Fixtures     : {self.total_articles}",
             f"Alert Conformance (Passed)  : {self.true_positives}",
@@ -175,6 +191,7 @@ class OfflineBenchmarkEvaluator:
         min_score: int = 82,
     ) -> BenchmarkMetrics:
         """Run evaluation comparing predicted picks with ground-truth labels."""
+        caller_supplied = predicted_picks is not None
         if predicted_picks is None:
             predicted_picks = self.simulate_model_decisions()
 
@@ -244,6 +261,12 @@ class OfflineBenchmarkEvaluator:
         dup_acc = dup_correct / dup_total if dup_total > 0 else 1.0
         update_acc = update_correct / update_total if update_total > 0 else 1.0
 
+        pred_source = (
+            "CALLER_SUPPLIED_PREDICTIONS"
+            if caller_supplied
+            else "PREDICTIONS_DERIVED_FROM_EXPECTED_LABELS"
+        )
+
         return BenchmarkMetrics(
             total_articles=len(self.items),
             true_positives=tp,
@@ -256,6 +279,9 @@ class OfflineBenchmarkEvaluator:
             duplicate_accuracy=dup_acc,
             update_recognition_rate=update_acc,
             vertical_stats=vertical_stats,
+            evaluation_kind="SYNTHETIC_RULE_VALIDATION",
+            prediction_source=pred_source,
+            model_accuracy_status="NOT_MEASURED_MODEL_ACCURACY",
         )
 
 

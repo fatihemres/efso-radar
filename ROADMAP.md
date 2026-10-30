@@ -14,11 +14,25 @@
 | Phase 5B.3F | Hermetic reliability/concurrency and recovery validation | [PR #12](https://github.com/fatihemres/efso-radar/pull/12), [Issue #11](https://github.com/fatihemres/efso-radar/issues/11) | **INTEGRATED / OFFLINE VERIFIED** |
 | Phase 5B.3G-A | Controlled live staging *specification*, without live execution | [PR #14](https://github.com/fatihemres/efso-radar/pull/14) | **INTEGRATED (DESIGN)** |
 | Phase 5B.3G-B | Hermetic eight-step mock staging runner, strict safety barriers | [PR #16](https://github.com/fatihemres/efso-radar/pull/16) | **INTEGRATED / OFFLINE VERIFIED** |
-| Phase 5B.3G-C | Controlled staging safeguards, manifest store, offline recovery, DACL evidence, durability and cross-runner recovery contract | [Issue #13](https://github.com/fatihemres/efso-radar/issues/13), [Issue #41](https://github.com/fatihemres/efso-radar/issues/41), [Issue #43](https://github.com/fatihemres/efso-radar/issues/43), [Issue #45](https://github.com/fatihemres/efso-radar/issues/45), [plan](docs/PHASE5B3G_LIVE_STAGING_RELIABILITY_PLAN.md) | **PR #35/#36/#38/#40/#42/#44 INTEGRATED (OFFLINE) / ISSUE #45 CANDIDATE / LIVE BLOCKED** |
+| Phase 5B.3G-C | Controlled staging safeguards, manifest store, offline recovery, DACL evidence, durability and cross-runner recovery contract | [Issue #13](https://github.com/fatihemres/efso-radar/issues/13), [Issue #41](https://github.com/fatihemres/efso-radar/issues/41), [Issue #43](https://github.com/fatihemres/efso-radar/issues/43), [Issue #45](https://github.com/fatihemres/efso-radar/issues/45), [plan](docs/PHASE5B3G_LIVE_STAGING_RELIABILITY_PLAN.md) | **PR #35/#36/#38/#40/#42/#44/#46 INTEGRATED (OFFLINE) / LIVE BLOCKED** |
+| Editorial Product Acceptance | Honest offline quality scorecard, benchmark self-oracle disclaimer, and measured vs unmeasured audit | [Issue #47](https://github.com/fatihemres/efso-radar/issues/47), [Verification](VERIFICATION.md) | **ISSUE #47 CANDIDATE / OFFLINE AUDIT ONLY** |
 | Follow-on cloud cutover & unattended operations | Cloud parity, backups, zero-cost controls, human editorial recipient tests, PO release decision | Existing Phase 5 architecture; future issue required | **DISCOVERY / NOT AUTHORIZED** |
 | Rights and distribution | Review third-party origins and decide visibility/distribution | [Issue #17](https://github.com/fatihemres/efso-radar/issues/17) | **IN PROGRESS (AUDIT)** |
 
-## 2026-10-29 Phase 5B.3G-C Cross-Runner Ownership & Recovery Architecture Contract Checkpoint (Issue #45)
+## 2026-10-29 Editorial Product Acceptance Scorecard Checkpoint (Issue #47)
+
+Offline editorial quality scorecard and benchmark self-oracle disclaimer implemented in `src/efso_radar/ai/benchmark.py` and `VERIFICATION.md`:
+- Formally distinguished synthetic rule conformance from genuinely measured editorial quality across all 6 news pipeline stages.
+- Outward benchmark report in `src/efso_radar/ai/benchmark.py` dynamically displays `prediction_source` (`PREDICTIONS_DERIVED_FROM_EXPECTED_LABELS` vs `CALLER_SUPPLIED_PREDICTIONS`) alongside `SYNTHETIC_RULE_VALIDATION` and `NOT_MEASURED_MODEL_ACCURACY`.
+- Added regression tests in `tests/test_editorial_intelligence.py` asserting these disclaimers for both default self-oracle and caller-supplied prediction modes.
+- Established operational scorecard in `VERIFICATION.md` defining 6 measurable metrics (Editorial Precision, Recall@K, Duplicate Leakage, Update False Positives, Rumor Safety Veto, Digest Cadence) with unmeasured operational fields marked `NOT MEASURED` and thresholds left as `PO TO SET`.
+- Clarified 00:00–08:30 Europe/Istanbul quiet hours, 3-hour SCAN_ONLY (8/day) vs 3 daily digest slots (09:30, 15:30, 21:30), max 5-item ceiling (no minimum), and reconciled scoring and dispatch routing with actual code paths in `ai/client.py` and `ai/calibration.py` (path-dependent on disposition, verification, strategy, quiet hours and caps; no universal score-band mapping).
+- Documented single next quality gate recommendation: owner-controlled small blind evaluation sample of 50-100 real news items, strictly distinct from staging transport Issue #13.
+- Verification: 18 passed in `test_editorial_intelligence.py`; 17 passed in `test_news_discovery.py`; 12 passed / 3 skipped in `test_calibration_phase3c.py`.
+
+## 2026-10-29 Phase 5B.3G-C Cross-Runner Ownership & Recovery Architecture Contract Checkpoint (Issue #45; INTEGRATED in PR #46)
+
+*(Addendum 2026-10-29: PR #46 subsequently verified and integrated into main at commit 589cf85045f73463515d8912205d82e0194f1501; post-merge main CI #40945829461 4/4 PASS; dated candidate text below retained for historical provenance.)*
 
 Offline cross-runner ownership and recovery architecture contract implemented in `src/efso_radar/staging/offline_recovery_evidence.py` with deterministic contract tests (`TestCrossRunnerOwnershipRecoveryContract` in `tests/test_phase5b3g_c_cross_runner_recovery_offline.py`):
 - Operational mode distinction: Mode (a) controlled one-off staging on persistent Linux host vs. Mode (b) unattended automation on ephemeral GitHub-hosted Actions runners.
