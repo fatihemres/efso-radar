@@ -295,5 +295,67 @@ class TestDeduplication(unittest.TestCase):
         self.assertEqual(peacock_rep.raw_metadata.get("cluster_size", 1), 1)
 
 
+    def test_shared_first_name_different_celebrities_never_merge_ryan_reynolds_vs_gosling(self):
+        """Regression test for P2-3:
+        Different celebrities sharing a common first name (Ryan Reynolds vs Ryan Gosling)
+        must NOT merge, even with similar event phrasing ('spotted at a film premiere').
+        """
+        reynolds = Article.create(
+            "Ryan Reynolds spotted at a film premiere",
+            "https://variety.com/news/ryan-reynolds-premiere-123",
+            "Variety",
+            self.now,
+            snippet="Ryan Reynolds walked the red carpet at the film premiere in New York.",
+        )
+        gosling = Article.create(
+            "Ryan Gosling spotted at a film premiere",
+            "https://variety.com/news/ryan-gosling-premiere-456",
+            "Variety",
+            self.now,
+            snippet="Ryan Gosling walked the red carpet at the film premiere in New York.",
+        )
+
+        candidates = self.engine.filter_fresh_candidates([reynolds, gosling])
+        self.assertEqual(
+            len(candidates),
+            2,
+            f"Expected 2 separate candidate clusters for Ryan Reynolds and Ryan Gosling, but got {len(candidates)}: {[c.title for c in candidates]}",
+        )
+        reynolds_rep = next(c for c in candidates if "Reynolds" in c.title)
+        gosling_rep = next(c for c in candidates if "Gosling" in c.title)
+        self.assertEqual(reynolds_rep.raw_metadata.get("cluster_size", 1), 1)
+        self.assertEqual(gosling_rep.raw_metadata.get("cluster_size", 1), 1)
+
+    def test_shared_first_name_different_celebrities_never_merge_chris_pratt_vs_pine(self):
+        """Secondary negative control for P2-3:
+        Chris Pratt vs Chris Pine must NOT merge despite sharing first name 'Chris'.
+        """
+        pratt = Article.create(
+            "Chris Pratt attends premiere in London",
+            "https://variety.com/news/chris-pratt-london-123",
+            "Variety",
+            self.now,
+            snippet="Chris Pratt was seen attending the premiere in London.",
+        )
+        pine = Article.create(
+            "Chris Pine attends premiere in London",
+            "https://variety.com/news/chris-pine-london-456",
+            "Variety",
+            self.now,
+            snippet="Chris Pine was seen attending the premiere in London.",
+        )
+
+        candidates = self.engine.filter_fresh_candidates([pratt, pine])
+        self.assertEqual(
+            len(candidates),
+            2,
+            f"Expected 2 separate candidate clusters for Chris Pratt and Chris Pine, but got {len(candidates)}: {[c.title for c in candidates]}",
+        )
+        pratt_rep = next(c for c in candidates if "Pratt" in c.title)
+        pine_rep = next(c for c in candidates if "Pine" in c.title)
+        self.assertEqual(pratt_rep.raw_metadata.get("cluster_size", 1), 1)
+        self.assertEqual(pine_rep.raw_metadata.get("cluster_size", 1), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
