@@ -324,6 +324,50 @@ def compute_stable_digest_identity(assessments: list[EditorialAssessment]) -> st
     return hashlib.sha256(key_str.encode("utf-8")).hexdigest()[:24]
 
 
+def compute_editorial_digest_revision_id(
+    assessments: list[EditorialAssessment],
+    is_ux_test: bool = False,
+    window_label: Optional[str] = None,
+) -> str:
+    """Compute a presentation-independent, editorial-revision-scoped canonical hash for an editorial digest.
+
+    Guarantees:
+    1. Stable across display timestamps, whitespace, and formatting variations.
+    2. Captures all editorial revisions: kinds (NEW vs UPDATE), headlines, developments,
+       and story article identities.
+    3. Distinguishes UX test mode from live editorial digests.
+    4. Distinguishes different window intervals (if specified).
+    5. 100% deterministic across Python processes and platforms (SHA-256).
+    """
+    story_reprs: list[str] = []
+    for a in assessments:
+        canonical_arts = (
+            sorted(a.article_ids)
+            if a.article_ids
+            else (sorted(art.id for art in a.supporting_articles) if a.supporting_articles else [])
+        )
+        art_str = ",".join(canonical_arts)
+        kind_str = a.kind.value if hasattr(a.kind, "value") else str(a.kind)
+        parent_id = a.parent_story_id or ""
+        headline_clean = normalize_text(a.headline_tr)
+        dev_clean = normalize_text(a.development_tr or "")
+        why_clean = normalize_text(a.why_efso_tr or "")
+        cover_clean = normalize_text(a.cover_title_tr or "")
+
+        story_repr = (
+            f"arts={art_str};k={kind_str};p={parent_id};"
+            f"h={headline_clean};dev={dev_clean};why={why_clean};c={cover_clean}"
+        )
+        story_reprs.append(story_repr)
+
+    sorted_stories = sorted(story_reprs)
+    stories_block = "|".join(sorted_stories)
+    ux_tag = "UX" if is_ux_test else "PROD"
+    win_tag = normalize_text(window_label or "")
+    canonical_seed = f"mode={ux_tag};win={win_tag};items={stories_block}"
+    return hashlib.sha256(canonical_seed.encode("utf-8")).hexdigest()[:24]
+
+
 def format_telegram_digest_legacy(
     assessments: list[EditorialAssessment],
     window_label: str = "6 Saatlik Editoryal Özet",

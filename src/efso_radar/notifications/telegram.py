@@ -40,6 +40,7 @@ from efso_radar.domain import (
 from efso_radar.notifications.base import NotificationChannel
 from efso_radar.repositories.base import StateRepository
 from efso_radar.notifications.formatters import (
+    compute_editorial_digest_revision_id,
     compute_stable_digest_identity,
     format_telegram_alert,
     format_telegram_breaking,
@@ -1472,6 +1473,7 @@ def deliver_one_shot_editorial_digest(
     target_recipient_role: Optional[str] = None,
     repository: Optional[StateRepository] = None,
     allow_legacy_admin_broadcast: bool = False,
+    timestamp: Optional[datetime] = None,
 ) -> dict[str, Any]:
     """Execute a dedicated, one-shot editorial digest delivery with persistent per-recipient duplicate protection.
 
@@ -1649,6 +1651,7 @@ def deliver_one_shot_editorial_digest(
         assessments,
         window_label=window_label,
         deduplicate=False,
+        timestamp=timestamp,
         is_ux_test=is_ux_test,
     )
     if len(rendered_html) > 4096:
@@ -1662,7 +1665,14 @@ def deliver_one_shot_editorial_digest(
 
     digest_hash = hashlib.sha256(rendered_html.encode("utf-8")).hexdigest()[:24]
     stable_digest_id = ("ux_test_" if is_ux_test else "") + compute_stable_digest_identity(assessments)
+    editorial_revision_id = compute_editorial_digest_revision_id(
+        assessments,
+        is_ux_test=is_ux_test,
+        window_label=window_label,
+    )
+    canonical_outbox_key = ("UX-DIGEST-" if is_ux_test else "DIGEST-") + editorial_revision_id[:20]
     candidate_article_ids = sorted(set(aid for a in assessments for aid in a.article_ids if aid))
+    has_editorial_update = any(a.kind == EditorialKind.UPDATE for a in assessments)
 
     # Gate 6: Load ledger data (fail closed on missing ledger in live mode, or corrupted/invalid ledger)
     ledger_file = Path(ledger_path)
@@ -1724,21 +1734,33 @@ def deliver_one_shot_editorial_digest(
     def _find_existing_record(r_chat: str, r_role: str) -> Optional[dict[str, Any]]:
         is_admin_recipient = (r_role == "ADMIN" or r_chat == settings.telegram_chat_id)
 
-        # 1. Exact key match for this recipient: f"{r_chat}:{digest_hash}"
+        # 1. Exact canonical revision key match: f"{r_chat}:{canonical_outbox_key}"
+        r_can_key = f"{r_chat}:{canonical_outbox_key}"
+        if r_can_key in deliveries:
+            rec = deliveries[r_can_key]
+            if isinstance(rec, dict):
+                return rec
+
+        # 2. Exact key match for this recipient: f"{r_chat}:{digest_hash}"
         r_key = f"{r_chat}:{digest_hash}"
         if r_key in deliveries:
             rec = deliveries[r_key]
             if isinstance(rec, dict):
                 return rec
 
-        # 2. Stable identity match for this recipient: f"{r_chat}:{stable_digest_id}"
+        # 3. Stable identity match for this recipient: f"{r_chat}:{stable_digest_id}"
         r_stable_key = f"{r_chat}:{stable_digest_id}"
         if r_stable_key in deliveries:
             rec = deliveries[r_stable_key]
             if isinstance(rec, dict):
-                return rec
+                rec_can = rec.get("canonical_outbox_key")
+                if rec_can:
+                    if rec_can == canonical_outbox_key:
+                        return rec
+                elif not has_editorial_update:
+                    return rec
 
-        # 3. Iterate through all deliveries and find records that belong strictly to THIS recipient
+        # 4. Iterate through all deliveries and find records that belong strictly to THIS recipient
         for rec_k, rec_v in deliveries.items():
             if not isinstance(rec_v, dict):
                 continue
@@ -1769,19 +1791,22 @@ def deliver_one_shot_editorial_digest(
                 continue
 
             # Check digest identity
+            if rec_v.get("canonical_outbox_key") == canonical_outbox_key:
+                return rec_v
             if rec_v.get("digest_hash") == digest_hash:
                 return rec_v
-            if rec_v.get("stable_digest_id") == stable_digest_id:
-                return rec_v
-            if not is_ux_test:
-                rec_art_ids = rec_v.get("article_ids")
-                if rec_art_ids and set(rec_art_ids) == set(candidate_article_ids):
+            if not has_editorial_update:
+                if rec_v.get("stable_digest_id") == stable_digest_id:
                     return rec_v
-                if is_admin_recipient and rec_k in KNOWN_HISTORICAL_HASHES:
-                    if KNOWN_HISTORICAL_HASHES[rec_k] == set(candidate_article_ids):
+                if not is_ux_test:
+                    rec_art_ids = rec_v.get("article_ids")
+                    if rec_art_ids and set(rec_art_ids) == set(candidate_article_ids):
                         return rec_v
+                    if is_admin_recipient and rec_k in KNOWN_HISTORICAL_HASHES:
+                        if KNOWN_HISTORICAL_HASHES[rec_k] == set(candidate_article_ids):
+                            return rec_v
 
-        # 4. Backward compatibility check for legacy un-prefixed keys
+        # 5. Backward compatibility check for legacy un-prefixed keys
         if is_admin_recipient or (settings.telegram_chat_id and r_chat == settings.telegram_chat_id):
             if not is_ux_test and digest_hash in deliveries:
                 legacy_rec = deliveries[digest_hash]
@@ -1806,6 +1831,7 @@ def deliver_one_shot_editorial_digest(
             "stories_count": len(assessments),
             "digest_hash": digest_hash,
             "stable_digest_id": stable_digest_id,
+            "canonical_outbox_key": canonical_outbox_key,
             "article_ids": candidate_article_ids,
             "is_ux_test": is_ux_test,
             "digest_type": "UX_TEST" if is_ux_test else "EDITORIAL_DIGEST",
@@ -1814,8 +1840,9 @@ def deliver_one_shot_editorial_digest(
             rec["message_id"] = msg_id
         if err_desc:
             rec["error"] = err_desc
-        # Save under per-recipient key
-        ledger_data.setdefault("deliveries", {})[f"{r_chat}:{digest_hash}"] = rec
+        # Save under canonical key and per-recipient digest_hash
+        ledger_data.setdefault("deliveries", {})[f"{r_chat}:{canonical_outbox_key}"] = rec
+        ledger_data["deliveries"][f"{r_chat}:{digest_hash}"] = rec
         # If ADMIN, also write to digest_hash for legacy single-recipient tests
         if r_role == "ADMIN" or r_chat == settings.telegram_chat_id:
             ledger_data["deliveries"][digest_hash] = rec
@@ -1839,10 +1866,11 @@ def deliver_one_shot_editorial_digest(
                 "SAFE_PREVIEW_PASSED": DeliveryStatus.PENDING,
             }
             repo_status = status_map.get(rec_status, DeliveryStatus.FAILED)
-            deliv_id = f"DELIV-{digest_hash[:8]}-{abs(hash(r_chat)) % 1000000:06d}"
+            chat_hash = hashlib.sha256(r_chat.encode("utf-8")).hexdigest()[:6]
+            deliv_id = f"DELIV-{canonical_outbox_key[:16]}-{chat_hash}"
             deliv_rec = TelegramDeliveryRecord(
                 delivery_id=deliv_id,
-                message_key=digest_hash,
+                message_key=canonical_outbox_key,
                 recipient_role=r_role,
                 recipient_chat_id=r_chat,
                 category=TelegramNotificationCategory.EDITORIAL_DIGEST,
@@ -1852,6 +1880,8 @@ def deliver_one_shot_editorial_digest(
                 error_message=err_desc,
                 payload={
                     "stable_digest_id": stable_digest_id,
+                    "canonical_outbox_key": canonical_outbox_key,
+                    "digest_hash": digest_hash,
                     "is_ux_test": is_ux_test,
                     "stories_count": len(assessments),
                     "message_id": msg_id,
@@ -1893,9 +1923,16 @@ def deliver_one_shot_editorial_digest(
 
         repo_rec = None
         if repository is not None:
-            repo_rec = repository.get_telegram_delivery(r_chat, digest_hash)
+            # 1. Primary lookup by canonical revision key
+            repo_rec = repository.get_telegram_delivery(r_chat, canonical_outbox_key)
+            # 2. Backward compatibility: look up by rendered digest_hash (legacy Phase 4/5B.3C key)
             if not repo_rec:
-                repo_rec = repository.get_telegram_delivery(r_chat, stable_digest_id)
+                repo_rec = repository.get_telegram_delivery(r_chat, digest_hash)
+            # 3. Backward compatibility: look up by stable_digest_id (only if no UPDATE)
+            if not repo_rec and not has_editorial_update:
+                repo_rec = repository.get_telegram_delivery(r_chat, f"DIGEST-{stable_digest_id[:16]}")
+                if not repo_rec:
+                    repo_rec = repository.get_telegram_delivery(r_chat, stable_digest_id)
 
         rec_status = None
         delivered_at_str = None
@@ -1922,6 +1959,7 @@ def deliver_one_shot_editorial_digest(
                     "error": f"Duplicate delivery prevented: This exact {rec_label} was already delivered to {r_role} on {delivered_at_str}.",
                     "digest_hash": digest_hash,
                     "stable_digest_id": stable_digest_id,
+                    "canonical_outbox_key": canonical_outbox_key,
                     "stories_count": len(assessments),
                     "attempt_made": False,
                     "attempts_count": 0,
@@ -1935,6 +1973,7 @@ def deliver_one_shot_editorial_digest(
                     "error": f"Duplicate delivery prevented: A prior attempt for {r_role} resulted in an ambiguous timeout on {delivered_at_str}. Automatic resend is blocked.",
                     "digest_hash": digest_hash,
                     "stable_digest_id": stable_digest_id,
+                    "canonical_outbox_key": canonical_outbox_key,
                     "stories_count": len(assessments),
                     "attempt_made": False,
                     "attempts_count": 0,
@@ -1964,16 +2003,19 @@ def deliver_one_shot_editorial_digest(
         # Atomically acquire delivery claim before external HTTP call to guarantee no duplicate dispatches
         # and prevent competing workers from sending the same logical message.
         if repository is not None:
-            deliv_id = f"DELIV-{digest_hash[:8]}-{abs(hash(r_chat)) % 1000000:06d}"
+            chat_hash = hashlib.sha256(r_chat.encode("utf-8")).hexdigest()[:6]
+            deliv_id = f"DELIV-{canonical_outbox_key[:16]}-{chat_hash}"
             try:
                 claimed = repository.claim_telegram_delivery(
                     delivery_id=deliv_id,
-                    message_key=digest_hash,
+                    message_key=canonical_outbox_key,
                     recipient_role=r_role,
                     recipient_chat_id=r_chat,
                     category=TelegramNotificationCategory.EDITORIAL_DIGEST,
                     payload={
                         "stable_digest_id": stable_digest_id,
+                        "canonical_outbox_key": canonical_outbox_key,
+                        "digest_hash": digest_hash,
                         "is_ux_test": is_ux_test,
                         "stories_count": len(assessments),
                     },
@@ -1985,6 +2027,7 @@ def deliver_one_shot_editorial_digest(
                     "error": f"Failed closed: repository claim error: {sanitize_telegram_text(str(exc), settings.telegram_bot_token)}",
                     "digest_hash": digest_hash,
                     "stable_digest_id": stable_digest_id,
+                    "canonical_outbox_key": canonical_outbox_key,
                     "attempt_made": False,
                     "attempts_count": 0,
                     "is_ux_test": is_ux_test,
@@ -1992,7 +2035,13 @@ def deliver_one_shot_editorial_digest(
                 continue
 
             if not claimed:
-                existing_deliv = repository.get_telegram_delivery(r_chat, digest_hash)
+                existing_deliv = repository.get_telegram_delivery(r_chat, canonical_outbox_key)
+                if not existing_deliv:
+                    existing_deliv = repository.get_telegram_delivery(r_chat, digest_hash)
+                if not existing_deliv and not has_editorial_update:
+                    existing_deliv = repository.get_telegram_delivery(r_chat, f"DIGEST-{stable_digest_id[:16]}")
+                    if not existing_deliv:
+                        existing_deliv = repository.get_telegram_delivery(r_chat, stable_digest_id)
                 deliv_st = existing_deliv.status.value if existing_deliv else "UNKNOWN"
                 if existing_deliv and existing_deliv.status in (DeliveryStatus.SENT, DeliveryStatus.DELIVERY_UNCERTAIN):
                     _record_public_result(r_role, r_masked, {
@@ -2000,6 +2049,7 @@ def deliver_one_shot_editorial_digest(
                         "error": f"Duplicate delivery prevented: prior durable repository delivery status is {deliv_st}.",
                         "digest_hash": digest_hash,
                         "stable_digest_id": stable_digest_id,
+                        "canonical_outbox_key": canonical_outbox_key,
                         "stories_count": len(assessments),
                         "attempt_made": False,
                         "attempts_count": 0,
@@ -2011,6 +2061,7 @@ def deliver_one_shot_editorial_digest(
                         "error": f"Delivery claim rejected: an in-flight worker or prior attempt holds this message (status: {deliv_st}).",
                         "digest_hash": digest_hash,
                         "stable_digest_id": stable_digest_id,
+                        "canonical_outbox_key": canonical_outbox_key,
                         "stories_count": len(assessments),
                         "attempt_made": False,
                         "attempts_count": 0,
@@ -2188,6 +2239,7 @@ def deliver_one_shot_editorial_digest(
             "masked_token": token_masked,
             "digest_hash": digest_hash,
             "stable_digest_id": stable_digest_id,
+            "canonical_outbox_key": canonical_outbox_key,
             "stories_count": len(assessments),
             "rendered_html": rendered_html,
             "is_ux_test": is_ux_test,
