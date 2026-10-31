@@ -1866,8 +1866,8 @@ def deliver_one_shot_editorial_digest(
                 "SAFE_PREVIEW_PASSED": DeliveryStatus.PENDING,
             }
             repo_status = status_map.get(rec_status, DeliveryStatus.FAILED)
-            chat_hash = hashlib.sha256(r_chat.encode("utf-8")).hexdigest()[:6]
-            deliv_id = f"DELIV-{canonical_outbox_key[:16]}-{chat_hash}"
+            deliv_token = hashlib.sha256(f"{r_chat}:{canonical_outbox_key}".encode("utf-8")).hexdigest()
+            deliv_id = f"DELIV-{deliv_token[:32]}"
             deliv_rec = TelegramDeliveryRecord(
                 delivery_id=deliv_id,
                 message_key=canonical_outbox_key,
@@ -1928,11 +1928,48 @@ def deliver_one_shot_editorial_digest(
             # 2. Backward compatibility: look up by rendered digest_hash (legacy Phase 4/5B.3C key)
             if not repo_rec:
                 repo_rec = repository.get_telegram_delivery(r_chat, digest_hash)
-            # 3. Backward compatibility: look up by stable_digest_id (only if no UPDATE)
-            if not repo_rec and not has_editorial_update:
-                repo_rec = repository.get_telegram_delivery(r_chat, f"DIGEST-{stable_digest_id[:16]}")
-                if not repo_rec:
-                    repo_rec = repository.get_telegram_delivery(r_chat, stable_digest_id)
+            # 3. Exhaustive legacy outbox lookup by stable_digest_id across all relevant history
+            if not repo_rec:
+                try:
+                    legacy_match = repository.find_legacy_editorial_delivery(
+                        recipient_chat_id=r_chat,
+                        stable_digest_id=stable_digest_id,
+                        category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                    )
+                    if legacy_match:
+                        # If legacy_match already has a canonical_outbox_key, it is a modern revision record,
+                        # not an unkeyed legacy record. Its distinct revision was already evaluated by key.
+                        match_can_key = legacy_match.payload.get("canonical_outbox_key")
+                        if match_can_key:
+                            if match_can_key == canonical_outbox_key:
+                                repo_rec = legacy_match
+                        elif legacy_match.status == DeliveryStatus.DISPATCHING:
+                            # Legacy in-flight worker holds this digest
+                            repo_rec = legacy_match
+                        elif not has_editorial_update:
+                            # Identical stories without editorial update in legacy record
+                            repo_rec = legacy_match
+                        else:
+                            # Genuine UPDATE present, but legacy record lacked canonical revision key.
+                            # Treat ambiguous same-article old records conservatively for operator review
+                            logger.warning(
+                                "Ambiguous legacy delivery record found for %s with update; failing closed for operator review",
+                                r_chat,
+                            )
+                            repo_rec = legacy_match
+                except Exception as exc:
+                    logger.error("Failed closed during legacy delivery history inspection: %s", exc)
+                    _record_public_result(r_role, r_masked, {
+                        "status": "REPOSITORY_ERROR",
+                        "error": f"Failed closed: corrupted or unparseable delivery history for {r_role}: {sanitize_telegram_text(str(exc), settings.telegram_bot_token)}",
+                        "digest_hash": digest_hash,
+                        "stable_digest_id": stable_digest_id,
+                        "canonical_outbox_key": canonical_outbox_key,
+                        "attempt_made": False,
+                        "attempts_count": 0,
+                        "is_ux_test": is_ux_test,
+                    })
+                    continue
 
         rec_status = None
         delivered_at_str = None
@@ -1949,6 +1986,9 @@ def deliver_one_shot_editorial_digest(
                 msg_id_val = repo_rec.payload.get("message_id")
             elif repo_rec.status == DeliveryStatus.DELIVERY_UNCERTAIN:
                 rec_status = "DELIVERY_UNCERTAIN"
+                delivered_at_str = repo_rec.updated_at.isoformat()
+            elif repo_rec.status == DeliveryStatus.DISPATCHING:
+                rec_status = "DISPATCHING"
                 delivered_at_str = repo_rec.updated_at.isoformat()
 
         if rec_status:
@@ -1971,6 +2011,19 @@ def deliver_one_shot_editorial_digest(
                 _record_public_result(r_role, r_masked, {
                     "status": "DUPLICATE_DELIVERY_PREVENTED",
                     "error": f"Duplicate delivery prevented: A prior attempt for {r_role} resulted in an ambiguous timeout on {delivered_at_str}. Automatic resend is blocked.",
+                    "digest_hash": digest_hash,
+                    "stable_digest_id": stable_digest_id,
+                    "canonical_outbox_key": canonical_outbox_key,
+                    "stories_count": len(assessments),
+                    "attempt_made": False,
+                    "attempts_count": 0,
+                    "is_ux_test": is_ux_test,
+                })
+                continue
+            elif rec_status == "DISPATCHING":
+                _record_public_result(r_role, r_masked, {
+                    "status": "CLAIM_REJECTED",
+                    "error": f"Delivery claim rejected: an in-flight worker or prior attempt holds this message (status: DISPATCHING, started at: {delivered_at_str}).",
                     "digest_hash": digest_hash,
                     "stable_digest_id": stable_digest_id,
                     "canonical_outbox_key": canonical_outbox_key,
@@ -2003,8 +2056,8 @@ def deliver_one_shot_editorial_digest(
         # Atomically acquire delivery claim before external HTTP call to guarantee no duplicate dispatches
         # and prevent competing workers from sending the same logical message.
         if repository is not None:
-            chat_hash = hashlib.sha256(r_chat.encode("utf-8")).hexdigest()[:6]
-            deliv_id = f"DELIV-{canonical_outbox_key[:16]}-{chat_hash}"
+            deliv_token = hashlib.sha256(f"{r_chat}:{canonical_outbox_key}".encode("utf-8")).hexdigest()
+            deliv_id = f"DELIV-{deliv_token[:32]}"
             try:
                 claimed = repository.claim_telegram_delivery(
                     delivery_id=deliv_id,
@@ -2038,10 +2091,13 @@ def deliver_one_shot_editorial_digest(
                 existing_deliv = repository.get_telegram_delivery(r_chat, canonical_outbox_key)
                 if not existing_deliv:
                     existing_deliv = repository.get_telegram_delivery(r_chat, digest_hash)
-                if not existing_deliv and not has_editorial_update:
-                    existing_deliv = repository.get_telegram_delivery(r_chat, f"DIGEST-{stable_digest_id[:16]}")
-                    if not existing_deliv:
-                        existing_deliv = repository.get_telegram_delivery(r_chat, stable_digest_id)
+                if not existing_deliv:
+                    try:
+                        existing_deliv = repository.find_legacy_editorial_delivery(
+                            r_chat, stable_digest_id, TelegramNotificationCategory.EDITORIAL_DIGEST
+                        )
+                    except Exception:
+                        pass
                 deliv_st = existing_deliv.status.value if existing_deliv else "UNKNOWN"
                 if existing_deliv and existing_deliv.status in (DeliveryStatus.SENT, DeliveryStatus.DELIVERY_UNCERTAIN):
                     _record_public_result(r_role, r_masked, {

@@ -1547,6 +1547,69 @@ class SqliteStateRepository(StateRepository):
             )
             return cursor.fetchone() is not None
 
+    def find_legacy_editorial_delivery(
+        self,
+        recipient_chat_id: str,
+        stable_digest_id: str,
+        category: TelegramNotificationCategory = TelegramNotificationCategory.EDITORIAL_DIGEST,
+        batch_size: int = 100,
+    ) -> Optional[TelegramDeliveryRecord]:
+        offset = 0
+        with self._connection() as conn:
+            while True:
+                cursor = conn.execute(
+                    """
+                    SELECT delivery_id, message_key, recipient_role, recipient_chat_id,
+                           category, status, attempt_count, max_attempts, error_message,
+                           payload_json, created_at, updated_at, sent_at
+                    FROM telegram_delivery_records
+                    WHERE recipient_chat_id = ? AND category = ?
+                    ORDER BY created_at DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (recipient_chat_id, category.value, batch_size, offset),
+                )
+                rows = cursor.fetchall()
+                if not rows:
+                    break
+
+                for row in rows:
+                    raw_payload = row["payload_json"]
+                    try:
+                        payload = json.loads(raw_payload or "{}")
+                        if not isinstance(payload, dict):
+                            raise ValueError(f"Payload in delivery record '{row['delivery_id']}' is not a valid JSON object.")
+                    except Exception as exc:
+                        raise ValueError(
+                            f"Corrupted delivery record detected for recipient '{recipient_chat_id}': "
+                            f"record '{row['delivery_id']}' has unparseable payload_json ({exc})."
+                        ) from exc
+
+                    rec_stable_id = payload.get("stable_digest_id")
+                    rec_key = row["message_key"]
+
+                    if rec_stable_id == stable_digest_id or rec_key == stable_digest_id:
+                        return TelegramDeliveryRecord(
+                            delivery_id=row["delivery_id"],
+                            message_key=row["message_key"],
+                            recipient_role=row["recipient_role"],
+                            recipient_chat_id=row["recipient_chat_id"],
+                            category=TelegramNotificationCategory(row["category"]),
+                            status=DeliveryStatus(row["status"]),
+                            attempt_count=int(row["attempt_count"]),
+                            max_attempts=int(row["max_attempts"]),
+                            error_message=row["error_message"],
+                            payload=payload,
+                            created_at=datetime.fromisoformat(row["created_at"]),
+                            updated_at=datetime.fromisoformat(row["updated_at"]),
+                            sent_at=datetime.fromisoformat(row["sent_at"]) if row["sent_at"] else None,
+                        )
+
+                offset += len(rows)
+                if len(rows) < batch_size:
+                    break
+        return None
+
     def get_pending_telegram_deliveries(self, limit: int = 50) -> list[TelegramDeliveryRecord]:
         with self._connection() as conn:
             cursor = conn.execute(

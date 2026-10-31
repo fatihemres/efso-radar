@@ -354,17 +354,18 @@ def compute_editorial_digest_revision_id(
         why_clean = normalize_text(a.why_efso_tr or "")
         cover_clean = normalize_text(a.cover_title_tr or "")
 
+        # Cosmetic elements (why_efso_tr, cover_title_tr) are omitted from core revision identity
+        # so presentation copy tweaks do not trigger duplicate broadcast sends to recipients.
         story_repr = (
             f"arts={art_str};k={kind_str};p={parent_id};"
-            f"h={headline_clean};dev={dev_clean};why={why_clean};c={cover_clean}"
+            f"h={headline_clean};dev={dev_clean}"
         )
         story_reprs.append(story_repr)
 
     sorted_stories = sorted(story_reprs)
     stories_block = "|".join(sorted_stories)
     ux_tag = "UX" if is_ux_test else "PROD"
-    win_tag = normalize_text(window_label or "")
-    canonical_seed = f"mode={ux_tag};win={win_tag};items={stories_block}"
+    canonical_seed = f"mode={ux_tag};items={stories_block}"
     return hashlib.sha256(canonical_seed.encode("utf-8")).hexdigest()[:24]
 
 
