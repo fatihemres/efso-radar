@@ -1953,7 +1953,11 @@ def deliver_one_shot_editorial_digest(
             if not repo_rec:
                 repo_rec = repository.get_telegram_delivery(r_chat, digest_hash)
             # 3. Exhaustive legacy outbox lookup by stable_digest_id across all relevant history
-            if not repo_rec:
+            if not repo_rec or repo_rec.status not in (
+                DeliveryStatus.SENT,
+                DeliveryStatus.DELIVERY_UNCERTAIN,
+                DeliveryStatus.DISPATCHING,
+            ):
                 try:
                     legacy_match = repository.find_legacy_editorial_delivery(
                         recipient_chat_id=r_chat,
@@ -1967,20 +1971,25 @@ def deliver_one_shot_editorial_digest(
                         if match_can_key:
                             if match_can_key == canonical_outbox_key:
                                 repo_rec = legacy_match
-                        elif legacy_match.status == DeliveryStatus.DISPATCHING:
-                            # Legacy in-flight worker holds this digest
-                            repo_rec = legacy_match
-                        elif not has_editorial_update:
-                            # Identical stories without editorial update in legacy record
-                            repo_rec = legacy_match
-                        else:
-                            # Genuine UPDATE present, but legacy record lacked canonical revision key.
-                            # Treat ambiguous same-article old records conservatively for operator review
-                            logger.warning(
-                                "Ambiguous legacy delivery record found for %s with update; failing closed for operator review",
-                                r_masked,
-                            )
-                            repo_rec = legacy_match
+                        elif legacy_match.status in (
+                            DeliveryStatus.SENT,
+                            DeliveryStatus.DELIVERY_UNCERTAIN,
+                            DeliveryStatus.DISPATCHING,
+                        ):
+                            if legacy_match.status == DeliveryStatus.DISPATCHING:
+                                # Legacy in-flight worker holds this digest
+                                repo_rec = legacy_match
+                            elif not has_editorial_update:
+                                # Identical stories without editorial update in legacy record
+                                repo_rec = legacy_match
+                            else:
+                                # Genuine UPDATE present, but legacy record lacked canonical revision key.
+                                # Treat ambiguous same-article old records conservatively for operator review
+                                logger.warning(
+                                    "Ambiguous legacy delivery record found for %s with update; failing closed for operator review",
+                                    r_masked,
+                                )
+                                repo_rec = legacy_match
                 except Exception as exc:
                     logger.error("Failed closed during legacy delivery history inspection: %s", exc)
                     _record_public_result(r_role, r_masked, {

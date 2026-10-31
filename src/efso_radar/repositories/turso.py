@@ -1330,6 +1330,8 @@ class TursoStateRepository(StateRepository):
         category: TelegramNotificationCategory = TelegramNotificationCategory.EDITORIAL_DIGEST,
         batch_size: int = 100,
     ) -> Optional[TelegramDeliveryRecord]:
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be a positive integer, got {batch_size}")
         last_created_at: Optional[str] = None
         last_delivery_id: Optional[str] = None
         legacy_matches: list[TelegramDeliveryRecord] = []

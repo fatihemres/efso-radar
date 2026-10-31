@@ -48,7 +48,7 @@ from efso_radar.domain import (
     VerificationStatus,
     utc_now,
 )
-from efso_radar.notifications.formatters import format_telegram_digest, compute_stable_digest_identity
+from efso_radar.notifications.formatters import format_telegram_digest, compute_stable_digest_identity, compute_editorial_digest_revision_id
 from efso_radar.notifications.telegram import (
     TelegramNotificationChannel,
     deliver_one_shot_editorial_digest,
@@ -3273,6 +3273,358 @@ class TestPhase5B3CCloudPersistenceIntegration(unittest.TestCase):
         self.assertIsNotNone(persisted_rec)
         self.assertEqual(persisted_rec.delivery_id, expected_deliv_id, "delivery_id must match full SHA-256 derived ID exactly!")
         self.assertEqual(persisted_rec.status, DeliveryStatus.SENT)
+
+    # --- Test 51: Modern PENDING Record Does Not Bypass Older Legacy SENT or UNCERTAIN (Round 3 Priority 1) ---
+    def test_51_modern_pending_record_does_not_bypass_older_legacy_sent_or_uncertain(self):
+        """A modern canonical-key PENDING record must NOT bypass an older legacy SENT or UNCERTAIN record for the same story/recipient."""
+        repo = self._create_turso_repo()
+        editor_chat = self.test_settings.telegram_primary_editor_chat_id
+        t_old = datetime(2026, 10, 31, 10, 0, tzinfo=timezone.utc)
+        t_pending = datetime(2026, 10, 31, 10, 30, tzinfo=timezone.utc)
+
+        assessments = [
+            EditorialAssessment(
+                article_ids=["pending_bypass_1"], score=90, kind=EditorialKind.NEW,
+                headline_tr="Haber Başlığı 1", why_efso_tr="Neden 1",
+            ),
+            EditorialAssessment(
+                article_ids=["pending_bypass_2"], score=88, kind=EditorialKind.NEW,
+                headline_tr="Haber Başlığı 2", why_efso_tr="Neden 2",
+            ),
+            EditorialAssessment(
+                article_ids=["pending_bypass_3"], score=85, kind=EditorialKind.NEW,
+                headline_tr="Haber Başlığı 3", why_efso_tr="Neden 3",
+            ),
+        ]
+        stable_id = compute_stable_digest_identity(assessments)
+        revision_id = compute_editorial_digest_revision_id(assessments)
+        canonical_key = f"DIGEST-{revision_id[:20]}"
+
+        # 1. Insert older legacy record without canonical_outbox_key (status: SENT)
+        legacy_deliv = TelegramDeliveryRecord(
+            delivery_id="DELIV-LEGACY-TERMINAL-SENT",
+            message_key=stable_id,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=editor_chat,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            status=DeliveryStatus.SENT,
+            attempt_count=1,
+            max_attempts=1,
+            payload={
+                "stable_digest_id": stable_id,
+                "is_ux_test": False,
+                "stories_count": 3,
+            },
+            created_at=t_old,
+            updated_at=t_old,
+            sent_at=t_old,
+        )
+        repo.record_telegram_delivery(legacy_deliv)
+
+        # 2. Insert newer modern record with message_key = canonical_key but status = PENDING (e.g. previewed or pre-seeded)
+        pending_deliv = TelegramDeliveryRecord(
+            delivery_id="DELIV-MODERN-PENDING-KEY",
+            message_key=canonical_key,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=editor_chat,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            status=DeliveryStatus.PENDING,
+            attempt_count=0,
+            max_attempts=1,
+            payload={
+                "stable_digest_id": stable_id,
+                "canonical_outbox_key": canonical_key,
+                "is_ux_test": False,
+                "stories_count": 3,
+            },
+            created_at=t_pending,
+            updated_at=t_pending,
+        )
+        repo.record_telegram_delivery(pending_deliv)
+
+        sent_messages = []
+
+        def handle_request(request: httpx.Request) -> httpx.Response:
+            sent_messages.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 9999}})
+
+        mock_tg_transport = httpx.MockTransport(handle_request)
+
+        # Dispatch attempt with ephemeral ledger
+        res = deliver_one_shot_editorial_digest(
+            settings=self.test_settings,
+            assessments=assessments,
+            dry_run=False,
+            ledger_path=self.tmp_path / "pending_bypass_empty_ledger.json",
+            transport=mock_tg_transport,
+            target_recipient_role="PRIMARY_EDITOR",
+            repository=repo,
+            timestamp=datetime(2026, 10, 31, 11, 0, tzinfo=timezone.utc),
+        )
+        status = res.get("status") or res.get("PRIMARY_EDITOR", {}).get("status")
+
+        # Crucial assertions: Modern PENDING record MUST NOT bypass older legacy SENT record!
+        self.assertEqual(status, "DUPLICATE_DELIVERY_PREVENTED", "Modern PENDING record must not bypass older legacy SENT record!")
+        self.assertEqual(len(sent_messages), 0, "Zero mock HTTP calls permitted when older legacy SENT record exists!")
+
+    # --- Test 52: Privacy Regression End-to-End Logs & Public Return Structures (Round 3 Priority 2) ---
+    def test_52_privacy_regression_end_to_end_logs_and_public_results(self):
+        """End-to-end privacy check: raw recipient chat ID must NOT appear in log records or public return structures."""
+        repo = self._create_turso_repo()
+        secret_chat = "9876543210"
+        masked_secret = "98...10"
+
+        custom_settings = Settings(
+            gemini_api_key="synthetic_gemini_key_for_testing_purposes_only",
+            telegram_bot_token="synthetic_bot_token_1234567890",
+            telegram_chat_id="99999999",
+            telegram_primary_editor_chat_id=secret_chat,
+            telegram_allowed_chat_ids=[secret_chat, "99999999"],
+            telegram_delivery_enabled=True,
+            turso_database_url="http://127.0.0.1:8080",
+            turso_auth_token="synthetic_turso_auth_token_for_hermetic_testing",
+        )
+
+        assessments = [
+            EditorialAssessment(
+                article_ids=["priv_art_1"], score=90, kind=EditorialKind.NEW,
+                headline_tr="Gizlilik Haber 1", why_efso_tr="Neden 1",
+            ),
+            EditorialAssessment(
+                article_ids=["priv_art_2"], score=88, kind=EditorialKind.NEW,
+                headline_tr="Gizlilik Haber 2", why_efso_tr="Neden 2",
+            ),
+            EditorialAssessment(
+                article_ids=["priv_art_3"], score=85, kind=EditorialKind.NEW,
+                headline_tr="Gizlilik Haber 3", why_efso_tr="Neden 3",
+            ),
+        ]
+        stable_id = compute_stable_digest_identity(assessments)
+
+        # Case A: Corrupted legacy history
+        repo.client.execute(
+            """
+            INSERT INTO telegram_delivery_records (
+                delivery_id, message_key, recipient_role, recipient_chat_id,
+                category, status, attempt_count, max_attempts, payload_json,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, 1, 'CORRUPTED_JSON_NOT_VALID', ?, ?)
+            """,
+            [
+                "DELIV-CORRUPT-ENDTOEND",
+                "corrupt-key",
+                "PRIMARY_EDITOR",
+                secret_chat,
+                TelegramNotificationCategory.EDITORIAL_DIGEST.value,
+                DeliveryStatus.SENT.value,
+                datetime.now(timezone.utc).isoformat(),
+                datetime.now(timezone.utc).isoformat(),
+            ],
+        )
+
+        with self.assertLogs("efso-radar.notifications.telegram", level="ERROR") as cm_err:
+            res_a = deliver_one_shot_editorial_digest(
+                settings=custom_settings,
+                assessments=assessments,
+                dry_run=False,
+                ledger_path=self.tmp_path / "privacy_corrupt_ledger.json",
+                transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"ok": True})),
+                target_recipient_role="PRIMARY_EDITOR",
+                repository=repo,
+                timestamp=datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc),
+            )
+
+        # Verify logger output has NO raw chat ID and DOES have masked chat ID
+        all_err_logs = " ".join(cm_err.output)
+        self.assertNotIn(secret_chat, all_err_logs, "Raw chat ID leaked in logger.error output!")
+        self.assertIn(masked_secret, all_err_logs, "Masked chat ID should appear in log!")
+
+        # Verify public return dictionary has NO raw chat ID
+        res_a_str = json.dumps(res_a)
+        self.assertNotIn(secret_chat, res_a_str, "Raw chat ID leaked in public return structure on corrupted history!")
+        self.assertIn(masked_secret, res_a_str, "Masked chat ID must appear in public return structure!")
+
+        # Case B: Ambiguous legacy delivery record with editorial update
+        repo.client.execute("DELETE FROM telegram_delivery_records WHERE delivery_id = 'DELIV-CORRUPT-ENDTOEND'")
+        repo.client.execute(
+            """
+            INSERT INTO telegram_delivery_records (
+                delivery_id, message_key, recipient_role, recipient_chat_id,
+                category, status, attempt_count, max_attempts, payload_json,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?)
+            """,
+            [
+                "DELIV-LEGACY-UPDATE-TEST",
+                stable_id,
+                "PRIMARY_EDITOR",
+                secret_chat,
+                TelegramNotificationCategory.EDITORIAL_DIGEST.value,
+                DeliveryStatus.SENT.value,
+                json.dumps({"stable_digest_id": stable_id, "is_ux_test": False}),
+                datetime.now(timezone.utc).isoformat(),
+                datetime.now(timezone.utc).isoformat(),
+            ],
+        )
+
+        update_assessments = [
+            EditorialAssessment(
+                article_ids=["priv_art_1"], score=90, kind=EditorialKind.UPDATE,
+                headline_tr="Gizlilik Haber 1 Güncellendi", development_tr="Yeni gelişme var", why_efso_tr="Neden",
+            ),
+            EditorialAssessment(
+                article_ids=["priv_art_2"], score=88, kind=EditorialKind.NEW,
+                headline_tr="Gizlilik Haber 2", why_efso_tr="Neden 2",
+            ),
+            EditorialAssessment(
+                article_ids=["priv_art_3"], score=85, kind=EditorialKind.NEW,
+                headline_tr="Gizlilik Haber 3", why_efso_tr="Neden 3",
+            ),
+        ]
+
+        with self.assertLogs("efso-radar.notifications.telegram", level="WARNING") as cm_warn:
+            res_b = deliver_one_shot_editorial_digest(
+                settings=custom_settings,
+                assessments=update_assessments,
+                dry_run=False,
+                ledger_path=self.tmp_path / "privacy_update_ledger.json",
+                transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"ok": True})),
+                target_recipient_role="PRIMARY_EDITOR",
+                repository=repo,
+                timestamp=datetime(2026, 10, 31, 12, 10, tzinfo=timezone.utc),
+            )
+
+        all_warn_logs = " ".join(cm_warn.output)
+        self.assertNotIn(secret_chat, all_warn_logs, "Raw chat ID leaked in logger.warning output!")
+        self.assertIn(masked_secret, all_warn_logs, "Masked chat ID must appear in warning log!")
+
+        res_b_str = json.dumps(res_b)
+        self.assertNotIn(secret_chat, res_b_str, "Raw chat ID leaked in public return structure on ambiguous update!")
+        self.assertIn(masked_secret, res_b_str, "Masked chat ID must appear in public return structure!")
+
+    # --- Test 53: Concurrent Insertion Keyset Analysis (Round 3 Priority 3) ---
+    def test_53_concurrent_insertion_during_keyset_pagination_and_cutover_analysis(self):
+        """Analyze concurrent insertion during keyset pagination: proves keyset pagination provides monotonic progress across static data, but requires quiescent state for cross-version migration."""
+        repo = self._create_turso_repo()
+        editor_chat = "33221100"
+        t0 = "2026-10-31T10:01:00.000000+00:00"
+        t1 = "2026-10-31T10:02:00.000000+00:00"
+        t2_concurrent = "2026-10-31T10:03:00.000000+00:00"
+        target_stable_id = "DIGEST-concurrent-analysis"
+
+        # Pre-seed 2 initial rows with created_at t1 and t0
+        repo.client.execute(
+            """
+            INSERT INTO telegram_delivery_records (
+                delivery_id, message_key, recipient_role, recipient_chat_id,
+                category, status, attempt_count, max_attempts, payload_json,
+                created_at, updated_at
+            ) VALUES (?, ?, 'PRIMARY_EDITOR', ?, 'EDITORIAL_DIGEST', 'FAILED', 1, 1, '{}', ?, ?)
+            """,
+            ["DELIV-001", "key-001", editor_chat, t1, t1],
+        )
+        repo.client.execute(
+            """
+            INSERT INTO telegram_delivery_records (
+                delivery_id, message_key, recipient_role, recipient_chat_id,
+                category, status, attempt_count, max_attempts, payload_json,
+                created_at, updated_at
+            ) VALUES (?, ?, 'PRIMARY_EDITOR', ?, 'EDITORIAL_DIGEST', 'FAILED', 1, 1, '{}', ?, ?)
+            """,
+            ["DELIV-002", "key-002", editor_chat, t0, t0],
+        )
+
+        # Simulate Page 1 read with batch_size=1
+        res_p1 = repo.client.execute(
+            """
+            SELECT delivery_id, message_key, created_at
+            FROM telegram_delivery_records
+            WHERE recipient_chat_id = ? AND category = 'EDITORIAL_DIGEST'
+            ORDER BY created_at DESC, delivery_id DESC
+            LIMIT 1
+            """,
+            [editor_chat],
+        )
+        rows_p1 = res_p1.fetchall()
+        self.assertEqual(len(rows_p1), 1)
+        self.assertEqual(rows_p1[0]["delivery_id"], "DELIV-001")
+        last_created_at = rows_p1[0]["created_at"]
+        last_deliv_id = rows_p1[0]["delivery_id"]
+
+        # NOW: Simulate concurrent legacy runner inserting a new blocking legacy record at t2_concurrent (later timestamp)
+        repo.client.execute(
+            """
+            INSERT INTO telegram_delivery_records (
+                delivery_id, message_key, recipient_role, recipient_chat_id,
+                category, status, attempt_count, max_attempts, payload_json,
+                created_at, updated_at
+            ) VALUES (?, ?, 'PRIMARY_EDITOR', ?, 'EDITORIAL_DIGEST', 'SENT', 1, 1, ?, ?, ?)
+            """,
+            [
+                "DELIV-003-BLOCKING",
+                target_stable_id,
+                editor_chat,
+                json.dumps({"stable_digest_id": target_stable_id}),
+                t2_concurrent,
+                t2_concurrent,
+            ],
+        )
+
+        # Page 2 query using keyset predicate: created_at < last_created_at OR ...
+        res_p2 = repo.client.execute(
+            """
+            SELECT delivery_id, message_key, created_at
+            FROM telegram_delivery_records
+            WHERE recipient_chat_id = ? AND category = 'EDITORIAL_DIGEST'
+              AND (created_at < ? OR (created_at = ? AND delivery_id < ?))
+            ORDER BY created_at DESC, delivery_id DESC
+            LIMIT 1
+            """,
+            [editor_chat, last_created_at, last_created_at, last_deliv_id],
+        )
+        rows_p2 = res_p2.fetchall()
+        self.assertEqual(len(rows_p2), 1)
+        self.assertEqual(rows_p2[0]["delivery_id"], "DELIV-002")
+
+        # Page 3 query
+        last_created_at = rows_p2[0]["created_at"]
+        last_deliv_id = rows_p2[0]["delivery_id"]
+        res_p3 = repo.client.execute(
+            """
+            SELECT delivery_id, message_key, created_at
+            FROM telegram_delivery_records
+            WHERE recipient_chat_id = ? AND category = 'EDITORIAL_DIGEST'
+              AND (created_at < ? OR (created_at = ? AND delivery_id < ?))
+            ORDER BY created_at DESC, delivery_id DESC
+            LIMIT 1
+            """,
+            [editor_chat, last_created_at, last_created_at, last_deliv_id],
+        )
+        rows_p3 = res_p3.fetchall()
+        self.assertEqual(len(rows_p3), 0)
+
+    # --- Test 54: Batch size validation in find_legacy_editorial_delivery ---
+    def test_54_batch_size_validation_in_find_legacy_editorial_delivery(self):
+        """Verify that find_legacy_editorial_delivery raises ValueError when batch_size <= 0 on both SQLite and Turso repos."""
+        turso_repo = self._create_turso_repo()
+        sqlite_repo = SqliteStateRepository(self.tmp_path / "test_54.db")
+
+        for repo in (turso_repo, sqlite_repo):
+            with self.assertRaises(ValueError) as ctx_zero:
+                repo.find_legacy_editorial_delivery(
+                    recipient_chat_id="12345",
+                    stable_digest_id="DIGEST-TEST",
+                    batch_size=0,
+                )
+            self.assertIn("batch_size must be a positive integer", str(ctx_zero.exception))
+
+            with self.assertRaises(ValueError) as ctx_neg:
+                repo.find_legacy_editorial_delivery(
+                    recipient_chat_id="12345",
+                    stable_digest_id="DIGEST-TEST",
+                    batch_size=-10,
+                )
+            self.assertIn("batch_size must be a positive integer", str(ctx_neg.exception))
 
 
 if __name__ == '__main__':
