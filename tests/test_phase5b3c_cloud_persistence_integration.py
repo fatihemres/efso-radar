@@ -15,6 +15,7 @@ Verifies:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import sqlite3
@@ -47,6 +48,7 @@ from efso_radar.domain import (
     VerificationStatus,
     utc_now,
 )
+from efso_radar.notifications.formatters import format_telegram_digest, compute_stable_digest_identity, compute_editorial_digest_revision_id
 from efso_radar.notifications.telegram import (
     TelegramNotificationChannel,
     deliver_one_shot_editorial_digest,
@@ -2309,5 +2311,1321 @@ class TestPhase5B3CCloudPersistenceIntegration(unittest.TestCase):
         self.assertEqual(queued[0].notification_id, "NOTIF-Q-TEST-37")
         self.assertEqual(queued[0].status, DeliveryStatus.QUEUED_FOR_DIGEST)
 
-if __name__ == "__main__":
+    # --- Test 38: Minute-Rollover Duplicate Prevention Across Ephemeral Runners (Issue #55 RED) ---
+    def test_38_telegram_outbox_minute_rollover_duplicate_prevention_across_runners(self):
+        """Runner 1 delivers at 07:37:59; Runner 2 executes at 07:38:01 across minute boundary.
+        Must be blocked by persistent outbox with zero additional HTTP calls.
+        """
+        repo = self._create_turso_repo()
+        t0 = datetime(2026, 10, 31, 7, 37, 59, tzinfo=timezone.utc)
+        t1 = datetime(2026, 10, 31, 7, 38, 1, tzinfo=timezone.utc)
+
+        assessments = [
+            EditorialAssessment(
+                article_ids=["m_a1"], score=88, kind=EditorialKind.NEW,
+                headline_tr="Dakika Siniri Haber Bir", why_efso_tr="Neden Efso 1",
+            ),
+            EditorialAssessment(
+                article_ids=["m_a2"], score=85, kind=EditorialKind.NEW,
+                headline_tr="Dakika Siniri Haber Iki", why_efso_tr="Neden Efso 2",
+            ),
+            EditorialAssessment(
+                article_ids=["m_a3"], score=82, kind=EditorialKind.NEW,
+                headline_tr="Dakika Siniri Haber Uc", why_efso_tr="Neden Efso 3",
+            ),
+        ]
+
+        sent_messages = []
+
+        def mock_telegram_post(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode("utf-8"))
+            sent_messages.append(body)
+            return httpx.Response(
+                200,
+                json={"ok": True, "result": {"message_id": 8001}},
+                request=request,
+            )
+
+        mock_tg_transport = httpx.MockTransport(mock_telegram_post)
+
+        current_time = [t0]
+        with unittest.mock.patch("efso_radar.notifications.formatters.datetime") as mock_dt_fmt, \
+             unittest.mock.patch("efso_radar.notifications.telegram.datetime") as mock_dt_tg:
+            mock_dt_fmt.now.side_effect = lambda tz=None: current_time[0]
+            mock_dt_tg.now.side_effect = lambda tz=None: current_time[0]
+
+            # Runner 1 executes delivery at t0 (07:37:59)
+            current_time[0] = t0
+            temp_ledger_1 = self.tmp_path / "ephemeral_runner_1_ledger.json"
+            res_1 = deliver_one_shot_editorial_digest(
+                settings=self.test_settings,
+                assessments=assessments,
+                dry_run=False,
+                ledger_path=temp_ledger_1,
+                transport=mock_tg_transport,
+                target_recipient_role="PRIMARY_EDITOR",
+                repository=repo,
+            )
+
+            status_1 = res_1.get("status") or res_1.get("PRIMARY_EDITOR", {}).get("status")
+            self.assertEqual(status_1, "DELIVERY_SUCCESS")
+            self.assertEqual(len(sent_messages), 1)
+
+            # Runner 1 destroyed. Runner 2 executes at t1 (07:38:01 - next minute) on ephemeral runner
+            current_time[0] = t1
+            temp_ledger_2 = self.tmp_path / "ephemeral_runner_2_empty_ledger.json"
+            self.assertFalse(temp_ledger_2.exists())
+
+            res_2 = deliver_one_shot_editorial_digest(
+                settings=self.test_settings,
+                assessments=assessments,
+                dry_run=False,
+                ledger_path=temp_ledger_2,
+                transport=mock_tg_transport,
+                target_recipient_role="PRIMARY_EDITOR",
+                repository=repo,
+            )
+
+            status_2 = res_2.get("status") or res_2.get("PRIMARY_EDITOR", {}).get("status")
+            self.assertEqual(status_2, "DUPLICATE_DELIVERY_PREVENTED")
+            self.assertEqual(len(sent_messages), 1, "Duplicate message sent across minute rollover!")
+
+    # --- Test 39: Genuine Editorial UPDATE Is Permitted Across Runners ---
+    def test_39_telegram_outbox_genuine_editorial_update_permitted_without_false_suppression(self):
+        """Runner 1 delivers base digest; Runner 2 delivers revised digest with an UPDATE kind and new headline.
+        Must NOT be falsely suppressed as duplicate.
+        """
+        repo = self._create_turso_repo()
+
+        initial_assessments = [
+            EditorialAssessment(
+                article_ids=["u_a1"], score=88, kind=EditorialKind.NEW,
+                headline_tr="Ilk Surum Haber Basligi", why_efso_tr="Ilk Neden",
+            ),
+            EditorialAssessment(
+                article_ids=["u_a2"], score=85, kind=EditorialKind.NEW,
+                headline_tr="Sabit Haber Iki", why_efso_tr="Neden 2",
+            ),
+            EditorialAssessment(
+                article_ids=["u_a3"], score=82, kind=EditorialKind.NEW,
+                headline_tr="Sabit Haber Uc", why_efso_tr="Neden 3",
+            ),
+        ]
+
+        sent_messages = []
+
+        def mock_telegram_post(request: httpx.Request) -> httpx.Response:
+            sent_messages.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(
+                200,
+                json={"ok": True, "result": {"message_id": 8100 + len(sent_messages)}},
+                request=request,
+            )
+
+        mock_tg_transport = httpx.MockTransport(mock_telegram_post)
+
+        # Runner 1 delivers initial version
+        res_1 = deliver_one_shot_editorial_digest(
+            settings=self.test_settings,
+            assessments=initial_assessments,
+            dry_run=False,
+            ledger_path=self.tmp_path / "u_runner_1_ledger.json",
+            transport=mock_tg_transport,
+            target_recipient_role="PRIMARY_EDITOR",
+            repository=repo,
+        )
+        self.assertEqual(res_1.get("status") or res_1.get("PRIMARY_EDITOR", {}).get("status"), "DELIVERY_SUCCESS")
+        self.assertEqual(len(sent_messages), 1)
+
+        # Runner 2 on ephemeral runner encounters genuine UPDATE revision for u_a1
+        revised_assessments = [
+            EditorialAssessment(
+                article_ids=["u_a1"], score=92, kind=EditorialKind.UPDATE,
+                headline_tr="Guncellenmis Son Dakika Gelismesi",
+                development_tr="Resmi aciklama ile gelisme dogrulandi",
+                why_efso_tr="Onemli guncelleme",
+            ),
+            EditorialAssessment(
+                article_ids=["u_a2"], score=85, kind=EditorialKind.NEW,
+                headline_tr="Sabit Haber Iki", why_efso_tr="Neden 2",
+            ),
+            EditorialAssessment(
+                article_ids=["u_a3"], score=82, kind=EditorialKind.NEW,
+                headline_tr="Sabit Haber Uc", why_efso_tr="Neden 3",
+            ),
+        ]
+
+        res_2 = deliver_one_shot_editorial_digest(
+            settings=self.test_settings,
+            assessments=revised_assessments,
+            dry_run=False,
+            ledger_path=self.tmp_path / "u_runner_2_ledger.json",
+            transport=mock_tg_transport,
+            target_recipient_role="PRIMARY_EDITOR",
+            repository=repo,
+        )
+        status_2 = res_2.get("status") or res_2.get("PRIMARY_EDITOR", {}).get("status")
+        self.assertEqual(status_2, "DELIVERY_SUCCESS", "Genuine UPDATE was falsely suppressed!")
+        self.assertEqual(len(sent_messages), 2)
+
+    # --- Test 40: Legacy Hash-Keyed SENT Across Minute Rollover & Ephemeral Ledger ---
+    def test_40_telegram_outbox_legacy_hash_keyed_sent_minute_rollover_no_resend(self):
+        """A historical outbox record with message_key = digest_hash at t0 must block duplicate send at t1 with an empty ephemeral ledger."""
+        repo = self._create_turso_repo()
+        t0 = datetime(2026, 10, 31, 11, 59, 0, tzinfo=timezone.utc)
+        t1 = datetime(2026, 10, 31, 12, 0, 0, tzinfo=timezone.utc)
+
+        assessments = [
+            EditorialAssessment(
+                article_ids=["leg_a1"], score=88, kind=EditorialKind.NEW,
+                headline_tr="Eski Format Haber Bir", why_efso_tr="Neden 1",
+            ),
+            EditorialAssessment(
+                article_ids=["leg_a2"], score=85, kind=EditorialKind.NEW,
+                headline_tr="Eski Format Haber Iki", why_efso_tr="Neden 2",
+            ),
+            EditorialAssessment(
+                article_ids=["leg_a3"], score=82, kind=EditorialKind.NEW,
+                headline_tr="Eski Format Haber Uc", why_efso_tr="Neden 3",
+            ),
+        ]
+
+        rendered_html_t0 = format_telegram_digest(assessments, window_label="6 Saatlik Editoryal Özet", timestamp=t0, deduplicate=False)
+        legacy_digest_hash_t0 = hashlib.sha256(rendered_html_t0.encode("utf-8")).hexdigest()[:24]
+        stable_digest_id = compute_stable_digest_identity(assessments)
+
+        # Seed legacy record directly into repository using historical schema: message_key = legacy_digest_hash_t0
+        editor_chat = self.test_settings.telegram_primary_editor_chat_id
+        legacy_record = TelegramDeliveryRecord(
+            delivery_id=f"DELIV-{legacy_digest_hash_t0[:8]}-999999",
+            message_key=legacy_digest_hash_t0,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=editor_chat,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            status=DeliveryStatus.SENT,
+            attempt_count=1,
+            max_attempts=1,
+            payload={
+                "stable_digest_id": stable_digest_id,
+                "is_ux_test": False,
+                "stories_count": 3,
+                "message_id": 7777,
+            },
+            created_at=t0,
+            updated_at=t0,
+            sent_at=t0,
+        )
+        repo.record_telegram_delivery(legacy_record)
+
+        sent_messages = []
+        def mock_post(req: httpx.Request) -> httpx.Response:
+            sent_messages.append(req)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 8888}}, request=req)
+
+        mock_tg_transport = httpx.MockTransport(mock_post)
+
+        res = deliver_one_shot_editorial_digest(
+            settings=self.test_settings,
+            assessments=assessments,
+            dry_run=False,
+            ledger_path=self.tmp_path / "legacy_runner_empty_ledger.json",
+            transport=mock_tg_transport,
+            target_recipient_role="PRIMARY_EDITOR",
+            repository=repo,
+            timestamp=t1,
+        )
+
+        status = res.get("status") or res.get("PRIMARY_EDITOR", {}).get("status")
+        self.assertEqual(status, "DUPLICATE_DELIVERY_PREVENTED", "Legacy hash-keyed SENT record failed to block duplicate across minute boundary!")
+        self.assertEqual(len(sent_messages), 0, "HTTP request was dispatched despite legacy SENT record!")
+
+    # --- Test 41: Legacy Hash-Keyed DELIVERY_UNCERTAIN Across Minute Rollover Blocks Blind Retry ---
+    def test_41_telegram_outbox_legacy_hash_keyed_uncertain_minute_rollover_no_blind_retry(self):
+        """A historical DELIVERY_UNCERTAIN outbox record at t0 must block blind retry at t1 with an empty ephemeral ledger."""
+        repo = self._create_turso_repo()
+        t0 = datetime(2026, 10, 31, 11, 59, 0, tzinfo=timezone.utc)
+        t1 = datetime(2026, 10, 31, 12, 0, 0, tzinfo=timezone.utc)
+
+        assessments = [
+            EditorialAssessment(
+                article_ids=["leg_u1"], score=88, kind=EditorialKind.NEW,
+                headline_tr="Belirsiz Eski Haber 1", why_efso_tr="Neden 1",
+            ),
+            EditorialAssessment(
+                article_ids=["leg_u2"], score=85, kind=EditorialKind.NEW,
+                headline_tr="Belirsiz Eski Haber 2", why_efso_tr="Neden 2",
+            ),
+            EditorialAssessment(
+                article_ids=["leg_u3"], score=82, kind=EditorialKind.NEW,
+                headline_tr="Belirsiz Eski Haber 3", why_efso_tr="Neden 3",
+            ),
+        ]
+
+        rendered_html_t0 = format_telegram_digest(assessments, window_label="6 Saatlik Editoryal Özet", timestamp=t0, deduplicate=False)
+        legacy_digest_hash_t0 = hashlib.sha256(rendered_html_t0.encode("utf-8")).hexdigest()[:24]
+        stable_digest_id = compute_stable_digest_identity(assessments)
+
+        editor_chat = self.test_settings.telegram_primary_editor_chat_id
+        legacy_record = TelegramDeliveryRecord(
+            delivery_id=f"DELIV-{legacy_digest_hash_t0[:8]}-888888",
+            message_key=legacy_digest_hash_t0,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=editor_chat,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            status=DeliveryStatus.DELIVERY_UNCERTAIN,
+            attempt_count=1,
+            max_attempts=1,
+            error_message="Gateway Timeout (HTTP 504)",
+            payload={
+                "stable_digest_id": stable_digest_id,
+                "is_ux_test": False,
+                "stories_count": 3,
+            },
+            created_at=t0,
+            updated_at=t0,
+            sent_at=None,
+        )
+        repo.record_telegram_delivery(legacy_record)
+
+        sent_messages = []
+        def mock_post(req: httpx.Request) -> httpx.Response:
+            sent_messages.append(req)
+            return httpx.Response(200, json={"ok": True}, request=req)
+
+        mock_tg_transport = httpx.MockTransport(mock_post)
+
+        res = deliver_one_shot_editorial_digest(
+            settings=self.test_settings,
+            assessments=assessments,
+            dry_run=False,
+            ledger_path=self.tmp_path / "legacy_uncertain_runner_empty_ledger.json",
+            transport=mock_tg_transport,
+            target_recipient_role="PRIMARY_EDITOR",
+            repository=repo,
+            timestamp=t1,
+        )
+
+        status = res.get("status") or res.get("PRIMARY_EDITOR", {}).get("status")
+        self.assertEqual(status, "DUPLICATE_DELIVERY_PREVENTED", "Legacy DELIVERY_UNCERTAIN failed to block blind retry across minute boundary!")
+        self.assertEqual(len(sent_messages), 0, "Blind retry dispatched HTTP request despite legacy DELIVERY_UNCERTAIN!")
+
+    # --- Test 42: Legacy In-Flight DISPATCHING Across Minute Rollover Blocks Second Claim ---
+    def test_42_telegram_outbox_legacy_hash_keyed_dispatching_minute_rollover_blocks_claim(self):
+        """A historical in-flight DISPATCHING outbox record at t0 must block a competing claim at t1 with empty ephemeral ledger."""
+        repo = self._create_turso_repo()
+        t0 = datetime(2026, 10, 31, 11, 59, 0, tzinfo=timezone.utc)
+        t1 = datetime(2026, 10, 31, 12, 0, 0, tzinfo=timezone.utc)
+
+        assessments = [
+            EditorialAssessment(
+                article_ids=["leg_d1"], score=88, kind=EditorialKind.NEW,
+                headline_tr="Gonderilmekte Olan Haber 1", why_efso_tr="Neden 1",
+            ),
+            EditorialAssessment(
+                article_ids=["leg_d2"], score=85, kind=EditorialKind.NEW,
+                headline_tr="Gonderilmekte Olan Haber 2", why_efso_tr="Neden 2",
+            ),
+            EditorialAssessment(
+                article_ids=["leg_d3"], score=82, kind=EditorialKind.NEW,
+                headline_tr="Gonderilmekte Olan Haber 3", why_efso_tr="Neden 3",
+            ),
+        ]
+
+        rendered_html_t0 = format_telegram_digest(assessments, window_label="6 Saatlik Editoryal Özet", timestamp=t0, deduplicate=False)
+        legacy_digest_hash_t0 = hashlib.sha256(rendered_html_t0.encode("utf-8")).hexdigest()[:24]
+        stable_digest_id = compute_stable_digest_identity(assessments)
+
+        editor_chat = self.test_settings.telegram_primary_editor_chat_id
+        legacy_record = TelegramDeliveryRecord(
+            delivery_id=f"DELIV-{legacy_digest_hash_t0[:8]}-777777",
+            message_key=legacy_digest_hash_t0,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=editor_chat,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            status=DeliveryStatus.DISPATCHING,
+            attempt_count=1,
+            max_attempts=1,
+            payload={
+                "stable_digest_id": stable_digest_id,
+                "is_ux_test": False,
+                "stories_count": 3,
+            },
+            created_at=t0,
+            updated_at=t0,
+            sent_at=None,
+        )
+        repo.record_telegram_delivery(legacy_record)
+
+        sent_messages = []
+        def mock_post(req: httpx.Request) -> httpx.Response:
+            sent_messages.append(req)
+            return httpx.Response(200, json={"ok": True}, request=req)
+
+        mock_tg_transport = httpx.MockTransport(mock_post)
+
+        res = deliver_one_shot_editorial_digest(
+            settings=self.test_settings,
+            assessments=assessments,
+            dry_run=False,
+            ledger_path=self.tmp_path / "legacy_dispatching_empty_ledger.json",
+            transport=mock_tg_transport,
+            target_recipient_role="PRIMARY_EDITOR",
+            repository=repo,
+            timestamp=t1,
+        )
+
+        status = res.get("status") or res.get("PRIMARY_EDITOR", {}).get("status")
+        self.assertIn(status, ("CLAIM_REJECTED", "DUPLICATE_DELIVERY_PREVENTED"), f"Expected claim block, got: {status}")
+        self.assertEqual(len(sent_messages), 0, "HTTP request was dispatched while legacy DISPATCHING record held the digest!")
+
+    # --- Test 43: Cosmetic Metadata Changes Suppressed Across Local Ledger & Cloud Outbox ---
+    def test_43_editorial_revision_cosmetic_edits_suppressed_across_json_and_cloud(self):
+        """Cosmetic text changes (why_efso_tr, cover_title_tr, window_label) must not trigger duplicate delivery."""
+        repo = self._create_turso_repo()
+        t0 = datetime(2026, 10, 31, 10, 0, 0, tzinfo=timezone.utc)
+        t1 = datetime(2026, 10, 31, 10, 5, 0, tzinfo=timezone.utc)
+
+        initial_assessments = [
+            EditorialAssessment(
+                article_ids=["cos_a1"], score=90, kind=EditorialKind.NEW,
+                headline_tr="Baslik Birinci Haber",
+                why_efso_tr="Orijinal Neden Efso Aciklamasi",
+                cover_title_tr="Kapak Onerisi Ilk",
+            ),
+            EditorialAssessment(
+                article_ids=["cos_a2"], score=88, kind=EditorialKind.NEW,
+                headline_tr="Baslik Ikinci Haber",
+                why_efso_tr="Orijinal Neden 2",
+            ),
+            EditorialAssessment(
+                article_ids=["cos_a3"], score=85, kind=EditorialKind.NEW,
+                headline_tr="Baslik Ucuncu Haber",
+                why_efso_tr="Orijinal Neden 3",
+            ),
+        ]
+
+        sent_messages = []
+        def mock_post(req: httpx.Request) -> httpx.Response:
+            sent_messages.append(req)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 9101 + len(sent_messages)}}, request=req)
+
+        mock_tg_transport = httpx.MockTransport(mock_post)
+
+        # Runner 1 delivers initial version
+        ledger_path = self.tmp_path / "cosmetic_ledger.json"
+        res_1 = deliver_one_shot_editorial_digest(
+            settings=self.test_settings,
+            assessments=initial_assessments,
+            dry_run=False,
+            ledger_path=ledger_path,
+            transport=mock_tg_transport,
+            target_recipient_role="PRIMARY_EDITOR",
+            repository=repo,
+            timestamp=t0,
+            window_label="6 Saatlik Editoryal Özet",
+        )
+        status_1 = res_1.get("status") or res_1.get("PRIMARY_EDITOR", {}).get("status")
+        self.assertEqual(status_1, "DELIVERY_SUCCESS")
+        self.assertEqual(len(sent_messages), 1)
+
+        # Runner 2 modifies ONLY cosmetic/presentation text: why_efso_tr, cover_title_tr, window_label
+        cosmetic_assessments = [
+            EditorialAssessment(
+                article_ids=["cos_a1"], score=90, kind=EditorialKind.NEW,
+                headline_tr="Baslik Birinci Haber",  # IDENTICAL
+                why_efso_tr="Tamamen Farkli Kozmetik Neden Metni",  # COSMETIC EDIT
+                cover_title_tr="Kapak Onerisi Ikinci Deneme",      # COSMETIC EDIT
+            ),
+            EditorialAssessment(
+                article_ids=["cos_a2"], score=88, kind=EditorialKind.NEW,
+                headline_tr="Baslik Ikinci Haber",  # IDENTICAL
+                why_efso_tr="Degismis Editör Notu Metni",          # COSMETIC EDIT
+            ),
+            EditorialAssessment(
+                article_ids=["cos_a3"], score=85, kind=EditorialKind.NEW,
+                headline_tr="Baslik Ucuncu Haber",  # IDENTICAL
+                why_efso_tr="Baska Bir Kozmetik Neden",            # COSMETIC EDIT
+            ),
+        ]
+
+        # Case A: Same runner with persistent local JSON ledger
+        res_2a = deliver_one_shot_editorial_digest(
+            settings=self.test_settings,
+            assessments=cosmetic_assessments,
+            dry_run=False,
+            ledger_path=ledger_path,
+            transport=mock_tg_transport,
+            target_recipient_role="PRIMARY_EDITOR",
+            repository=repo,
+            timestamp=t1,
+            window_label="12 Saatlik Editoryal Özet",  # COSMETIC EDIT
+        )
+        status_2a = res_2a.get("status") or res_2a.get("PRIMARY_EDITOR", {}).get("status")
+        self.assertEqual(status_2a, "DUPLICATE_DELIVERY_PREVENTED", "Cosmetic change should be suppressed by local ledger!")
+        self.assertEqual(len(sent_messages), 1, "HTTP request made for cosmetic change in persistent ledger!")
+
+        # Case B: Ephemeral runner (empty local ledger, cloud outbox only)
+        res_2b = deliver_one_shot_editorial_digest(
+            settings=self.test_settings,
+            assessments=cosmetic_assessments,
+            dry_run=False,
+            ledger_path=self.tmp_path / "ephemeral_cosmetic_empty_ledger.json",
+            transport=mock_tg_transport,
+            target_recipient_role="PRIMARY_EDITOR",
+            repository=repo,
+            timestamp=t1,
+            window_label="12 Saatlik Editoryal Özet",  # COSMETIC EDIT
+        )
+        status_2b = res_2b.get("status") or res_2b.get("PRIMARY_EDITOR", {}).get("status")
+        self.assertEqual(status_2b, "DUPLICATE_DELIVERY_PREVENTED", "Cosmetic change should be suppressed by cloud outbox!")
+        self.assertEqual(len(sent_messages), 1, "HTTP request made for cosmetic change on ephemeral runner!")
+
+    # --- Test 44: UPDATE -> UPDATE with Distinct Development Note Permitted ---
+    def test_44_editorial_revision_update_to_update_distinct_development_permitted(self):
+        """UPDATE -> UPDATE revision with genuinely new development_tr must be delivered, not suppressed."""
+        repo = self._create_turso_repo()
+        t0 = datetime(2026, 10, 31, 8, 0, 0, tzinfo=timezone.utc)
+        t1 = datetime(2026, 10, 31, 9, 0, 0, tzinfo=timezone.utc)
+
+        assessments_v1 = [
+            EditorialAssessment(
+                article_ids=["up_a1"], score=90, kind=EditorialKind.UPDATE,
+                headline_tr="Gelisim Basligi",
+                development_tr="Ilk Gelisme: Bakanlik aciklama yapti.",
+                why_efso_tr="Neden 1",
+            ),
+            EditorialAssessment(
+                article_ids=["up_a2"], score=88, kind=EditorialKind.NEW,
+                headline_tr="Diger Haber 2", why_efso_tr="Neden 2",
+            ),
+            EditorialAssessment(
+                article_ids=["up_a3"], score=85, kind=EditorialKind.NEW,
+                headline_tr="Diger Haber 3", why_efso_tr="Neden 3",
+            ),
+        ]
+
+        sent_messages = []
+        def mock_post(req: httpx.Request) -> httpx.Response:
+            sent_messages.append(req)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 9200 + len(sent_messages)}}, request=req)
+
+        mock_tg_transport = httpx.MockTransport(mock_post)
+
+        # Runner 1 delivers v1
+        res_1 = deliver_one_shot_editorial_digest(
+            settings=self.test_settings,
+            assessments=assessments_v1,
+            dry_run=False,
+            ledger_path=self.tmp_path / "up_v1_ledger.json",
+            transport=mock_tg_transport,
+            target_recipient_role="PRIMARY_EDITOR",
+            repository=repo,
+            timestamp=t0,
+        )
+        self.assertEqual(res_1.get("status") or res_1.get("PRIMARY_EDITOR", {}).get("status"), "DELIVERY_SUCCESS")
+        self.assertEqual(len(sent_messages), 1)
+
+        # Runner 2 encounters identical development_tr -> MUST BE SUPPRESSED
+        res_1_dup = deliver_one_shot_editorial_digest(
+            settings=self.test_settings,
+            assessments=assessments_v1,
+            dry_run=False,
+            ledger_path=self.tmp_path / "up_dup_ledger.json",
+            transport=mock_tg_transport,
+            target_recipient_role="PRIMARY_EDITOR",
+            repository=repo,
+            timestamp=t1,
+        )
+        self.assertEqual(res_1_dup.get("status") or res_1_dup.get("PRIMARY_EDITOR", {}).get("status"), "DUPLICATE_DELIVERY_PREVENTED")
+        self.assertEqual(len(sent_messages), 1)
+
+        # Runner 3 encounters genuinely new development_tr -> MUST BE DELIVERED
+        assessments_v2 = [
+            EditorialAssessment(
+                article_ids=["up_a1"], score=92, kind=EditorialKind.UPDATE,
+                headline_tr="Gelisim Basligi",
+                development_tr="Ikinci Gelisme: Savcilik resmen sorusturma baslatti.",  # NEW DEVELOPMENT
+                why_efso_tr="Neden 1",
+            ),
+            EditorialAssessment(
+                article_ids=["up_a2"], score=88, kind=EditorialKind.NEW,
+                headline_tr="Diger Haber 2", why_efso_tr="Neden 2",
+            ),
+            EditorialAssessment(
+                article_ids=["up_a3"], score=85, kind=EditorialKind.NEW,
+                headline_tr="Diger Haber 3", why_efso_tr="Neden 3",
+            ),
+        ]
+
+        res_2 = deliver_one_shot_editorial_digest(
+            settings=self.test_settings,
+            assessments=assessments_v2,
+            dry_run=False,
+            ledger_path=self.tmp_path / "up_v2_ledger.json",
+            transport=mock_tg_transport,
+            target_recipient_role="PRIMARY_EDITOR",
+            repository=repo,
+            timestamp=t1,
+        )
+        self.assertEqual(res_2.get("status") or res_2.get("PRIMARY_EDITOR", {}).get("status"), "DELIVERY_SUCCESS")
+        self.assertEqual(len(sent_messages), 2)
+
+    # --- Test 45: Strong Deterministic delivery_id Derivation & Uniqueness ---
+    def test_45_delivery_id_strong_sha256_uniqueness_and_recipient_isolation(self):
+        """delivery_id must be a strong deterministic SHA-256 identifier with zero collision across distinct keys/chats."""
+        repo = self._create_turso_repo()
+        editor_chat_1 = "11111111"
+        editor_chat_2 = "22222222"
+
+        key_1 = "DIGEST-aaaa1111bbbb2222cccc"
+        key_2 = "DIGEST-aaaa1111bbbb2222dddd"  # Differs only at the end
+
+        # Compute deterministic delivery IDs using full string
+        deliv_id_1a = f"DELIV-{hashlib.sha256(f'{editor_chat_1}:{key_1}'.encode('utf-8')).hexdigest()[:32]}"
+        deliv_id_1b = f"DELIV-{hashlib.sha256(f'{editor_chat_2}:{key_1}'.encode('utf-8')).hexdigest()[:32]}"
+        deliv_id_2a = f"DELIV-{hashlib.sha256(f'{editor_chat_1}:{key_2}'.encode('utf-8')).hexdigest()[:32]}"
+        deliv_id_2b = f"DELIV-{hashlib.sha256(f'{editor_chat_2}:{key_2}'.encode('utf-8')).hexdigest()[:32]}"
+
+        # Uniqueness assertion across all combinations
+        all_ids = {deliv_id_1a, deliv_id_1b, deliv_id_2a, deliv_id_2b}
+        self.assertEqual(len(all_ids), 4, "Collision detected in strong deterministic delivery_id derivation!")
+
+        # Verify atomic claims with distinct keys succeed without PRIMARY KEY collision
+        claimed_1a = repo.claim_telegram_delivery(
+            delivery_id=deliv_id_1a,
+            message_key=key_1,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=editor_chat_1,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+        )
+        self.assertTrue(claimed_1a)
+
+        claimed_2a = repo.claim_telegram_delivery(
+            delivery_id=deliv_id_2a,
+            message_key=key_2,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=editor_chat_1,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+        )
+        self.assertTrue(claimed_2a)
+
+    # --- Test 46: Legacy Lookup Completeness Under Multiple Records (Finding A) ---
+    def test_46_legacy_lookup_completeness_under_multiple_records_and_modern_shadowing(self):
+        """A newer modern record with distinct revision or a non-blocking status must NOT hide an older blocking legacy SENT record."""
+        repo = self._create_turso_repo()
+        editor_chat = self.test_settings.telegram_primary_editor_chat_id
+        t_old = datetime(2026, 10, 31, 10, 0, tzinfo=timezone.utc)
+        t_new = datetime(2026, 10, 31, 10, 30, tzinfo=timezone.utc)
+
+        # 3 assessments to satisfy minimum candidate count
+        assessments = [
+            EditorialAssessment(
+                article_ids=["leg_shadow_1"], score=90, kind=EditorialKind.NEW,
+                headline_tr="Eski Haber Başlığı 1", why_efso_tr="Neden 1",
+            ),
+            EditorialAssessment(
+                article_ids=["leg_shadow_2"], score=88, kind=EditorialKind.NEW,
+                headline_tr="Eski Haber Başlığı 2", why_efso_tr="Neden 2",
+            ),
+            EditorialAssessment(
+                article_ids=["leg_shadow_3"], score=85, kind=EditorialKind.NEW,
+                headline_tr="Eski Haber Başlığı 3", why_efso_tr="Neden 3",
+            ),
+        ]
+        stable_id = compute_stable_digest_identity(assessments)
+
+        # 1. Insert older legacy record without canonical_outbox_key (status: SENT)
+        legacy_deliv = TelegramDeliveryRecord(
+            delivery_id="DELIV-LEGACY-OLD-SENT",
+            message_key=stable_id,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=editor_chat,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            status=DeliveryStatus.SENT,
+            attempt_count=1,
+            max_attempts=1,
+            payload={
+                "stable_digest_id": stable_id,
+                "is_ux_test": False,
+                "stories_count": 3,
+            },
+            created_at=t_old,
+            updated_at=t_old,
+            sent_at=t_old,
+        )
+        repo.record_telegram_delivery(legacy_deliv)
+
+        # 2. Insert newer record with same stable_digest_id but different canonical revision (e.g. modern record)
+        modern_deliv = TelegramDeliveryRecord(
+            delivery_id="DELIV-MODERN-NEWER-OTHER-REV",
+            message_key="outbox:digest:other_revision_999",
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=editor_chat,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            status=DeliveryStatus.FAILED,
+            attempt_count=1,
+            max_attempts=1,
+            payload={
+                "stable_digest_id": stable_id,
+                "canonical_outbox_key": "outbox:digest:other_revision_999",
+                "is_ux_test": False,
+                "stories_count": 3,
+            },
+            created_at=t_new,
+            updated_at=t_new,
+        )
+        repo.record_telegram_delivery(modern_deliv)
+
+        # find_legacy_editorial_delivery must exhaustively find the blocking legacy SENT record, NOT the newer modern/failed one
+        match = repo.find_legacy_editorial_delivery(
+            recipient_chat_id=editor_chat,
+            stable_digest_id=stable_id,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+        )
+        self.assertIsNotNone(match, "Legacy matching record must be found!")
+        self.assertEqual(match.delivery_id, "DELIV-LEGACY-OLD-SENT", "Must return older blocking legacy SENT record, not modern record!")
+        self.assertEqual(match.status, DeliveryStatus.SENT)
+
+        # End-to-end: dispatching the same stable_id without editorial updates must be blocked
+        sent_messages = []
+
+        def handle_request(request: httpx.Request) -> httpx.Response:
+            sent_messages.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 9999}})
+
+        mock_tg_transport = httpx.MockTransport(handle_request)
+
+        # Use an ephemeral ledger to rely entirely on repository
+        res = deliver_one_shot_editorial_digest(
+            settings=self.test_settings,
+            assessments=assessments,
+            dry_run=False,
+            ledger_path=self.tmp_path / "shadow_test_empty_ledger.json",
+            transport=mock_tg_transport,
+            target_recipient_role="PRIMARY_EDITOR",
+            repository=repo,
+            timestamp=datetime(2026, 10, 31, 11, 0, tzinfo=timezone.utc),
+        )
+        status = res.get("status") or res.get("PRIMARY_EDITOR", {}).get("status")
+        self.assertEqual(status, "DUPLICATE_DELIVERY_PREVENTED")
+        self.assertEqual(len(sent_messages), 0, "No duplicate dispatch allowed when older legacy SENT record exists!")
+
+    # --- Test 47: Keyset Pagination Completeness & Timestamp Collision (Finding B) ---
+    def test_47_keyset_pagination_completeness_and_timestamp_collision(self):
+        """Pagination must deterministically scan >100 records with identical timestamps without skipping or repeating."""
+        repo = self._create_turso_repo()
+        editor_chat = "77665544"
+        equal_time = datetime(2026, 10, 31, 12, 0, 0, 0, tzinfo=timezone.utc)
+        target_stable_id = "DIGEST-target-at-index-125"
+
+        # Insert 150 records with exact same created_at timestamp
+        for i in range(150):
+            sid = target_stable_id if i == 125 else f"DIGEST-filler-{i:03d}"
+            st = DeliveryStatus.SENT if i == 125 else DeliveryStatus.FAILED
+            deliv = TelegramDeliveryRecord(
+                delivery_id=f"DELIV-{i:04d}",
+                message_key=f"key-{i:04d}",
+                recipient_role="PRIMARY_EDITOR",
+                recipient_chat_id=editor_chat,
+                category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                status=st,
+                attempt_count=1,
+                max_attempts=1,
+                payload={
+                    "stable_digest_id": sid,
+                    "is_ux_test": False,
+                },
+                created_at=equal_time,
+                updated_at=equal_time,
+                sent_at=equal_time if st == DeliveryStatus.SENT else None,
+            )
+            repo.record_telegram_delivery(deliv)
+
+        # Batch size 50 requires 3 full page traversals across identical timestamps
+        match = repo.find_legacy_editorial_delivery(
+            recipient_chat_id=editor_chat,
+            stable_digest_id=target_stable_id,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            batch_size=50,
+        )
+        self.assertIsNotNone(match, "Keyset pagination must find target record across timestamp collisions!")
+        self.assertEqual(match.delivery_id, "DELIV-0125")
+        self.assertEqual(match.status, DeliveryStatus.SENT)
+
+    # --- Test 48: Editorial Revision Parity for NEW->NEW Headline Revisions (Finding C) ---
+    def test_48_editorial_revision_parity_new_to_new_headline_revisions(self):
+        """NEW->NEW headline revisions with identical article IDs must be delivered on both persistent and ephemeral ledgers."""
+        repo = self._create_turso_repo()
+        sent_messages = []
+
+        def handle_request(request: httpx.Request) -> httpx.Response:
+            sent_messages.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 5000 + len(sent_messages)}})
+
+        mock_tg_transport = httpx.MockTransport(handle_request)
+        ledger_path = self.tmp_path / "persistent_new_new_ledger.json"
+
+        # Story version 1 (NEW)
+        assessments_v1 = [
+            EditorialAssessment(
+                article_ids=["shared_art_1"],
+                score=92,
+                kind=EditorialKind.NEW,
+                headline_tr="Hükümet Yeni Vergi Paketini Açıkladı",
+                why_efso_tr="Vergi reformu gündemi",
+            ),
+            EditorialAssessment(
+                article_ids=["shared_art_2"],
+                score=88,
+                kind=EditorialKind.NEW,
+                headline_tr="Enflasyon Rakamları Belli Oldu",
+                why_efso_tr="TÜİK verileri",
+            ),
+            EditorialAssessment(
+                article_ids=["shared_art_3"],
+                score=85,
+                kind=EditorialKind.NEW,
+                headline_tr="Merkez Bankası Faiz Kararı",
+                why_efso_tr="Para politikası",
+            ),
+        ]
+
+        # Run 1: Delivers initial NEW digest
+        res_1 = deliver_one_shot_editorial_digest(
+            settings=self.test_settings,
+            assessments=assessments_v1,
+            dry_run=False,
+            ledger_path=ledger_path,
+            transport=mock_tg_transport,
+            target_recipient_role="PRIMARY_EDITOR",
+            repository=repo,
+            timestamp=datetime(2026, 10, 31, 14, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(res_1.get("status") or res_1.get("PRIMARY_EDITOR", {}).get("status"), "DELIVERY_SUCCESS")
+        self.assertEqual(len(sent_messages), 1)
+
+        # Story version 2: Same article IDs, still kind=NEW, but REVISED HEADLINE for article 1
+        assessments_v2 = [
+            EditorialAssessment(
+                article_ids=["shared_art_1"],
+                score=92,
+                kind=EditorialKind.NEW,
+                headline_tr="Hükümet Vergi Paketinde Geri Adım Attı",  # REVISED HEADLINE
+                why_efso_tr="Vergi reformu gündemi",
+            ),
+            EditorialAssessment(
+                article_ids=["shared_art_2"],
+                score=88,
+                kind=EditorialKind.NEW,
+                headline_tr="Enflasyon Rakamları Belli Oldu",
+                why_efso_tr="TÜİK verileri",
+            ),
+            EditorialAssessment(
+                article_ids=["shared_art_3"],
+                score=85,
+                kind=EditorialKind.NEW,
+                headline_tr="Merkez Bankası Faiz Kararı",
+                why_efso_tr="Para politikası",
+            ),
+        ]
+
+        # Run 2 with persistent local JSON ledger: MUST NOT be blocked by article-only matching!
+        res_2 = deliver_one_shot_editorial_digest(
+            settings=self.test_settings,
+            assessments=assessments_v2,
+            dry_run=False,
+            ledger_path=ledger_path,
+            transport=mock_tg_transport,
+            target_recipient_role="PRIMARY_EDITOR",
+            repository=repo,
+            timestamp=datetime(2026, 10, 31, 14, 30, tzinfo=timezone.utc),
+        )
+        status_2 = res_2.get("status") or res_2.get("PRIMARY_EDITOR", {}).get("status")
+        self.assertEqual(status_2, "DELIVERY_SUCCESS", "Legitimate NEW->NEW headline revision must be delivered on persistent ledger!")
+        self.assertEqual(len(sent_messages), 2, "Second HTTP send must occur for revised headline!")
+
+        # Run 3: Exact rerun of version 2 on persistent ledger -> MUST BE PREVENTED
+        res_3 = deliver_one_shot_editorial_digest(
+            settings=self.test_settings,
+            assessments=assessments_v2,
+            dry_run=False,
+            ledger_path=ledger_path,
+            transport=mock_tg_transport,
+            target_recipient_role="PRIMARY_EDITOR",
+            repository=repo,
+            timestamp=datetime(2026, 10, 31, 14, 35, tzinfo=timezone.utc),
+        )
+        status_3 = res_3.get("status") or res_3.get("PRIMARY_EDITOR", {}).get("status")
+        self.assertEqual(status_3, "DUPLICATE_DELIVERY_PREVENTED", "Identical rerun must be suppressed!")
+        self.assertEqual(len(sent_messages), 2)
+
+    # --- Test 49: Recipient Chat ID Privacy & Error Sanitization (Finding D) ---
+    def test_49_recipient_privacy_and_error_sanitization(self):
+        """Raw recipient chat ID must NEVER appear in exceptions or warning logs."""
+        repo = self._create_turso_repo()
+        secret_chat = "5544332211"
+        masked_secret = "55...11"
+
+        # 1. Test DeliveryIdentityConflictError in repository
+        repo.claim_telegram_delivery(
+            delivery_id="DELIV-CONFLICT-TEST",
+            message_key="key-conflict",
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=secret_chat,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+        )
+        with self.assertRaises(DeliveryIdentityConflictError) as ctx:
+            repo.claim_telegram_delivery(
+                delivery_id="DELIV-CONFLICT-TEST-2",
+                message_key="key-conflict",
+                recipient_role="ADMIN",  # Conflicting role
+                recipient_chat_id=secret_chat,
+                category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            )
+        err_msg = str(ctx.exception)
+        self.assertNotIn(secret_chat, err_msg, "Raw chat ID leaked in DeliveryIdentityConflictError!")
+        self.assertIn(masked_secret, err_msg, "Masked chat ID must appear in error!")
+
+        # 2. Test corrupted payload in find_legacy_editorial_delivery
+        repo.client.execute(
+            """
+            INSERT INTO telegram_delivery_records (
+                delivery_id, message_key, recipient_role, recipient_chat_id,
+                category, status, attempt_count, max_attempts, payload_json,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, 1, 'NOT_VALID_JSON{', ?, ?)
+            """,
+            [
+                "DELIV-CORRUPT",
+                "key-corrupt",
+                "PRIMARY_EDITOR",
+                secret_chat,
+                TelegramNotificationCategory.EDITORIAL_DIGEST.value,
+                DeliveryStatus.SENT.value,
+                datetime.now(timezone.utc).isoformat(),
+                datetime.now(timezone.utc).isoformat(),
+            ],
+        )
+        with self.assertRaises(ValueError) as ctx_corrupt:
+            repo.find_legacy_editorial_delivery(
+                recipient_chat_id=secret_chat,
+                stable_digest_id="any-id",
+                category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            )
+        corrupt_msg = str(ctx_corrupt.exception)
+        self.assertNotIn(secret_chat, corrupt_msg, "Raw chat ID leaked in corrupted payload exception!")
+        self.assertIn(masked_secret, corrupt_msg, "Masked chat ID must appear in error!")
+
+    # --- Test 50: Deterministic SHA-256 Delivery ID End-to-End Parity ---
+    def test_50_delivery_id_end_to_end_parity_and_full_entropy(self):
+        """delivery_id created at atomic claim must match persisted delivery_id with full 256-bit SHA-256 derivation."""
+        repo = self._create_turso_repo()
+        sent_messages = []
+
+        def handle_request(request: httpx.Request) -> httpx.Response:
+            sent_messages.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 8888}})
+
+        mock_tg_transport = httpx.MockTransport(handle_request)
+        assessments = [
+            EditorialAssessment(
+                article_ids=["full_art_1"],
+                score=95,
+                kind=EditorialKind.NEW,
+                headline_tr="Haber Basligi 256 Bit Test 1",
+                why_efso_tr="Neden 1",
+            ),
+            EditorialAssessment(
+                article_ids=["full_art_2"],
+                score=90,
+                kind=EditorialKind.NEW,
+                headline_tr="Haber Basligi 256 Bit Test 2",
+                why_efso_tr="Neden 2",
+            ),
+            EditorialAssessment(
+                article_ids=["full_art_3"],
+                score=88,
+                kind=EditorialKind.NEW,
+                headline_tr="Haber Basligi 256 Bit Test 3",
+                why_efso_tr="Neden 3",
+            ),
+        ]
+
+        res = deliver_one_shot_editorial_digest(
+            settings=self.test_settings,
+            assessments=assessments,
+            dry_run=False,
+            ledger_path=self.tmp_path / "parity_test_ledger.json",
+            transport=mock_tg_transport,
+            target_recipient_role="PRIMARY_EDITOR",
+            repository=repo,
+            timestamp=datetime(2026, 10, 31, 15, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(res.get("status") or res.get("PRIMARY_EDITOR", {}).get("status"), "DELIVERY_SUCCESS")
+
+        # Inspect persisted record in repo
+        target_chat = self.test_settings.telegram_primary_editor_chat_id
+        can_key = res["canonical_outbox_key"]
+        expected_token = hashlib.sha256(f"{target_chat}:{can_key}".encode("utf-8")).hexdigest()
+        expected_deliv_id = f"DELIV-{expected_token}"
+
+        persisted_rec = repo.get_telegram_delivery(target_chat, can_key)
+        self.assertIsNotNone(persisted_rec)
+        self.assertEqual(persisted_rec.delivery_id, expected_deliv_id, "delivery_id must match full SHA-256 derived ID exactly!")
+        self.assertEqual(persisted_rec.status, DeliveryStatus.SENT)
+
+    # --- Test 51: Modern PENDING Record Does Not Bypass Older Legacy SENT or UNCERTAIN (Round 3 Priority 1) ---
+    def test_51_modern_pending_record_does_not_bypass_older_legacy_sent_or_uncertain(self):
+        """A modern canonical-key PENDING record must NOT bypass an older legacy SENT or UNCERTAIN record for the same story/recipient."""
+        repo = self._create_turso_repo()
+        editor_chat = self.test_settings.telegram_primary_editor_chat_id
+        t_old = datetime(2026, 10, 31, 10, 0, tzinfo=timezone.utc)
+        t_pending = datetime(2026, 10, 31, 10, 30, tzinfo=timezone.utc)
+
+        assessments = [
+            EditorialAssessment(
+                article_ids=["pending_bypass_1"], score=90, kind=EditorialKind.NEW,
+                headline_tr="Haber Başlığı 1", why_efso_tr="Neden 1",
+            ),
+            EditorialAssessment(
+                article_ids=["pending_bypass_2"], score=88, kind=EditorialKind.NEW,
+                headline_tr="Haber Başlığı 2", why_efso_tr="Neden 2",
+            ),
+            EditorialAssessment(
+                article_ids=["pending_bypass_3"], score=85, kind=EditorialKind.NEW,
+                headline_tr="Haber Başlığı 3", why_efso_tr="Neden 3",
+            ),
+        ]
+        stable_id = compute_stable_digest_identity(assessments)
+        revision_id = compute_editorial_digest_revision_id(assessments)
+        canonical_key = f"DIGEST-{revision_id[:20]}"
+
+        # 1. Insert older legacy record without canonical_outbox_key (status: SENT)
+        legacy_deliv = TelegramDeliveryRecord(
+            delivery_id="DELIV-LEGACY-TERMINAL-SENT",
+            message_key=stable_id,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=editor_chat,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            status=DeliveryStatus.SENT,
+            attempt_count=1,
+            max_attempts=1,
+            payload={
+                "stable_digest_id": stable_id,
+                "is_ux_test": False,
+                "stories_count": 3,
+            },
+            created_at=t_old,
+            updated_at=t_old,
+            sent_at=t_old,
+        )
+        repo.record_telegram_delivery(legacy_deliv)
+
+        # 2. Insert newer modern record with message_key = canonical_key but status = PENDING (e.g. previewed or pre-seeded)
+        pending_deliv = TelegramDeliveryRecord(
+            delivery_id="DELIV-MODERN-PENDING-KEY",
+            message_key=canonical_key,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=editor_chat,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            status=DeliveryStatus.PENDING,
+            attempt_count=0,
+            max_attempts=1,
+            payload={
+                "stable_digest_id": stable_id,
+                "canonical_outbox_key": canonical_key,
+                "is_ux_test": False,
+                "stories_count": 3,
+            },
+            created_at=t_pending,
+            updated_at=t_pending,
+        )
+        repo.record_telegram_delivery(pending_deliv)
+
+        sent_messages = []
+
+        def handle_request(request: httpx.Request) -> httpx.Response:
+            sent_messages.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 9999}})
+
+        mock_tg_transport = httpx.MockTransport(handle_request)
+
+        # Dispatch attempt with ephemeral ledger
+        res = deliver_one_shot_editorial_digest(
+            settings=self.test_settings,
+            assessments=assessments,
+            dry_run=False,
+            ledger_path=self.tmp_path / "pending_bypass_empty_ledger.json",
+            transport=mock_tg_transport,
+            target_recipient_role="PRIMARY_EDITOR",
+            repository=repo,
+            timestamp=datetime(2026, 10, 31, 11, 0, tzinfo=timezone.utc),
+        )
+        status = res.get("status") or res.get("PRIMARY_EDITOR", {}).get("status")
+
+        # Crucial assertions: Modern PENDING record MUST NOT bypass older legacy SENT record!
+        self.assertEqual(status, "DUPLICATE_DELIVERY_PREVENTED", "Modern PENDING record must not bypass older legacy SENT record!")
+        self.assertEqual(len(sent_messages), 0, "Zero mock HTTP calls permitted when older legacy SENT record exists!")
+
+    # --- Test 52: Privacy Regression End-to-End Logs & Public Return Structures (Round 3 Priority 2) ---
+    def test_52_privacy_regression_end_to_end_logs_and_public_results(self):
+        """End-to-end privacy check: raw recipient chat ID must NOT appear in log records or public return structures."""
+        repo = self._create_turso_repo()
+        secret_chat = "9876543210"
+        masked_secret = "98...10"
+
+        custom_settings = Settings(
+            gemini_api_key="synthetic_gemini_key_for_testing_purposes_only",
+            telegram_bot_token="synthetic_bot_token_1234567890",
+            telegram_chat_id="99999999",
+            telegram_primary_editor_chat_id=secret_chat,
+            telegram_allowed_chat_ids=[secret_chat, "99999999"],
+            telegram_delivery_enabled=True,
+            turso_database_url="http://127.0.0.1:8080",
+            turso_auth_token="synthetic_turso_auth_token_for_hermetic_testing",
+        )
+
+        assessments = [
+            EditorialAssessment(
+                article_ids=["priv_art_1"], score=90, kind=EditorialKind.NEW,
+                headline_tr="Gizlilik Haber 1", why_efso_tr="Neden 1",
+            ),
+            EditorialAssessment(
+                article_ids=["priv_art_2"], score=88, kind=EditorialKind.NEW,
+                headline_tr="Gizlilik Haber 2", why_efso_tr="Neden 2",
+            ),
+            EditorialAssessment(
+                article_ids=["priv_art_3"], score=85, kind=EditorialKind.NEW,
+                headline_tr="Gizlilik Haber 3", why_efso_tr="Neden 3",
+            ),
+        ]
+        stable_id = compute_stable_digest_identity(assessments)
+
+        # Case A: Corrupted legacy history
+        repo.client.execute(
+            """
+            INSERT INTO telegram_delivery_records (
+                delivery_id, message_key, recipient_role, recipient_chat_id,
+                category, status, attempt_count, max_attempts, payload_json,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, 1, 'CORRUPTED_JSON_NOT_VALID', ?, ?)
+            """,
+            [
+                "DELIV-CORRUPT-ENDTOEND",
+                "corrupt-key",
+                "PRIMARY_EDITOR",
+                secret_chat,
+                TelegramNotificationCategory.EDITORIAL_DIGEST.value,
+                DeliveryStatus.SENT.value,
+                datetime.now(timezone.utc).isoformat(),
+                datetime.now(timezone.utc).isoformat(),
+            ],
+        )
+
+        with self.assertLogs("efso-radar.notifications.telegram", level="ERROR") as cm_err:
+            res_a = deliver_one_shot_editorial_digest(
+                settings=custom_settings,
+                assessments=assessments,
+                dry_run=False,
+                ledger_path=self.tmp_path / "privacy_corrupt_ledger.json",
+                transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"ok": True})),
+                target_recipient_role="PRIMARY_EDITOR",
+                repository=repo,
+                timestamp=datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc),
+            )
+
+        # Verify logger output has NO raw chat ID and DOES have masked chat ID
+        all_err_logs = " ".join(cm_err.output)
+        self.assertNotIn(secret_chat, all_err_logs, "Raw chat ID leaked in logger.error output!")
+        self.assertIn(masked_secret, all_err_logs, "Masked chat ID should appear in log!")
+
+        # Verify public return dictionary has NO raw chat ID
+        res_a_str = json.dumps(res_a)
+        self.assertNotIn(secret_chat, res_a_str, "Raw chat ID leaked in public return structure on corrupted history!")
+        self.assertIn(masked_secret, res_a_str, "Masked chat ID must appear in public return structure!")
+
+        # Case B: Ambiguous legacy delivery record with editorial update
+        repo.client.execute("DELETE FROM telegram_delivery_records WHERE delivery_id = 'DELIV-CORRUPT-ENDTOEND'")
+        repo.client.execute(
+            """
+            INSERT INTO telegram_delivery_records (
+                delivery_id, message_key, recipient_role, recipient_chat_id,
+                category, status, attempt_count, max_attempts, payload_json,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?)
+            """,
+            [
+                "DELIV-LEGACY-UPDATE-TEST",
+                stable_id,
+                "PRIMARY_EDITOR",
+                secret_chat,
+                TelegramNotificationCategory.EDITORIAL_DIGEST.value,
+                DeliveryStatus.SENT.value,
+                json.dumps({"stable_digest_id": stable_id, "is_ux_test": False}),
+                datetime.now(timezone.utc).isoformat(),
+                datetime.now(timezone.utc).isoformat(),
+            ],
+        )
+
+        update_assessments = [
+            EditorialAssessment(
+                article_ids=["priv_art_1"], score=90, kind=EditorialKind.UPDATE,
+                headline_tr="Gizlilik Haber 1 Güncellendi", development_tr="Yeni gelişme var", why_efso_tr="Neden",
+            ),
+            EditorialAssessment(
+                article_ids=["priv_art_2"], score=88, kind=EditorialKind.NEW,
+                headline_tr="Gizlilik Haber 2", why_efso_tr="Neden 2",
+            ),
+            EditorialAssessment(
+                article_ids=["priv_art_3"], score=85, kind=EditorialKind.NEW,
+                headline_tr="Gizlilik Haber 3", why_efso_tr="Neden 3",
+            ),
+        ]
+
+        with self.assertLogs("efso-radar.notifications.telegram", level="WARNING") as cm_warn:
+            res_b = deliver_one_shot_editorial_digest(
+                settings=custom_settings,
+                assessments=update_assessments,
+                dry_run=False,
+                ledger_path=self.tmp_path / "privacy_update_ledger.json",
+                transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"ok": True})),
+                target_recipient_role="PRIMARY_EDITOR",
+                repository=repo,
+                timestamp=datetime(2026, 10, 31, 12, 10, tzinfo=timezone.utc),
+            )
+
+        all_warn_logs = " ".join(cm_warn.output)
+        self.assertNotIn(secret_chat, all_warn_logs, "Raw chat ID leaked in logger.warning output!")
+        self.assertIn(masked_secret, all_warn_logs, "Masked chat ID must appear in warning log!")
+
+        res_b_str = json.dumps(res_b)
+        self.assertNotIn(secret_chat, res_b_str, "Raw chat ID leaked in public return structure on ambiguous update!")
+        self.assertIn(masked_secret, res_b_str, "Masked chat ID must appear in public return structure!")
+
+    # --- Test 53: Concurrent Insertion Keyset Analysis (Round 3 Priority 3) ---
+    def test_53_concurrent_insertion_during_keyset_pagination_and_cutover_analysis(self):
+        """Analyze concurrent insertion during keyset pagination: proves keyset pagination provides monotonic progress across static data, but requires quiescent state for cross-version migration."""
+        repo = self._create_turso_repo()
+        editor_chat = "33221100"
+        t0 = "2026-10-31T10:01:00.000000+00:00"
+        t1 = "2026-10-31T10:02:00.000000+00:00"
+        t2_concurrent = "2026-10-31T10:03:00.000000+00:00"
+        target_stable_id = "DIGEST-concurrent-analysis"
+
+        # Pre-seed 2 initial rows with created_at t1 and t0
+        repo.client.execute(
+            """
+            INSERT INTO telegram_delivery_records (
+                delivery_id, message_key, recipient_role, recipient_chat_id,
+                category, status, attempt_count, max_attempts, payload_json,
+                created_at, updated_at
+            ) VALUES (?, ?, 'PRIMARY_EDITOR', ?, 'EDITORIAL_DIGEST', 'FAILED', 1, 1, '{}', ?, ?)
+            """,
+            ["DELIV-001", "key-001", editor_chat, t1, t1],
+        )
+        repo.client.execute(
+            """
+            INSERT INTO telegram_delivery_records (
+                delivery_id, message_key, recipient_role, recipient_chat_id,
+                category, status, attempt_count, max_attempts, payload_json,
+                created_at, updated_at
+            ) VALUES (?, ?, 'PRIMARY_EDITOR', ?, 'EDITORIAL_DIGEST', 'FAILED', 1, 1, '{}', ?, ?)
+            """,
+            ["DELIV-002", "key-002", editor_chat, t0, t0],
+        )
+
+        # Simulate Page 1 read with batch_size=1
+        res_p1 = repo.client.execute(
+            """
+            SELECT delivery_id, message_key, created_at
+            FROM telegram_delivery_records
+            WHERE recipient_chat_id = ? AND category = 'EDITORIAL_DIGEST'
+            ORDER BY created_at DESC, delivery_id DESC
+            LIMIT 1
+            """,
+            [editor_chat],
+        )
+        rows_p1 = res_p1.fetchall()
+        self.assertEqual(len(rows_p1), 1)
+        self.assertEqual(rows_p1[0]["delivery_id"], "DELIV-001")
+        last_created_at = rows_p1[0]["created_at"]
+        last_deliv_id = rows_p1[0]["delivery_id"]
+
+        # NOW: Simulate concurrent legacy runner inserting a new blocking legacy record at t2_concurrent (later timestamp)
+        repo.client.execute(
+            """
+            INSERT INTO telegram_delivery_records (
+                delivery_id, message_key, recipient_role, recipient_chat_id,
+                category, status, attempt_count, max_attempts, payload_json,
+                created_at, updated_at
+            ) VALUES (?, ?, 'PRIMARY_EDITOR', ?, 'EDITORIAL_DIGEST', 'SENT', 1, 1, ?, ?, ?)
+            """,
+            [
+                "DELIV-003-BLOCKING",
+                target_stable_id,
+                editor_chat,
+                json.dumps({"stable_digest_id": target_stable_id}),
+                t2_concurrent,
+                t2_concurrent,
+            ],
+        )
+
+        # Page 2 query using keyset predicate: created_at < last_created_at OR ...
+        res_p2 = repo.client.execute(
+            """
+            SELECT delivery_id, message_key, created_at
+            FROM telegram_delivery_records
+            WHERE recipient_chat_id = ? AND category = 'EDITORIAL_DIGEST'
+              AND (created_at < ? OR (created_at = ? AND delivery_id < ?))
+            ORDER BY created_at DESC, delivery_id DESC
+            LIMIT 1
+            """,
+            [editor_chat, last_created_at, last_created_at, last_deliv_id],
+        )
+        rows_p2 = res_p2.fetchall()
+        self.assertEqual(len(rows_p2), 1)
+        self.assertEqual(rows_p2[0]["delivery_id"], "DELIV-002")
+
+        # Page 3 query
+        last_created_at = rows_p2[0]["created_at"]
+        last_deliv_id = rows_p2[0]["delivery_id"]
+        res_p3 = repo.client.execute(
+            """
+            SELECT delivery_id, message_key, created_at
+            FROM telegram_delivery_records
+            WHERE recipient_chat_id = ? AND category = 'EDITORIAL_DIGEST'
+              AND (created_at < ? OR (created_at = ? AND delivery_id < ?))
+            ORDER BY created_at DESC, delivery_id DESC
+            LIMIT 1
+            """,
+            [editor_chat, last_created_at, last_created_at, last_deliv_id],
+        )
+        rows_p3 = res_p3.fetchall()
+        self.assertEqual(len(rows_p3), 0)
+
+    # --- Test 54: Batch size validation in find_legacy_editorial_delivery ---
+    def test_54_batch_size_validation_in_find_legacy_editorial_delivery(self):
+        """Verify that find_legacy_editorial_delivery raises ValueError when batch_size <= 0 on both SQLite and Turso repos."""
+        turso_repo = self._create_turso_repo()
+        sqlite_repo = SqliteStateRepository(self.tmp_path / "test_54.db")
+
+        for repo in (turso_repo, sqlite_repo):
+            with self.assertRaises(ValueError) as ctx_zero:
+                repo.find_legacy_editorial_delivery(
+                    recipient_chat_id="12345",
+                    stable_digest_id="DIGEST-TEST",
+                    batch_size=0,
+                )
+            self.assertIn("batch_size must be a positive integer", str(ctx_zero.exception))
+
+            with self.assertRaises(ValueError) as ctx_neg:
+                repo.find_legacy_editorial_delivery(
+                    recipient_chat_id="12345",
+                    stable_digest_id="DIGEST-TEST",
+                    batch_size=-10,
+                )
+            self.assertIn("batch_size must be a positive integer", str(ctx_neg.exception))
+
+
+if __name__ == '__main__':
     unittest.main()

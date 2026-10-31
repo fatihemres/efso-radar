@@ -323,6 +323,22 @@ class StateRepository(ABC):
         pass
 
     @abstractmethod
+    def find_legacy_editorial_delivery(
+        self,
+        recipient_chat_id: str,
+        stable_digest_id: str,
+        category: TelegramNotificationCategory = TelegramNotificationCategory.EDITORIAL_DIGEST,
+        batch_size: int = 100,
+    ) -> Optional[TelegramDeliveryRecord]:
+        """Exhaustively find a delivery record matching stable_digest_id within recipient and category scope.
+
+        Performs provably complete, batch-paginated inspection across all matching historical records.
+        Returns the first matching TelegramDeliveryRecord if found.
+        Raises ValueError if any historical record in the recipient scope contains unparseable or corrupted payload JSON.
+        """
+        pass
+
+    @abstractmethod
     def get_pending_telegram_deliveries(self, limit: int = 50) -> list[TelegramDeliveryRecord]:
         """Fetch outbox records pending delivery attempt."""
         pass
