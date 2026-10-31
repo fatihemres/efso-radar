@@ -294,6 +294,38 @@ class TestDeduplication(unittest.TestCase):
         self.assertEqual(hulu_rep.raw_metadata.get("cluster_size", 1), 1)
         self.assertEqual(peacock_rep.raw_metadata.get("cluster_size", 1), 1)
 
+    def test_joint_event_different_headlined_participants_still_merge(self):
+        """
+        Positive control: Two publishers reporting the exact same joint event
+        where one headlines participant A and the other headlines participant B,
+        while co-mentioning both in the event context, must still collapse into a single cluster.
+        """
+        outlet_a = Article.create(
+            "Afra Saraçoğlu Yalı Çapkını yeni sezon galasında kırmızı halıda",
+            "https://magazin-a.com/afra-gala-2026",
+            "Magazin A",
+            self.now,
+            snippet="Afra Saraçoğlu ve Mert Ramazan Demir yeni sezon galasında birlikte poz verdi.",
+        )
+        outlet_b = Article.create(
+            "Mert Ramazan Demir Yalı Çapkını yeni sezon galasında kırmızı halıda",
+            "https://magazin-b.com/mert-gala-2026",
+            "Magazin B",
+            self.now,
+            snippet="Mert Ramazan Demir ve Afra Saraçoğlu galada hayranlarıyla buluştu.",
+        )
+
+        candidates = self.engine.filter_fresh_candidates([outlet_a, outlet_b])
+        self.assertEqual(
+            len(candidates),
+            1,
+            f"Expected joint event to merge into 1 cluster, but got {len(candidates)}: {[c.title for c in candidates]}",
+        )
+        self.assertEqual(candidates[0].raw_metadata.get("cluster_size"), 2)
+        cluster_ids = candidates[0].raw_metadata.get("cluster_article_ids", [])
+        self.assertIn(outlet_a.id, cluster_ids)
+        self.assertIn(outlet_b.id, cluster_ids)
+
 
     def test_shared_first_name_different_celebrities_never_merge_ryan_reynolds_vs_gosling(self):
         """Regression test for P2-3:
