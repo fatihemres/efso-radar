@@ -405,6 +405,16 @@ class NotificationRecord(BaseModel):
     is_preview: bool = False
 
 
+def mask_chat_id(chat_id: Optional[str | int] = None) -> str:
+    """Return safely masked chat ID for logging and exception messages without leaking private recipient credentials."""
+    cid = str(chat_id or "").strip()
+    if not cid:
+        return "<NOT_SET>"
+    if len(cid) <= 4:
+        return "***"
+    return f"{cid[:2]}...{cid[-2:]}"
+
+
 class TelegramDeliveryRecord(BaseModel):
     """Durable recipient-specific outbox and delivery record.
 
@@ -427,10 +437,7 @@ class TelegramDeliveryRecord(BaseModel):
 
     @property
     def masked_recipient_chat_id(self) -> str:
-        cid = self.recipient_chat_id.strip()
-        if len(cid) <= 4:
-            return "***"
-        return f"{cid[:2]}...{cid[-2:]}"
+        return mask_chat_id(self.recipient_chat_id)
 
 
 class DurableRecoveryRecord(BaseModel):

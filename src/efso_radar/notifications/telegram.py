@@ -1759,6 +1759,12 @@ def deliver_one_shot_editorial_digest(
                         return rec
                 elif not has_editorial_update:
                     return rec
+                else:
+                    logger.warning(
+                        "Ambiguous legacy delivery record found in local ledger for %s with update; failing closed for operator review",
+                        r_masked,
+                    )
+                    return rec
 
         # 4. Iterate through all deliveries and find records that belong strictly to THIS recipient
         for rec_k, rec_v in deliveries.items():
@@ -1791,20 +1797,38 @@ def deliver_one_shot_editorial_digest(
                 continue
 
             # Check digest identity
-            if rec_v.get("canonical_outbox_key") == canonical_outbox_key:
-                return rec_v
+            rec_can = rec_v.get("canonical_outbox_key")
+            if rec_can:
+                # Modern revision record: must match exact canonical revision key
+                if rec_can == canonical_outbox_key:
+                    return rec_v
+                # Distinct canonical revision: do not match or suppress
+                continue
+
+            # Legacy unkeyed record handling (Phase 4 / Phase 5B.3C)
             if rec_v.get("digest_hash") == digest_hash:
                 return rec_v
-            if not has_editorial_update:
-                if rec_v.get("stable_digest_id") == stable_digest_id:
+
+            # Check stable digest or article set identity for legacy records
+            is_same_stable = (rec_v.get("stable_digest_id") == stable_digest_id)
+            rec_art_ids = rec_v.get("article_ids")
+            is_same_articles = bool(
+                not is_ux_test
+                and (
+                    (rec_art_ids and set(rec_art_ids) == set(candidate_article_ids))
+                    or (is_admin_recipient and rec_k in KNOWN_HISTORICAL_HASHES and KNOWN_HISTORICAL_HASHES[rec_k] == set(candidate_article_ids))
+                )
+            )
+
+            if is_same_stable or is_same_articles:
+                if not has_editorial_update:
                     return rec_v
-                if not is_ux_test:
-                    rec_art_ids = rec_v.get("article_ids")
-                    if rec_art_ids and set(rec_art_ids) == set(candidate_article_ids):
-                        return rec_v
-                    if is_admin_recipient and rec_k in KNOWN_HISTORICAL_HASHES:
-                        if KNOWN_HISTORICAL_HASHES[rec_k] == set(candidate_article_ids):
-                            return rec_v
+                else:
+                    logger.warning(
+                        "Ambiguous legacy delivery record found for %s with update; failing closed for operator review",
+                        r_masked,
+                    )
+                    return rec_v
 
         # 5. Backward compatibility check for legacy un-prefixed keys
         if is_admin_recipient or (settings.telegram_chat_id and r_chat == settings.telegram_chat_id):
@@ -1867,7 +1891,7 @@ def deliver_one_shot_editorial_digest(
             }
             repo_status = status_map.get(rec_status, DeliveryStatus.FAILED)
             deliv_token = hashlib.sha256(f"{r_chat}:{canonical_outbox_key}".encode("utf-8")).hexdigest()
-            deliv_id = f"DELIV-{deliv_token[:32]}"
+            deliv_id = f"DELIV-{deliv_token}"
             deliv_rec = TelegramDeliveryRecord(
                 delivery_id=deliv_id,
                 message_key=canonical_outbox_key,
@@ -1954,7 +1978,7 @@ def deliver_one_shot_editorial_digest(
                             # Treat ambiguous same-article old records conservatively for operator review
                             logger.warning(
                                 "Ambiguous legacy delivery record found for %s with update; failing closed for operator review",
-                                r_chat,
+                                r_masked,
                             )
                             repo_rec = legacy_match
                 except Exception as exc:
@@ -2057,7 +2081,7 @@ def deliver_one_shot_editorial_digest(
         # and prevent competing workers from sending the same logical message.
         if repository is not None:
             deliv_token = hashlib.sha256(f"{r_chat}:{canonical_outbox_key}".encode("utf-8")).hexdigest()
-            deliv_id = f"DELIV-{deliv_token[:32]}"
+            deliv_id = f"DELIV-{deliv_token}"
             try:
                 claimed = repository.claim_telegram_delivery(
                     delivery_id=deliv_id,

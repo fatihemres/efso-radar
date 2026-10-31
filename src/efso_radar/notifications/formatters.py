@@ -332,11 +332,13 @@ def compute_editorial_digest_revision_id(
     """Compute a presentation-independent, editorial-revision-scoped canonical hash for an editorial digest.
 
     Guarantees:
-    1. Stable across display timestamps, whitespace, and formatting variations.
-    2. Captures all editorial revisions: kinds (NEW vs UPDATE), headlines, developments,
+    1. Stable across display timestamps, whitespace, and presentation copy tweaks.
+    2. Captures all core editorial revisions: kinds (NEW vs UPDATE), headlines, developments,
        and story article identities.
     3. Distinguishes UX test mode from live editorial digests.
-    4. Distinguishes different window intervals (if specified).
+    4. Presentation/cosmetic elements (why_efso_tr, cover_title_tr, window_label, display timestamps)
+       are intentionally omitted from core revision identity so presentation tweaks do not trigger
+       duplicate broadcast sends to recipients.
     5. 100% deterministic across Python processes and platforms (SHA-256).
     """
     story_reprs: list[str] = []
