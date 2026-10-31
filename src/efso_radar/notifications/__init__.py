@@ -1,6 +1,7 @@
 """Notifications package for Efso Radar."""
 from efso_radar.notifications.base import NotificationChannel
 from efso_radar.notifications.formatters import (
+    compute_editorial_digest_revision_id,
     compute_stable_digest_identity,
     deduplicate_assessments,
     extract_factual_summary,
@@ -13,6 +14,7 @@ from efso_radar.notifications.telegram import TelegramNotificationChannel
 __all__ = [
     "NotificationChannel",
     "TelegramNotificationChannel",
+    "compute_editorial_digest_revision_id",
     "compute_stable_digest_identity",
     "deduplicate_assessments",
     "extract_factual_summary",

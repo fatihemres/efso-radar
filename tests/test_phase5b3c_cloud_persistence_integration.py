@@ -15,6 +15,7 @@ Verifies:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import sqlite3
@@ -47,6 +48,7 @@ from efso_radar.domain import (
     VerificationStatus,
     utc_now,
 )
+from efso_radar.notifications.formatters import format_telegram_digest
 from efso_radar.notifications.telegram import (
     TelegramNotificationChannel,
     deliver_one_shot_editorial_digest,
@@ -2308,6 +2310,284 @@ class TestPhase5B3CCloudPersistenceIntegration(unittest.TestCase):
         self.assertEqual(len(queued), 1)
         self.assertEqual(queued[0].notification_id, "NOTIF-Q-TEST-37")
         self.assertEqual(queued[0].status, DeliveryStatus.QUEUED_FOR_DIGEST)
+
+    # --- Test 38: Minute-Rollover Duplicate Prevention Across Ephemeral Runners (Issue #55 RED) ---
+    def test_38_telegram_outbox_minute_rollover_duplicate_prevention_across_runners(self):
+        """Runner 1 delivers at 07:37:59; Runner 2 executes at 07:38:01 across minute boundary.
+        Must be blocked by persistent outbox with zero additional HTTP calls.
+        """
+        repo = self._create_turso_repo()
+        t0 = datetime(2026, 10, 31, 7, 37, 59, tzinfo=timezone.utc)
+        t1 = datetime(2026, 10, 31, 7, 38, 1, tzinfo=timezone.utc)
+
+        assessments = [
+            EditorialAssessment(
+                article_ids=["m_a1"], score=88, kind=EditorialKind.NEW,
+                headline_tr="Dakika Siniri Haber Bir", why_efso_tr="Neden Efso 1",
+            ),
+            EditorialAssessment(
+                article_ids=["m_a2"], score=85, kind=EditorialKind.NEW,
+                headline_tr="Dakika Siniri Haber Iki", why_efso_tr="Neden Efso 2",
+            ),
+            EditorialAssessment(
+                article_ids=["m_a3"], score=82, kind=EditorialKind.NEW,
+                headline_tr="Dakika Siniri Haber Uc", why_efso_tr="Neden Efso 3",
+            ),
+        ]
+
+        sent_messages = []
+
+        def mock_telegram_post(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode("utf-8"))
+            sent_messages.append(body)
+            return httpx.Response(
+                200,
+                json={"ok": True, "result": {"message_id": 8001}},
+                request=request,
+            )
+
+        mock_tg_transport = httpx.MockTransport(mock_telegram_post)
+
+        current_time = [t0]
+        with unittest.mock.patch("efso_radar.notifications.formatters.datetime") as mock_dt_fmt, \
+             unittest.mock.patch("efso_radar.notifications.telegram.datetime") as mock_dt_tg:
+            mock_dt_fmt.now.side_effect = lambda tz=None: current_time[0]
+            mock_dt_tg.now.side_effect = lambda tz=None: current_time[0]
+
+            # Runner 1 executes delivery at t0 (07:37:59)
+            current_time[0] = t0
+            temp_ledger_1 = self.tmp_path / "ephemeral_runner_1_ledger.json"
+            res_1 = deliver_one_shot_editorial_digest(
+                settings=self.test_settings,
+                assessments=assessments,
+                dry_run=False,
+                ledger_path=temp_ledger_1,
+                transport=mock_tg_transport,
+                target_recipient_role="PRIMARY_EDITOR",
+                repository=repo,
+            )
+
+            status_1 = res_1.get("status") or res_1.get("PRIMARY_EDITOR", {}).get("status")
+            self.assertEqual(status_1, "DELIVERY_SUCCESS")
+            self.assertEqual(len(sent_messages), 1)
+
+            # Runner 1 destroyed. Runner 2 executes at t1 (07:38:01 - next minute) on ephemeral runner
+            current_time[0] = t1
+            temp_ledger_2 = self.tmp_path / "ephemeral_runner_2_empty_ledger.json"
+            self.assertFalse(temp_ledger_2.exists())
+
+            res_2 = deliver_one_shot_editorial_digest(
+                settings=self.test_settings,
+                assessments=assessments,
+                dry_run=False,
+                ledger_path=temp_ledger_2,
+                transport=mock_tg_transport,
+                target_recipient_role="PRIMARY_EDITOR",
+                repository=repo,
+            )
+
+            status_2 = res_2.get("status") or res_2.get("PRIMARY_EDITOR", {}).get("status")
+            self.assertEqual(status_2, "DUPLICATE_DELIVERY_PREVENTED")
+            self.assertEqual(len(sent_messages), 1, "Duplicate message sent across minute rollover!")
+
+    # --- Test 39: Genuine Editorial UPDATE Is Permitted Across Runners ---
+    def test_39_telegram_outbox_genuine_editorial_update_permitted_without_false_suppression(self):
+        """Runner 1 delivers base digest; Runner 2 delivers revised digest with an UPDATE kind and new headline.
+        Must NOT be falsely suppressed as duplicate.
+        """
+        repo = self._create_turso_repo()
+
+        initial_assessments = [
+            EditorialAssessment(
+                article_ids=["u_a1"], score=88, kind=EditorialKind.NEW,
+                headline_tr="Ilk Surum Haber Basligi", why_efso_tr="Ilk Neden",
+            ),
+            EditorialAssessment(
+                article_ids=["u_a2"], score=85, kind=EditorialKind.NEW,
+                headline_tr="Sabit Haber Iki", why_efso_tr="Neden 2",
+            ),
+            EditorialAssessment(
+                article_ids=["u_a3"], score=82, kind=EditorialKind.NEW,
+                headline_tr="Sabit Haber Uc", why_efso_tr="Neden 3",
+            ),
+        ]
+
+        sent_messages = []
+
+        def mock_telegram_post(request: httpx.Request) -> httpx.Response:
+            sent_messages.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(
+                200,
+                json={"ok": True, "result": {"message_id": 8100 + len(sent_messages)}},
+                request=request,
+            )
+
+        mock_tg_transport = httpx.MockTransport(mock_telegram_post)
+
+        # Runner 1 delivers initial version
+        res_1 = deliver_one_shot_editorial_digest(
+            settings=self.test_settings,
+            assessments=initial_assessments,
+            dry_run=False,
+            ledger_path=self.tmp_path / "u_runner_1_ledger.json",
+            transport=mock_tg_transport,
+            target_recipient_role="PRIMARY_EDITOR",
+            repository=repo,
+        )
+        self.assertEqual(res_1.get("status") or res_1.get("PRIMARY_EDITOR", {}).get("status"), "DELIVERY_SUCCESS")
+        self.assertEqual(len(sent_messages), 1)
+
+        # Runner 2 on ephemeral runner encounters genuine UPDATE revision for u_a1
+        revised_assessments = [
+            EditorialAssessment(
+                article_ids=["u_a1"], score=92, kind=EditorialKind.UPDATE,
+                headline_tr="Guncellenmis Son Dakika Gelismesi",
+                development_tr="Resmi aciklama ile gelisme dogrulandi",
+                why_efso_tr="Onemli guncelleme",
+            ),
+            EditorialAssessment(
+                article_ids=["u_a2"], score=85, kind=EditorialKind.NEW,
+                headline_tr="Sabit Haber Iki", why_efso_tr="Neden 2",
+            ),
+            EditorialAssessment(
+                article_ids=["u_a3"], score=82, kind=EditorialKind.NEW,
+                headline_tr="Sabit Haber Uc", why_efso_tr="Neden 3",
+            ),
+        ]
+
+        res_2 = deliver_one_shot_editorial_digest(
+            settings=self.test_settings,
+            assessments=revised_assessments,
+            dry_run=False,
+            ledger_path=self.tmp_path / "u_runner_2_ledger.json",
+            transport=mock_tg_transport,
+            target_recipient_role="PRIMARY_EDITOR",
+            repository=repo,
+        )
+        status_2 = res_2.get("status") or res_2.get("PRIMARY_EDITOR", {}).get("status")
+        self.assertEqual(status_2, "DELIVERY_SUCCESS", "Genuine UPDATE was falsely suppressed!")
+        self.assertEqual(len(sent_messages), 2)
+
+    # --- Test 40: Legacy Hash-Keyed Record Duplicate Prevention Compatibility ---
+    def test_40_telegram_outbox_legacy_hash_keyed_record_duplicate_prevention(self):
+        """A historical outbox record with legacy message_key = digest_hash must block duplicate sends."""
+        repo = self._create_turso_repo()
+
+        assessments = [
+            EditorialAssessment(
+                article_ids=["leg_a1"], score=88, kind=EditorialKind.NEW,
+                headline_tr="Eski Format Haber Bir", why_efso_tr="Neden 1",
+            ),
+            EditorialAssessment(
+                article_ids=["leg_a2"], score=85, kind=EditorialKind.NEW,
+                headline_tr="Eski Format Haber Iki", why_efso_tr="Neden 2",
+            ),
+            EditorialAssessment(
+                article_ids=["leg_a3"], score=82, kind=EditorialKind.NEW,
+                headline_tr="Eski Format Haber Uc", why_efso_tr="Neden 3",
+            ),
+        ]
+
+        fixed_time = datetime(2026, 10, 19, 11, 0, 0, tzinfo=timezone.utc)
+        rendered_html = format_telegram_digest(assessments, window_label="6 Saatlik Editoryal Özet", timestamp=fixed_time, deduplicate=False)
+        legacy_digest_hash = hashlib.sha256(rendered_html.encode("utf-8")).hexdigest()[:24]
+
+        # Seed legacy record directly into repository using legacy message_key = legacy_digest_hash
+        editor_chat = self.test_settings.telegram_primary_editor_chat_id
+        legacy_record = TelegramDeliveryRecord(
+            delivery_id=f"DELIV-{legacy_digest_hash[:8]}-999999",
+            message_key=legacy_digest_hash,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=editor_chat,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            status=DeliveryStatus.SENT,
+            attempt_count=1,
+            max_attempts=1,
+            payload={"message_id": 7777, "digest_hash": legacy_digest_hash},
+            created_at=fixed_time,
+            updated_at=fixed_time,
+            sent_at=fixed_time,
+        )
+        repo.record_telegram_delivery(legacy_record)
+
+        sent_messages = []
+        mock_tg_transport = httpx.MockTransport(lambda req: httpx.Response(200, json={"ok": True}, request=req))
+
+        with unittest.mock.patch("efso_radar.notifications.formatters.datetime") as mock_dt_fmt, \
+             unittest.mock.patch("efso_radar.notifications.telegram.datetime") as mock_dt_tg:
+            mock_dt_fmt.now.side_effect = lambda tz=None: fixed_time
+            mock_dt_tg.now.side_effect = lambda tz=None: fixed_time
+
+            res = deliver_one_shot_editorial_digest(
+                settings=self.test_settings,
+                assessments=assessments,
+                dry_run=False,
+                ledger_path=self.tmp_path / "legacy_runner_empty_ledger.json",
+                transport=mock_tg_transport,
+                target_recipient_role="PRIMARY_EDITOR",
+                repository=repo,
+            )
+
+        status = res.get("status") or res.get("PRIMARY_EDITOR", {}).get("status")
+        self.assertEqual(status, "DUPLICATE_DELIVERY_PREVENTED", "Legacy hash-keyed record failed to block duplicate!")
+
+    # --- Test 41: Ambiguous DELIVERY_UNCERTAIN Across Minute Boundary Blocks Blind Retry ---
+    def test_41_telegram_outbox_ambiguous_uncertain_minute_rollover_no_blind_retry(self):
+        """Runner 1 gets 504 timeout at 07:37:59 (DELIVERY_UNCERTAIN). Runner 2 at 07:38:01 must be blocked."""
+        repo = self._create_turso_repo()
+        t0 = datetime(2026, 10, 31, 7, 37, 59, tzinfo=timezone.utc)
+        t1 = datetime(2026, 10, 31, 7, 38, 1, tzinfo=timezone.utc)
+
+        assessments = [
+            EditorialAssessment(article_ids=["to_a1"], score=88, kind=EditorialKind.NEW, headline_tr="Timeout Haber 1"),
+            EditorialAssessment(article_ids=["to_a2"], score=85, kind=EditorialKind.NEW, headline_tr="Timeout Haber 2"),
+            EditorialAssessment(article_ids=["to_a3"], score=82, kind=EditorialKind.NEW, headline_tr="Timeout Haber 3"),
+        ]
+
+        attempt_count = 0
+
+        def mock_timeout_post(request: httpx.Request) -> httpx.Response:
+            nonlocal attempt_count
+            attempt_count += 1
+            return httpx.Response(504, text="Gateway Timeout", request=request)
+
+        mock_timeout_transport = httpx.MockTransport(mock_timeout_post)
+
+        current_time = [t0]
+        with unittest.mock.patch("efso_radar.notifications.formatters.datetime") as mock_dt_fmt, \
+             unittest.mock.patch("efso_radar.notifications.telegram.datetime") as mock_dt_tg:
+            mock_dt_fmt.now.side_effect = lambda tz=None: current_time[0]
+            mock_dt_tg.now.side_effect = lambda tz=None: current_time[0]
+
+            # Runner 1 encounters gateway timeout at t0
+            current_time[0] = t0
+            res_1 = deliver_one_shot_editorial_digest(
+                settings=self.test_settings,
+                assessments=assessments,
+                dry_run=False,
+                ledger_path=self.tmp_path / "timeout_runner_1_ledger.json",
+                transport=mock_timeout_transport,
+                target_recipient_role="PRIMARY_EDITOR",
+                repository=repo,
+            )
+            status_1 = res_1.get("status") or res_1.get("PRIMARY_EDITOR", {}).get("status")
+            self.assertEqual(status_1, "DELIVERY_UNCERTAIN")
+            self.assertEqual(attempt_count, 1)
+
+            # Runner 2 starts on ephemeral runner at t1 across minute rollover
+            current_time[0] = t1
+            res_2 = deliver_one_shot_editorial_digest(
+                settings=self.test_settings,
+                assessments=assessments,
+                dry_run=False,
+                ledger_path=self.tmp_path / "timeout_runner_2_empty_ledger.json",
+                transport=mock_timeout_transport,
+                target_recipient_role="PRIMARY_EDITOR",
+                repository=repo,
+            )
+            status_2 = res_2.get("status") or res_2.get("PRIMARY_EDITOR", {}).get("status")
+            self.assertEqual(status_2, "DUPLICATE_DELIVERY_PREVENTED")
+            self.assertEqual(attempt_count, 1, "Blind retry occurred after ambiguous DELIVERY_UNCERTAIN!")
 
 if __name__ == "__main__":
     unittest.main()
