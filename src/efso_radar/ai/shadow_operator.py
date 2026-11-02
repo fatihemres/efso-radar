@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field, ValidationError
@@ -48,6 +49,10 @@ from efso_radar.ai.shadow_preflight import (
     SHADOW_SAMPLE_ID,
     get_historical_public_shadow_sample,
     sanitize_report_text,
+)
+from efso_radar.ai.shadow_session import (
+    ShadowSessionClaimRecord,
+    claim_shadow_session,
 )
 from efso_radar.config import Settings
 from efso_radar.domain import Article
@@ -313,11 +318,36 @@ class OneShotShadowOperatorRunner:
     - Full segregation of raw model picks, approved suggestions, suppressed picks, and unreturned candidates.
     """
 
-    def __init__(self, settings: Optional[Settings] = None):
+    def __init__(
+        self,
+        settings: Optional[Settings] = None,
+        session_fixture_root: Optional[Path | str] = None,
+    ):
         # Never call Settings.from_env() in offline operator; instantiate clean Settings
         self.settings = settings or Settings()
+        self.session_fixture_root = Path(session_fixture_root) if session_fixture_root else None
+        self.session_claim: Optional[ShadowSessionClaimRecord] = None
         self._execution_attempted: bool = False
         self._call_count: int = 0
+
+    def claim_session_pre_dispatch(
+        self,
+        fixture_root: Optional[Path | str] = None,
+        purpose_version: str = "STAGE-B-SHADOW-V1",
+    ) -> Optional[ShadowSessionClaimRecord]:
+        """Atomically claim session pre-dispatch in a trusted fixture root if configured."""
+        target_root = fixture_root or self.session_fixture_root
+        if target_root is None:
+            return None
+
+        claim = claim_shadow_session(
+            fixture_root=target_root,
+            cohort_id=SHADOW_SAMPLE_ID,
+            model_name=self.settings.gemini_model,
+            purpose_version=purpose_version,
+        )
+        self.session_claim = claim
+        return claim
 
     @property
     def execution_attempted(self) -> bool:
@@ -386,8 +416,16 @@ class OneShotShadowOperatorRunner:
         self,
         candidates: Optional[list[Article]] = None,
         as_of_time: Optional[datetime] = None,
+        session_fixture_root: Optional[Path | str] = None,
     ) -> ShadowOperatorResult:
         """Execute a completely offline dry run validating prompt, token bounds, and sample integrity."""
+        claim_record = self.claim_session_pre_dispatch(session_fixture_root)
+        session_lock_status = (
+            f"SAME_HOST_FIXTURE_CLAIM_CONSUMED:{claim_record.session_identity}"
+            if claim_record
+            else "CROSS_PROCESS_SESSION_LOCK_PENDING_LIVE_AUTHORIZATION"
+        )
+
         active_candidates = self._resolve_and_validate_candidates(candidates)
         ref_now = as_of_time or SHADOW_SAMPLE_AS_OF_UTC
 
@@ -429,6 +467,7 @@ class OneShotShadowOperatorRunner:
             finish_reason=None,
             timeout_ms=OPERATOR_TIMEOUT_MS,
             grounding_forbidden=True,
+            session_lock_status=session_lock_status,
             raw_summary_tr=None,
             raw_picks=[],
             approved_suggestions=[],
@@ -445,6 +484,7 @@ class OneShotShadowOperatorRunner:
         candidates: Optional[list[Article]] = None,
         as_of_time: Optional[datetime] = None,
         finish_reason: Optional[str] = "STOP",
+        session_fixture_root: Optional[Path | str] = None,
     ) -> ShadowOperatorResult:
         """Hermetic, offline evaluation of a pre-computed or synthetic structured response.
 
@@ -453,6 +493,13 @@ class OneShotShadowOperatorRunner:
         - Enforces single-shot session execution within the runner instance.
         - Segregates raw model picks vs approved suggestions vs filtered dispositions vs unreturned candidates.
         """
+        claim_record = self.claim_session_pre_dispatch(session_fixture_root)
+        session_lock_status = (
+            f"SAME_HOST_FIXTURE_CLAIM_CONSUMED:{claim_record.session_identity}"
+            if claim_record
+            else "CROSS_PROCESS_SESSION_LOCK_PENDING_LIVE_AUTHORIZATION"
+        )
+
         if self._execution_attempted:
             raise AIEvaluationError(
                 "Repeated execution blocked: Stage B shadow operator enforces strict single-shot execution "
@@ -614,6 +661,7 @@ class OneShotShadowOperatorRunner:
             finish_reason=finish_reason,
             timeout_ms=OPERATOR_TIMEOUT_MS,
             grounding_forbidden=True,
+            session_lock_status=session_lock_status,
             raw_summary_tr=batch.run_editorial_summary_tr,
             raw_picks=raw_picks,
             approved_suggestions=approved_suggestions,
@@ -627,6 +675,7 @@ class OneShotShadowOperatorRunner:
     def execute_one_shot(
         self,
         confirm_single_shot_free_tier: bool = False,
+        session_fixture_root: Optional[Path | str] = None,
         **kwargs: Any,
     ) -> ShadowOperatorResult:
         """P1 Security Gate: Live execution is strictly denied in merged Stage B code.
@@ -634,6 +683,9 @@ class OneShotShadowOperatorRunner:
         Always fails closed to prevent unauthorized live network calls.
         Real inference requires separate, explicit PO operational authorization.
         """
+        # Pre-dispatch session claim: consumed BEFORE any hypothetical call or authorization check
+        self.claim_session_pre_dispatch(session_fixture_root)
+
         # Mark attempt as consumed
         self._execution_attempted = True
         raise AIEvaluationError(
