@@ -492,7 +492,9 @@ class OneShotShadowOperatorRunner:
         try:
             batch = EditorialDecisionBatch.model_validate_json(response_json)
         except (json.JSONDecodeError, ValidationError) as exc:
-            raise AIEvaluationError(f"Malformed structured response from model: {exc}") from exc
+            raise AIEvaluationError(
+                "Malformed structured response: payload does not conform to EditorialDecisionBatch schema."
+            ) from exc
 
         # Re-use application-level business rules post-validation with keyless settings
         keyless_settings = self.settings.model_copy(update={"gemini_api_key": ""})

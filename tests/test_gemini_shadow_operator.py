@@ -289,7 +289,9 @@ class TestGeminiShadowOperator(unittest.TestCase):
         runner2 = OneShotShadowOperatorRunner(self.settings)
         with self.assertRaises(AIEvaluationError) as ctx2:
             runner2.evaluate_precomputed_response_json("{not valid json at all")
-        self.assertIn("Malformed structured response from model", str(ctx2.exception))
+        self.assertIn("Malformed structured response: payload does not conform", str(ctx2.exception))
+        # Ensure raw input payload is not leaked in exception string
+        self.assertNotIn("not valid json at all", str(ctx2.exception))
 
     def test_model_enforcement_and_grounding_rejection(self) -> None:
         """Any model other than gemini-3.5-flash-lite and enable_search_grounding=True must be rejected."""
@@ -359,29 +361,35 @@ class TestGeminiShadowOperator(unittest.TestCase):
             exit_code2 = main()
             self.assertEqual(exit_code2, 0)
 
-    def test_cli_output_path_validation_protects_operational_records(self) -> None:
-        """scripts/run_gemini_shadow_operator.py must forbid writing to .env, data/, or overwriting files."""
-        from scripts.run_gemini_shadow_operator import validate_output_path
+    def test_cli_rejects_forbidden_file_parameters(self) -> None:
+        """scripts/run_gemini_shadow_operator.py must reject --evaluate-json and --output-file flags."""
+        from scripts.run_gemini_shadow_operator import main
 
-        # 1. Target .env rejected
-        with self.assertRaises(ValueError) as ctx1:
-            validate_output_path(".env")
-        self.assertIn("operational .env file is strictly forbidden", str(ctx1.exception))
+        # 1. --evaluate-json is rejected before opening any file
+        with patch("sys.argv", ["run_gemini_shadow_operator.py", "--evaluate-json", "data/state.json"]):
+            with self.assertRaises(SystemExit) as ctx1:
+                main()
+            self.assertEqual(ctx1.exception.code, 2)
 
-        # 2. Target data/ directory rejected
-        with self.assertRaises(ValueError) as ctx2:
-            validate_output_path("data/report.md")
-        self.assertIn("operational data/ directory is strictly forbidden", str(ctx2.exception))
+        # 2. --output-file is rejected before writing any file
+        with patch("sys.argv", ["run_gemini_shadow_operator.py", "--output-file", "report.md"]):
+            with self.assertRaises(SystemExit) as ctx2:
+                main()
+            self.assertEqual(ctx2.exception.code, 2)
 
-        # 3. Existing file overwrite rejected
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp_path = Path(tmp.name)
-        try:
-            with self.assertRaises(ValueError) as ctx3:
-                validate_output_path(str(tmp_path))
-            self.assertIn("Overwriting is forbidden for safety", str(ctx3.exception))
-        finally:
-            tmp_path.unlink(missing_ok=True)
+    def test_cli_never_instantiates_sdk_client_under_any_flag(self) -> None:
+        """CLI execution never instantiates genai.Client under any flag."""
+        from scripts.run_gemini_shadow_operator import main
+
+        with patch("google.genai.Client") as mock_client:
+            with patch("sys.argv", ["run_gemini_shadow_operator.py", "--dry-run"]):
+                self.assertEqual(main(), 0)
+            with patch("sys.argv", ["run_gemini_shadow_operator.py", "--confirm-single-shot-free-tier"]):
+                self.assertEqual(main(), 1)
+            with patch("sys.argv", ["run_gemini_shadow_operator.py"]):
+                self.assertEqual(main(), 0)
+
+            mock_client.assert_not_called()
 
 
 if __name__ == "__main__":
