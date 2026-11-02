@@ -3,6 +3,11 @@ from efso_radar.ai.client import AIEditorialEngine, GeminiEditorialEngine
 from efso_radar.ai.cost import estimate_call_cost, estimate_tokens_from_text
 from efso_radar.ai.prompts import build_editorial_prompt
 from efso_radar.ai.schemas import EditorialDecisionBatch, EditorialPickSchema
+from efso_radar.ai.shadow_preflight import (
+    OneShotShadowPreflightRunner,
+    ShadowPreflightResult,
+    get_historical_public_shadow_sample,
+)
 
 __all__ = [
     "AIEditorialEngine",
@@ -12,4 +17,7 @@ __all__ = [
     "build_editorial_prompt",
     "estimate_call_cost",
     "estimate_tokens_from_text",
+    "OneShotShadowPreflightRunner",
+    "ShadowPreflightResult",
+    "get_historical_public_shadow_sample",
 ]
