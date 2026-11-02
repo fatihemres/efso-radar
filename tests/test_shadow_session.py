@@ -1,18 +1,15 @@
 """Hermetic unit tests for Issue #65 / Stage B shadow session claim and replay denial contract.
 
-Verifies:
-1. Stable canonical session identity & filename derived deterministically from (cohort, model, purpose).
-2. Verified empty fixture -> CONSUMED pre-dispatch claim record.
-3. Second run after claim halts with ShadowSessionReplayError.
-4. Race-resistant atomic claim between two distinct Python test subprocesses on same tmp_path.
-5. Simulated interruption / ambiguous dispatch leaves claim consumed and blocks replay.
-6. Short-write and fsync errors retain partial file on disk without deletion and block replay.
-7. Stale, 0-byte, oversized, and malformed claim files halt fail-closed without deletion.
-8. Security rejection of untrusted roots (.env, data/, src/, repo root, traversal, null bytes).
-9. Symlink and reparse point rejection across root and ancestors.
-10. OneShotShadowOperatorRunner integration updates session_lock_status and blocks repeat execution.
-11. Explicit documentation of same-host fixture-only, power-loss, and cross-runner limitations.
-12. Negative safety tests proving zero SDK client instantiation or live inference.
+Independent Review Hardening:
+1. Gated behind ShadowSessionFixtureScope attestation; un-attested or arbitrary directories fail before os.open.
+2. Routine dry_run(), execute_one_shot(), and evaluate_precomputed_response_json() are strictly side-effect-free (0 I/O).
+3. Pre-dispatch claim exercised only at deliberate simulated dispatch seam (simulate_hermetic_dispatched_session).
+4. Data/model validation occurs before claim I/O; invalid candidates/model halt with 0 files created.
+5. Non-empty roots with foreign/stray entries are rejected fail-closed (HALT/UNKNOWN).
+6. Constant sanitized error messages; no raw payload reflections or unredacted sensitive paths.
+7. Reparse point check fails closed on OSError.
+8. Race-resistant atomic no-overwrite claim between two distinct test subprocesses.
+9. Zero live SDK client calls or network dispatches.
 """
 from __future__ import annotations
 
@@ -38,6 +35,7 @@ from efso_radar.ai.shadow_session import (
     ShadowSessionClaimRecord,
     ShadowSessionCorruptedError,
     ShadowSessionError,
+    ShadowSessionFixtureScope,
     ShadowSessionReplayError,
     ShadowSessionSecurityError,
     ShadowSessionStorageError,
@@ -47,20 +45,26 @@ from efso_radar.ai.shadow_session import (
     compute_canonical_session_identity,
     get_canonical_claim_filename,
     inspect_existing_session_claim,
-    validate_fixture_root,
+    validate_test_fixture_root,
 )
 from efso_radar.config import Settings
+from efso_radar.domain import Article
 
 
 class TestShadowSessionClaimContract(unittest.TestCase):
     """Hermetic test suite for Issue #65 shadow session claim & replay denial contract."""
 
     def setUp(self) -> None:
-        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.tmp_dir = tempfile.TemporaryDirectory(prefix="pytest-session-test-")
         self.fixture_root = Path(self.tmp_dir.name).resolve()
+        self.scope = ShadowSessionFixtureScope(self.fixture_root)
+        self.scope.__enter__()
 
     def tearDown(self) -> None:
-        self.tmp_dir.cleanup()
+        try:
+            self.scope.__exit__(None, None, None)
+        finally:
+            self.tmp_dir.cleanup()
 
     def test_canonical_session_identity_and_filename_derivation(self) -> None:
         """Identity and filename are deterministically derived from fixed immutable inputs."""
@@ -88,13 +92,64 @@ class TestShadowSessionClaimContract(unittest.TestCase):
         with self.assertRaises(ShadowSessionSecurityError):
             compute_canonical_session_identity(purpose_version="custom-uuid-v2")
 
+    def test_fixture_scope_attestation_required_before_write(self) -> None:
+        """Claim operations are gated behind explicit ShadowSessionFixtureScope attestation."""
+        # Create an un-attested valid temporary directory
+        with tempfile.TemporaryDirectory(prefix="pytest-unattested-") as td:
+            unattested_path = Path(td).resolve()
+            # Fails before attempting any write or os.open
+            with self.assertRaises(ShadowSessionSecurityError) as ctx:
+                claim_shadow_session(unattested_path)
+
+            self.assertIn("has not been attested as an authorized test-owned fixture scope", str(ctx.exception))
+            # No files created
+            self.assertEqual(list(unattested_path.iterdir()), [])
+
+            # Entering the scope authorizes it
+            with ShadowSessionFixtureScope(unattested_path):
+                rec = claim_shadow_session(unattested_path)
+                self.assertEqual(rec.state, "CONSUMED")
+
+    def test_untrusted_arbitrary_directories_rejected_before_os_open(self) -> None:
+        """Arbitrary project, desktop, non-temp, or non-pytest directories are rejected fail-closed."""
+        repo_root = _find_repo_root()
+        self.assertIsNotNone(repo_root)
+
+        # 1. Repository root rejected
+        with self.assertRaises(ShadowSessionSecurityError):
+            validate_test_fixture_root(repo_root)
+
+        # 2. Inside repository working copy rejected
+        with self.assertRaises(ShadowSessionSecurityError):
+            validate_test_fixture_root(repo_root / "src")
+
+        # 3. Path traversal (..) rejected
+        with self.assertRaises(ShadowSessionSecurityError):
+            validate_test_fixture_root(f"{self.fixture_root}/../other")
+
+        # 4. Null byte rejected
+        with self.assertRaises(ShadowSessionSecurityError):
+            validate_test_fixture_root(f"{self.fixture_root}\x00/bad")
+
+        # 5. Non-temp directory rejected
+        with self.assertRaises(ShadowSessionSecurityError):
+            validate_test_fixture_root(Path.home())
+
+        # 6. Temp root itself rejected
+        with self.assertRaises(ShadowSessionSecurityError):
+            validate_test_fixture_root(tempfile.gettempdir())
+
+        # 7. Non-pytest prefix temporary directory rejected
+        with tempfile.TemporaryDirectory(prefix="ordinary-temp-") as ordinary_td:
+            with self.assertRaises(ShadowSessionSecurityError) as ctx_ord:
+                validate_test_fixture_root(ordinary_td)
+            self.assertIn("does not belong to a valid pytest fixture hierarchy", str(ctx_ord.exception))
+
     def test_verified_empty_fixture_claims_consumed_pre_dispatch(self) -> None:
         """Verified empty fixture transitions to CONSUMED pre-dispatch with complete evidence."""
-        # Pre-condition: no claim file
         existing = inspect_existing_session_claim(self.fixture_root)
         self.assertIsNone(existing)
 
-        # Claim execution
         record = claim_shadow_session(self.fixture_root)
         self.assertIsInstance(record, ShadowSessionClaimRecord)
         self.assertEqual(record.state, "CONSUMED")
@@ -104,12 +159,10 @@ class TestShadowSessionClaimContract(unittest.TestCase):
         self.assertEqual(record.process_pid, os.getpid())
         self.assertIn("STAGE B SAME-HOST ONE-USE SESSION CLAIM CONTRACT", record.disclaimer)
 
-        # Post-condition: claim file exists on disk
         claim_file = self.fixture_root / get_canonical_claim_filename()
         self.assertTrue(claim_file.exists())
         self.assertTrue(claim_file.is_file())
 
-        # Inspect reads back valid record
         inspected = inspect_existing_session_claim(self.fixture_root)
         self.assertIsNotNone(inspected)
         self.assertEqual(inspected.session_identity, record.session_identity)
@@ -125,15 +178,37 @@ class TestShadowSessionClaimContract(unittest.TestCase):
         self.assertIn("Replay denied: session", str(ctx.exception))
         self.assertIn("has already been claimed and consumed", str(ctx.exception))
 
-        # Claim file remains intact on disk
         claim_file = self.fixture_root / get_canonical_claim_filename()
         self.assertTrue(claim_file.exists())
 
+    def test_nonempty_fixture_with_foreign_entries_rejected_fail_closed(self) -> None:
+        """A fixture directory containing foreign entries or unknown files is rejected as UNKNOWN/HALT."""
+        foreign_file = self.fixture_root / "stray_foreign_file.txt"
+        foreign_file.write_text("unverified content", encoding="utf-8")
+
+        # 1. Unclaimed directory with foreign file fails before os.open
+        with self.assertRaises(ShadowSessionSecurityError) as ctx1:
+            claim_shadow_session(self.fixture_root)
+        self.assertIn("Fixture root is not clean/empty", str(ctx1.exception))
+        self.assertIn("foreign or unverified entries", str(ctx1.exception))
+
+        # Stray file is NOT deleted
+        self.assertTrue(foreign_file.exists())
+
+        # 2. Existing valid claim file alongside foreign file fails as corrupted/extraneous
+        foreign_file.unlink()
+        claim_shadow_session(self.fixture_root)
+
+        foreign_file.write_text("another stray", encoding="utf-8")
+        with self.assertRaises(ShadowSessionCorruptedError) as ctx2:
+            claim_shadow_session(self.fixture_root)
+        self.assertIn("extraneous foreign entries alongside claim file", str(ctx2.exception))
+
     def test_race_resistant_atomic_claim_between_two_distinct_subprocesses(self) -> None:
-        """Two distinct Python subprocesses concurrently racing to claim the same fixture root.
+        """Two distinct Python subprocesses concurrently racing to claim the same attested fixture root.
 
         Guarantees:
-        - At most one subprocess succeeds (exit code 0).
+        - Exactly one subprocess succeeds (exit code 0).
         - The other subprocess is rejected with ReplayDenied (exit code 1).
         - Exactly one claim file is created.
         - Subsequent sequential execution is also rejected.
@@ -141,9 +216,11 @@ class TestShadowSessionClaimContract(unittest.TestCase):
         subproc_script = (
             "import sys\n"
             "from pathlib import Path\n"
-            "from efso_radar.ai.shadow_session import claim_shadow_session, ShadowSessionError\n"
+            "from efso_radar.ai.shadow_session import claim_shadow_session, ShadowSessionFixtureScope, ShadowSessionError\n"
+            "root = Path(sys.argv[1])\n"
+            "ShadowSessionFixtureScope.register_authorized_fixture_root(root)\n"
             "try:\n"
-            "    claim = claim_shadow_session(Path(sys.argv[1]))\n"
+            "    claim = claim_shadow_session(root)\n"
             "    sys.exit(0)\n"
             "except ShadowSessionError:\n"
             "    sys.exit(1)\n"
@@ -155,7 +232,6 @@ class TestShadowSessionClaimContract(unittest.TestCase):
         env = os.environ.copy()
         env["PYTHONPATH"] = repo_src
 
-        # Launch two distinct subprocesses concurrently
         p1 = subprocess.Popen(
             [sys.executable, "-c", subproc_script, str(self.fixture_root)],
             env=env,
@@ -176,14 +252,12 @@ class TestShadowSessionClaimContract(unittest.TestCase):
         self.assertEqual(
             exit_codes,
             [0, 1],
-            msg=f"Expected [0, 1] exit codes for concurrent racers. Got {exit_codes}. p1 err: {err1}, p2 err: {err2}",
+            msg=f"Expected [0, 1] exit codes for concurrent racers. Got {exit_codes}. p1: {err1}, p2: {err2}",
         )
 
-        # Verify exactly one claim file was created
         claim_files = list(self.fixture_root.glob("claim_*.json"))
         self.assertEqual(len(claim_files), 1)
 
-        # Subsequent third run also fails
         p3 = subprocess.run(
             [sys.executable, "-c", subproc_script, str(self.fixture_root)],
             env=env,
@@ -192,27 +266,111 @@ class TestShadowSessionClaimContract(unittest.TestCase):
         )
         self.assertEqual(p3.returncode, 1)
 
-    def test_simulated_interruption_ambiguous_dispatch_retains_claim_blocks_replay(self) -> None:
-        """Simulated ambiguous / denied dispatch leaves session consumed and prevents re-execution."""
-        runner = OneShotShadowOperatorRunner(session_fixture_root=self.fixture_root)
+    def test_denied_live_calls_and_dry_run_produce_zero_filesystem_io(self) -> None:
+        """Routine execute_one_shot(), dry_run(), and invalid evaluation produce 0 claim files / I/O."""
+        runner = OneShotShadowOperatorRunner()
 
-        # execute_one_shot unconditionally fails closed with AIEvaluationError (live denial)
+        # 1. Denied execute_one_shot() produces zero I/O
+        with patch("builtins.open") as mock_open:
+            with self.assertRaises(AIEvaluationError):
+                runner.execute_one_shot()
+            mock_open.assert_not_called()
+
+        self.assertEqual(list(self.fixture_root.iterdir()), [])
+
+        # 2. Routine dry_run() produces zero I/O
+        fresh_runner = OneShotShadowOperatorRunner()
+        res = fresh_runner.dry_run()
+        self.assertEqual(res.status, "DRY_RUN_COMPLETED_OFFLINE")
+        self.assertEqual(res.session_lock_status, "CROSS_PROCESS_SESSION_LOCK_PENDING_LIVE_AUTHORIZATION")
+        self.assertEqual(list(self.fixture_root.iterdir()), [])
+
+        # 3. Invalid precomputed JSON produces zero I/O
+        third_runner = OneShotShadowOperatorRunner()
         with self.assertRaises(AIEvaluationError):
-            runner.execute_one_shot(session_fixture_root=self.fixture_root)
+            third_runner.evaluate_precomputed_response_json("{malformed json")
+        self.assertEqual(list(self.fixture_root.iterdir()), [])
 
-        # Pre-dispatch claim was written before the error
+    def test_simulated_dispatch_seam_validates_data_before_claim_io(self) -> None:
+        """Simulation seam validates candidates and model BEFORE any claim file I/O."""
+        # 1. Invalid model halts before claim creation
+        bad_settings = Settings(gemini_model="gemini-1.5-pro")
+        runner_bad_model = OneShotShadowOperatorRunner(settings=bad_settings)
+        with self.assertRaises(AIEvaluationError) as ctx1:
+            runner_bad_model.simulate_hermetic_dispatched_session(self.fixture_root)
+        self.assertIn("Shadow operator only permits model", str(ctx1.exception))
+        # Zero claim files created
+        self.assertEqual(list(self.fixture_root.iterdir()), [])
+
+        # 2. Tampered candidate content halts before claim creation
+        runner_ok = OneShotShadowOperatorRunner()
+        from efso_radar.ai.shadow_preflight import get_historical_public_shadow_sample
+        sample = get_historical_public_shadow_sample()
+        tampered_sample = [
+            Article(
+                id=sample[0].id,
+                title="TAMPERED TITLE INJECTION",
+                snippet=sample[0].snippet,
+                url=sample[0].url,
+                source=sample[0].source,
+                published_at=sample[0].published_at,
+                market=sample[0].market,
+                canonical_url=sample[0].canonical_url,
+            )
+        ] + sample[1:]
+
+        with self.assertRaises(AIEvaluationError) as ctx2:
+            runner_ok.simulate_hermetic_dispatched_session(self.fixture_root, candidates=tampered_sample)
+        self.assertIn("Candidate content modification rejected", str(ctx2.exception))
+        # Zero claim files created
+        self.assertEqual(list(self.fixture_root.iterdir()), [])
+
+    def test_simulated_dispatch_interruption_retains_claim_and_blocks_replay(self) -> None:
+        """Simulated dispatch interruption retains pre-dispatch claim on disk and blocks second run."""
+        runner = OneShotShadowOperatorRunner()
+
+        def fail_dispatch_callback() -> None:
+            raise RuntimeError("Simulated dispatch crash / transport timeout")
+
+        with self.assertRaises(RuntimeError):
+            runner.simulate_hermetic_dispatched_session(
+                self.fixture_root, dispatch_callback=fail_dispatch_callback
+            )
+
+        # Claim was created pre-dispatch and retained
         claim_file = self.fixture_root / get_canonical_claim_filename()
         self.assertTrue(claim_file.exists())
         record = inspect_existing_session_claim(self.fixture_root)
         self.assertIsNotNone(record)
         self.assertEqual(record.state, "CONSUMED")
 
-        # Second attempt with a fresh runner instance fails with ShadowSessionReplayError
-        fresh_runner = OneShotShadowOperatorRunner(session_fixture_root=self.fixture_root)
-        with self.assertRaises(ShadowSessionReplayError) as ctx:
-            fresh_runner.execute_one_shot(session_fixture_root=self.fixture_root)
+        # Second attempt with fresh runner is blocked by ReplayDenied
+        runner2 = OneShotShadowOperatorRunner()
+        with self.assertRaises(ShadowSessionReplayError):
+            runner2.simulate_hermetic_dispatched_session(self.fixture_root)
 
-        self.assertIn("has already been claimed and consumed", str(ctx.exception))
+    def test_simulated_dispatch_success_updates_session_lock_status(self) -> None:
+        """Successful simulated dispatch updates session_lock_status to SAME_HOST_FIXTURE_CLAIM_CONSUMED."""
+        runner = OneShotShadowOperatorRunner()
+        result = runner.simulate_hermetic_dispatched_session(self.fixture_root)
+
+        expected_ident = compute_canonical_session_identity()
+        self.assertEqual(result.status, "HERMETIC_SIMULATED_DISPATCH_SUCCESS")
+        self.assertIn("SAME_HOST_FIXTURE_CLAIM_CONSUMED", result.session_lock_status)
+        self.assertIn(expected_ident, result.session_lock_status)
+
+        # Second run on same root is denied
+        runner2 = OneShotShadowOperatorRunner()
+        with self.assertRaises(ShadowSessionReplayError):
+            runner2.simulate_hermetic_dispatched_session(self.fixture_root)
+
+    def test_reparse_point_check_fails_closed_on_oserror(self) -> None:
+        """_is_reparse_point_or_symlink fails closed with ShadowSessionSecurityError on OSError."""
+        with patch("os.lstat", side_effect=OSError("Access denied during lstat")):
+            with patch("sys.platform", "win32"):
+                with self.assertRaises(ShadowSessionSecurityError) as ctx:
+                    _is_reparse_point_or_symlink(self.fixture_root)
+                self.assertIn("Filesystem attribute inspection failed", str(ctx.exception))
 
     def test_short_write_and_fsync_error_retains_partial_file_and_blocks_replay(self) -> None:
         """Fsync error during claim creation retains partial file on disk without deletion and blocks replay."""
@@ -223,11 +381,9 @@ class TestShadowSessionClaimContract(unittest.TestCase):
             self.assertIn("Failed to fsync session claim to disk", str(ctx.exception))
             self.assertIn("State retained on disk to deny replay", str(ctx.exception))
 
-        # Retention guarantee: file was NOT deleted
         claim_file = self.fixture_root / get_canonical_claim_filename()
         self.assertTrue(claim_file.exists())
 
-        # Subsequent attempt to claim sees the existing file and fails closed
         with self.assertRaises((ShadowSessionReplayError, ShadowSessionCorruptedError)):
             claim_shadow_session(self.fixture_root)
 
@@ -240,21 +396,21 @@ class TestShadowSessionClaimContract(unittest.TestCase):
         with self.assertRaises(ShadowSessionCorruptedError) as ctx1:
             claim_shadow_session(self.fixture_root)
         self.assertIn("Existing claim file is empty (0 bytes)", str(ctx1.exception))
-        self.assertTrue(claim_file.exists(), "Empty claim file must not be deleted")
+        self.assertTrue(claim_file.exists())
 
         # 2. Corrupted / partial JSON
         claim_file.write_text('{"session_identity": "partial_json', encoding="utf-8")
         with self.assertRaises(ShadowSessionCorruptedError) as ctx2:
             claim_shadow_session(self.fixture_root)
         self.assertIn("Existing claim file is malformed", str(ctx2.exception))
-        self.assertTrue(claim_file.exists(), "Corrupted claim file must not be deleted")
+        self.assertTrue(claim_file.exists())
 
         # 3. Oversized file (> 64 KB)
         claim_file.write_text("x" * (MAX_CLAIM_FILE_BYTES + 100), encoding="utf-8")
         with self.assertRaises(ShadowSessionCorruptedError) as ctx3:
             claim_shadow_session(self.fixture_root)
         self.assertIn("exceeds maximum size", str(ctx3.exception))
-        self.assertTrue(claim_file.exists(), "Oversized file must not be deleted")
+        self.assertTrue(claim_file.exists())
 
         # 4. Foreign session identity mismatch
         foreign_record = {
@@ -272,103 +428,20 @@ class TestShadowSessionClaimContract(unittest.TestCase):
         with self.assertRaises(ShadowSessionCorruptedError) as ctx4:
             claim_shadow_session(self.fixture_root)
         self.assertIn("Claim record identity mismatch", str(ctx4.exception))
-        self.assertTrue(claim_file.exists(), "Foreign claim file must not be deleted")
+        self.assertTrue(claim_file.exists())
 
-    def test_rejects_untrusted_operational_and_traversal_roots(self) -> None:
-        """Untrusted operational roots, path traversal, and null bytes are rejected fail-closed."""
-        repo_root = _find_repo_root()
-        self.assertIsNotNone(repo_root)
+    def test_error_messages_contain_no_raw_payloads_or_unredacted_paths(self) -> None:
+        """Error messages are constant sanitized codes and do not leak raw payload data or full paths."""
+        claim_file = self.fixture_root / get_canonical_claim_filename()
+        sensitive_payload = '{"private_leak": "SECRET_USER_DATA_12345"}'
+        claim_file.write_text(sensitive_payload, encoding="utf-8")
 
-        # 1. Null bytes
-        with self.assertRaises(ShadowSessionSecurityError) as ctx1:
-            validate_fixture_root(str(self.fixture_root) + "\x00/hack")
-        self.assertIn("Null bytes forbidden", str(ctx1.exception))
+        with self.assertRaises(ShadowSessionCorruptedError) as ctx:
+            claim_shadow_session(self.fixture_root)
 
-        # 2. Path traversal
-        with self.assertRaises(ShadowSessionSecurityError) as ctx2:
-            validate_fixture_root(f"{self.fixture_root}/../other")
-        self.assertIn("Path traversal ('..') is strictly forbidden", str(ctx2.exception))
-
-        # 3. Repository root
-        with self.assertRaises(ShadowSessionSecurityError) as ctx3:
-            validate_fixture_root(repo_root)
-        self.assertIn("Repository root cannot be used as a test fixture root", str(ctx3.exception))
-
-        # 4. Operational data directory inside repo
-        data_dir = repo_root / "data"
-        if data_dir.exists():
-            with self.assertRaises(ShadowSessionSecurityError) as ctx4:
-                validate_fixture_root(data_dir)
-            self.assertIn("Fixture root cannot reside inside the repository working directory", str(ctx4.exception))
-
-        # 5. Non-existent directory
-        with self.assertRaises(ShadowSessionSecurityError) as ctx5:
-            validate_fixture_root(self.fixture_root / "does_not_exist_xyz")
-        self.assertIn("Fixture root directory does not exist", str(ctx5.exception))
-
-        # 6. File path instead of directory
-        temp_file = self.fixture_root / "regular_file.txt"
-        temp_file.write_text("hello", encoding="utf-8")
-        with self.assertRaises(ShadowSessionSecurityError) as ctx6:
-            validate_fixture_root(temp_file)
-        self.assertIn("Fixture root must be a directory", str(ctx6.exception))
-
-    def test_symlink_and_reparse_point_rejected(self) -> None:
-        """Symlinks and reparse points are rejected across candidate path and hierarchy."""
-        with patch("efso_radar.ai.shadow_session._is_reparse_point_or_symlink", return_value=True):
-            with self.assertRaises(ShadowSessionSecurityError) as ctx:
-                validate_fixture_root(self.fixture_root)
-            self.assertIn("Symlink or reparse point detected", str(ctx.exception))
-
-    def test_runner_integration_dry_run_updates_session_lock_status(self) -> None:
-        """OneShotShadowOperatorRunner integrates session claim into report session_lock_status."""
-        runner = OneShotShadowOperatorRunner(session_fixture_root=self.fixture_root)
-        result = runner.dry_run()
-
-        expected_ident = compute_canonical_session_identity()
-        self.assertIn("SAME_HOST_FIXTURE_CLAIM_CONSUMED", result.session_lock_status)
-        self.assertIn(expected_ident, result.session_lock_status)
-
-        # Markdown report surfaces the consumed session lock status
-        md = result.to_markdown_report()
-        self.assertIn(f"**Cross-Process Session Lock:** `SAME_HOST_FIXTURE_CLAIM_CONSUMED:{expected_ident}`", md)
-
-        # A second runner instance on the same fixture root fails replay
-        runner2 = OneShotShadowOperatorRunner(session_fixture_root=self.fixture_root)
-        with self.assertRaises(ShadowSessionReplayError):
-            runner2.dry_run()
-
-    def test_runner_integration_evaluate_precomputed_json_updates_session_lock_status(self) -> None:
-        """OneShotShadowOperatorRunner offline precomputed JSON evaluation claims session pre-dispatch."""
-        synthetic_payload = json.dumps({
-            "run_editorial_summary_tr": "Sentetik editoryal özet",
-            "picks": [
-                {
-                    "article_ids": ["news-20261030-001"],
-                    "kind": "NEW",
-                    "headline_tr": "Test Başlık",
-                    "cover_title_tr": "Test Kapak",
-                    "caption_idea_tr": "Test Açıklama",
-                    "why_efso_tr": "Test Neden Efso",
-                    "uncertainties_tr": "",
-                    "suggested_format": "POST",
-                    "category": "GLOBAL",
-                    "verification_status": "REPUTABLE_REPORTING",
-                    "score": 85,
-                }
-            ],
-        })
-        runner = OneShotShadowOperatorRunner(session_fixture_root=self.fixture_root)
-        result = runner.evaluate_precomputed_response_json(synthetic_payload)
-
-        expected_ident = compute_canonical_session_identity()
-        self.assertIn("SAME_HOST_FIXTURE_CLAIM_CONSUMED", result.session_lock_status)
-        self.assertIn(expected_ident, result.session_lock_status)
-
-        # Second evaluation with fresh runner on same fixture root fails replay
-        runner2 = OneShotShadowOperatorRunner(session_fixture_root=self.fixture_root)
-        with self.assertRaises(ShadowSessionReplayError):
-            runner2.evaluate_precomputed_response_json(synthetic_payload)
+        err_msg = str(ctx.exception)
+        self.assertNotIn("SECRET_USER_DATA_12345", err_msg)
+        self.assertNotIn("private_leak", err_msg)
 
     def test_documented_limitations_integrity(self) -> None:
         """Session contract disclaimers strictly state platform limits and non-power-loss boundaries."""
@@ -384,16 +457,12 @@ class TestShadowSessionClaimContract(unittest.TestCase):
         with patch("google.genai.Client") as mock_client:
             claim_shadow_session(self.fixture_root)
 
-            # Dry run on second fixture
-            with tempfile.TemporaryDirectory() as td2:
-                r2 = OneShotShadowOperatorRunner(session_fixture_root=Path(td2))
-                r2.dry_run()
+            r2 = OneShotShadowOperatorRunner()
+            r2.dry_run()
 
-            # Live execute_one_shot denial on third fixture
-            with tempfile.TemporaryDirectory() as td3:
-                r3 = OneShotShadowOperatorRunner(session_fixture_root=Path(td3))
-                with self.assertRaises(AIEvaluationError):
-                    r3.execute_one_shot()
+            r3 = OneShotShadowOperatorRunner()
+            with self.assertRaises(AIEvaluationError):
+                r3.execute_one_shot()
 
             mock_client.assert_not_called()
 

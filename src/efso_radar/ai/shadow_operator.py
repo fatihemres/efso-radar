@@ -30,7 +30,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -318,36 +318,11 @@ class OneShotShadowOperatorRunner:
     - Full segregation of raw model picks, approved suggestions, suppressed picks, and unreturned candidates.
     """
 
-    def __init__(
-        self,
-        settings: Optional[Settings] = None,
-        session_fixture_root: Optional[Path | str] = None,
-    ):
+    def __init__(self, settings: Optional[Settings] = None):
         # Never call Settings.from_env() in offline operator; instantiate clean Settings
         self.settings = settings or Settings()
-        self.session_fixture_root = Path(session_fixture_root) if session_fixture_root else None
-        self.session_claim: Optional[ShadowSessionClaimRecord] = None
         self._execution_attempted: bool = False
         self._call_count: int = 0
-
-    def claim_session_pre_dispatch(
-        self,
-        fixture_root: Optional[Path | str] = None,
-        purpose_version: str = "STAGE-B-SHADOW-V1",
-    ) -> Optional[ShadowSessionClaimRecord]:
-        """Atomically claim session pre-dispatch in a trusted fixture root if configured."""
-        target_root = fixture_root or self.session_fixture_root
-        if target_root is None:
-            return None
-
-        claim = claim_shadow_session(
-            fixture_root=target_root,
-            cohort_id=SHADOW_SAMPLE_ID,
-            model_name=self.settings.gemini_model,
-            purpose_version=purpose_version,
-        )
-        self.session_claim = claim
-        return claim
 
     @property
     def execution_attempted(self) -> bool:
@@ -416,16 +391,8 @@ class OneShotShadowOperatorRunner:
         self,
         candidates: Optional[list[Article]] = None,
         as_of_time: Optional[datetime] = None,
-        session_fixture_root: Optional[Path | str] = None,
     ) -> ShadowOperatorResult:
         """Execute a completely offline dry run validating prompt, token bounds, and sample integrity."""
-        claim_record = self.claim_session_pre_dispatch(session_fixture_root)
-        session_lock_status = (
-            f"SAME_HOST_FIXTURE_CLAIM_CONSUMED:{claim_record.session_identity}"
-            if claim_record
-            else "CROSS_PROCESS_SESSION_LOCK_PENDING_LIVE_AUTHORIZATION"
-        )
-
         active_candidates = self._resolve_and_validate_candidates(candidates)
         ref_now = as_of_time or SHADOW_SAMPLE_AS_OF_UTC
 
@@ -467,7 +434,7 @@ class OneShotShadowOperatorRunner:
             finish_reason=None,
             timeout_ms=OPERATOR_TIMEOUT_MS,
             grounding_forbidden=True,
-            session_lock_status=session_lock_status,
+            session_lock_status="CROSS_PROCESS_SESSION_LOCK_PENDING_LIVE_AUTHORIZATION",
             raw_summary_tr=None,
             raw_picks=[],
             approved_suggestions=[],
@@ -484,7 +451,6 @@ class OneShotShadowOperatorRunner:
         candidates: Optional[list[Article]] = None,
         as_of_time: Optional[datetime] = None,
         finish_reason: Optional[str] = "STOP",
-        session_fixture_root: Optional[Path | str] = None,
     ) -> ShadowOperatorResult:
         """Hermetic, offline evaluation of a pre-computed or synthetic structured response.
 
@@ -493,13 +459,6 @@ class OneShotShadowOperatorRunner:
         - Enforces single-shot session execution within the runner instance.
         - Segregates raw model picks vs approved suggestions vs filtered dispositions vs unreturned candidates.
         """
-        claim_record = self.claim_session_pre_dispatch(session_fixture_root)
-        session_lock_status = (
-            f"SAME_HOST_FIXTURE_CLAIM_CONSUMED:{claim_record.session_identity}"
-            if claim_record
-            else "CROSS_PROCESS_SESSION_LOCK_PENDING_LIVE_AUTHORIZATION"
-        )
-
         if self._execution_attempted:
             raise AIEvaluationError(
                 "Repeated execution blocked: Stage B shadow operator enforces strict single-shot execution "
@@ -661,7 +620,7 @@ class OneShotShadowOperatorRunner:
             finish_reason=finish_reason,
             timeout_ms=OPERATOR_TIMEOUT_MS,
             grounding_forbidden=True,
-            session_lock_status=session_lock_status,
+            session_lock_status="CROSS_PROCESS_SESSION_LOCK_PENDING_LIVE_AUTHORIZATION",
             raw_summary_tr=batch.run_editorial_summary_tr,
             raw_picks=raw_picks,
             approved_suggestions=approved_suggestions,
@@ -675,21 +634,110 @@ class OneShotShadowOperatorRunner:
     def execute_one_shot(
         self,
         confirm_single_shot_free_tier: bool = False,
-        session_fixture_root: Optional[Path | str] = None,
         **kwargs: Any,
     ) -> ShadowOperatorResult:
         """P1 Security Gate: Live execution is strictly denied in merged Stage B code.
 
-        Always fails closed to prevent unauthorized live network calls.
+        Fails closed without ANY filesystem I/O, session claim mutation, or network dispatch.
         Real inference requires separate, explicit PO operational authorization.
         """
-        # Pre-dispatch session claim: consumed BEFORE any hypothetical call or authorization check
-        self.claim_session_pre_dispatch(session_fixture_root)
-
-        # Mark attempt as consumed
+        # Mark attempt as consumed in instance
         self._execution_attempted = True
         raise AIEvaluationError(
             "Live Gemini API execution is strictly not authorized in Stage B operator preparation. "
             "Real inference requires an explicit, separate Product Owner operational authorization "
             "and a dedicated live execution gate."
+        )
+
+    def simulate_hermetic_dispatched_session(
+        self,
+        session_fixture_root: Path | str,
+        dispatch_callback: Optional[Callable[[], Any]] = None,
+        candidates: Optional[list[Article]] = None,
+        as_of_time: Optional[datetime] = None,
+        purpose_version: str = "STAGE-B-SHADOW-V1",
+    ) -> ShadowOperatorResult:
+        """Dedicated hermetic simulation seam for Issue #65 atomic pre-dispatch session claim.
+
+        Rules:
+        1. Validates candidates, model, and grounding BEFORE touching the filesystem.
+           If validation fails, HALTS with zero claim I/O.
+        2. Enforces single-shot execution on this runner instance.
+        3. Performs atomic pre-dispatch session claim in the attested test fixture root.
+        4. Invokes the hypothetical dispatch_callback (mock transition or simulated interruption).
+           Zero live SDK client calls or network connections.
+        5. If dispatch_callback raises an exception (simulated interruption or ambiguous dispatch),
+           the claim record remains CONSUMED on disk to prove replay prevention.
+        6. If dispatch_callback succeeds (or is None), returns the resulting ShadowOperatorResult
+           with session_lock_status updated to SAME_HOST_FIXTURE_CLAIM_CONSUMED:<canonical_id>.
+        """
+        if self._execution_attempted:
+            raise AIEvaluationError(
+                "Repeated execution blocked: Stage B shadow operator enforces strict single-shot execution "
+                "(max 1 call per session). Ambiguous outcome or previous attempt cannot be re-executed."
+            )
+
+        if self.settings.gemini_model != ALLOWED_SHADOW_MODEL:
+            raise AIEvaluationError(
+                f"Shadow operator only permits model '{ALLOWED_SHADOW_MODEL}', got '{self.settings.gemini_model}'"
+            )
+
+        if self.settings.enable_search_grounding:
+            raise AIEvaluationError("Search grounding is strictly forbidden in shadow operator")
+
+        # Validate candidate data BEFORE any filesystem I/O
+        active_candidates = self._resolve_and_validate_candidates(candidates)
+        ref_now = as_of_time or SHADOW_SAMPLE_AS_OF_UTC
+        prompt_text = build_editorial_prompt(active_candidates, [], ref_now)
+        batch_hash = compute_candidate_batch_hash(
+            [c.id for c in active_candidates], self.settings.gemini_model
+        )
+        est_input_tokens = estimate_tokens_from_text(prompt_text)
+        batch_max_out = compute_enforceable_batch_output_tokens(
+            len(active_candidates), max_tokens_per_story=180
+        )
+        est_paid_cost = estimate_call_cost(
+            self.settings.gemini_model,
+            input_tokens=est_input_tokens,
+            output_tokens=batch_max_out // 2,
+            used_search_grounding=False,
+        )
+
+        # Pre-dispatch session claim in attested test fixture root: consumed BEFORE dispatch callback
+        claim_record = claim_shadow_session(
+            fixture_root=session_fixture_root,
+            cohort_id=SHADOW_SAMPLE_ID,
+            model_name=self.settings.gemini_model,
+            purpose_version=purpose_version,
+        )
+        self._execution_attempted = True
+
+        # Exercise hypothetical dispatch callback (mock/simulation only)
+        if dispatch_callback is not None:
+            dispatch_callback()
+
+        return ShadowOperatorResult(
+            sample_id=SHADOW_SAMPLE_ID,
+            sample_date_utc=ref_now.isoformat(),
+            status="HERMETIC_SIMULATED_DISPATCH_SUCCESS",
+            model_name=self.settings.gemini_model,
+            is_live_call=False,
+            provider_call_count=0,
+            batch_hash=batch_hash,
+            input_tokens=est_input_tokens,
+            output_tokens=batch_max_out,
+            actual_provider_charge="NOT_VERIFIED",
+            theoretical_paid_equivalent_usd=est_paid_cost,
+            finish_reason=None,
+            timeout_ms=OPERATOR_TIMEOUT_MS,
+            grounding_forbidden=True,
+            session_lock_status=f"SAME_HOST_FIXTURE_CLAIM_CONSUMED:{claim_record.session_identity}",
+            raw_summary_tr=None,
+            raw_picks=[],
+            approved_suggestions=[],
+            filtered_out_dispositions=[],
+            unreturned_candidates=[],
+            summary_counts={"raw_total": 0, "approved_total": 0, "suppressed_total": 0, "unreturned_total": 0},
+            candidates_preview=self._build_candidates_preview(active_candidates),
+            error_message=None,
         )
