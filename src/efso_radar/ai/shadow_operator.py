@@ -26,9 +26,11 @@ Stage B Software Preparation & Safety Rules:
 """
 from __future__ import annotations
 
+from enum import Enum
 import json
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field, ValidationError
@@ -49,6 +51,10 @@ from efso_radar.ai.shadow_preflight import (
     get_historical_public_shadow_sample,
     sanitize_report_text,
 )
+from efso_radar.ai.shadow_session import (
+    ShadowSessionClaimRecord,
+    claim_shadow_session,
+)
 from efso_radar.config import Settings
 from efso_radar.domain import Article
 
@@ -67,6 +73,16 @@ STAGE_B_OFFLINE_DISCLAIMER = (
     "editorial precision, recall, or end-to-end product acceptance. "
     "Provider charge is NOT_VERIFIED; no live inference or invoice reconciliation has occurred."
 )
+
+
+class SimulatedDispatchOutcome(str, Enum):
+    """Closed, inert outcome enumeration for hermetic test simulation seam.
+
+    Callers cannot execute arbitrary callbacks or network handlers.
+    """
+
+    SUCCESS = "SUCCESS"
+    SIMULATED_UNKNOWN = "SIMULATED_UNKNOWN"
 
 
 class ShadowOperatorResult(BaseModel):
@@ -429,6 +445,7 @@ class OneShotShadowOperatorRunner:
             finish_reason=None,
             timeout_ms=OPERATOR_TIMEOUT_MS,
             grounding_forbidden=True,
+            session_lock_status="CROSS_PROCESS_SESSION_LOCK_PENDING_LIVE_AUTHORIZATION",
             raw_summary_tr=None,
             raw_picks=[],
             approved_suggestions=[],
@@ -614,6 +631,7 @@ class OneShotShadowOperatorRunner:
             finish_reason=finish_reason,
             timeout_ms=OPERATOR_TIMEOUT_MS,
             grounding_forbidden=True,
+            session_lock_status="CROSS_PROCESS_SESSION_LOCK_PENDING_LIVE_AUTHORIZATION",
             raw_summary_tr=batch.run_editorial_summary_tr,
             raw_picks=raw_picks,
             approved_suggestions=approved_suggestions,
@@ -631,13 +649,118 @@ class OneShotShadowOperatorRunner:
     ) -> ShadowOperatorResult:
         """P1 Security Gate: Live execution is strictly denied in merged Stage B code.
 
-        Always fails closed to prevent unauthorized live network calls.
+        Fails closed without ANY filesystem I/O, session claim mutation, or network dispatch.
         Real inference requires separate, explicit PO operational authorization.
         """
-        # Mark attempt as consumed
+        # Mark attempt as consumed in instance
         self._execution_attempted = True
         raise AIEvaluationError(
             "Live Gemini API execution is strictly not authorized in Stage B operator preparation. "
             "Real inference requires an explicit, separate Product Owner operational authorization "
             "and a dedicated live execution gate."
+        )
+
+    def simulate_hermetic_dispatched_session(
+        self,
+        session_fixture_root: Path | str,
+        simulated_outcome: SimulatedDispatchOutcome = SimulatedDispatchOutcome.SUCCESS,
+        candidates: Optional[list[Article]] = None,
+        as_of_time: Optional[datetime] = None,
+        purpose_version: str = "STAGE-B-SHADOW-V1",
+    ) -> ShadowOperatorResult:
+        """Dedicated hermetic simulation seam for Issue #65 atomic pre-dispatch session claim.
+
+        Rules:
+        1. Validates candidates, model, and grounding BEFORE touching the filesystem.
+           If validation fails, HALTS with zero claim I/O.
+        2. Enforces single-shot execution on this runner instance.
+        3. Performs atomic pre-dispatch session claim in the attested test fixture root.
+        4. Simulates dispatch outcome using closed SimulatedDispatchOutcome enum only.
+           Zero live SDK client calls, network connections, or caller-provided callbacks.
+        5. If simulated_outcome is SIMULATED_UNKNOWN, raises AIEvaluationError while
+           the claim record remains CONSUMED on disk to prove replay prevention.
+        6. If simulated_outcome is SUCCESS, returns the resulting ShadowOperatorResult
+           with session_lock_status updated to SAME_HOST_FIXTURE_CLAIM_CONSUMED:<canonical_id>.
+        """
+        if self._execution_attempted:
+            raise AIEvaluationError(
+                "Repeated execution blocked: Stage B shadow operator enforces strict single-shot execution "
+                "(max 1 call per session). Ambiguous outcome or previous attempt cannot be re-executed."
+            )
+
+        if self.settings.gemini_model != ALLOWED_SHADOW_MODEL:
+            raise AIEvaluationError(
+                f"Shadow operator only permits model '{ALLOWED_SHADOW_MODEL}', got '{self.settings.gemini_model}'"
+            )
+
+        if self.settings.enable_search_grounding:
+            raise AIEvaluationError("Search grounding is strictly forbidden in shadow operator")
+
+        # Validate simulated outcome parameter
+        if isinstance(simulated_outcome, str):
+            try:
+                simulated_outcome = SimulatedDispatchOutcome(simulated_outcome)
+            except ValueError:
+                raise ValueError(f"Invalid simulated dispatch outcome: {simulated_outcome}")
+        elif not isinstance(simulated_outcome, SimulatedDispatchOutcome):
+            raise ValueError(f"Invalid simulated dispatch outcome: {simulated_outcome}")
+
+        # Validate candidate data BEFORE any filesystem I/O
+        active_candidates = self._resolve_and_validate_candidates(candidates)
+        ref_now = as_of_time or SHADOW_SAMPLE_AS_OF_UTC
+        prompt_text = build_editorial_prompt(active_candidates, [], ref_now)
+        batch_hash = compute_candidate_batch_hash(
+            [c.id for c in active_candidates], self.settings.gemini_model
+        )
+        est_input_tokens = estimate_tokens_from_text(prompt_text)
+        batch_max_out = compute_enforceable_batch_output_tokens(
+            len(active_candidates), max_tokens_per_story=180
+        )
+        est_paid_cost = estimate_call_cost(
+            self.settings.gemini_model,
+            input_tokens=est_input_tokens,
+            output_tokens=batch_max_out // 2,
+            used_search_grounding=False,
+        )
+
+        # Pre-dispatch session claim in attested test fixture root: consumed BEFORE dispatch simulation
+        claim_record = claim_shadow_session(
+            fixture_root=session_fixture_root,
+            cohort_id=SHADOW_SAMPLE_ID,
+            model_name=self.settings.gemini_model,
+            purpose_version=purpose_version,
+        )
+        self._execution_attempted = True
+
+        # Closed simulated dispatch outcome: no caller execution, no network
+        if simulated_outcome == SimulatedDispatchOutcome.SIMULATED_UNKNOWN:
+            raise AIEvaluationError(
+                "Simulated hermetic dispatch interrupted with unknown outcome. "
+                "Session claim retained on disk to deny replay."
+            )
+
+        return ShadowOperatorResult(
+            sample_id=SHADOW_SAMPLE_ID,
+            sample_date_utc=ref_now.isoformat(),
+            status="HERMETIC_SIMULATED_DISPATCH_SUCCESS",
+            model_name=self.settings.gemini_model,
+            is_live_call=False,
+            provider_call_count=0,
+            batch_hash=batch_hash,
+            input_tokens=est_input_tokens,
+            output_tokens=batch_max_out,
+            actual_provider_charge="NOT_VERIFIED",
+            theoretical_paid_equivalent_usd=est_paid_cost,
+            finish_reason=None,
+            timeout_ms=OPERATOR_TIMEOUT_MS,
+            grounding_forbidden=True,
+            session_lock_status=f"SAME_HOST_FIXTURE_CLAIM_CONSUMED:{claim_record.session_identity}",
+            raw_summary_tr=None,
+            raw_picks=[],
+            approved_suggestions=[],
+            filtered_out_dispositions=[],
+            unreturned_candidates=[],
+            summary_counts={"raw_total": 0, "approved_total": 0, "suppressed_total": 0, "unreturned_total": 0},
+            candidates_preview=self._build_candidates_preview(active_candidates),
+            error_message=None,
         )
