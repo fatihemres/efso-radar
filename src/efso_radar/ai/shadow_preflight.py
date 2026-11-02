@@ -1,22 +1,23 @@
 """Phase 5B.3 / Issue #61: Bounded, fail-closed one-shot Gemini editorial shadow preflight harness.
 
-Strictly offline-by-default and fail-closed:
+Stage A Implementation (Strictly Offline & Zero-Network):
 1. Reuses existing editorial prompt (build_editorial_prompt) and strict structured
    validation (GeminiEditorialEngine._validate_and_transform_picks); builds NO second classifier.
-2. Uses a fixed, immutable, public-only historical news sample (from Issue #49) stripped of
-   all private editor labels, owner notes, and credentials.
-3. Enforces fixed model `gemini-3.5-flash-lite`, zero search grounding, zero tools,
-   and single-shot execution with zero SDK retries.
-4. Preserves `require_verified_free_tier()` unconditional block; produces structured
-   preview with `AI_RESULT_NOT_AVAILABLE` and `PROVIDER_CALL_NOT_AUTHORIZED` until real
-   model inference has been separately authorized and genuinely occurred.
-5. Injected mock client support for hermetic tests with fail-closed behavior on timeout/429/5xx,
-   malformed JSON, truncation, and hallucinated candidates.
+2. Strictly restricted to the fixed historical public news sample (SHADOW_SAMPLE_ID from Issue #49);
+   rejects arbitrary/custom candidate ingestion.
+3. Completely network-incapable: contains NO SDK client invocation or generate_content() call.
+   All mock/synthetic testing operates strictly on pre-computed structured JSON payloads.
+4. Preserves require_verified_free_tier() unconditional block. Default execution produces
+   a blocked offline preview with AI_RESULT_NOT_AVAILABLE and PROVIDER_CALL_NOT_AUTHORIZED.
+5. All token/pricing calculations explicitly distinguish defensive theoretical estimates
+   from actual provider charges ($0.00 / 0 TRY).
+6. Comprehensive report sanitization against API keys, tokens, and credentials.
 """
 from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -43,9 +44,27 @@ SHADOW_SAMPLE_AS_OF_UTC = datetime(2026, 10, 30, 7, 0, tzinfo=timezone.utc)
 ALLOWED_SHADOW_MODEL = "gemini-3.5-flash-lite"
 NOT_REAL_GEMINI_DISCLAIMER = (
     "NOT REAL GEMINI. Real Gemini editorial evaluation has NOT occurred. "
-    "Any decision fields shown in test output were produced exclusively via an offline "
-    "injected mock client for hermetic validation, not real AI inference."
+    "Stage A code contains zero network-capable client execution paths. "
+    "Any decision fields shown in test output were produced exclusively via offline "
+    "synthetic JSON payloads through the application validation layer."
 )
+
+
+def sanitize_report_text(text: str) -> str:
+    """Sanitize strings against accidental API key, token, or credential leakage."""
+    if not text:
+        return ""
+    # Mask potential Google API keys: AIza...
+    sanitized = re.sub(r"AIza[0-9A-Za-z-_]{35}", "[REDACTED_API_KEY]", text)
+    # Mask bearer tokens
+    sanitized = re.sub(r"(?i)bearer\s+[A-Za-z0-9-_.]+", "Bearer [REDACTED_TOKEN]", sanitized)
+    # Mask common key/secret patterns
+    sanitized = re.sub(
+        r"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*(['\"][^'\"]*['\"]|[^\s'\"]+)",
+        r"\1=[REDACTED]",
+        sanitized,
+    )
+    return sanitized
 
 
 def get_historical_public_shadow_sample() -> list[Article]:
@@ -132,8 +151,8 @@ class ShadowPreflightResult(BaseModel):
 
     sample_id: str = Field(description="Deterministic sample cohort identifier")
     sample_date_utc: str = Field(description="Reference as-of UTC timestamp for the cohort")
-    status: str = Field(description="Execution outcome status (e.g. PREFLIGHT_READY_OFFLINE_ONLY)")
-    ai_result: str = Field(description="AI recommendation status: AI_RESULT_NOT_AVAILABLE unless mock tested")
+    status: str = Field(description="Execution outcome status (e.g. PREFLIGHT_BLOCKED_OFFLINE_ONLY)")
+    ai_result: str = Field(description="AI recommendation status: AI_RESULT_NOT_AVAILABLE unless synthetic test")
     provider_status: str = Field(description="Provider connection status: PROVIDER_CALL_NOT_AUTHORIZED")
     free_tier_gate_status: str = Field(description="require_verified_free_tier() enforcement status")
     model_name: str = Field(description="Fixed Gemini model name (gemini-3.5-flash-lite)")
@@ -141,15 +160,27 @@ class ShadowPreflightResult(BaseModel):
     batch_hash: str = Field(description="Deterministic SHA256 hash of candidate IDs and model")
     estimated_input_tokens: int = Field(description="Estimated prompt input tokens")
     enforceable_max_output_tokens: int = Field(description="Enforceable batch output token ceiling")
-    estimated_cost_usd: float = Field(description="Estimated USD cost (0.00 for Free Tier target)")
-    call_count: int = Field(description="Actual inference call count executed in this runner (max 1)")
-    max_allowed_calls: int = Field(default=1, description="Strict maximum calls allowed per session")
-    zero_retry_enforced: bool = Field(default=True, description="Whether HttpRetryOptions(attempts=1) was set")
+    actual_cost_usd: float = Field(default=0.0, description="Actual provider charge incurred ($0.00 / 0 TRY)")
+    theoretical_paid_equivalent_usd: float = Field(
+        description="Defensive theoretical estimate based on public list pricing; NOT a verified charge"
+    )
+    call_count: int = Field(description="Actual inference calls executed (strictly 0 in Stage A)")
+    sdk_network_executed: bool = Field(default=False, description="Whether any network SDK call was made")
+    zero_retry_design_contract: str = Field(
+        default="HttpRetryOptions(attempts=1) designed; NO live SDK session exercised",
+        description="Designed retry contract",
+    )
     grounding_forbidden: bool = Field(default=True, description="Whether search grounding and tools are disabled")
+    cost_disclaimer: str = Field(
+        default="Actual cost is $0.00 / 0 TRY (provider call blocked). Theoretical paid-equivalent estimate is based on standard list pricing, NOT an active billing charge or provider guarantee.",
+        description="Cost calculation disclaimer",
+    )
     disclaimer: str = Field(description="Explicit human-readable safety and non-production disclaimer")
     candidates_preview: list[dict[str, Any]] = Field(default_factory=list, description="Sanitized candidates")
-    decisions: list[dict[str, Any]] = Field(default_factory=list, description="Approved decisions if mock tested")
-    error_message: Optional[str] = Field(default=None, description="Error reason if blocked or failed")
+    decisions: list[dict[str, Any]] = Field(
+        default_factory=list, description="Approved decisions if synthetic response was evaluated"
+    )
+    error_message: Optional[str] = Field(default=None, description="Sanitized error reason if blocked or failed")
 
     def to_markdown_report(self) -> str:
         """Render a clean, redacted, human-readable markdown report safe for public PR and CI."""
@@ -163,13 +194,18 @@ class ShadowPreflightResult(BaseModel):
             f"- **AI Result Status:** `{self.ai_result}`",
             f"- **Provider Call Status:** `{self.provider_status}`",
             f"- **Free-Tier Gate:** `{self.free_tier_gate_status}`",
-            f"- **Calls Executed:** `{self.call_count} / {self.max_allowed_calls}` (Zero retries enforced: `{self.zero_retry_enforced}`)",
+            f"- **Actual Cost Incurred:** `${self.actual_cost_usd:.4f}` USD ($0.00 / 0 TRY)",
+            f"- **Theoretical Paid-Equivalent:** `~${self.theoretical_paid_equivalent_usd:.4f}` USD (Defensive estimate only)",
+            f"- **SDK Network Calls Executed:** `{self.call_count}` (Network-capable calls absent in Stage A)",
+            f"- **Retry Contract (Designed):** `{self.zero_retry_design_contract}`",
             f"- **Search Grounding:** `{'Disabled' if self.grounding_forbidden else 'Enabled'}`",
-            f"- **Candidate Count:** `{self.candidate_count}`",
+            f"- **Candidate Count:** `{self.candidate_count}` (Public historical sample only)",
             f"- **Batch Hash:** `{self.batch_hash}`",
             f"- **Estimated Input Tokens:** `~{self.estimated_input_tokens}`",
             f"- **Output Token Ceiling:** `{self.enforceable_max_output_tokens}`",
-            f"- **Estimated Cost:** `${self.estimated_cost_usd:.4f}` USD",
+            f"",
+            f"### Cost & Billing Disclaimer",
+            f"> {self.cost_disclaimer}",
             f"",
             f"### Safety Disclaimer",
             f"> {self.disclaimer}",
@@ -179,22 +215,27 @@ class ShadowPreflightResult(BaseModel):
             f"| :--- | :--- | :---: | :--- | :--- | :--- |",
         ]
         for idx, c in enumerate(self.candidates_preview, start=1):
+            sanitized_title = sanitize_report_text(str(c.get("title", "")))
+            sanitized_source = sanitize_report_text(str(c.get("source", "")))
+            sanitized_url = sanitize_report_text(str(c.get("url", "")))
             lines.append(
-                f"| {idx} | {c.get('source')} | {c.get('market')} | {c.get('title')} | "
-                f"{c.get('published_at')} | {c.get('url')} |"
+                f"| {idx} | {sanitized_source} | {c.get('market')} | {sanitized_title} | "
+                f"{c.get('published_at')} | {sanitized_url} |"
             )
 
         if self.decisions:
             lines.extend([
                 f"",
-                f"### Mock Evaluation Decisions ({len(self.decisions)} approved)",
-                f"> [!WARNING] These decisions were generated by an INJECTED MOCK CLIENT in hermetic test. NOT REAL GEMINI.",
+                f"### Synthetic Evaluation Decisions ({len(self.decisions)} approved)",
+                f"> [!WARNING] These decisions were generated from an OFFLINE SYNTHETIC JSON PAYLOAD in hermetic test. NOT REAL GEMINI.",
                 f"| Article IDs | Headline (TR) | Score | Kind | Category | Format | Verification |",
                 f"| :--- | :--- | :---: | :---: | :---: | :---: | :--- |",
             ])
             for d in self.decisions:
+                sanitized_hl = sanitize_report_text(str(d.get("headline_tr", "")))
+                art_ids_str = ", ".join(d.get("article_ids", []))
                 lines.append(
-                    f"| {', '.join(d.get('article_ids', []))} | {d.get('headline_tr')} | {d.get('score')} | "
+                    f"| {art_ids_str} | {sanitized_hl} | {d.get('score')} | "
                     f"{d.get('kind')} | {d.get('category')} | {d.get('format')} | {d.get('verification_status')} |"
                 )
         else:
@@ -205,11 +246,12 @@ class ShadowPreflightResult(BaseModel):
             ])
 
         if self.error_message:
+            sanitized_err = sanitize_report_text(self.error_message)
             lines.extend([
                 f"",
-                f"### Block / Error Detail",
+                f"### Block / Gate Detail",
                 f"```text",
-                f"{self.error_message}",
+                f"{sanitized_err}",
                 f"```",
             ])
 
@@ -219,13 +261,14 @@ class ShadowPreflightResult(BaseModel):
 class OneShotShadowPreflightRunner:
     """Bounded, fail-closed one-shot Gemini editorial shadow preflight harness.
 
-    Enforces all requirements of Issue #61:
-    - Fixed model `gemini-3.5-flash-lite`.
-    - Zero search grounding / tools.
-    - Zero automatic SDK retries (attempts=1).
-    - Single-shot execution guard: max 1 call per runner session; repeated execution blocked.
-    - Default offline mode respects require_verified_free_tier() and produces safe preview.
-    - Injected mock client mode for hermetic unit testing.
+    Stage A Guarantees:
+    - Purely offline and fail-closed: NO network-capable client execution path exists.
+    - Strictly bound to authorized historical public news sample (SHADOW_SAMPLE_ID).
+    - Preserves require_verified_free_tier() unconditional block.
+    - Model restriction: gemini-3.5-flash-lite only.
+    - Grounding forbidden: enable_search_grounding=False only.
+    - Zero retries designed: HttpRetryOptions(attempts=1).
+    - Synthetic testing operates strictly on pre-computed string JSON payloads.
     """
 
     def __init__(self, settings: Optional[Settings] = None):
@@ -236,47 +279,62 @@ class OneShotShadowPreflightRunner:
     def call_count(self) -> int:
         return self._call_count
 
+    def _resolve_and_validate_candidates(
+        self, candidates: Optional[list[Article]] = None
+    ) -> list[Article]:
+        """Enforce that only the authorized historical public sample can enter Stage A preflight."""
+        authorized_sample = get_historical_public_shadow_sample()
+        authorized_ids = {a.id for a in authorized_sample}
+
+        if candidates is None:
+            return authorized_sample
+
+        if not candidates:
+            raise AIEvaluationError("Candidate list is empty: shadow preflight requires at least one article")
+
+        input_ids = {c.id for c in candidates}
+        if input_ids != authorized_ids:
+            raise AIEvaluationError(
+                f"Arbitrary candidates rejected: Stage A is strictly restricted to the authorized "
+                f"historical public metadata sample ({SHADOW_SAMPLE_ID}). Custom candidate ingestion is forbidden."
+            )
+        return candidates
+
     def run_preflight(
         self,
         candidates: Optional[list[Article]] = None,
-        recent_stories: Optional[list[Story]] = None,
         as_of_time: Optional[datetime] = None,
-        mock_client: Optional[Any] = None,
+        **kwargs: Any,
     ) -> ShadowPreflightResult:
-        """Execute the fail-closed shadow preflight or mock-injected evaluation.
+        """Execute the fail-closed offline shadow preflight.
 
-        Args:
-            candidates: Optional custom candidates list (defaults to historical public sample).
-            recent_stories: Optional recent stories context for deduplication/update check.
-            as_of_time: Optional reference time (defaults to 2026-10-30T07:00:00Z).
-            mock_client: Optional injected mock genai client for hermetic offline testing.
+        Guarantees:
+        - NEVER makes a network call.
+        - Rejects any attempt to inject a network-capable client.
+        - Strictly evaluates require_verified_free_tier() and produces an offline preview.
         """
-        # 1. Enforce single-invocation guard
-        if self._call_count >= 1:
+        # P1 Security Guard: explicitly reject any client injection attempts
+        if "client" in kwargs or "mock_client" in kwargs or "engine" in kwargs:
             raise AIEvaluationError(
-                "Repeated execution blocked: shadow harness enforces single-shot execution (max 1 call)"
+                "Stage A preflight strictly forbids network-capable client injection. "
+                "No SDK client can be executed through this API."
             )
 
-        # 2. Resolve candidates and timestamps
-        active_candidates = candidates if candidates is not None else get_historical_public_shadow_sample()
-        if not active_candidates:
-            raise AIEvaluationError("Candidate list is empty: shadow preflight requires at least one article")
-
+        active_candidates = self._resolve_and_validate_candidates(candidates)
         ref_now = as_of_time or SHADOW_SAMPLE_AS_OF_UTC
-        active_stories = recent_stories or []
 
-        # 3. Enforce model restriction
+        # Enforce model restriction
         if self.settings.gemini_model != ALLOWED_SHADOW_MODEL:
             raise AIEvaluationError(
                 f"Shadow preflight only permits model '{ALLOWED_SHADOW_MODEL}', got '{self.settings.gemini_model}'"
             )
 
-        # 4. Enforce zero grounding / tools
+        # Enforce zero grounding / tools
         if self.settings.enable_search_grounding:
             raise AIEvaluationError("Search grounding is strictly forbidden in shadow preflight")
 
-        # 5. Compute deterministic parameters and prompt
-        prompt_text = build_editorial_prompt(active_candidates, active_stories, ref_now)
+        # Compute deterministic parameters and prompt
+        prompt_text = build_editorial_prompt(active_candidates, [], ref_now)
         batch_hash = compute_candidate_batch_hash(
             [c.id for c in active_candidates], self.settings.gemini_model
         )
@@ -284,7 +342,7 @@ class OneShotShadowPreflightRunner:
         batch_max_out = compute_enforceable_batch_output_tokens(
             len(active_candidates), max_tokens_per_story=180
         )
-        est_cost = estimate_call_cost(
+        est_paid_cost = estimate_call_cost(
             self.settings.gemini_model,
             input_tokens=est_input_tokens,
             output_tokens=batch_max_out // 2,
@@ -294,111 +352,84 @@ class OneShotShadowPreflightRunner:
         candidates_preview = [
             {
                 "id": c.id,
-                "title": c.title,
-                "source": c.source,
+                "title": sanitize_report_text(c.title),
+                "source": sanitize_report_text(c.source),
                 "published_at": c.published_at.isoformat(),
-                "url": c.canonical_url or c.url,
+                "url": sanitize_report_text(c.canonical_url or c.url),
                 "market": c.market.value,
-                "snippet": c.snippet,
+                "snippet": sanitize_report_text(c.snippet),
             }
             for c in active_candidates
         ]
 
-        # 6. Default Offline Mode (No mock client injected)
-        if mock_client is None:
-            # Enforce verified free-tier guard; must fail closed before any network attempt
-            try:
-                require_verified_free_tier()
-            except RuntimeError as exc:
-                logger.info(
-                    "Shadow preflight: real provider call blocked as expected by require_verified_free_tier()"
-                )
-                return ShadowPreflightResult(
-                    sample_id=SHADOW_SAMPLE_ID,
-                    sample_date_utc=ref_now.isoformat(),
-                    status="PREFLIGHT_READY_OFFLINE_ONLY",
-                    ai_result="AI_RESULT_NOT_AVAILABLE",
-                    provider_status="PROVIDER_CALL_NOT_AUTHORIZED",
-                    free_tier_gate_status="BLOCKED_BY_REQUIRE_VERIFIED_FREE_TIER",
-                    model_name=self.settings.gemini_model,
-                    candidate_count=len(active_candidates),
-                    batch_hash=batch_hash,
-                    estimated_input_tokens=est_input_tokens,
-                    enforceable_max_output_tokens=batch_max_out,
-                    estimated_cost_usd=est_cost,
-                    call_count=0,
-                    max_allowed_calls=1,
-                    zero_retry_enforced=True,
-                    grounding_forbidden=True,
-                    disclaimer=NOT_REAL_GEMINI_DISCLAIMER,
-                    candidates_preview=candidates_preview,
-                    decisions=[],
-                    error_message=str(exc),
-                )
-            # Stage A safety invariant: never permit real inference in this PR
-            raise AIEvaluationError("Real API execution is strictly not authorized in Stage A")
-
-        # 7. Injected Mock Client Mode (Hermetic test execution only)
-        self._call_count += 1
-        from google.genai import types
-
-        thinking_cfg = None
-        if hasattr(types, "ThinkingConfig"):
-            try:
-                thinking_cfg = types.ThinkingConfig(thinking_level="minimal")
-            except Exception:
-                thinking_cfg = None
-
-        http_opts = None
-        if hasattr(types, "HttpOptions") and hasattr(types, "HttpRetryOptions"):
-            # Enforce attempts=1 (zero SDK retries)
-            http_opts = types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=1))
-
-        afc_cfg = None
-        if hasattr(types, "AutomaticFunctionCallingConfig"):
-            afc_cfg = types.AutomaticFunctionCallingConfig(disable=True, maximum_remote_calls=0)
-
-        config_kwargs: dict[str, Any] = {
-            "response_mime_type": "application/json",
-            "response_schema": EditorialDecisionBatch,
-            "temperature": 0.15,
-            "max_output_tokens": batch_max_out,
-        }
-        if thinking_cfg is not None:
-            config_kwargs["thinking_config"] = thinking_cfg
-        if http_opts is not None:
-            config_kwargs["http_options"] = http_opts
-        if afc_cfg is not None:
-            config_kwargs["automatic_function_calling"] = afc_cfg
-
-        config = types.GenerateContentConfig(**config_kwargs)
-
+        # Enforce verified free-tier guard; must fail closed before any network attempt
         try:
-            response = mock_client.models.generate_content(
-                model=self.settings.gemini_model,
-                contents=prompt_text,
-                config=config,
+            require_verified_free_tier()
+        except RuntimeError as exc:
+            logger.info(
+                "Shadow preflight: provider call safely blocked as expected by require_verified_free_tier()"
             )
-        except Exception as exc:
-            msg = f"Injected mock call failed: {exc}"
-            logger.error(msg)
-            raise AIEvaluationError(msg) from exc
+            return ShadowPreflightResult(
+                sample_id=SHADOW_SAMPLE_ID,
+                sample_date_utc=ref_now.isoformat(),
+                status="PREFLIGHT_BLOCKED_OFFLINE_ONLY",
+                ai_result="AI_RESULT_NOT_AVAILABLE",
+                provider_status="PROVIDER_CALL_NOT_AUTHORIZED",
+                free_tier_gate_status="BLOCKED_BY_REQUIRE_VERIFIED_FREE_TIER",
+                model_name=self.settings.gemini_model,
+                candidate_count=len(active_candidates),
+                batch_hash=batch_hash,
+                estimated_input_tokens=est_input_tokens,
+                enforceable_max_output_tokens=batch_max_out,
+                actual_cost_usd=0.0,
+                theoretical_paid_equivalent_usd=est_paid_cost,
+                call_count=0,
+                sdk_network_executed=False,
+                zero_retry_design_contract="HttpRetryOptions(attempts=1) designed; NO live SDK session exercised",
+                grounding_forbidden=True,
+                disclaimer=NOT_REAL_GEMINI_DISCLAIMER,
+                candidates_preview=candidates_preview,
+                decisions=[],
+                error_message=sanitize_report_text(str(exc)),
+            )
 
-        # Check truncation fail-closed
-        if getattr(response, "candidates", None) and len(response.candidates) > 0:
-            cand = response.candidates[0]
-            finish_reason = getattr(cand, "finish_reason", None)
-            if finish_reason and "MAX_TOKENS" in str(finish_reason).upper():
-                raise AIEvaluationError("Gemini response was truncated due to MAX_TOKENS ceiling")
+        # Stage A safety invariant: if require_verified_free_tier() did not raise, fail closed anyway
+        raise AIEvaluationError("Real API execution is strictly not authorized in Stage A")
 
-        raw_text = getattr(response, "text", "")
-        if not raw_text or not raw_text.strip():
-            raise AIEvaluationError("Gemini response returned empty text payload")
+    def evaluate_synthetic_response(
+        self,
+        synthetic_response_json: str,
+        candidates: Optional[list[Article]] = None,
+        recent_stories: Optional[list[Story]] = None,
+        as_of_time: Optional[datetime] = None,
+    ) -> ShadowPreflightResult:
+        """Hermetic test-only evaluation of a pre-computed synthetic JSON structured response.
+
+        Guarantees:
+        - NEVER calls an SDK client or makes a network request (accepts raw string JSON only).
+        - Enforces single-shot execution guard (repeated calls on same runner instance fail closed).
+        - Runs raw payload through Pydantic validation (EditorialDecisionBatch) and
+          authoritative application business rules (GeminiEditorialEngine._validate_and_transform_picks).
+        - Produces decisions explicitly marked SYNTHETIC_AI_RESULT_NOT_REAL_GEMINI.
+        """
+        # Enforce single-invocation guard
+        if self._call_count >= 1:
+            raise AIEvaluationError(
+                "Repeated execution blocked: shadow harness enforces single-shot execution (max 1 call)"
+            )
+        self._call_count += 1
+
+        active_candidates = self._resolve_and_validate_candidates(candidates)
+        ref_now = as_of_time or SHADOW_SAMPLE_AS_OF_UTC
+        active_stories = recent_stories or []
+
+        if not synthetic_response_json or not synthetic_response_json.strip():
+            raise AIEvaluationError("Synthetic response payload is empty")
 
         try:
-            batch = EditorialDecisionBatch.model_validate_json(raw_text)
+            batch = EditorialDecisionBatch.model_validate_json(synthetic_response_json)
         except (json.JSONDecodeError, ValidationError) as exc:
-            raise AIEvaluationError(f"Malformed Gemini structured output: {exc}") from exc
+            raise AIEvaluationError(f"Malformed synthetic structured output: {exc}") from exc
 
         # Re-use authoritative application-level business rules validation
         engine = GeminiEditorialEngine(self.settings)
@@ -409,34 +440,63 @@ class OneShotShadowPreflightRunner:
         decisions = [
             {
                 "article_ids": asm.article_ids,
-                "headline_tr": asm.headline_tr,
+                "headline_tr": sanitize_report_text(asm.headline_tr),
                 "score": asm.score,
                 "kind": asm.kind.value,
                 "category": asm.category.value,
                 "format": asm.suggested_format.value,
                 "verification_status": asm.verification_status.value,
-                "why_efso_tr": asm.why_efso_tr,
-                "uncertainties_tr": asm.uncertainties_tr,
+                "why_efso_tr": sanitize_report_text(asm.why_efso_tr),
+                "uncertainties_tr": sanitize_report_text(asm.uncertainties_tr),
             }
             for asm in approved_assessments
+        ]
+
+        batch_hash = compute_candidate_batch_hash(
+            [c.id for c in active_candidates], self.settings.gemini_model
+        )
+        batch_max_out = compute_enforceable_batch_output_tokens(
+            len(active_candidates), max_tokens_per_story=180
+        )
+        prompt_text = build_editorial_prompt(active_candidates, active_stories, ref_now)
+        est_input_tokens = estimate_tokens_from_text(prompt_text)
+        est_paid_cost = estimate_call_cost(
+            self.settings.gemini_model,
+            input_tokens=est_input_tokens,
+            output_tokens=batch_max_out // 2,
+            used_search_grounding=False,
+        )
+
+        candidates_preview = [
+            {
+                "id": c.id,
+                "title": sanitize_report_text(c.title),
+                "source": sanitize_report_text(c.source),
+                "published_at": c.published_at.isoformat(),
+                "url": sanitize_report_text(c.canonical_url or c.url),
+                "market": c.market.value,
+                "snippet": sanitize_report_text(c.snippet),
+            }
+            for c in active_candidates
         ]
 
         return ShadowPreflightResult(
             sample_id=SHADOW_SAMPLE_ID,
             sample_date_utc=ref_now.isoformat(),
-            status="MOCK_EVALUATION_COMPLETED",
-            ai_result="MOCK_AI_RESULT_NOT_REAL_GEMINI",
-            provider_status="MOCK_TRANSPORT_TEST_ONLY",
-            free_tier_gate_status="MOCK_CLIENT_INJECTED_FOR_TEST",
+            status="SYNTHETIC_EVALUATION_COMPLETED_TEST_ONLY",
+            ai_result="SYNTHETIC_AI_RESULT_NOT_REAL_GEMINI",
+            provider_status="PROVIDER_CALL_NEVER_ATTEMPTED",
+            free_tier_gate_status="SYNTHETIC_OFFLINE_PAYLOAD_EVALUATED",
             model_name=self.settings.gemini_model,
             candidate_count=len(active_candidates),
             batch_hash=batch_hash,
             estimated_input_tokens=est_input_tokens,
             enforceable_max_output_tokens=batch_max_out,
-            estimated_cost_usd=est_cost,
+            actual_cost_usd=0.0,
+            theoretical_paid_equivalent_usd=est_paid_cost,
             call_count=self._call_count,
-            max_allowed_calls=1,
-            zero_retry_enforced=True,
+            sdk_network_executed=False,
+            zero_retry_design_contract="Offline synthetic payload; NO live SDK session exercised",
             grounding_forbidden=True,
             disclaimer=NOT_REAL_GEMINI_DISCLAIMER,
             candidates_preview=candidates_preview,
