@@ -34,7 +34,10 @@ from efso_radar.domain import (
     SuggestedFormat,
     VerificationStatus,
 )
-from efso_radar.notifications.telegram import deliver_one_shot_editorial_digest
+from efso_radar.notifications.telegram import (
+    TelegramNotificationCategory,
+    deliver_one_shot_editorial_digest,
+)
 from scripts.deliver_telegram_digest_oneshot import build_final_three_assessments
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -241,7 +244,7 @@ class TestPhase4EDigestDelivery(unittest.TestCase):
 
 
     def test_digest_delivery_claim_repository_error_fails_closed(self) -> None:
-        """Repository claim exception fails closed with REPOSITORY_ERROR and zero Telegram HTTP calls."""
+        """Repository claim exception fails closed with REPOSITORY_ERROR, redacted token, and zero HTTP calls."""
         calls = []
 
         def mock_handler(request: httpx.Request) -> httpx.Response:
@@ -250,8 +253,12 @@ class TestPhase4EDigestDelivery(unittest.TestCase):
 
         mock_transport = httpx.MockTransport(mock_handler)
         mock_repo = MagicMock()
-        mock_repo.claim_telegram_delivery.side_effect = RuntimeError("Synthetic database locked failure")
+        mock_repo.get_telegram_delivery.return_value = None
+        mock_repo.find_legacy_editorial_delivery.return_value = None
+
         live_settings = self.settings.model_copy(update={"telegram_delivery_enabled": True})
+        synthetic_error = f"Synthetic database locked failure containing token {live_settings.telegram_bot_token}"
+        mock_repo.claim_telegram_delivery.side_effect = RuntimeError(synthetic_error)
 
         result = deliver_one_shot_editorial_digest(
             settings=live_settings,
@@ -266,10 +273,24 @@ class TestPhase4EDigestDelivery(unittest.TestCase):
         self.assertFalse(result["attempt_made"])
         self.assertEqual(result["attempts_count"], 0)
         self.assertEqual(len(calls), 0)
+
+        # Verify claim attempt targeted correct recipient role, chat ID, category, and canonical outbox key
+        mock_repo.claim_telegram_delivery.assert_called_once()
+        claim_kwargs = mock_repo.claim_telegram_delivery.call_args.kwargs
+        self.assertEqual(claim_kwargs["recipient_role"], "PRIMARY_EDITOR")
+        self.assertEqual(claim_kwargs["recipient_chat_id"], "1000000001")
+        self.assertEqual(claim_kwargs["message_key"], result["canonical_outbox_key"])
+        self.assertEqual(claim_kwargs["category"], TelegramNotificationCategory.EDITORIAL_DIGEST)
+
+        # Verify recipient results and secret token redaction
         self.assertIn("PRIMARY_EDITOR", result["recipient_results"])
-        self.assertEqual(result["recipient_results"]["PRIMARY_EDITOR"]["status"], "REPOSITORY_ERROR")
-        self.assertFalse(result["recipient_results"]["PRIMARY_EDITOR"]["attempt_made"])
-        self.assertIn("Synthetic database locked failure", result["recipient_results"]["PRIMARY_EDITOR"]["error"])
+        editor_result = result["recipient_results"]["PRIMARY_EDITOR"]
+        self.assertEqual(editor_result["status"], "REPOSITORY_ERROR")
+        self.assertFalse(editor_result["attempt_made"])
+        error_text = editor_result["error"]
+        self.assertNotIn(live_settings.telegram_bot_token, error_text)
+        self.assertIn("[REDACTED_BOT_TOKEN]", error_text)
+        self.assertIn("Synthetic database locked failure", error_text)
 
 
 if __name__ == "__main__":
