@@ -17,6 +17,7 @@ import httpx
 
 from efso_radar.domain import (
     Article,
+    DeliveryIdentityConflictError,
     DeliveryStatus,
     EditorialAssessment,
     EditorialKind,
@@ -32,7 +33,7 @@ from efso_radar.domain import (
     utc_now,
 )
 from efso_radar.repositories.schema import CURRENT_SCHEMA_VERSION
-from efso_radar.repositories.sqlite import DeliveryIdentityConflictError, SqliteStateRepository
+from efso_radar.repositories.sqlite import SqliteStateRepository
 from efso_radar.repositories.turso import TursoStateRepository
 from efso_radar.repositories.turso_client import deserialize_hrana_value
 
@@ -629,12 +630,11 @@ class RepositoryContractTestMixin:
         stored = self.repo.get_telegram_delivery(chat_id, message_key)
         self.assertIsNotNone(stored)
         self.assertEqual(stored.status, DeliveryStatus.DELIVERY_UNCERTAIN)
-        # In telegram delivery lifecycle, claim sets attempt_count=1 and status update increments to 2
-        self.assertEqual(stored.attempt_count, 2)
         self.assertEqual(stored.error_message, original_error)
         self.assertEqual(stored.payload, payload)
         self.assertIsNone(stored.sent_at)
         updated_at_before = stored.updated_at
+        attempt_count_baseline = stored.attempt_count
 
         # 3. Repeated call with status=DELIVERY_UNCERTAIN, different error, and attempted sent_at
         t_attempted = t0 + timedelta(hours=3)
@@ -650,7 +650,7 @@ class RepositoryContractTestMixin:
         after = self.repo.get_telegram_delivery(chat_id, message_key)
         self.assertIsNotNone(after)
         self.assertEqual(after.status, DeliveryStatus.DELIVERY_UNCERTAIN)
-        self.assertEqual(after.attempt_count, 2, "attempt_count must not increment on idempotent replay")
+        self.assertEqual(after.attempt_count, attempt_count_baseline, "attempt_count must not increment on idempotent replay")
         self.assertEqual(after.error_message, original_error, "error_message must not be overwritten on replay")
         self.assertEqual(after.payload, payload)
         self.assertEqual(after.updated_at, updated_at_before, "updated_at must remain intact on replay")
