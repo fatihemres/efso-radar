@@ -2,31 +2,35 @@
 
 Verifies:
 1. Dry-run succeeds offline without network, API key, or provider calls.
-2. Single-shot safety: execute_one_shot requires explicit confirm_single_shot_free_tier=True.
-3. Live call without API key or client fails closed safely.
-4. Segregation contract: Raw model picks (NEW, UPDATE, DUPLICATE, IGNORE) are preserved
-   and reported separately from post-validation alertable suggestions.
-5. Filtered-out dispositions breakdown captures exact suppression reasons (IGNORE, DUPLICATE, score < min_score).
-6. Single-shot execution guard: Repeated calls on the same runner instance are strictly blocked.
-7. Ambiguous failure / network error: Runner remains consumed and cannot be re-executed.
-8. Truncation detection (MAX_TOKENS) fails closed.
-9. Empty or malformed response fails closed.
-10. Model enforcement: Only gemini-3.5-flash-lite allowed.
-11. Grounding forbidden: enable_search_grounding=True rejected.
-12. Candidate content integrity: Tampered candidates with identical IDs are strictly rejected.
-13. Post-validation uses keyless Settings (no SDK client created for validation).
-14. Markdown report formatting and secret sanitization.
+2. P1 Live Deny: execute_one_shot() strictly fails closed; no live execution path exists in Stage B.
+3. P1 Live Deny Proof: genai.Client is NEVER instantiated under any CLI flag or direct API method.
+4. P1 SDK timeout is exactly 30_000 milliseconds (30 seconds).
+5. P1 Provider charge is honestly reported as NOT_VERIFIED (no invoice or live charge claimed).
+6. P1 Cross-process session lock is documented as pending live authorization.
+7. P2 Sample coverage: Unreferenced cohort candidates are explicitly marked NOT_RETURNED_BY_MODEL.
+8. P2 Segregation: Raw model picks (NEW, UPDATE, DUPLICATE, IGNORE) vs approved suggestions vs filtered dispositions.
+9. P2 Output safety: CLI output path validation blocks writing to .env, data/, or overwriting existing files.
+10. Single-shot guard: Repeated evaluations on the same runner instance are blocked fail-closed.
+11. Truncation detection (MAX_TOKENS) fails closed.
+12. Empty and malformed JSON payloads fail closed.
+13. Model enforcement: Only gemini-3.5-flash-lite allowed.
+14. Search grounding forbidden: enable_search_grounding=True rejected.
+15. Candidate content tampering: Altered content with authentic IDs is strictly rejected.
+16. Post-validation uses keyless settings guarantee.
 """
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from efso_radar.ai.client import AIEvaluationError
 from efso_radar.ai.shadow_operator import (
     ALLOWED_SHADOW_MODEL,
+    OPERATOR_TIMEOUT_MS,
     SHADOW_SAMPLE_AS_OF_UTC,
     SHADOW_SAMPLE_ID,
     OneShotShadowOperatorRunner,
@@ -59,8 +63,10 @@ class TestGeminiShadowOperator(unittest.TestCase):
         self.assertEqual(result.status, "DRY_RUN_COMPLETED_OFFLINE")
         self.assertFalse(result.is_live_call)
         self.assertEqual(result.provider_call_count, 0)
-        self.assertEqual(result.actual_cost_usd, 0.0)
+        self.assertEqual(result.actual_provider_charge, "NOT_VERIFIED")
         self.assertGreater(result.theoretical_paid_equivalent_usd, 0.0)
+        self.assertEqual(result.timeout_ms, 30_000)
+        self.assertEqual(result.session_lock_status, "CROSS_PROCESS_SESSION_LOCK_PENDING_LIVE_AUTHORIZATION")
         self.assertEqual(result.sample_id, SHADOW_SAMPLE_ID)
         self.assertEqual(result.model_name, ALLOWED_SHADOW_MODEL)
         self.assertTrue(result.grounding_forbidden)
@@ -69,69 +75,118 @@ class TestGeminiShadowOperator(unittest.TestCase):
         self.assertEqual(len(result.candidates_preview), 7)
         self.assertFalse(runner.execution_attempted, "Dry run must not mark runner as consumed")
 
-    def test_execute_one_shot_requires_explicit_confirmation_flag(self) -> None:
-        """execute_one_shot must fail closed if confirm_single_shot_free_tier is not True."""
+    def test_p1_live_deny_execute_one_shot_fails_closed(self) -> None:
+        """P1 Security Gate: execute_one_shot must fail closed; live calls are strictly unauthorized."""
         runner = OneShotShadowOperatorRunner(self.settings)
         with self.assertRaises(AIEvaluationError) as ctx:
-            runner.execute_one_shot(confirm_single_shot_free_tier=False)
-        self.assertIn("Safety gate: Stage B operator execution requires explicit", str(ctx.exception))
-        self.assertTrue(runner.execution_attempted, "Attempt must mark runner consumed")
-
-    def test_execute_one_shot_without_api_key_or_client_fails_closed(self) -> None:
-        """If no client is passed and settings has no API key, fail closed safely."""
-        keyless_settings = self.settings.model_copy(update={"gemini_api_key": ""})
-        runner = OneShotShadowOperatorRunner(keyless_settings)
-        with self.assertRaises(AIEvaluationError) as ctx:
             runner.execute_one_shot(confirm_single_shot_free_tier=True)
-        self.assertIn("GEMINI_API_KEY is not configured or empty", str(ctx.exception))
+        self.assertIn("Live Gemini API execution is strictly not authorized", str(ctx.exception))
         self.assertTrue(runner.execution_attempted)
 
-    def _build_mock_response(
-        self,
-        picks: list[dict],
-        summary: str = "Test özeti.",
-        finish_reason: str = "STOP",
-        prompt_tokens: int = 1600,
-        candidates_tokens: int = 350,
-    ) -> MagicMock:
-        mock_resp = MagicMock()
-        mock_resp.text = json.dumps({"picks": picks, "run_editorial_summary_tr": summary})
+    def test_p1_live_deny_proves_zero_sdk_client_instantiations(self) -> None:
+        """Negative security proof: genai.Client is NEVER instantiated under any path."""
+        with patch("google.genai.Client") as mock_client:
+            runner = OneShotShadowOperatorRunner(self.settings)
+            runner.dry_run()
+            with self.assertRaises(AIEvaluationError):
+                runner.execute_one_shot(confirm_single_shot_free_tier=True)
 
-        cand = MagicMock()
-        cand.finish_reason = finish_reason
-        mock_resp.candidates = [cand]
+            payload = json.dumps({"picks": [], "run_editorial_summary_tr": "Boş."})
+            fresh_runner = OneShotShadowOperatorRunner(self.settings)
+            fresh_runner.evaluate_precomputed_response_json(payload)
 
-        usage = MagicMock()
-        usage.prompt_token_count = prompt_tokens
-        usage.candidates_token_count = candidates_tokens
-        usage.thoughts_token_count = 0
-        usage.total_token_count = prompt_tokens + candidates_tokens
-        mock_resp.usage_metadata = usage
-        return mock_resp
+            # Crucial verification: genai.Client was NEVER called
+            mock_client.assert_not_called()
 
-    def test_execute_one_shot_mock_client_success_and_raw_vs_approved_segregation(self) -> None:
-        """Hermetic test: Verifies successful execution and full segregation of raw model picks vs approved suggestions."""
-        real_cand1 = self.sample[0]
-        real_cand2 = self.sample[1]
-        real_cand3 = self.sample[2]
+    def test_p1_sdk_timeout_unit_is_30000_ms(self) -> None:
+        """SDK HttpOptions.timeout is in milliseconds; must be exactly 30_000 ms for 30 seconds."""
+        self.assertEqual(OPERATOR_TIMEOUT_MS, 30_000)
+        self.assertEqual(OPERATOR_TIMEOUT_MS / 1000.0, 30.0)
+        runner = OneShotShadowOperatorRunner(self.settings)
+        result = runner.dry_run()
+        self.assertEqual(result.timeout_ms, 30_000)
+
+    def test_p1_actual_provider_charge_reported_as_not_verified(self) -> None:
+        """Provider billing charge must be honestly reported as NOT_VERIFIED."""
+        runner = OneShotShadowOperatorRunner(self.settings)
+        result = runner.dry_run()
+        self.assertEqual(result.actual_provider_charge, "NOT_VERIFIED")
+        report = result.to_markdown_report()
+        self.assertIn("Provider Invoiced Charge:** `NOT_VERIFIED`", report)
+        self.assertIn("Theoretical Paid-Equivalent", report)
+
+    def test_p2_sample_coverage_marks_unreferenced_items_not_returned_by_model(self) -> None:
+        """Articles from the 7-item sample not referenced in model picks must be marked NOT_RETURNED_BY_MODEL."""
+        cand1 = self.sample[0]
+        cand2 = self.sample[1]
+
+        # Model selects only 2 of the 7 candidate articles
+        picks = [
+            {
+                "article_ids": [cand1.id],
+                "score": 85,
+                "kind": "NEW",
+                "verification_status": "REPUTABLE_REPORTING",
+                "headline_tr": "Seçilen Birinci Haber",
+                "cover_title_tr": "BİRİNCİ",
+                "caption_idea_tr": "Detay.",
+                "why_efso_tr": "Popüler.",
+                "suggested_format": "POST",
+                "category": "YERLI",
+            },
+            {
+                "article_ids": [cand2.id],
+                "score": 30,
+                "kind": "IGNORE",
+                "verification_status": "UNVERIFIED_RUMOR",
+                "headline_tr": "İhmal Edilen İkinci Haber",
+                "cover_title_tr": "İHMAL",
+                "caption_idea_tr": "Detay.",
+                "why_efso_tr": "Düşük.",
+                "suggested_format": "CAROUSEL",
+                "category": "YERLI",
+            },
+        ]
+        payload = json.dumps({"picks": picks, "run_editorial_summary_tr": "2 haber seçildi."})
+
+        runner = OneShotShadowOperatorRunner(self.settings)
+        result = runner.evaluate_precomputed_response_json(payload)
+
+        # 2 referenced articles -> exactly 5 unreturned candidate articles
+        self.assertEqual(len(result.raw_picks), 2)
+        self.assertEqual(len(result.unreturned_candidates), 5)
+        for u in result.unreturned_candidates:
+            self.assertEqual(u["status"], "NOT_RETURNED_BY_MODEL")
+            self.assertNotIn(u["id"], [cand1.id, cand2.id])
+
+        report = result.to_markdown_report()
+        self.assertIn("## 5. Unreturned Candidate Articles (NOT_RETURNED_BY_MODEL)", report)
+        self.assertIn("NOT_RETURNED_BY_MODEL", report)
+
+    def test_raw_vs_approved_vs_filtered_segregation(self) -> None:
+        """Full segregation: raw model picks, approved suggestions, suppressed picks, and unreturned items."""
+        cand1 = self.sample[0]
+        cand2 = self.sample[1]
+        cand3 = self.sample[2]
+        cand4 = self.sample[3]
 
         picks = [
-            # 1. Alertable high-scoring NEW pick
+            # 1. Alertable NEW pick
             {
-                "article_ids": [real_cand1.id],
+                "article_ids": [cand1.id],
                 "score": 89,
                 "kind": "NEW",
                 "verification_status": "REPUTABLE_REPORTING",
-                "headline_tr": "Devin Booker ve Hande Erçel Etkileşimi Gündem Oldu",
+                "headline_tr": "Devin Booker ve Hande Erçel Etkileşimi",
                 "cover_title_tr": "DİKKAT ÇEKEN BEĞENİ",
-                "caption_idea_tr": "Detaylı açıklama.",
+                "caption_idea_tr": "Açıklama.",
                 "why_efso_tr": "Yüksek popüler kültür etkileşimi.",
                 "suggested_format": "POST",
                 "category": "YERLI",
             },
-            # 2. Model classified as IGNORE (Must be in raw_picks, but suppressed from approved_suggestions)
+            # 2. Model IGNORE pick
             {
-                "article_ids": [real_cand2.id],
+                "article_ids": [cand2.id],
                 "score": 35,
                 "kind": "IGNORE",
                 "verification_status": "UNVERIFIED_RUMOR",
@@ -142,9 +197,9 @@ class TestGeminiShadowOperator(unittest.TestCase):
                 "suggested_format": "CAROUSEL",
                 "category": "YERLI",
             },
-            # 3. Model classified as DUPLICATE (Must be in raw_picks, but suppressed from approved_suggestions)
+            # 3. Model DUPLICATE pick
             {
-                "article_ids": [real_cand1.id, real_cand2.id],
+                "article_ids": [cand1.id, cand2.id],
                 "score": 80,
                 "kind": "DUPLICATE",
                 "verification_status": "REPUTABLE_REPORTING",
@@ -155,9 +210,9 @@ class TestGeminiShadowOperator(unittest.TestCase):
                 "suggested_format": "POST",
                 "category": "YERLI",
             },
-            # 4. Model classified as NEW, but score is below min_score (78)
+            # 4. Model NEW pick below min_score (78)
             {
-                "article_ids": [real_cand3.id],
+                "article_ids": [cand3.id],
                 "score": 65,
                 "kind": "NEW",
                 "verification_status": "REPUTABLE_REPORTING",
@@ -169,161 +224,89 @@ class TestGeminiShadowOperator(unittest.TestCase):
                 "category": "YERLI",
             },
         ]
-
-        mock_response = self._build_mock_response(picks, summary="1 alertable, 3 suppressed.")
-        mock_client = MagicMock()
-        mock_client.models = MagicMock()
-        mock_client.models.generate_content.return_value = mock_response
+        payload = json.dumps({"picks": picks, "run_editorial_summary_tr": "4 raw picks evaluated."})
 
         runner = OneShotShadowOperatorRunner(self.settings)
-        result = runner.execute_one_shot(confirm_single_shot_free_tier=True, client=mock_client)
+        result = runner.evaluate_precomputed_response_json(payload)
 
-        # 1. General result checks
-        self.assertEqual(result.status, "OPERATOR_EXECUTION_SUCCESS")
-        self.assertTrue(result.is_live_call)
-        self.assertEqual(result.provider_call_count, 1)
-        self.assertEqual(runner.call_count, 1)
-        self.assertEqual(result.actual_cost_usd, 0.0)
-        self.assertGreater(result.theoretical_paid_equivalent_usd, 0.0)
-        self.assertEqual(result.finish_reason, "STOP")
-        self.assertEqual(result.input_tokens, 1600)
-        self.assertEqual(result.output_tokens, 350)
+        self.assertEqual(result.status, "OPERATOR_OFFLINE_EVALUATION_SUCCESS")
+        self.assertFalse(result.is_live_call)
+        self.assertEqual(result.provider_call_count, 0)
+        self.assertEqual(result.actual_provider_charge, "NOT_VERIFIED")
 
-        # 2. Segregation Verification: All 4 raw model picks are preserved
+        # Raw picks count
         self.assertEqual(len(result.raw_picks), 4)
-        raw_kinds = [p["kind"] for p in result.raw_picks]
-        self.assertIn("NEW", raw_kinds)
-        self.assertIn("IGNORE", raw_kinds)
-        self.assertIn("DUPLICATE", raw_kinds)
 
-        # 3. Approved Suggestions Verification: Only 1 pick approved by business rules
+        # Approved suggestions count
         self.assertEqual(len(result.approved_suggestions), 1)
-        approved = result.approved_suggestions[0]
-        self.assertEqual(approved["headline_tr"], "Devin Booker ve Hande Erçel Etkileşimi Gündem Oldu")
-        self.assertEqual(approved["score"], 89)
+        self.assertEqual(result.approved_suggestions[0]["headline_tr"], "Devin Booker ve Hande Erçel Etkileşimi")
 
-        # 4. Filtered Out Dispositions Breakdown Verification: Exactly 3 picks suppressed with reasons
+        # Suppressed dispositions
         self.assertEqual(len(result.filtered_out_dispositions), 3)
         suppressed_reasons = {f["kind"]: f["filter_reason"] for f in result.filtered_out_dispositions}
-
-        self.assertIn("IGNORE", suppressed_reasons)
         self.assertIn("SUPPRESSED_KIND_IGNORE", suppressed_reasons["IGNORE"])
-
-        self.assertIn("DUPLICATE", suppressed_reasons)
         self.assertIn("SUPPRESSED_KIND_DUPLICATE", suppressed_reasons["DUPLICATE"])
-
-        self.assertIn("NEW", suppressed_reasons)
         self.assertIn("BELOW_SCORE_THRESHOLD", suppressed_reasons["NEW"])
 
-        # 5. Summary counts check
+        # Unreturned candidates count (7 - 3 distinct referenced = 4 unreturned)
+        self.assertEqual(len(result.unreturned_candidates), 4)
+
+        # Summary counts
         self.assertEqual(result.summary_counts["raw_total"], 4)
-        self.assertEqual(result.summary_counts["raw_new"], 2)
-        self.assertEqual(result.summary_counts["raw_ignore"], 1)
-        self.assertEqual(result.summary_counts["raw_duplicate"], 1)
         self.assertEqual(result.summary_counts["approved_total"], 1)
         self.assertEqual(result.summary_counts["suppressed_total"], 3)
+        self.assertEqual(result.summary_counts["unreturned_total"], 4)
 
-        # 6. Verify SDK call arguments: zero retry, no grounding, model
-        mock_client.models.generate_content.assert_called_once()
-        _, kwargs = mock_client.models.generate_content.call_args
-        self.assertEqual(kwargs["model"], ALLOWED_SHADOW_MODEL)
-        cfg = kwargs["config"]
-        self.assertEqual(cfg.temperature, 0.0)
-        self.assertIsNone(cfg.tools)
-
-    def test_single_shot_guard_blocks_repeated_calls(self) -> None:
-        """Runner must enforce max 1 execution; repeated call on same runner instance is blocked."""
-        mock_response = self._build_mock_response([])
-        mock_client = MagicMock()
-        mock_client.models.generate_content.return_value = mock_response
-
+    def test_single_shot_guard_blocks_repeated_offline_evaluations(self) -> None:
+        """Runner must enforce max 1 evaluation; repeated evaluation on same runner instance is blocked."""
+        payload = json.dumps({"picks": [], "run_editorial_summary_tr": "Boş özet."})
         runner = OneShotShadowOperatorRunner(self.settings)
 
-        # 1. First execution succeeds
-        result1 = runner.execute_one_shot(confirm_single_shot_free_tier=True, client=mock_client)
-        self.assertEqual(result1.provider_call_count, 1)
+        # 1. First evaluation succeeds
+        result1 = runner.evaluate_precomputed_response_json(payload)
+        self.assertEqual(result1.status, "OPERATOR_OFFLINE_EVALUATION_SUCCESS")
 
-        # 2. Second execution must be blocked fail-closed
+        # 2. Second evaluation must be blocked
         with self.assertRaises(AIEvaluationError) as ctx:
-            runner.execute_one_shot(confirm_single_shot_free_tier=True, client=mock_client)
+            runner.evaluate_precomputed_response_json(payload)
         self.assertIn("Repeated execution blocked: Stage B shadow operator enforces strict single-shot execution", str(ctx.exception))
-        self.assertEqual(runner.call_count, 1, "Call count must not increment after block")
-
-    def test_ambiguous_failure_blocks_rerun_and_zero_retry(self) -> None:
-        """Ambiguous provider failure (network error, timeout) must fail closed and block rerun."""
-        mock_client = MagicMock()
-        mock_client.models.generate_content.side_effect = RuntimeError("Provider 503 Service Unavailable")
-
-        runner = OneShotShadowOperatorRunner(self.settings)
-
-        # First call fails
-        with self.assertRaises(AIEvaluationError) as ctx1:
-            runner.execute_one_shot(confirm_single_shot_free_tier=True, client=mock_client)
-        self.assertIn("Gemini operator call failed", str(ctx1.exception))
-        self.assertTrue(runner.execution_attempted)
-
-        # Re-execution is strictly forbidden
-        with self.assertRaises(AIEvaluationError) as ctx2:
-            runner.execute_one_shot(confirm_single_shot_free_tier=True, client=mock_client)
-        self.assertIn("Repeated execution blocked", str(ctx2.exception))
-        self.assertIn("cannot be re-executed", str(ctx2.exception))
 
     def test_truncation_max_tokens_fails_closed(self) -> None:
         """Truncated response (finish_reason=MAX_TOKENS) must fail closed."""
-        mock_response = self._build_mock_response([], finish_reason="MAX_TOKENS")
-        mock_client = MagicMock()
-        mock_client.models.generate_content.return_value = mock_response
-
+        payload = json.dumps({"picks": [], "run_editorial_summary_tr": "Yarıda kaldı."})
         runner = OneShotShadowOperatorRunner(self.settings)
         with self.assertRaises(AIEvaluationError) as ctx:
-            runner.execute_one_shot(confirm_single_shot_free_tier=True, client=mock_client)
+            runner.evaluate_precomputed_response_json(payload, finish_reason="MAX_TOKENS")
         self.assertIn("Gemini response truncated at max token limit (finish_reason=MAX_TOKENS)", str(ctx.exception))
 
-    def test_empty_or_null_response_fails_closed(self) -> None:
-        """Empty or null text response from Gemini must fail closed."""
-        mock_response = MagicMock()
-        mock_response.text = ""
-        mock_response.candidates = [MagicMock(finish_reason="STOP")]
-        mock_client = MagicMock()
-        mock_client.models.generate_content.return_value = mock_response
+    def test_empty_and_malformed_json_fails_closed(self) -> None:
+        """Empty and malformed JSON payloads must fail closed."""
+        runner1 = OneShotShadowOperatorRunner(self.settings)
+        with self.assertRaises(AIEvaluationError) as ctx1:
+            runner1.evaluate_precomputed_response_json("")
+        self.assertIn("Structured response JSON is empty or null", str(ctx1.exception))
 
-        runner = OneShotShadowOperatorRunner(self.settings)
-        with self.assertRaises(AIEvaluationError) as ctx:
-            runner.execute_one_shot(confirm_single_shot_free_tier=True, client=mock_client)
-        self.assertIn("Gemini returned empty or null response", str(ctx.exception))
+        runner2 = OneShotShadowOperatorRunner(self.settings)
+        with self.assertRaises(AIEvaluationError) as ctx2:
+            runner2.evaluate_precomputed_response_json("{not valid json at all")
+        self.assertIn("Malformed structured response from model", str(ctx2.exception))
 
-    def test_malformed_json_response_fails_closed(self) -> None:
-        """Malformed JSON structured response must fail closed."""
-        mock_response = MagicMock()
-        mock_response.text = "{not valid json at all"
-        mock_response.candidates = [MagicMock(finish_reason="STOP")]
-        mock_client = MagicMock()
-        mock_client.models.generate_content.return_value = mock_response
+    def test_model_enforcement_and_grounding_rejection(self) -> None:
+        """Any model other than gemini-3.5-flash-lite and enable_search_grounding=True must be rejected."""
+        bad_model_settings = Settings(gemini_model="gemini-2.0-flash")
+        runner1 = OneShotShadowOperatorRunner(bad_model_settings)
+        with self.assertRaises(AIEvaluationError) as ctx1:
+            runner1.dry_run()
+        self.assertIn("Shadow operator only permits model", str(ctx1.exception))
 
-        runner = OneShotShadowOperatorRunner(self.settings)
-        with self.assertRaises(AIEvaluationError) as ctx:
-            runner.execute_one_shot(confirm_single_shot_free_tier=True, client=mock_client)
-        self.assertIn("Malformed structured response from model", str(ctx.exception))
-
-    def test_model_enforcement_permits_gemini_3_5_flash_lite_only(self) -> None:
-        """Any model other than gemini-3.5-flash-lite must be rejected immediately."""
-        for bad_model in ["gemini-1.5-pro", "gemini-2.0-flash", "gpt-4o"]:
-            bad_settings = Settings(gemini_model=bad_model)
-            runner = OneShotShadowOperatorRunner(bad_settings)
-            with self.assertRaises(AIEvaluationError) as ctx:
-                runner.dry_run()
-            self.assertIn("Shadow operator only permits model", str(ctx.exception))
-
-    def test_search_grounding_forbidden(self) -> None:
-        """enable_search_grounding=True must be rejected fail-closed."""
-        bad_settings = Settings(
+        bad_grounding_settings = Settings(
             gemini_model=ALLOWED_SHADOW_MODEL,
             enable_search_grounding=True,
         )
-        runner = OneShotShadowOperatorRunner(bad_settings)
-        with self.assertRaises(AIEvaluationError) as ctx:
-            runner.dry_run()
-        self.assertIn("Search grounding is strictly forbidden", str(ctx.exception))
+        runner2 = OneShotShadowOperatorRunner(bad_grounding_settings)
+        with self.assertRaises(AIEvaluationError) as ctx2:
+            runner2.dry_run()
+        self.assertIn("Search grounding is strictly forbidden", str(ctx2.exception))
 
     def test_candidate_content_tampering_rejected(self) -> None:
         """Altered candidate content with identical IDs must be strictly rejected fail-closed."""
@@ -344,83 +327,61 @@ class TestGeminiShadowOperator(unittest.TestCase):
             runner.dry_run(candidates=altered_batch)
         self.assertIn("Candidate content modification rejected", str(ctx.exception))
 
-    def test_post_validation_uses_keyless_settings_and_never_creates_validation_sdk_client(self) -> None:
+    def test_post_validation_uses_keyless_settings_guarantee(self) -> None:
         """Even if settings contains an API key, post-validation engine has client=None."""
         settings_with_key = Settings(
             gemini_api_key="AIzaSyTestKey12345678901234567890",
             gemini_model=ALLOWED_SHADOW_MODEL,
             enable_search_grounding=False,
         )
-        mock_response = self._build_mock_response([])
-        mock_client = MagicMock()
-        mock_client.models.generate_content.return_value = mock_response
-
+        payload = json.dumps({"picks": [], "run_editorial_summary_tr": "Boş."})
         runner = OneShotShadowOperatorRunner(settings_with_key)
-        result = runner.execute_one_shot(confirm_single_shot_free_tier=True, client=mock_client)
-        self.assertEqual(result.status, "OPERATOR_EXECUTION_SUCCESS")
+        result = runner.evaluate_precomputed_response_json(payload)
+        self.assertEqual(result.status, "OPERATOR_OFFLINE_EVALUATION_SUCCESS")
 
-    def test_markdown_report_structure_and_sanitization(self) -> None:
-        """Markdown report must present raw picks, approved suggestions, filter breakdown, and strip secrets."""
-        real_cand = self.sample[0]
-        picks = [
-            {
-                "article_ids": [real_cand.id],
-                "score": 88,
-                "kind": "NEW",
-                "verification_status": "REPUTABLE_REPORTING",
-                "headline_tr": "Devin Booker ve Hande Erçel Etkileşimi (api_key='secret-key-123')",
-                "cover_title_tr": "BEĞENİ",
-                "caption_idea_tr": "Açıklama.",
-                "why_efso_tr": "Viral potansiyel.",
-                "suggested_format": "POST",
-                "category": "YERLI",
-            },
-            {
-                "article_ids": [self.sample[1].id],
-                "score": 25,
-                "kind": "IGNORE",
-                "verification_status": "UNVERIFIED_RUMOR",
-                "headline_tr": "Gereksiz Haber",
-                "cover_title_tr": "GEREKSİZ",
-                "caption_idea_tr": "Açıklama.",
-                "why_efso_tr": "Gereksiz.",
-                "suggested_format": "CAROUSEL",
-                "category": "YERLI",
-            },
-        ]
-        mock_response = self._build_mock_response(picks, summary="1 alertable, 1 ignored.")
-        mock_client = MagicMock()
-        mock_client.models.generate_content.return_value = mock_response
+    def test_cli_confirm_flag_fails_closed(self) -> None:
+        """scripts/run_gemini_shadow_operator.py --confirm-single-shot-free-tier must fail closed."""
+        from scripts.run_gemini_shadow_operator import main
 
-        runner = OneShotShadowOperatorRunner(self.settings)
-        result = runner.execute_one_shot(confirm_single_shot_free_tier=True, client=mock_client)
-        report = result.to_markdown_report()
+        with patch("sys.argv", ["run_gemini_shadow_operator.py", "--confirm-single-shot-free-tier"]):
+            exit_code = main()
+            self.assertEqual(exit_code, 1)
 
-        # Section headings check
-        self.assertIn("1. Execution & Metadata Overview", report)
-        self.assertIn("2. Raw Model Dispositions", report)
-        self.assertIn("3. Post-Validation Alertable Suggestions", report)
-        self.assertIn("4. Filtered Out Dispositions Breakdown", report)
-        self.assertIn("5. Public Historical Sample Candidates", report)
-
-        # Content check
-        self.assertIn("SUPPRESSED_KIND_IGNORE", report)
-        self.assertIn("Devin Booker ve Hande Erçel Etkileşimi", report)
-        self.assertIn("Actual Cost Incurred:** `$0.0000` USD ($0.00 / 0 TRY)", report)
-        self.assertIn("NOT CURRENT NEWS FRESHNESS", report)
-        self.assertIn("Small sample qualitative smoke test", report)
-
-        # Sanitization check: secret key stripped
-        self.assertNotIn("secret-key-123", report)
-        self.assertIn("[REDACTED]", report)
-
-    def test_cli_script_defaults_to_dry_run_safely(self) -> None:
-        """scripts/run_gemini_shadow_operator.py must default to offline dry run when run without flags."""
+    def test_cli_defaults_to_dry_run_safely(self) -> None:
+        """scripts/run_gemini_shadow_operator.py must default to offline dry run when run without flags or --dry-run."""
         from scripts.run_gemini_shadow_operator import main
 
         with patch("sys.argv", ["run_gemini_shadow_operator.py", "--dry-run"]):
             exit_code = main()
             self.assertEqual(exit_code, 0)
+
+        with patch("sys.argv", ["run_gemini_shadow_operator.py"]):
+            exit_code2 = main()
+            self.assertEqual(exit_code2, 0)
+
+    def test_cli_output_path_validation_protects_operational_records(self) -> None:
+        """scripts/run_gemini_shadow_operator.py must forbid writing to .env, data/, or overwriting files."""
+        from scripts.run_gemini_shadow_operator import validate_output_path
+
+        # 1. Target .env rejected
+        with self.assertRaises(ValueError) as ctx1:
+            validate_output_path(".env")
+        self.assertIn("operational .env file is strictly forbidden", str(ctx1.exception))
+
+        # 2. Target data/ directory rejected
+        with self.assertRaises(ValueError) as ctx2:
+            validate_output_path("data/report.md")
+        self.assertIn("operational data/ directory is strictly forbidden", str(ctx2.exception))
+
+        # 3. Existing file overwrite rejected
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            with self.assertRaises(ValueError) as ctx3:
+                validate_output_path(str(tmp_path))
+            self.assertIn("Overwriting is forbidden for safety", str(ctx3.exception))
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

@@ -1,29 +1,28 @@
 """Phase 5B.3 / Issue #63: Stage B manual, one-shot Gemini editorial shadow evaluation operator.
 
-Guarantees & Safety Constraints:
+Stage B Software Preparation & Safety Rules:
 1. Isolated Operator: Completely separated from production AI evaluation and Stage A preflight.
-   Does NOT modify, bypass, or monkeypatch require_verified_free_tier().
-2. Data Boundary: Strictly bound to Stage A's authorized 7-item historical public news sample
+   Does NOT modify, bypass, or monkeypatch require_verified_free_tier() or AI_EVALUATION_ENABLED.
+2. Network-Incapable Merged Code: Stage B merged code is strictly offline and fail-closed.
+   Contains NO live SDK client invocation or generate_content() network dispatch.
+   Live inference remains strictly unapproved and requires an explicit, separate PO operational gate.
+3. Candidate Data Boundary: Strictly bound to Stage A's authorized 7-item historical public news sample
    (EFSO-SHADOW-20261030-HISTORICAL-PUBLIC-V1). Rejects custom, altered, or empty candidate batches.
-3. Raw Model Dispositions vs Post-Validation Filtered Suggestions:
-   Captures and preserves all structured model decisions (NEW, UPDATE, DUPLICATE, IGNORE)
-   separately from the post-validation alertable suggestions approved by business rules.
-4. Execution Contract:
-   - Exactly one Standard generate_content request only.
-   - Zero automatic SDK retries: HttpRetryOptions(attempts=1).
-   - Zero transport retries: single dispatch.
-   - Fixed model: gemini-3.5-flash-lite only.
-   - Search grounding / tools: strictly forbidden (tools=None, enable_search_grounding=False).
-   - Output token ceiling: compute_enforceable_batch_output_tokens(7, 180).
-   - Timeout bounded: 30.0s.
-   - Single-shot guard: Max 1 execution attempt per runner instance.
-   - No re-execution on ambiguous outcomes or failure: runner instance remains consumed.
-   - Explicit confirmation required: confirm_single_shot_free_tier=True.
-5. Privacy & Sanitization:
-   - Reports and outputs are strictly sanitized against API keys, tokens, and credentials.
-   - Never exposes private operational notes or unredacted secrets.
-6. Offline Hermetic Testing:
-   - All unit tests use mocked clients or pre-computed payloads; zero real network or API calls.
+4. Raw Model Dispositions vs Filtered Suggestions vs Unreturned Candidates:
+   - Captures all structured model decisions (NEW, UPDATE, DUPLICATE, IGNORE) in raw_picks.
+   - Evaluates business rules post-validation via keyless GeminiEditorialEngine (client=None).
+   - Identifies suppressed raw picks with specific reasons (SUPPRESSED_KIND_IGNORE, etc.).
+   - Explicitly marks unreferenced cohort candidates as NOT_RETURNED_BY_MODEL (prompt bounds choices to <= 3).
+5. Cross-Process Session Lock Status:
+   Documented as PENDING LIVE AUTHORIZATION; process-level single-shot is enforced, but cross-process
+   persistence is not claimed without a persistent atomic lock mechanism.
+6. Timeout & Options Standard:
+   SDK HttpOptions timeout is strictly defined in milliseconds: 30_000 ms (30.0 seconds).
+7. Honest Provider Charges:
+   Actual provider charge is reported as NOT_VERIFIED (no external invoice or provider billing reconciliation).
+   Theoretical paid-equivalent is explicitly marked as a bookkeeping estimate only ($0.10/M in, $0.40/M out).
+8. Privacy & Sanitization:
+   All report strings, titles, summaries, and errors are sanitized via sanitize_report_text().
 """
 from __future__ import annotations
 
@@ -40,7 +39,6 @@ from efso_radar.ai.cost import (
     compute_enforceable_batch_output_tokens,
     estimate_call_cost,
     estimate_tokens_from_text,
-    extract_provider_token_usage,
 )
 from efso_radar.ai.prompts import build_editorial_prompt
 from efso_radar.ai.schemas import EditorialDecisionBatch
@@ -56,40 +54,55 @@ from efso_radar.domain import Article
 
 logger = logging.getLogger("efso-radar.ai.shadow_operator")
 
-STAGE_B_DISCLAIMER = (
-    "STAGE B SHADOW EVALUATION REPORT. Historical news replay only "
+# SDK HttpOptions.timeout is in MILLISECONDS: 30,000 ms = 30 seconds
+OPERATOR_TIMEOUT_MS: int = 30_000
+
+STAGE_B_OFFLINE_DISCLAIMER = (
+    "STAGE B SHADOW EVALUATION REPORT (OFFLINE PREVIEW). Historical news replay only "
     f"(Sample ID: {SHADOW_SAMPLE_ID}, As-Of: {SHADOW_SAMPLE_AS_OF_UTC.isoformat()}). "
+    "NOT REAL GEMINI. Real Gemini editorial evaluation has NOT occurred. "
+    "Stage B merged software contains zero network-capable client execution paths. "
     "NOT CURRENT NEWS FRESHNESS. "
     "Small sample qualitative smoke test (7 public articles); NOT a measurement of population "
     "editorial precision, recall, or end-to-end product acceptance. "
-    "All decisions and token counts reflect a single-shot execution on Free Tier ($0.00 / 0 TRY)."
+    "Provider charge is NOT_VERIFIED; no live inference or invoice reconciliation has occurred."
 )
 
 
 class ShadowOperatorResult(BaseModel):
-    """Structured, sanitized outcome of the Stage B one-shot shadow operator."""
+    """Structured, sanitized outcome of the Stage B shadow operator."""
 
     sample_id: str = Field(description="Deterministic sample cohort identifier")
     sample_date_utc: str = Field(description="Reference as-of UTC timestamp for the cohort")
-    status: str = Field(description="Outcome status (e.g. OPERATOR_EXECUTION_SUCCESS, DRY_RUN_COMPLETED_OFFLINE)")
+    status: str = Field(description="Outcome status (e.g. OPERATOR_OFFLINE_EVALUATION_SUCCESS, DRY_RUN_COMPLETED_OFFLINE)")
     model_name: str = Field(description="Fixed Gemini model name (gemini-3.5-flash-lite)")
-    is_live_call: bool = Field(default=False, description="Whether a live/mock provider SDK call was dispatched")
-    provider_call_count: int = Field(default=0, description="Provider inference calls executed (0 or 1)")
+    is_live_call: bool = Field(default=False, description="Strictly False in Stage B merged code; no live calls")
+    provider_call_count: int = Field(default=0, description="Provider inference calls executed (strictly 0)")
     batch_hash: str = Field(description="Deterministic SHA256 hash of candidate IDs and model")
-    input_tokens: int = Field(description="Input token count (from provider usage_metadata or fallback estimate)")
-    output_tokens: int = Field(description="Output token count (from provider usage_metadata or fallback estimate)")
-    actual_cost_usd: float = Field(default=0.0, description="Actual provider charge incurred ($0.00 / 0 TRY on Free Tier)")
-    theoretical_paid_equivalent_usd: float = Field(description="Defensive theoretical estimate for accounting only")
-    finish_reason: Optional[str] = Field(default=None, description="SDK candidate finish reason (e.g. STOP)")
+    input_tokens: int = Field(description="Input token count (estimated)")
+    output_tokens: int = Field(description="Output token ceiling or estimated count")
+    actual_provider_charge: str = Field(
+        default="NOT_VERIFIED",
+        description="Provider-reconciled billing charge; strictly NOT_VERIFIED until live reconciliation",
+    )
+    theoretical_paid_equivalent_usd: float = Field(
+        description="Defensive theoretical estimate for accounting only; NOT an actual charge"
+    )
+    finish_reason: Optional[str] = Field(default=None, description="SDK candidate finish reason")
+    timeout_ms: int = Field(default=OPERATOR_TIMEOUT_MS, description="SDK timeout in milliseconds (30,000 ms)")
     zero_retry_design_contract: str = Field(
-        default="HttpRetryOptions(attempts=1) enforced; zero retry at SDK and transport",
+        default="HttpRetryOptions(attempts=1) designed; zero retry at SDK and transport",
         description="Enforced retry contract",
     )
     grounding_forbidden: bool = Field(default=True, description="Whether search grounding and tools are disabled")
+    session_lock_status: str = Field(
+        default="CROSS_PROCESS_SESSION_LOCK_PENDING_LIVE_AUTHORIZATION",
+        description="Durable cross-process session lock status",
+    )
     raw_summary_tr: Optional[str] = Field(default=None, description="Model overall editorial summary in Turkish")
     raw_picks: list[dict[str, Any]] = Field(
         default_factory=list,
-        description="ALL raw structured model decisions directly from JSON (NEW, UPDATE, DUPLICATE, IGNORE)",
+        description="ALL raw structured model decisions from JSON (NEW, UPDATE, DUPLICATE, IGNORE)",
     )
     approved_suggestions: list[dict[str, Any]] = Field(
         default_factory=list,
@@ -97,13 +110,17 @@ class ShadowOperatorResult(BaseModel):
     )
     filtered_out_dispositions: list[dict[str, Any]] = Field(
         default_factory=list,
-        description="Raw model picks filtered out during post-validation, with specific suppression reason",
+        description="Raw model picks filtered out during post-validation with specific suppression reasons",
+    )
+    unreturned_candidates: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Candidate articles from the 7-item cohort not referenced in any model pick (NOT_RETURNED_BY_MODEL)",
     )
     summary_counts: dict[str, int] = Field(
         default_factory=dict,
-        description="Counts breakdown: total raw picks, approved suggestions, suppressed picks",
+        description="Counts breakdown: total raw picks, approved suggestions, suppressed picks, unreturned candidates",
     )
-    disclaimer: str = Field(default=STAGE_B_DISCLAIMER, description="Safety and non-production disclaimer")
+    disclaimer: str = Field(default=STAGE_B_OFFLINE_DISCLAIMER, description="Safety and non-production disclaimer")
     candidates_preview: list[dict[str, Any]] = Field(default_factory=list, description="Sanitized candidate metadata")
     error_message: Optional[str] = Field(default=None, description="Sanitized error reason if failed")
 
@@ -117,24 +134,27 @@ class ShadowOperatorResult(BaseModel):
             f"- **Reference As-Of:** `{self.sample_date_utc}`",
             f"- **Model:** `{self.model_name}`",
             f"- **Execution Status:** `{self.status}`",
-            f"- **Live Provider Call Dispatched:** `{'Yes' if self.is_live_call else 'No (Dry Run / Mock)'}`",
-            f"- **Provider API Calls Executed:** `{self.provider_call_count}`",
-            f"- **Actual Cost Incurred:** `${self.actual_cost_usd:.4f}` USD ($0.00 / 0 TRY)",
+            f"- **Live Provider Call Dispatched:** `No (Offline Preparation)`",
+            f"- **Provider API Calls Executed:** `{self.provider_call_count}` (Strictly 0; live calls not authorized)",
+            f"- **Provider Invoiced Charge:** `{self.actual_provider_charge}` (No live invoice or charge reconciled)",
             f"- **Theoretical Paid-Equivalent:** `~${self.theoretical_paid_equivalent_usd:.4f}` USD (Defensive estimate only)",
             f"- **Input Tokens:** `{self.input_tokens}`",
             f"- **Output Tokens:** `{self.output_tokens}`",
             f"- **Finish Reason:** `{self.finish_reason or 'N/A'}`",
+            f"- **SDK Timeout Setting:** `{self.timeout_ms} ms` (30 seconds)",
             f"- **Retry Contract:** `{self.zero_retry_design_contract}`",
             f"- **Search Grounding:** `{'Disabled' if self.grounding_forbidden else 'Enabled'}`",
             f"- **Candidate Batch Hash:** `{self.batch_hash}`",
+            f"- **Cross-Process Session Lock:** `{self.session_lock_status}`",
             "",
             "### Safety & Scope Disclaimers",
-            f"> [!IMPORTANT]",
-            f"> **Historical Replay:** {self.disclaimer}",
+            "> [!IMPORTANT]",
+            f"> **Historical Replay & Non-Production:** {self.disclaimer}",
             "",
             "> [!NOTE]",
-            "> **Cost & Billing:** Actual provider cost is strictly $0.00 / 0 TRY on eligible Free Tier. "
-            "Theoretical paid-equivalent is calculated defensively based on standard list pricing ($0.10/M input, $0.40/M output).",
+            "> **Billing Integrity:** Provider charge is NOT_VERIFIED. Eligible Free Tier allows $0.00 / 0 TRY, "
+            "but no live invoice is collected. Theoretical paid-equivalent is a standard list pricing estimate "
+            "($0.10/M input, $0.40/M output), NOT an active billing charge.",
             "",
         ]
 
@@ -225,10 +245,35 @@ class ShadowOperatorResult(BaseModel):
         else:
             lines.append("_No items were suppressed by business rules._")
 
-        # Section 5: Candidates Provenance
+        # Section 5: Unreturned Candidate Articles (NOT_RETURNED_BY_MODEL)
         lines.extend([
             "",
-            "## 5. Public Historical Sample Candidates (7 items)",
+            "## 5. Unreturned Candidate Articles (NOT_RETURNED_BY_MODEL)",
+            "> [!NOTE] These articles from the 7-item historical sample were NOT referenced or selected by the model. "
+            "The prompt bounds model output to at most 3 choices.",
+            "",
+            f"**Total Unreturned Articles:** `{len(self.unreturned_candidates)}`",
+            "",
+        ])
+
+        if self.unreturned_candidates:
+            lines.extend([
+                "| Article ID | Source | Market | Title | Status |",
+                "| :--- | :--- | :---: | :--- | :--- |",
+            ])
+            for u in self.unreturned_candidates:
+                t = sanitize_report_text(str(u.get("title", "")))
+                s = sanitize_report_text(str(u.get("source", "")))
+                lines.append(
+                    f"| `{u.get('id')}` | {s} | {u.get('market')} | {t} | `NOT_RETURNED_BY_MODEL` |"
+                )
+        else:
+            lines.append("_All candidates were referenced by the model._")
+
+        # Section 6: Candidates Provenance
+        lines.extend([
+            "",
+            "## 6. Public Historical Sample Candidates (7 items)",
             "| # | Source | Market | Title | Published (UTC) | URL |",
             "| :--- | :--- | :---: | :--- | :--- | :--- |",
         ])
@@ -244,7 +289,7 @@ class ShadowOperatorResult(BaseModel):
         if self.error_message:
             lines.extend([
                 "",
-                "## 6. Execution Error Detail",
+                "## 7. Execution Error Detail",
                 "```text",
                 f"{sanitize_report_text(self.error_message)}",
                 "```",
@@ -257,18 +302,19 @@ class OneShotShadowOperatorRunner:
     """Manual, bounded one-shot Gemini editorial shadow evaluation operator harness.
 
     Enforces:
-    - Exactly 1 provider execution attempt per session (runner marked consumed on attempt).
-    - Ambiguous outcome or failure cannot be re-executed in the same session.
-    - Explicit confirmation gate: confirm_single_shot_free_tier=True.
+    - Strictly offline execution in merged code: NO live SDK client invocation or generate_content() dispatch.
+    - Single-shot execution guard within the running process instance.
+    - Explicitly reports cross-process lock as pending live authorization.
     - Pinned model: gemini-3.5-flash-lite only.
     - Search grounding forbidden: enable_search_grounding=False only.
-    - Retry options: HttpRetryOptions(attempts=1) at SDK and transport.
+    - Timeout standard: 30_000 ms.
     - Candidate sample integrity: rejects altered or non-authentic candidate batches.
     - Keyless validator: GeminiEditorialEngine initialized with keyless settings for post-validation.
-    - Separation of raw model picks from post-validation alertable suggestions.
+    - Full segregation of raw model picks, approved suggestions, suppressed picks, and unreturned candidates.
     """
 
     def __init__(self, settings: Optional[Settings] = None):
+        # Never call Settings.from_env() in offline operator; instantiate clean Settings
         self.settings = settings or Settings()
         self._execution_attempted: bool = False
         self._call_count: int = 0
@@ -280,7 +326,7 @@ class OneShotShadowOperatorRunner:
 
     @property
     def call_count(self) -> int:
-        """Actual provider inference calls executed (0 or 1)."""
+        """Provider inference calls executed (strictly 0 in Stage B)."""
         return self._call_count
 
     def _resolve_and_validate_candidates(
@@ -378,35 +424,35 @@ class OneShotShadowOperatorRunner:
             batch_hash=batch_hash,
             input_tokens=est_input_tokens,
             output_tokens=batch_max_out,
-            actual_cost_usd=0.0,
+            actual_provider_charge="NOT_VERIFIED",
             theoretical_paid_equivalent_usd=est_paid_cost,
             finish_reason=None,
+            timeout_ms=OPERATOR_TIMEOUT_MS,
             grounding_forbidden=True,
             raw_summary_tr=None,
             raw_picks=[],
             approved_suggestions=[],
             filtered_out_dispositions=[],
-            summary_counts={"raw_total": 0, "approved_total": 0, "suppressed_total": 0},
+            unreturned_candidates=[],
+            summary_counts={"raw_total": 0, "approved_total": 0, "suppressed_total": 0, "unreturned_total": 0},
             candidates_preview=self._build_candidates_preview(active_candidates),
             error_message=None,
         )
 
-    def execute_one_shot(
+    def evaluate_precomputed_response_json(
         self,
-        confirm_single_shot_free_tier: bool = False,
-        client: Optional[Any] = None,
+        response_json: str,
         candidates: Optional[list[Article]] = None,
         as_of_time: Optional[datetime] = None,
+        finish_reason: Optional[str] = "STOP",
     ) -> ShadowOperatorResult:
-        """Execute the bounded, single-shot Gemini editorial shadow evaluation.
+        """Hermetic, offline evaluation of a pre-computed or synthetic structured response.
 
-        Enforces:
-        - Exactly one execution attempt per runner instance (no re-execution on error or ambiguous outcome).
-        - Explicit confirm_single_shot_free_tier=True flag required.
-        - Pinned gemini-3.5-flash-lite, no grounding, zero SDK retries.
-        - Distinguishes raw model picks from post-validation alertable suggestions.
+        Guarantees:
+        - NEVER calls an SDK client or makes a network request.
+        - Enforces single-shot session execution within the runner instance.
+        - Segregates raw model picks vs approved suggestions vs filtered dispositions vs unreturned candidates.
         """
-        # 1. Single-shot session guard: runner marked consumed immediately on attempt
         if self._execution_attempted:
             raise AIEvaluationError(
                 "Repeated execution blocked: Stage B shadow operator enforces strict single-shot execution "
@@ -414,30 +460,18 @@ class OneShotShadowOperatorRunner:
             )
         self._execution_attempted = True
 
-        # 2. Safety confirmation gate
-        if not confirm_single_shot_free_tier:
-            raise AIEvaluationError(
-                "Safety gate: Stage B operator execution requires explicit confirm_single_shot_free_tier=True "
-                "confirming that Free Tier status, active rate limits (15 RPM / 250K TPM / 500 RPD), and "
-                "explicit PO authorization have been verified."
-            )
-
-        # 3. Model enforcement
         if self.settings.gemini_model != ALLOWED_SHADOW_MODEL:
             raise AIEvaluationError(
                 f"Shadow operator only permits model '{ALLOWED_SHADOW_MODEL}', got '{self.settings.gemini_model}'"
             )
 
-        # 4. Search grounding forbidden
         if self.settings.enable_search_grounding:
             raise AIEvaluationError("Search grounding is strictly forbidden in shadow operator")
 
-        # 5. Candidate integrity
         active_candidates = self._resolve_and_validate_candidates(candidates)
         ref_now = as_of_time or SHADOW_SAMPLE_AS_OF_UTC
         candidates_preview = self._build_candidates_preview(active_candidates)
 
-        # 6. Prompt, hash, and token ceiling calculations
         prompt_text = build_editorial_prompt(active_candidates, [], ref_now)
         batch_hash = compute_candidate_batch_hash(
             [c.id for c in active_candidates], self.settings.gemini_model
@@ -447,90 +481,20 @@ class OneShotShadowOperatorRunner:
             len(active_candidates), max_tokens_per_story=180
         )
 
-        # 7. Resolve SDK Client
-        active_client = client
-        if active_client is None:
-            if not self.settings.gemini_api_key:
-                raise AIEvaluationError(
-                    "GEMINI_API_KEY is not configured or empty; Stage B operator cannot execute without an API key."
-                )
-            from google import genai
-            from google.genai import types
+        if not response_json or not response_json.strip():
+            raise AIEvaluationError("Structured response JSON is empty or null.")
 
-            http_opts = types.HttpOptions(
-                timeout=30.0,
-                retry_options=types.HttpRetryOptions(attempts=1),
-            )
-            active_client = genai.Client(
-                api_key=self.settings.gemini_api_key,
-                http_options=http_opts,
+        if finish_reason and "MAX_TOKENS" in str(finish_reason).upper():
+            raise AIEvaluationError(
+                f"Gemini response truncated at max token limit (finish_reason=MAX_TOKENS). Ceiling={batch_max_out}."
             )
 
-        # 8. Build request configuration
-        from google.genai import types
-
-        thinking_cfg = None
-        if hasattr(types, "ThinkingConfig"):
-            try:
-                thinking_cfg = types.ThinkingConfig(thinking_level="minimal")
-            except Exception:
-                thinking_cfg = None
-
-        http_opts = None
-        if hasattr(types, "HttpOptions") and hasattr(types, "HttpRetryOptions"):
-            http_opts = types.HttpOptions(
-                timeout=30.0,
-                retry_options=types.HttpRetryOptions(attempts=1),
-            )
-
-        afc_cfg = None
-        if hasattr(types, "AutomaticFunctionCallingConfig"):
-            afc_cfg = types.AutomaticFunctionCallingConfig(disable=True)
-
-        config = types.GenerateContentConfig(
-            temperature=0.0,
-            max_output_tokens=batch_max_out,
-            response_mime_type="application/json",
-            response_schema=EditorialDecisionBatch,
-            tools=None,
-            thinking_config=thinking_cfg,
-            http_options=http_opts,
-            automatic_function_calling=afc_cfg,
-        )
-
-        # 9. Single-shot dispatch (fail-closed, zero retry)
         try:
-            response = active_client.models.generate_content(
-                model=self.settings.gemini_model,
-                contents=prompt_text,
-                config=config,
-            )
-            self._call_count += 1
-        except Exception as exc:
-            err_sanitized = sanitize_report_text(str(exc))
-            logger.error("Stage B shadow operator call failed: %s", err_sanitized)
-            raise AIEvaluationError(f"Gemini operator call failed: {err_sanitized}") from exc
-
-        # 10. Truncation and structure validation
-        finish_reason = None
-        if hasattr(response, "candidates") and response.candidates:
-            cand = response.candidates[0]
-            finish_reason = str(getattr(cand, "finish_reason", "UNKNOWN"))
-            if "MAX_TOKENS" in finish_reason.upper():
-                raise AIEvaluationError(
-                    f"Gemini response truncated at max token limit (finish_reason=MAX_TOKENS). Ceiling={batch_max_out}."
-                )
-
-        if not response or not getattr(response, "text", None):
-            raise AIEvaluationError("Gemini returned empty or null response.")
-
-        raw_json = response.text
-        try:
-            batch = EditorialDecisionBatch.model_validate_json(raw_json)
+            batch = EditorialDecisionBatch.model_validate_json(response_json)
         except (json.JSONDecodeError, ValidationError) as exc:
             raise AIEvaluationError(f"Malformed structured response from model: {exc}") from exc
 
-        # 11. Re-use application-level business rules post-validation with keyless settings
+        # Re-use application-level business rules post-validation with keyless settings
         keyless_settings = self.settings.model_copy(update={"gemini_api_key": ""})
         engine = GeminiEditorialEngine(keyless_settings)
         if engine.client is not None:
@@ -542,9 +506,11 @@ class OneShotShadowOperatorRunner:
             batch.picks, active_candidates, []
         )
 
-        # 12. Structure raw picks
+        # Structure raw picks
         raw_picks = []
+        referenced_article_ids: set[str] = set()
         for p in batch.picks:
+            referenced_article_ids.update(p.article_ids)
             raw_picks.append({
                 "article_ids": p.article_ids,
                 "kind": p.kind,
@@ -559,7 +525,7 @@ class OneShotShadowOperatorRunner:
                 "verification_status": p.verification_status,
             })
 
-        # 13. Structure approved suggestions
+        # Structure approved suggestions
         approved_suggestions = []
         for asm in approved_assessments:
             approved_suggestions.append({
@@ -574,7 +540,7 @@ class OneShotShadowOperatorRunner:
                 "uncertainties_tr": sanitize_report_text(asm.uncertainties_tr) if asm.uncertainties_tr else None,
             })
 
-        # 14. Compute filtered-out dispositions breakdown
+        # Compute filtered-out dispositions breakdown
         candidate_id_set = {c.id for c in active_candidates}
         filtered_out_dispositions = []
         for p in batch.picks:
@@ -598,7 +564,19 @@ class OneShotShadowOperatorRunner:
                     "filter_reason": reason,
                 })
 
-        # 15. Summary statistics
+        # Compute unreturned cohort candidates (NOT_RETURNED_BY_MODEL)
+        unreturned_candidates = []
+        for c in active_candidates:
+            if c.id not in referenced_article_ids:
+                unreturned_candidates.append({
+                    "id": c.id,
+                    "title": sanitize_report_text(c.title),
+                    "source": sanitize_report_text(c.source),
+                    "market": c.market.value,
+                    "status": "NOT_RETURNED_BY_MODEL",
+                })
+
+        # Summary statistics
         raw_kinds = [p.kind for p in batch.picks]
         summary_counts = {
             "raw_total": len(raw_picks),
@@ -608,40 +586,56 @@ class OneShotShadowOperatorRunner:
             "raw_ignore": raw_kinds.count("IGNORE"),
             "approved_total": len(approved_suggestions),
             "suppressed_total": len(filtered_out_dispositions),
+            "unreturned_total": len(unreturned_candidates),
         }
 
-        # 16. Actual token extraction & bookkeeping cost calculation
-        actual_in, actual_out, _ = extract_provider_token_usage(
-            response,
-            fallback_input_tokens=est_input_tokens,
-            fallback_output_tokens=estimate_tokens_from_text(raw_json),
-        )
+        est_output_tokens = estimate_tokens_from_text(response_json)
         est_paid_cost = estimate_call_cost(
             self.settings.gemini_model,
-            input_tokens=actual_in,
-            output_tokens=actual_out,
+            input_tokens=est_input_tokens,
+            output_tokens=est_output_tokens,
             used_search_grounding=False,
         )
 
         return ShadowOperatorResult(
             sample_id=SHADOW_SAMPLE_ID,
             sample_date_utc=ref_now.isoformat(),
-            status="OPERATOR_EXECUTION_SUCCESS",
+            status="OPERATOR_OFFLINE_EVALUATION_SUCCESS",
             model_name=self.settings.gemini_model,
-            is_live_call=True,
-            provider_call_count=self._call_count,
+            is_live_call=False,
+            provider_call_count=0,
             batch_hash=batch_hash,
-            input_tokens=actual_in,
-            output_tokens=actual_out,
-            actual_cost_usd=0.0,
+            input_tokens=est_input_tokens,
+            output_tokens=est_output_tokens,
+            actual_provider_charge="NOT_VERIFIED",
             theoretical_paid_equivalent_usd=est_paid_cost,
             finish_reason=finish_reason,
+            timeout_ms=OPERATOR_TIMEOUT_MS,
             grounding_forbidden=True,
             raw_summary_tr=batch.run_editorial_summary_tr,
             raw_picks=raw_picks,
             approved_suggestions=approved_suggestions,
             filtered_out_dispositions=filtered_out_dispositions,
+            unreturned_candidates=unreturned_candidates,
             summary_counts=summary_counts,
             candidates_preview=candidates_preview,
             error_message=None,
+        )
+
+    def execute_one_shot(
+        self,
+        confirm_single_shot_free_tier: bool = False,
+        **kwargs: Any,
+    ) -> ShadowOperatorResult:
+        """P1 Security Gate: Live execution is strictly denied in merged Stage B code.
+
+        Always fails closed to prevent unauthorized live network calls.
+        Real inference requires separate, explicit PO operational authorization.
+        """
+        # Mark attempt as consumed
+        self._execution_attempted = True
+        raise AIEvaluationError(
+            "Live Gemini API execution is strictly not authorized in Stage B operator preparation. "
+            "Real inference requires an explicit, separate Product Owner operational authorization "
+            "and a dedicated live execution gate."
         )
