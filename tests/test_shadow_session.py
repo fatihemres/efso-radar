@@ -27,6 +27,7 @@ from efso_radar.ai.shadow_operator import (
     ALLOWED_SHADOW_MODEL,
     SHADOW_SAMPLE_ID,
     OneShotShadowOperatorRunner,
+    SimulatedDispatchOutcome,
 )
 from efso_radar.ai.shadow_session import (
     DEFAULT_PURPOSE_VERSION,
@@ -101,7 +102,7 @@ class TestShadowSessionClaimContract(unittest.TestCase):
             with self.assertRaises(ShadowSessionSecurityError) as ctx:
                 claim_shadow_session(unattested_path)
 
-            self.assertIn("has not been attested as an authorized test-owned fixture scope", str(ctx.exception))
+            self.assertIn("Fixture root has not been entered via an active ShadowSessionFixtureScope", str(ctx.exception))
             # No files created
             self.assertEqual(list(unattested_path.iterdir()), [])
 
@@ -111,7 +112,7 @@ class TestShadowSessionClaimContract(unittest.TestCase):
                 self.assertEqual(rec.state, "CONSUMED")
 
     def test_untrusted_arbitrary_directories_rejected_before_os_open(self) -> None:
-        """Arbitrary project, desktop, non-temp, or non-pytest directories are rejected fail-closed."""
+        """Arbitrary project, desktop, non-temp directories are rejected fail-closed."""
         repo_root = _find_repo_root()
         self.assertIsNotNone(repo_root)
 
@@ -139,11 +140,13 @@ class TestShadowSessionClaimContract(unittest.TestCase):
         with self.assertRaises(ShadowSessionSecurityError):
             validate_test_fixture_root(tempfile.gettempdir())
 
-        # 7. Non-pytest prefix temporary directory rejected
-        with tempfile.TemporaryDirectory(prefix="ordinary-temp-") as ordinary_td:
-            with self.assertRaises(ShadowSessionSecurityError) as ctx_ord:
-                validate_test_fixture_root(ordinary_td)
-            self.assertIn("does not belong to a valid pytest fixture hierarchy", str(ctx_ord.exception))
+        # 7. Un-entered temporary directory cannot execute claims without active ShadowSessionFixtureScope
+        with tempfile.TemporaryDirectory(prefix="unentered-temp-") as unentered_td:
+            unentered_path = Path(unentered_td).resolve()
+            self.assertEqual(validate_test_fixture_root(unentered_path), unentered_path)
+            with self.assertRaises(ShadowSessionSecurityError) as ctx_unatt:
+                claim_shadow_session(unentered_path)
+            self.assertIn("Fixture root has not been entered via an active ShadowSessionFixtureScope", str(ctx_unatt.exception))
 
     def test_verified_empty_fixture_claims_consumed_pre_dispatch(self) -> None:
         """Verified empty fixture transitions to CONSUMED pre-dispatch with complete evidence."""
@@ -157,7 +160,7 @@ class TestShadowSessionClaimContract(unittest.TestCase):
         self.assertEqual(record.model_name, ALLOWED_SHADOW_MODEL)
         self.assertEqual(record.purpose_version, DEFAULT_PURPOSE_VERSION)
         self.assertEqual(record.process_pid, os.getpid())
-        self.assertIn("STAGE B SAME-HOST ONE-USE SESSION CLAIM CONTRACT", record.disclaimer)
+        self.assertIn("STAGE B SAME-HOST TEST-FIXTURE SIMULATION CONTRACT", record.disclaimer)
 
         claim_file = self.fixture_root / get_canonical_claim_filename()
         self.assertTrue(claim_file.exists())
@@ -218,10 +221,10 @@ class TestShadowSessionClaimContract(unittest.TestCase):
             "from pathlib import Path\n"
             "from efso_radar.ai.shadow_session import claim_shadow_session, ShadowSessionFixtureScope, ShadowSessionError\n"
             "root = Path(sys.argv[1])\n"
-            "ShadowSessionFixtureScope.register_authorized_fixture_root(root)\n"
             "try:\n"
-            "    claim = claim_shadow_session(root)\n"
-            "    sys.exit(0)\n"
+            "    with ShadowSessionFixtureScope(root):\n"
+            "        claim = claim_shadow_session(root)\n"
+            "        sys.exit(0)\n"
             "except ShadowSessionError:\n"
             "    sys.exit(1)\n"
             "except Exception:\n"
@@ -329,13 +332,13 @@ class TestShadowSessionClaimContract(unittest.TestCase):
         """Simulated dispatch interruption retains pre-dispatch claim on disk and blocks second run."""
         runner = OneShotShadowOperatorRunner()
 
-        def fail_dispatch_callback() -> None:
-            raise RuntimeError("Simulated dispatch crash / transport timeout")
-
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(AIEvaluationError) as ctx:
             runner.simulate_hermetic_dispatched_session(
-                self.fixture_root, dispatch_callback=fail_dispatch_callback
+                self.fixture_root,
+                simulated_outcome=SimulatedDispatchOutcome.SIMULATED_UNKNOWN,
             )
+        self.assertIn("Simulated hermetic dispatch interrupted with unknown outcome", str(ctx.exception))
+        self.assertIn("Session claim retained on disk to deny replay", str(ctx.exception))
 
         # Claim was created pre-dispatch and retained
         claim_file = self.fixture_root / get_canonical_claim_filename()
@@ -348,6 +351,25 @@ class TestShadowSessionClaimContract(unittest.TestCase):
         runner2 = OneShotShadowOperatorRunner()
         with self.assertRaises(ShadowSessionReplayError):
             runner2.simulate_hermetic_dispatched_session(self.fixture_root)
+
+    def test_simulated_dispatch_rejects_arbitrary_callback_arguments(self) -> None:
+        """Caller-supplied dispatch_callback is rejected; only closed SimulatedDispatchOutcome enum is allowed."""
+        runner = OneShotShadowOperatorRunner()
+        with self.assertRaises(TypeError):
+            runner.simulate_hermetic_dispatched_session(
+                self.fixture_root,
+                dispatch_callback=lambda: None,  # type: ignore[call-arg]
+            )
+        # Zero files created
+        self.assertEqual(list(self.fixture_root.iterdir()), [])
+
+        # Invalid outcome string is also rejected
+        with self.assertRaises(ValueError):
+            runner.simulate_hermetic_dispatched_session(
+                self.fixture_root,
+                simulated_outcome="ARBITRARY_UNAPPROVED_STATUS",  # type: ignore[arg-type]
+            )
+        self.assertEqual(list(self.fixture_root.iterdir()), [])
 
     def test_simulated_dispatch_success_updates_session_lock_status(self) -> None:
         """Successful simulated dispatch updates session_lock_status to SAME_HOST_FIXTURE_CLAIM_CONSUMED."""
@@ -443,12 +465,22 @@ class TestShadowSessionClaimContract(unittest.TestCase):
         self.assertNotIn("SECRET_USER_DATA_12345", err_msg)
         self.assertNotIn("private_leak", err_msg)
 
+    def test_exception_chaining_suppressed_from_none(self) -> None:
+        """All internal parsing and OS errors are raised with 'from None' to prevent leaking traces or context."""
+        claim_file = self.fixture_root / get_canonical_claim_filename()
+        claim_file.write_text("invalid json { content: 123", encoding="utf-8")
+        with self.assertRaises(ShadowSessionCorruptedError) as ctx:
+            inspect_existing_session_claim(self.fixture_root)
+        self.assertIsNone(ctx.exception.__cause__)
+        self.assertTrue(ctx.exception.__suppress_context__)
+
     def test_documented_limitations_integrity(self) -> None:
         """Session contract disclaimers strictly state platform limits and non-power-loss boundaries."""
-        self.assertIn("SAME-HOST ONE-USE SESSION CLAIM CONTRACT", SHADOW_SESSION_DISCLAIMER)
+        self.assertIn("STAGE B SAME-HOST TEST-FIXTURE SIMULATION CONTRACT", SHADOW_SESSION_DISCLAIMER)
+        self.assertIn("Demonstrates at-most-one claim arbitration within a single attested test directory", SHADOW_SESSION_DISCLAIMER)
+        self.assertIn("NOT a trusted authorization barrier against a caller selecting a different root directory", SHADOW_SESSION_DISCLAIMER)
         self.assertIn("NOT cross-runner, NOT distributed, and NOT an exactly-once", SHADOW_SESSION_DISCLAIMER)
         self.assertIn("NOT a physical power-loss or host-reboot durability guarantee", SHADOW_SESSION_DISCLAIMER)
-        self.assertIn("Missing state on an untrusted or previously used root is UNKNOWN", SHADOW_SESSION_DISCLAIMER)
         self.assertIn("Windows directory durability and owner-host ACL remain blocked", SHADOW_SESSION_DISCLAIMER)
         self.assertIn("Contains zero live network or Gemini SDK capability", SHADOW_SESSION_DISCLAIMER)
 

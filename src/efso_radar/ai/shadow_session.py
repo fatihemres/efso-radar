@@ -1,40 +1,47 @@
 """Stage B: Offline same-host one-use Gemini shadow session claim and replay-denial contract.
 
 Issue #65 / Stage B safety standard & independent review hardening:
-1. Test-Owned Fixture Scope Attestation:
-   Write-capable claim operations are strictly gated behind an explicit ShadowSessionFixtureScope.
-   Arbitrary user, project, desktop, or operational directories cannot self-authorize.
-   Root must reside in system temporary storage under an authentic pytest fixture hierarchy (pytest-of-* or pytest-*).
-2. Clean / Fresh Fixture Enforcement:
+1. Test-Only Simulation Harness:
+   Explicitly an in-process, test-fixture simulation harness for verifying atomic
+   claim arbitration and replay denial within a single caller-provided test directory.
+   NOT a security capability or authorization barrier against a caller selecting a different root.
+   Single-host one-use is proven ONLY within a single fixed directory instance; a caller
+   switching roots is NOT prevented across arbitrary roots.
+2. Fixture Scope Context Gating:
+   Write-capable claim operations are strictly gated behind an active ShadowSessionFixtureScope.
+   Any un-attested directory, repository path, system root, or non-temp location fails before os.open.
+   Zero public arbitrary root registration methods.
+3. Clean / Fresh Fixture Enforcement:
    Fixture root must be verified completely empty before the initial claim. Any foreign files,
    stray manifests, or unrecognized entries cause immediate fail-closed rejection (HALT / UNKNOWN).
    Never silently starts or auto-clears on a reused root.
-3. Canonical Stable Identity:
+4. Canonical Stable Identity:
    Operation identity is strictly derived from immutable inputs:
    - Fixed cohort ID: EFSO-SHADOW-20261030-HISTORICAL-PUBLIC-V1
    - Pinned model: gemini-3.5-flash-lite
    - Fixed purpose version: STAGE-B-SHADOW-V1
    Callers cannot provide arbitrary UUIDs or file names to bypass replay detection.
-4. Pre-Dispatch Consumption & State Machine:
+5. Pre-Dispatch Consumption & State Machine:
    State transitions from verified clean fixture directly to CONSUMED pre-dispatch.
    Any subsequent run, existing record, partial file, corrupted data, foreign identity,
    or untrusted root results in immediate HALT / REPLAY_DENIED.
    Zero TTL reset, zero deletion, zero retry, and zero cleanup on error.
-5. Atomic Creation without Overwrite:
+6. Atomic Creation without Overwrite:
    Uses OS-level atomic creation (os.O_CREAT | os.O_EXCL) with fsync.
    Concurrent races between separate processes on the same host result in exactly one
    successful claim; all other racers fail with FileExists / ReplayDenied.
-6. Error & Path Sanitization:
+7. Error & Path Sanitization (from None):
    Constant sanitized error messages; zero reflection of raw payload contents or sensitive paths.
+   All internal exceptions suppressed via 'raise ... from None' to prevent leakage in tracebacks.
    Reparse point inspection fails closed on any OSError.
-7. Explicit Hardware & Platform Limits:
+8. Explicit Hardware & Platform Limits:
    - Same-host fixture-only at-most-one contract on a fixed attested root;
      NOT global one-use across arbitrary roots, NOT cross-runner, NOT exactly-once.
    - NOT a physical power-loss or host reboot durability guarantee (NTFS directory fsync
      is unsupported in Python standard library).
    - Missing state on an untrusted or previously used root is UNKNOWN, never fresh authorization.
    - Windows directory durability and owner-host ACL remain blocked.
-8. Zero Provider / Network Execution:
+9. Zero Provider / Network Execution:
    Contains ZERO google.genai.Client, HTTP, or network dispatch code.
 """
 from __future__ import annotations
@@ -61,8 +68,9 @@ DEFAULT_PURPOSE_VERSION: str = "STAGE-B-SHADOW-V1"
 MAX_CLAIM_FILE_BYTES: int = 65_536  # 64 KB safety limit for claim files
 
 SHADOW_SESSION_DISCLAIMER: str = (
-    "STAGE B SAME-HOST ONE-USE SESSION CLAIM CONTRACT. "
-    "At-most-one execution claim within a dedicated, attested test fixture root. "
+    "STAGE B SAME-HOST TEST-FIXTURE SIMULATION CONTRACT. "
+    "Demonstrates at-most-one claim arbitration within a single attested test directory. "
+    "NOT a trusted authorization barrier against a caller selecting a different root directory. "
     "NOT cross-runner, NOT distributed, and NOT an exactly-once execution guarantee. "
     "NOT a physical power-loss or host-reboot durability guarantee "
     "(NTFS directory metadata fsync unsupported in Python stdlib). "
@@ -171,11 +179,11 @@ def _is_reparse_point_or_symlink(path: Path) -> bool:
                 return True
         except FileNotFoundError:
             return False
-        except OSError as exc:
-            # Fail closed on any attribute inspection failure
+        except OSError:
+            # Fail closed on any attribute inspection failure; suppress raw OS error
             raise ShadowSessionSecurityError(
                 "Filesystem attribute inspection failed during reparse check."
-            ) from exc
+            ) from None
     return False
 
 
@@ -189,7 +197,6 @@ def validate_test_fixture_root(root_path: Path | str) -> Path:
     - Prohibits repository root, .env, data/, src/, and .git paths.
     - Prohibits user home directory root and system roots.
     - Must reside strictly within system temporary storage, and is NOT the temp root itself.
-    - Must belong to an authentic pytest fixture hierarchy (top component starts with 'pytest-of-' or 'pytest-').
     - On POSIX, owner UID must match process UID and permissions must be 0700.
     """
     if root_path is None or not isinstance(root_path, (str, Path)):
@@ -283,18 +290,6 @@ def validate_test_fixture_root(root_path: Path | str) -> Path:
     if not is_subpath_of_temp or matching_temp_root is None:
         raise ShadowSessionSecurityError("Fixture root does not reside within system temporary storage.")
 
-    # Pytest fixture hierarchy provenance check
-    rel_parts = resolved.relative_to(matching_temp_root).parts
-    if not rel_parts:
-        raise ShadowSessionSecurityError("Fixture root is the temporary root itself.")
-    top_component = rel_parts[0].lower()
-    if not (top_component.startswith("pytest-of-") or top_component.startswith("pytest-")):
-        raise ShadowSessionSecurityError(
-            "Fixture root does not belong to a valid pytest fixture hierarchy "
-            "(expected 'pytest-of-*' or 'pytest-*' directory structure within temporary storage). "
-            "Arbitrary temporary directories cannot self-authorize."
-        )
-
     # POSIX permissions & ownership check (0700)
     if sys.platform != "win32":
         try:
@@ -303,21 +298,27 @@ def validate_test_fixture_root(root_path: Path | str) -> Path:
                 raise ShadowSessionSecurityError("Fixture root owner UID does not match current process UID.")
             if bool(st.st_mode & 0o077):
                 raise ShadowSessionSecurityError("Fixture root has insecure permissions (must be mode 0700).")
-        except OSError as exc:
-            raise ShadowSessionSecurityError("Failed to check fixture root permissions.") from exc
+        except OSError:
+            raise ShadowSessionSecurityError("Failed to check fixture root permissions.") from None
 
     return resolved
 
 
 class ShadowSessionFixtureScope:
-    """Explicit test-owned fixture authorization scope for Stage B shadow session claim tests.
+    """Explicit, test-only simulation harness for Stage B shadow session claim tests.
 
-    Carries explicit attestation that the fixture root was created by pytest's tmp_path
-    or an authentic temporary test fixture within system temporary storage.
-    Arbitrary user, project, or operational directories cannot self-authorize.
+    Threat Model & Limitation Notice:
+    - This scope is strictly an in-process, test-fixture simulation harness for testing
+      concurrency and replay denial within a single caller-provided test directory.
+    - It does NOT provide a cryptographic, OS-level, or authorization barrier against a
+      caller selecting a different root directory.
+    - Single-host one-use is proven ONLY within a single fixed directory instance; a caller
+      switching roots is NOT prevented across arbitrary roots.
+    - Strictly NOT cross-runner, NOT distributed, and NOT an exactly-once execution guarantee.
+    - NOT a physical power-loss or host-reboot durability guarantee.
     """
 
-    _AUTHORIZED_FIXTURE_ROOTS: set[Path] = set()
+    _ACTIVE_SCOPES: set[Path] = set()
 
     def __init__(self, fixture_root: Path | str) -> None:
         self._fixture_root: Path = validate_test_fixture_root(fixture_root)
@@ -328,28 +329,34 @@ class ShadowSessionFixtureScope:
         return self._fixture_root
 
     def __enter__(self) -> ShadowSessionFixtureScope:
-        ShadowSessionFixtureScope._AUTHORIZED_FIXTURE_ROOTS.add(self._fixture_root)
+        ShadowSessionFixtureScope._ACTIVE_SCOPES.add(self._fixture_root)
         self._entered = True
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        ShadowSessionFixtureScope._AUTHORIZED_FIXTURE_ROOTS.discard(self._fixture_root)
+        ShadowSessionFixtureScope._ACTIVE_SCOPES.discard(self._fixture_root)
         self._entered = False
 
     def close(self) -> None:
         self.__exit__(None, None, None)
 
     @classmethod
-    def register_authorized_fixture_root(cls, root: Path | str) -> Path:
-        """Register an authorized test fixture root (e.g. for test subprocess execution)."""
-        validated = validate_test_fixture_root(root)
-        cls._AUTHORIZED_FIXTURE_ROOTS.add(validated)
-        return validated
+    def is_active(cls, path: Path) -> bool:
+        """Check if path is encompassed by an actively entered simulation scope."""
+        for active in cls._ACTIVE_SCOPES:
+            if path == active:
+                return True
+            try:
+                path.relative_to(active)
+                return True
+            except ValueError:
+                pass
+        return False
 
     @classmethod
-    def clear_authorized_fixture_roots(cls) -> None:
-        """Clear all registered authorized fixture roots."""
-        cls._AUTHORIZED_FIXTURE_ROOTS.clear()
+    def clear_active_scopes(cls) -> None:
+        """Clear all actively registered scopes."""
+        cls._ACTIVE_SCOPES.clear()
 
 
 def inspect_existing_session_claim(
@@ -389,14 +396,14 @@ def inspect_existing_session_claim(
         content = target_path.read_text(encoding="utf-8")
         data = json.loads(content)
         record = ShadowSessionClaimRecord.model_validate(data)
-    except (json.JSONDecodeError, ValidationError) as exc:
+    except (json.JSONDecodeError, ValidationError):
         raise ShadowSessionCorruptedError(
             "Existing claim file is malformed or schema-invalid. Replay denied."
-        ) from exc
-    except OSError as exc:
+        ) from None
+    except OSError:
         raise ShadowSessionCorruptedError(
             "Failed to read existing claim file. Replay denied."
-        ) from exc
+        ) from None
 
     expected_identity = compute_canonical_session_identity(cohort_id, model_name, purpose_version)
     if record.session_identity != expected_identity:
@@ -413,11 +420,11 @@ def claim_shadow_session(
     model_name: str = ALLOWED_SHADOW_MODEL,
     purpose_version: str = DEFAULT_PURPOSE_VERSION,
 ) -> ShadowSessionClaimRecord:
-    """Atomically claim a single-use shadow session within an attested test fixture root.
+    """Atomically claim a single-use shadow session within an attested test fixture scope.
 
     Contract:
-    1. Validates fixture root boundaries (temp storage, pytest provenance, 0700).
-    2. Enforces explicit ShadowSessionFixtureScope attestation before any filesystem write.
+    1. Validates fixture root boundaries (temp storage, 0700).
+    2. Enforces active ShadowSessionFixtureScope context before any filesystem write.
     3. Requires clean / empty fixture directory before initial claim.
        Any foreign files or stray entries cause immediate fail-closed rejection.
     4. Derives deterministic canonical filename: callers cannot vary UUIDs to evade replay.
@@ -434,30 +441,18 @@ def claim_shadow_session(
     """
     validated_root = validate_test_fixture_root(fixture_root)
 
-    # P1 Gate: Fixture root must be explicitly attested via ShadowSessionFixtureScope
-    is_authorized = False
-    for auth_root in ShadowSessionFixtureScope._AUTHORIZED_FIXTURE_ROOTS:
-        if validated_root == auth_root:
-            is_authorized = True
-            break
-        try:
-            validated_root.relative_to(auth_root)
-            is_authorized = True
-            break
-        except ValueError:
-            pass
-
-    if not is_authorized:
+    # Gated behind active ShadowSessionFixtureScope context
+    if not ShadowSessionFixtureScope.is_active(validated_root):
         raise ShadowSessionSecurityError(
-            "Fixture root has not been attested as an authorized test-owned fixture scope. "
-            "Arbitrary directories cannot execute session claims."
+            "Fixture root has not been entered via an active ShadowSessionFixtureScope test context. "
+            "Un-attested directories cannot execute session claims."
         )
 
     identity = compute_canonical_session_identity(cohort_id, model_name, purpose_version)
     filename = get_canonical_claim_filename(cohort_id, model_name, purpose_version)
     target_path = validated_root / filename
 
-    # P2 Gate: Clean / empty fixture enforcement
+    # Clean / empty fixture enforcement
     entries = list(validated_root.iterdir())
     if target_path.exists():
         if len(entries) > 1:
@@ -502,12 +497,12 @@ def claim_shadow_session(
     fd = -1
     try:
         fd = os.open(target_path, flags, 0o600)
-    except FileExistsError as exc:
+    except FileExistsError:
         raise ShadowSessionReplayError(
             "Replay denied: atomic session claim lost race; claim file already exists."
-        ) from exc
-    except OSError as exc:
-        raise ShadowSessionStorageError("Failed to create session claim file. Replay denied.") from exc
+        ) from None
+    except OSError:
+        raise ShadowSessionStorageError("Failed to create session claim file. Replay denied.") from None
 
     try:
         bytes_written = 0
@@ -518,15 +513,12 @@ def claim_shadow_session(
                 raise ShadowSessionStorageError("Short write encountered while writing session claim.")
             bytes_written += n
         os.fsync(fd)
-    except Exception as exc:
+    except Exception:
         # FAIL-CLOSED: DO NOT DELETE THE FILE!
-        logger.error(
-            "I/O or fsync error during session claim creation. Partial state retained on disk for replay denial: %s",
-            type(exc).__name__,
-        )
+        logger.error("I/O error during session claim creation. Partial state retained on disk for replay denial.")
         raise ShadowSessionStorageError(
             "Failed to fsync session claim to disk. State retained on disk to deny replay."
-        ) from exc
+        ) from None
     finally:
         if fd >= 0:
             try:

@@ -26,11 +26,12 @@ Stage B Software Preparation & Safety Rules:
 """
 from __future__ import annotations
 
+from enum import Enum
 import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -72,6 +73,16 @@ STAGE_B_OFFLINE_DISCLAIMER = (
     "editorial precision, recall, or end-to-end product acceptance. "
     "Provider charge is NOT_VERIFIED; no live inference or invoice reconciliation has occurred."
 )
+
+
+class SimulatedDispatchOutcome(str, Enum):
+    """Closed, inert outcome enumeration for hermetic test simulation seam.
+
+    Callers cannot execute arbitrary callbacks or network handlers.
+    """
+
+    SUCCESS = "SUCCESS"
+    SIMULATED_UNKNOWN = "SIMULATED_UNKNOWN"
 
 
 class ShadowOperatorResult(BaseModel):
@@ -652,7 +663,7 @@ class OneShotShadowOperatorRunner:
     def simulate_hermetic_dispatched_session(
         self,
         session_fixture_root: Path | str,
-        dispatch_callback: Optional[Callable[[], Any]] = None,
+        simulated_outcome: SimulatedDispatchOutcome = SimulatedDispatchOutcome.SUCCESS,
         candidates: Optional[list[Article]] = None,
         as_of_time: Optional[datetime] = None,
         purpose_version: str = "STAGE-B-SHADOW-V1",
@@ -664,11 +675,11 @@ class OneShotShadowOperatorRunner:
            If validation fails, HALTS with zero claim I/O.
         2. Enforces single-shot execution on this runner instance.
         3. Performs atomic pre-dispatch session claim in the attested test fixture root.
-        4. Invokes the hypothetical dispatch_callback (mock transition or simulated interruption).
-           Zero live SDK client calls or network connections.
-        5. If dispatch_callback raises an exception (simulated interruption or ambiguous dispatch),
+        4. Simulates dispatch outcome using closed SimulatedDispatchOutcome enum only.
+           Zero live SDK client calls, network connections, or caller-provided callbacks.
+        5. If simulated_outcome is SIMULATED_UNKNOWN, raises AIEvaluationError while
            the claim record remains CONSUMED on disk to prove replay prevention.
-        6. If dispatch_callback succeeds (or is None), returns the resulting ShadowOperatorResult
+        6. If simulated_outcome is SUCCESS, returns the resulting ShadowOperatorResult
            with session_lock_status updated to SAME_HOST_FIXTURE_CLAIM_CONSUMED:<canonical_id>.
         """
         if self._execution_attempted:
@@ -684,6 +695,15 @@ class OneShotShadowOperatorRunner:
 
         if self.settings.enable_search_grounding:
             raise AIEvaluationError("Search grounding is strictly forbidden in shadow operator")
+
+        # Validate simulated outcome parameter
+        if isinstance(simulated_outcome, str):
+            try:
+                simulated_outcome = SimulatedDispatchOutcome(simulated_outcome)
+            except ValueError:
+                raise ValueError(f"Invalid simulated dispatch outcome: {simulated_outcome}")
+        elif not isinstance(simulated_outcome, SimulatedDispatchOutcome):
+            raise ValueError(f"Invalid simulated dispatch outcome: {simulated_outcome}")
 
         # Validate candidate data BEFORE any filesystem I/O
         active_candidates = self._resolve_and_validate_candidates(candidates)
@@ -703,7 +723,7 @@ class OneShotShadowOperatorRunner:
             used_search_grounding=False,
         )
 
-        # Pre-dispatch session claim in attested test fixture root: consumed BEFORE dispatch callback
+        # Pre-dispatch session claim in attested test fixture root: consumed BEFORE dispatch simulation
         claim_record = claim_shadow_session(
             fixture_root=session_fixture_root,
             cohort_id=SHADOW_SAMPLE_ID,
@@ -712,9 +732,12 @@ class OneShotShadowOperatorRunner:
         )
         self._execution_attempted = True
 
-        # Exercise hypothetical dispatch callback (mock/simulation only)
-        if dispatch_callback is not None:
-            dispatch_callback()
+        # Closed simulated dispatch outcome: no caller execution, no network
+        if simulated_outcome == SimulatedDispatchOutcome.SIMULATED_UNKNOWN:
+            raise AIEvaluationError(
+                "Simulated hermetic dispatch interrupted with unknown outcome. "
+                "Session claim retained on disk to deny replay."
+            )
 
         return ShadowOperatorResult(
             sample_id=SHADOW_SAMPLE_ID,
