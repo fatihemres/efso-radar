@@ -11,6 +11,7 @@ Covers:
 - Source registry and excluded source catalog
 """
 import unittest
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
@@ -387,6 +388,85 @@ class TestMultiSourceDiscoveryEngine(unittest.TestCase):
         self.assertTrue(any("source_frequency_dampened" in r for r in reasons_heavy))
 
 
+class TestRSSFeedSource(unittest.TestCase):
+    """Hermetic regression tests for RSSFeedSource retry, backoff, and failure semantics."""
+
+    def setUp(self) -> None:
+        self.now = datetime(2026, 10, 12, 14, 0, 0, tzinfo=timezone.utc)
+        self.source_def = SourceDefinition(
+            source_id="test_rss_retry",
+            name="Test Retry Feed",
+            url="https://example.com/rss",
+            market=Market.TR,
+            category="MAGAZIN_TR",
+            timeout_seconds=5,
+        )
+        self.sample_rss_bytes = (
+            b'<?xml version="1.0" encoding="UTF-8"?>\n'
+            b'<rss version="2.0">\n'
+            b'  <channel>\n'
+            b'    <title>Test Feed</title>\n'
+            b'    <link>https://example.com</link>\n'
+            b'    <item>\n'
+            b'      <title>Haber Basligi</title>\n'
+            b'      <link>https://example.com/haber1</link>\n'
+            b'      <pubDate>Mon, 12 Oct 2026 12:00:00 GMT</pubDate>\n'
+            b'      <description>Haber ozeti metni</description>\n'
+            b'    </item>\n'
+            b'  </channel>\n'
+            b'</rss>\n'
+        )
+
+    def _create_mock_200_response(self) -> MagicMock:
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = self.sample_rss_bytes
+        mock_resp.__enter__.return_value = mock_resp
+        mock_resp.__exit__.return_value = None
+        return mock_resp
+
+    def test_fetch_result_retry_success_after_503(self) -> None:
+        """HTTP 503 triggers retry backoff and succeeds on subsequent 200 response."""
+        client = RSSFeedSource(self.source_def, max_retries=2)
+        err_503 = urllib.error.HTTPError(self.source_def.url, 503, "Service Unavailable", {}, None)
+        mock_resp_200 = self._create_mock_200_response()
+
+        with patch("urllib.request.urlopen", side_effect=[err_503, mock_resp_200]) as mock_open, patch("time.sleep") as mock_sleep:
+            result = client.fetch_result(now=self.now)
+
+        self.assertEqual(mock_open.call_count, 2)
+        mock_sleep.assert_called_once_with(0.35)
+        self.assertEqual(len(result.articles), 1)
+        self.assertEqual(result.articles[0].title, "Haber Basligi")
+
+    def test_fetch_result_retry_success_after_timeout(self) -> None:
+        """Network timeout triggers retry backoff and succeeds on subsequent 200 response."""
+        client = RSSFeedSource(self.source_def, max_retries=2)
+        mock_resp_200 = self._create_mock_200_response()
+
+        with patch("urllib.request.urlopen", side_effect=[TimeoutError("Synthetic socket timeout"), mock_resp_200]) as mock_open, patch("time.sleep") as mock_sleep:
+            result = client.fetch_result(now=self.now)
+
+        self.assertEqual(mock_open.call_count, 2)
+        mock_sleep.assert_called_once_with(0.35)
+        self.assertEqual(len(result.articles), 1)
+        self.assertEqual(result.articles[0].title, "Haber Basligi")
+
+    def test_fetch_result_all_retries_exhausted_raises_exception(self) -> None:
+        """Exhausting all retry attempts raises the last encountered exception with expected backoffs."""
+        client = RSSFeedSource(self.source_def, max_retries=2)
+        err_503 = urllib.error.HTTPError(self.source_def.url, 503, "Service Unavailable", {}, None)
+
+        with patch("urllib.request.urlopen", side_effect=[err_503, err_503, err_503]) as mock_open, patch("time.sleep") as mock_sleep:
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                client.fetch_result(now=self.now)
+
+        self.assertEqual(ctx.exception.code, 503)
+        self.assertEqual(mock_open.call_count, 3)
+        self.assertEqual(mock_sleep.call_count, 2)
+        self.assertEqual(mock_sleep.call_args_list[0][0][0], 0.35)
+        self.assertEqual(mock_sleep.call_args_list[1][0][0], 0.70)
+
+
 if __name__ == "__main__":
     unittest.main()
-

@@ -19,6 +19,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import httpx
 
@@ -237,6 +238,38 @@ class TestPhase4EDigestDelivery(unittest.TestCase):
         with open(self.ledger_path, "r", encoding="utf-8") as f:
             saved_ledger = json.load(f)
         self.assertEqual(saved_ledger["deliveries"][result["digest_hash"]]["status"], "DELIVERY_UNCERTAIN")
+
+
+    def test_digest_delivery_claim_repository_error_fails_closed(self) -> None:
+        """Repository claim exception fails closed with REPOSITORY_ERROR and zero Telegram HTTP calls."""
+        calls = []
+
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 999}})
+
+        mock_transport = httpx.MockTransport(mock_handler)
+        mock_repo = MagicMock()
+        mock_repo.claim_telegram_delivery.side_effect = RuntimeError("Synthetic database locked failure")
+        live_settings = self.settings.model_copy(update={"telegram_delivery_enabled": True})
+
+        result = deliver_one_shot_editorial_digest(
+            settings=live_settings,
+            assessments=self.assessments,
+            dry_run=False,
+            ledger_path=self.ledger_path,
+            repository=mock_repo,
+            transport=mock_transport,
+        )
+
+        self.assertEqual(result["status"], "REPOSITORY_ERROR")
+        self.assertFalse(result["attempt_made"])
+        self.assertEqual(result["attempts_count"], 0)
+        self.assertEqual(len(calls), 0)
+        self.assertIn("PRIMARY_EDITOR", result["recipient_results"])
+        self.assertEqual(result["recipient_results"]["PRIMARY_EDITOR"]["status"], "REPOSITORY_ERROR")
+        self.assertFalse(result["recipient_results"]["PRIMARY_EDITOR"]["attempt_made"])
+        self.assertIn("Synthetic database locked failure", result["recipient_results"]["PRIMARY_EDITOR"]["error"])
 
 
 if __name__ == "__main__":
