@@ -1282,7 +1282,8 @@ class TursoStateRepository(StateRepository):
                 updated_at = ?,
                 sent_at = COALESCE(sent_at, ?),
                 attempt_count = CASE
-                    WHEN status = 'PENDING' AND ? IN ('SENT', 'FAILED', 'DELIVERY_UNCERTAIN') THEN MAX(attempt_count, 1)
+                    WHEN status IN ('PENDING', 'HELD_QUIET_HOURS', 'HELD_FOR_VERIFICATION', 'HELD_FOR_SENSITIVE_REVIEW', 'FAILED')
+                         AND ? IN ('SENT', 'FAILED', 'DELIVERY_UNCERTAIN') THEN MAX(attempt_count, 1)
                     ELSE attempt_count
                 END
             WHERE delivery_id = ?
