@@ -630,6 +630,7 @@ class RepositoryContractTestMixin:
         stored = self.repo.get_telegram_delivery(chat_id, message_key)
         self.assertIsNotNone(stored)
         self.assertEqual(stored.status, DeliveryStatus.DELIVERY_UNCERTAIN)
+        self.assertEqual(stored.attempt_count, 1, "Initial claim + status update with max_attempts=1 must have attempt_count == 1")
         self.assertEqual(stored.error_message, original_error)
         self.assertEqual(stored.payload, payload)
         self.assertIsNone(stored.sent_at)
@@ -789,6 +790,331 @@ class RepositoryContractTestMixin:
             status=DeliveryStatus.DELIVERY_UNCERTAIN,
         )
         self.assertFalse(res)
+
+
+    def test_delivery_attempt_counter_lifecycle_and_single_attempt_correctness(self):
+        """Verifies attempt_count represents actual dispatch attempts across claim, update, retry, and pending states."""
+        chat_id = "1000000001"
+        t0 = self.now
+
+        # 1. Single attempt: DISPATCHING -> SENT with max_attempts=1
+        deliv_id_sent = "deliv_counter_sent_001"
+        key_sent = "key_counter_sent_001"
+        self.assertTrue(
+            self.repo.claim_telegram_delivery(
+                delivery_id=deliv_id_sent,
+                message_key=key_sent,
+                recipient_role="PRIMARY_EDITOR",
+                recipient_chat_id=chat_id,
+                category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                max_attempts=1,
+            )
+        )
+        rec_disp = self.repo.get_telegram_delivery(chat_id, key_sent)
+        self.assertIsNotNone(rec_disp)
+        self.assertEqual(rec_disp.status, DeliveryStatus.DISPATCHING)
+        self.assertEqual(rec_disp.attempt_count, 1)
+
+        self.assertTrue(self.repo.update_telegram_delivery_status(deliv_id_sent, DeliveryStatus.SENT))
+        rec_sent = self.repo.get_telegram_delivery(chat_id, key_sent)
+        self.assertIsNotNone(rec_sent)
+        self.assertEqual(rec_sent.status, DeliveryStatus.SENT)
+        self.assertEqual(rec_sent.attempt_count, 1, "Single successful delivery attempt must have attempt_count == 1")
+
+        # Subsequent claim permanently rejected
+        self.assertFalse(
+            self.repo.claim_telegram_delivery(
+                delivery_id="deliv_counter_sent_retry",
+                message_key=key_sent,
+                recipient_role="PRIMARY_EDITOR",
+                recipient_chat_id=chat_id,
+                category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            )
+        )
+
+        # 2. Single attempt: DISPATCHING -> FAILED with max_attempts=1
+        deliv_id_failed = "deliv_counter_failed_001"
+        key_failed = "key_counter_failed_001"
+        self.assertTrue(
+            self.repo.claim_telegram_delivery(
+                delivery_id=deliv_id_failed,
+                message_key=key_failed,
+                recipient_role="PRIMARY_EDITOR",
+                recipient_chat_id=chat_id,
+                category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                max_attempts=1,
+            )
+        )
+        self.assertTrue(
+            self.repo.update_telegram_delivery_status(
+                deliv_id_failed, DeliveryStatus.FAILED, error_message="Fatal HTTP 403"
+            )
+        )
+        rec_failed = self.repo.get_telegram_delivery(chat_id, key_failed)
+        self.assertIsNotNone(rec_failed)
+        self.assertEqual(rec_failed.status, DeliveryStatus.FAILED)
+        self.assertEqual(rec_failed.attempt_count, 1, "Single failed delivery attempt must have attempt_count == 1")
+
+        # Retry blocked because attempt_count (1) >= max_attempts (1)
+        self.assertFalse(
+            self.repo.claim_telegram_delivery(
+                delivery_id="deliv_counter_failed_retry",
+                message_key=key_failed,
+                recipient_role="PRIMARY_EDITOR",
+                recipient_chat_id=chat_id,
+                category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                max_attempts=1,
+            )
+        )
+
+        # 3. Multi-attempt retry lifecycle with max_attempts=2: FAILED -> re-claim -> SENT
+        deliv_id_retry = "deliv_counter_retry_001"
+        key_retry = "key_counter_retry_001"
+        # Attempt 1
+        self.assertTrue(
+            self.repo.claim_telegram_delivery(
+                delivery_id=deliv_id_retry,
+                message_key=key_retry,
+                recipient_role="PRIMARY_EDITOR",
+                recipient_chat_id=chat_id,
+                category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                max_attempts=2,
+            )
+        )
+        self.assertEqual(self.repo.get_telegram_delivery(chat_id, key_retry).attempt_count, 1)
+        self.assertTrue(
+            self.repo.update_telegram_delivery_status(
+                deliv_id_retry, DeliveryStatus.FAILED, error_message="Temporary network glitch"
+            )
+        )
+        rec_retry_1 = self.repo.get_telegram_delivery(chat_id, key_retry)
+        self.assertEqual(rec_retry_1.attempt_count, 1, "First failed attempt must leave attempt_count == 1")
+
+        # Attempt 2 (re-claim allowed because attempt_count 1 < max_attempts 2)
+        self.assertTrue(
+            self.repo.claim_telegram_delivery(
+                delivery_id=deliv_id_retry,
+                message_key=key_retry,
+                recipient_role="PRIMARY_EDITOR",
+                recipient_chat_id=chat_id,
+                category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                max_attempts=2,
+            )
+        )
+        rec_retry_disp2 = self.repo.get_telegram_delivery(chat_id, key_retry)
+        self.assertEqual(rec_retry_disp2.status, DeliveryStatus.DISPATCHING)
+        self.assertEqual(rec_retry_disp2.attempt_count, 2, "Second claim must set attempt_count == 2")
+
+        # Attempt 2 finalization
+        self.assertTrue(self.repo.update_telegram_delivery_status(deliv_id_retry, DeliveryStatus.SENT))
+        rec_retry_2 = self.repo.get_telegram_delivery(chat_id, key_retry)
+        self.assertEqual(rec_retry_2.status, DeliveryStatus.SENT)
+        self.assertEqual(rec_retry_2.attempt_count, 2, "Second successful attempt must leave attempt_count == 2")
+
+        # Attempt 3 blocked (already SENT and attempt_count 2 >= max_attempts 2)
+        self.assertFalse(
+            self.repo.claim_telegram_delivery(
+                delivery_id="deliv_counter_retry_003",
+                message_key=key_retry,
+                recipient_role="PRIMARY_EDITOR",
+                recipient_chat_id=chat_id,
+                category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                max_attempts=2,
+            )
+        )
+
+        # 4. Direct update on un-claimed / pre-seeded record in PENDING (attempt_count=0)
+        deliv_id_pend = "deliv_counter_pend_001"
+        key_pend = "key_counter_pend_001"
+        rec_pend = TelegramDeliveryRecord(
+            delivery_id=deliv_id_pend,
+            message_key=key_pend,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=chat_id,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            status=DeliveryStatus.PENDING,
+            attempt_count=0,
+            max_attempts=1,
+            created_at=t0,
+            updated_at=t0,
+            sent_at=None,
+        )
+        self.repo.record_telegram_delivery(rec_pend)
+        self.assertEqual(self.repo.get_telegram_delivery(chat_id, key_pend).attempt_count, 0)
+
+        # Direct transition PENDING -> HELD_QUIET_HOURS does not count as a dispatch attempt
+        self.assertTrue(
+            self.repo.update_telegram_delivery_status(deliv_id_pend, DeliveryStatus.HELD_QUIET_HOURS)
+        )
+        rec_quiet = self.repo.get_telegram_delivery(chat_id, key_pend)
+        self.assertEqual(rec_quiet.status, DeliveryStatus.HELD_QUIET_HOURS)
+        self.assertEqual(rec_quiet.attempt_count, 0, "Non-dispatch status update must not increment attempt_count")
+
+        # Direct transition from PENDING -> SENT (e.g. legacy/direct update) sets attempt_count to 1
+        deliv_id_pend_sent = "deliv_counter_pend_002"
+        key_pend_sent = "key_counter_pend_002"
+        rec_pend_sent = TelegramDeliveryRecord(
+            delivery_id=deliv_id_pend_sent,
+            message_key=key_pend_sent,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=chat_id,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            status=DeliveryStatus.PENDING,
+            attempt_count=0,
+            max_attempts=1,
+            created_at=t0,
+            updated_at=t0,
+            sent_at=None,
+        )
+        self.repo.record_telegram_delivery(rec_pend_sent)
+        self.assertTrue(
+            self.repo.update_telegram_delivery_status(deliv_id_pend_sent, DeliveryStatus.SENT)
+        )
+        rec_direct_sent = self.repo.get_telegram_delivery(chat_id, key_pend_sent)
+        self.assertEqual(rec_direct_sent.status, DeliveryStatus.SENT)
+        self.assertEqual(rec_direct_sent.attempt_count, 1, "Direct transition PENDING -> SENT must reflect 1 attempt")
+
+    def test_delivery_attempt_counter_held_and_direct_transitions_parity(self):
+        """Verifies attempt_count semantics for HELD_* and direct status transitions across backends."""
+        chat_id = "1000000002"
+        t0 = self.now
+
+        # 1. HELD_QUIET_HOURS -> SENT directly: attempt_count promoted to 1
+        deliv_id_quiet = "deliv_held_quiet_001"
+        key_quiet = "key_held_quiet_001"
+        self.repo.record_telegram_delivery(
+            TelegramDeliveryRecord(
+                delivery_id=deliv_id_quiet,
+                message_key=key_quiet,
+                recipient_role="PRIMARY_EDITOR",
+                recipient_chat_id=chat_id,
+                category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                status=DeliveryStatus.HELD_QUIET_HOURS,
+                attempt_count=0,
+                max_attempts=1,
+                created_at=t0,
+                updated_at=t0,
+            )
+        )
+        self.assertTrue(self.repo.update_telegram_delivery_status(deliv_id_quiet, DeliveryStatus.SENT))
+        rec_quiet_sent = self.repo.get_telegram_delivery(chat_id, key_quiet)
+        self.assertIsNotNone(rec_quiet_sent)
+        self.assertEqual(rec_quiet_sent.status, DeliveryStatus.SENT)
+        self.assertEqual(rec_quiet_sent.attempt_count, 1, "HELD_QUIET_HOURS -> SENT must promote attempt_count to 1")
+
+        # 2. HELD_FOR_VERIFICATION -> SENT directly: attempt_count promoted to 1
+        deliv_id_verif = "deliv_held_verif_001"
+        key_verif = "key_held_verif_001"
+        self.repo.record_telegram_delivery(
+            TelegramDeliveryRecord(
+                delivery_id=deliv_id_verif,
+                message_key=key_verif,
+                recipient_role="PRIMARY_EDITOR",
+                recipient_chat_id=chat_id,
+                category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                status=DeliveryStatus.HELD_FOR_VERIFICATION,
+                attempt_count=0,
+                max_attempts=1,
+                created_at=t0,
+                updated_at=t0,
+            )
+        )
+        self.assertTrue(self.repo.update_telegram_delivery_status(deliv_id_verif, DeliveryStatus.SENT))
+        rec_verif_sent = self.repo.get_telegram_delivery(chat_id, key_verif)
+        self.assertIsNotNone(rec_verif_sent)
+        self.assertEqual(rec_verif_sent.status, DeliveryStatus.SENT)
+        self.assertEqual(rec_verif_sent.attempt_count, 1, "HELD_FOR_VERIFICATION -> SENT must promote attempt_count to 1")
+
+        # 3. HELD_FOR_SENSITIVE_REVIEW -> SENT directly: attempt_count promoted to 1
+        deliv_id_sens = "deliv_held_sens_001"
+        key_sens = "key_held_sens_001"
+        self.repo.record_telegram_delivery(
+            TelegramDeliveryRecord(
+                delivery_id=deliv_id_sens,
+                message_key=key_sens,
+                recipient_role="PRIMARY_EDITOR",
+                recipient_chat_id=chat_id,
+                category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                status=DeliveryStatus.HELD_FOR_SENSITIVE_REVIEW,
+                attempt_count=0,
+                max_attempts=1,
+                created_at=t0,
+                updated_at=t0,
+            )
+        )
+        self.assertTrue(self.repo.update_telegram_delivery_status(deliv_id_sens, DeliveryStatus.SENT))
+        rec_sens_sent = self.repo.get_telegram_delivery(chat_id, key_sens)
+        self.assertIsNotNone(rec_sens_sent)
+        self.assertEqual(rec_sens_sent.status, DeliveryStatus.SENT)
+        self.assertEqual(rec_sens_sent.attempt_count, 1, "HELD_FOR_SENSITIVE_REVIEW -> SENT must promote attempt_count to 1")
+
+        # 4. Non-dispatch transitions from HELD_* must preserve attempt_count == 0
+        deliv_id_exp = "deliv_held_exp_001"
+        key_exp = "key_held_exp_001"
+        self.repo.record_telegram_delivery(
+            TelegramDeliveryRecord(
+                delivery_id=deliv_id_exp,
+                message_key=key_exp,
+                recipient_role="PRIMARY_EDITOR",
+                recipient_chat_id=chat_id,
+                category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                status=DeliveryStatus.HELD_QUIET_HOURS,
+                attempt_count=0,
+                max_attempts=1,
+                created_at=t0,
+                updated_at=t0,
+            )
+        )
+        self.assertTrue(self.repo.update_telegram_delivery_status(deliv_id_exp, DeliveryStatus.EXPIRED_STALE))
+        rec_exp = self.repo.get_telegram_delivery(chat_id, key_exp)
+        self.assertEqual(rec_exp.status, DeliveryStatus.EXPIRED_STALE)
+        self.assertEqual(rec_exp.attempt_count, 0, "HELD_QUIET_HOURS -> EXPIRED_STALE must retain attempt_count == 0")
+
+        # 5. Pre-seeded FAILED (attempt_count=0) -> SENT directly promotes attempt_count to 1
+        deliv_id_f0 = "deliv_failed_seed_001"
+        key_f0 = "key_failed_seed_001"
+        self.repo.record_telegram_delivery(
+            TelegramDeliveryRecord(
+                delivery_id=deliv_id_f0,
+                message_key=key_f0,
+                recipient_role="PRIMARY_EDITOR",
+                recipient_chat_id=chat_id,
+                category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                status=DeliveryStatus.FAILED,
+                attempt_count=0,
+                max_attempts=1,
+                created_at=t0,
+                updated_at=t0,
+            )
+        )
+        self.assertTrue(self.repo.update_telegram_delivery_status(deliv_id_f0, DeliveryStatus.SENT))
+        rec_f0 = self.repo.get_telegram_delivery(chat_id, key_f0)
+        self.assertEqual(rec_f0.status, DeliveryStatus.SENT)
+        self.assertEqual(rec_f0.attempt_count, 1, "Pre-seeded FAILED(0) -> SENT must promote attempt_count to 1")
+
+        # 6. Claimed FAILED (attempt_count=1) -> SENT directly preserves attempt_count == 1 under max_attempts=1
+        deliv_id_f1 = "deliv_failed_claimed_001"
+        key_f1 = "key_failed_claimed_001"
+        self.assertTrue(
+            self.repo.claim_telegram_delivery(
+                delivery_id=deliv_id_f1,
+                message_key=key_f1,
+                recipient_role="PRIMARY_EDITOR",
+                recipient_chat_id=chat_id,
+                category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+                max_attempts=1,
+            )
+        )
+        self.assertTrue(self.repo.update_telegram_delivery_status(deliv_id_f1, DeliveryStatus.FAILED))
+        rec_f1_pre = self.repo.get_telegram_delivery(chat_id, key_f1)
+        self.assertEqual(rec_f1_pre.status, DeliveryStatus.FAILED)
+        self.assertEqual(rec_f1_pre.attempt_count, 1)
+
+        # Direct status update FAILED -> SENT without re-claim
+        self.assertTrue(self.repo.update_telegram_delivery_status(deliv_id_f1, DeliveryStatus.SENT))
+        rec_f1_post = self.repo.get_telegram_delivery(chat_id, key_f1)
+        self.assertEqual(rec_f1_post.status, DeliveryStatus.SENT)
+        self.assertEqual(rec_f1_post.attempt_count, 1, "Direct FAILED(1) -> SENT must preserve attempt_count == 1")
 
 
 class TestSqliteRepositoryParity(unittest.TestCase, RepositoryContractTestMixin):

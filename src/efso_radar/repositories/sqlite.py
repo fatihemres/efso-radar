@@ -1375,11 +1375,15 @@ class SqliteStateRepository(StateRepository):
                     error_message = ?,
                     updated_at = ?,
                     sent_at = COALESCE(sent_at, ?),
-                    attempt_count = attempt_count + 1
+                    attempt_count = CASE
+                        WHEN status IN ('PENDING', 'HELD_QUIET_HOURS', 'HELD_FOR_VERIFICATION', 'HELD_FOR_SENSITIVE_REVIEW', 'FAILED')
+                             AND ? IN ('SENT', 'FAILED', 'DELIVERY_UNCERTAIN') THEN MAX(attempt_count, 1)
+                        ELSE attempt_count
+                    END
                 WHERE delivery_id = ?
                   AND status NOT IN ('SENT', 'DELIVERY_UNCERTAIN')
                 """,
-                (status.value, error_message, now_iso, sent_iso, delivery_id),
+                (status.value, error_message, now_iso, sent_iso, status.value, delivery_id),
             )
             return cursor.rowcount > 0
 
