@@ -164,7 +164,10 @@ class ShadowPreflightResult(BaseModel):
     theoretical_paid_equivalent_usd: float = Field(
         description="Defensive theoretical estimate based on public list pricing; NOT a verified charge"
     )
-    call_count: int = Field(description="Actual inference calls executed (strictly 0 in Stage A)")
+    call_count: int = Field(default=0, description="Actual provider inference calls executed (strictly 0 in Stage A)")
+    synthetic_evaluation_count: int = Field(
+        default=0, description="Synthetic structured payload evaluations executed (hermetic test only)"
+    )
     sdk_network_executed: bool = Field(default=False, description="Whether any network SDK call was made")
     zero_retry_design_contract: str = Field(
         default="HttpRetryOptions(attempts=1) designed; NO live SDK session exercised",
@@ -196,7 +199,8 @@ class ShadowPreflightResult(BaseModel):
             f"- **Free-Tier Gate:** `{self.free_tier_gate_status}`",
             f"- **Actual Cost Incurred:** `${self.actual_cost_usd:.4f}` USD ($0.00 / 0 TRY)",
             f"- **Theoretical Paid-Equivalent:** `~${self.theoretical_paid_equivalent_usd:.4f}` USD (Defensive estimate only)",
-            f"- **SDK Network Calls Executed:** `{self.call_count}` (Network-capable calls absent in Stage A)",
+            f"- **Provider API Calls Executed:** `{self.call_count}` (Stage A contains zero network-capable calls; strictly 0)",
+            f"- **Synthetic Evaluations Executed:** `{self.synthetic_evaluation_count}` (Hermetic offline test only)",
             f"- **Retry Contract (Designed):** `{self.zero_retry_design_contract}`",
             f"- **Search Grounding:** `{'Disabled' if self.grounding_forbidden else 'Enabled'}`",
             f"- **Candidate Count:** `{self.candidate_count}` (Public historical sample only)",
@@ -273,18 +277,34 @@ class OneShotShadowPreflightRunner:
 
     def __init__(self, settings: Optional[Settings] = None):
         self.settings = settings or Settings()
-        self._call_count = 0
+        self._provider_call_count = 0
+        self._synthetic_evaluation_count = 0
 
     @property
     def call_count(self) -> int:
-        return self._call_count
+        """Provider inference calls executed (strictly 0 in Stage A)."""
+        return self._provider_call_count
+
+    @property
+    def provider_call_count(self) -> int:
+        """Provider inference calls executed (strictly 0 in Stage A)."""
+        return self._provider_call_count
+
+    @property
+    def synthetic_evaluation_count(self) -> int:
+        """Synthetic structured payload evaluations executed (test-only)."""
+        return self._synthetic_evaluation_count
 
     def _resolve_and_validate_candidates(
         self, candidates: Optional[list[Article]] = None
     ) -> list[Article]:
-        """Enforce that only the authorized historical public sample can enter Stage A preflight."""
+        """Enforce that only the authentic, unaltered historical public sample can enter Stage A.
+
+        Stage A is strictly bound to the authorized historical public news sample (SHADOW_SAMPLE_ID).
+        Any custom candidates, candidate lists with different IDs, or candidates with altered/tampered
+        title, snippet, URL, source, or metadata are strictly rejected fail-closed.
+        """
         authorized_sample = get_historical_public_shadow_sample()
-        authorized_ids = {a.id for a in authorized_sample}
 
         if candidates is None:
             return authorized_sample
@@ -292,13 +312,32 @@ class OneShotShadowPreflightRunner:
         if not candidates:
             raise AIEvaluationError("Candidate list is empty: shadow preflight requires at least one article")
 
+        auth_by_id = {a.id: a for a in authorized_sample}
         input_ids = {c.id for c in candidates}
-        if input_ids != authorized_ids:
+        if input_ids != set(auth_by_id.keys()):
             raise AIEvaluationError(
                 f"Arbitrary candidates rejected: Stage A is strictly restricted to the authorized "
                 f"historical public metadata sample ({SHADOW_SAMPLE_ID}). Custom candidate ingestion is forbidden."
             )
-        return candidates
+
+        # Rigorous content integrity: reject candidates with identical IDs but modified content
+        for c in candidates:
+            auth_art = auth_by_id[c.id]
+            if (
+                c.title != auth_art.title
+                or c.url != auth_art.url
+                or c.snippet != auth_art.snippet
+                or c.source != auth_art.source
+                or c.market != auth_art.market
+                or c.published_at != auth_art.published_at
+                or c.canonical_url != auth_art.canonical_url
+            ):
+                raise AIEvaluationError(
+                    f"Candidate content modification rejected: candidate '{c.id}' has altered title, "
+                    f"snippet, URL, or metadata. Stage A strictly forbids tampered candidate content."
+                )
+
+        return authorized_sample
 
     def run_preflight(
         self,
@@ -384,6 +423,7 @@ class OneShotShadowPreflightRunner:
                 actual_cost_usd=0.0,
                 theoretical_paid_equivalent_usd=est_paid_cost,
                 call_count=0,
+                synthetic_evaluation_count=0,
                 sdk_network_executed=False,
                 zero_retry_design_contract="HttpRetryOptions(attempts=1) designed; NO live SDK session exercised",
                 grounding_forbidden=True,
@@ -400,28 +440,38 @@ class OneShotShadowPreflightRunner:
         self,
         synthetic_response_json: str,
         candidates: Optional[list[Article]] = None,
-        recent_stories: Optional[list[Story]] = None,
         as_of_time: Optional[datetime] = None,
+        **kwargs: Any,
     ) -> ShadowPreflightResult:
         """Hermetic test-only evaluation of a pre-computed synthetic JSON structured response.
 
         Guarantees:
         - NEVER calls an SDK client or makes a network request (accepts raw string JSON only).
-        - Enforces single-shot execution guard (repeated calls on same runner instance fail closed).
+        - Enforces single-shot execution guard on synthetic evaluations (max 1 call).
+        - Rejects external recent_stories; Stage A synthetic evaluation evaluates against an empty history.
+        - Instantiates validator with keyless settings (gemini_api_key="") to guarantee that
+          no genai.Client SDK instance is ever created, even if runner settings contain an API key.
         - Runs raw payload through Pydantic validation (EditorialDecisionBatch) and
           authoritative application business rules (GeminiEditorialEngine._validate_and_transform_picks).
+        - Distinguishes synthetic evaluation count from provider call count (strictly 0).
         - Produces decisions explicitly marked SYNTHETIC_AI_RESULT_NOT_REAL_GEMINI.
         """
-        # Enforce single-invocation guard
-        if self._call_count >= 1:
+        if "recent_stories" in kwargs:
             raise AIEvaluationError(
-                "Repeated execution blocked: shadow harness enforces single-shot execution (max 1 call)"
+                "evaluate_synthetic_response does not accept external recent_stories; "
+                "Stage A synthetic evaluations operate hermetically against an empty story history."
             )
-        self._call_count += 1
+
+        # Enforce single-invocation guard on synthetic evaluations
+        if self._synthetic_evaluation_count >= 1:
+            raise AIEvaluationError(
+                "Repeated execution blocked: shadow harness enforces single-shot evaluation (max 1 call)"
+            )
+        self._synthetic_evaluation_count += 1
 
         active_candidates = self._resolve_and_validate_candidates(candidates)
         ref_now = as_of_time or SHADOW_SAMPLE_AS_OF_UTC
-        active_stories = recent_stories or []
+        active_stories: list[Story] = []
 
         if not synthetic_response_json or not synthetic_response_json.strip():
             raise AIEvaluationError("Synthetic response payload is empty")
@@ -431,8 +481,14 @@ class OneShotShadowPreflightRunner:
         except (json.JSONDecodeError, ValidationError) as exc:
             raise AIEvaluationError(f"Malformed synthetic structured output: {exc}") from exc
 
-        # Re-use authoritative application-level business rules validation
-        engine = GeminiEditorialEngine(self.settings)
+        # Stage A Safety Invariant: validator must use keyless settings to guarantee no SDK client is created
+        keyless_settings = self.settings.model_copy(update={"gemini_api_key": ""})
+        engine = GeminiEditorialEngine(keyless_settings)
+        if engine.client is not None:
+            raise AIEvaluationError(
+                "Safety invariant violated: SDK client must never be instantiated during shadow evaluation"
+            )
+
         approved_assessments = engine._validate_and_transform_picks(
             batch.picks, active_candidates, active_stories
         )
@@ -494,7 +550,8 @@ class OneShotShadowPreflightRunner:
             enforceable_max_output_tokens=batch_max_out,
             actual_cost_usd=0.0,
             theoretical_paid_equivalent_usd=est_paid_cost,
-            call_count=self._call_count,
+            call_count=0,
+            synthetic_evaluation_count=self._synthetic_evaluation_count,
             sdk_network_executed=False,
             zero_retry_design_contract="Offline synthetic payload; NO live SDK session exercised",
             grounding_forbidden=True,
