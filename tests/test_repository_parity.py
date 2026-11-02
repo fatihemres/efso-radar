@@ -17,6 +17,7 @@ import httpx
 
 from efso_radar.domain import (
     Article,
+    DeliveryIdentityConflictError,
     DeliveryStatus,
     EditorialAssessment,
     EditorialKind,
@@ -27,6 +28,8 @@ from efso_radar.domain import (
     StoryCategory,
     StoryUpdate,
     SuggestedFormat,
+    TelegramDeliveryRecord,
+    TelegramNotificationCategory,
     utc_now,
 )
 from efso_radar.repositories.schema import CURRENT_SCHEMA_VERSION
@@ -35,7 +38,10 @@ from efso_radar.repositories.turso import TursoStateRepository
 from efso_radar.repositories.turso_client import deserialize_hrana_value
 
 
-def create_mock_hrana_transport(conn: sqlite3.Connection) -> httpx.MockTransport:
+def create_mock_hrana_transport(
+    conn: sqlite3.Connection,
+    executed_statements: list[str] | None = None,
+) -> httpx.MockTransport:
     """Creates an httpx.MockTransport that handles Hrana v2 /v2/pipeline calls using a real SQLite backend."""
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -53,6 +59,8 @@ def create_mock_hrana_transport(conn: sqlite3.Connection) -> httpx.MockTransport
             if req_type == "execute":
                 stmt = req.get("stmt", {})
                 sql = stmt.get("sql", "").strip()
+                if executed_statements is not None:
+                    executed_statements.append(sql)
                 raw_args = stmt.get("args", [])
                 args = [deserialize_hrana_value(a) for a in raw_args]
 
@@ -516,6 +524,273 @@ class RepositoryContractTestMixin:
         self.assertIn(art2.id, pending_after_eval_ids)
 
 
+    def test_delivery_uncertain_record_replay_idempotency_and_preservation(self):
+        """Verifies record_telegram_delivery replay on DELIVERY_UNCERTAIN is a safe no-op preserving all fields."""
+        chat_id = "1000000001"
+        message_key = "digest_uncertain_record_001"
+        delivery_id = "deliv_unc_rec_001"
+        payload = {"digest_hash": "hash_abc_123", "stories_count": 3}
+        original_error = "HTTP 504 Gateway Timeout during initial dispatch"
+        t0 = self.now
+
+        rec = TelegramDeliveryRecord(
+            delivery_id=delivery_id,
+            message_key=message_key,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=chat_id,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            status=DeliveryStatus.DELIVERY_UNCERTAIN,
+            attempt_count=1,
+            max_attempts=1,
+            error_message=original_error,
+            payload=payload,
+            created_at=t0,
+            updated_at=t0,
+            sent_at=None,
+        )
+        self.repo.record_telegram_delivery(rec)
+
+        # Baseline inspection
+        stored = self.repo.get_telegram_delivery(chat_id, message_key)
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.delivery_id, delivery_id)
+        self.assertEqual(stored.status, DeliveryStatus.DELIVERY_UNCERTAIN)
+        self.assertEqual(stored.attempt_count, 1)
+        self.assertEqual(stored.max_attempts, 1)
+        self.assertEqual(stored.error_message, original_error)
+        self.assertEqual(stored.payload, payload)
+        self.assertEqual(stored.created_at, t0)
+        self.assertEqual(stored.updated_at, t0)
+        self.assertIsNone(stored.sent_at)
+
+        # 1. Replay with exact same record
+        self.repo.record_telegram_delivery(rec)
+
+        # 2. Replay with candidate record having altered attempts, payload, error, and timestamps
+        t_later = t0 + timedelta(hours=2)
+        mutated_candidate = TelegramDeliveryRecord(
+            delivery_id="deliv_unc_rec_999",
+            message_key=message_key,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=chat_id,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            status=DeliveryStatus.DELIVERY_UNCERTAIN,
+            attempt_count=5,
+            max_attempts=10,
+            error_message="Altered error message that should be ignored",
+            payload={"digest_hash": "overwritten"},
+            created_at=t_later,
+            updated_at=t_later,
+            sent_at=t_later,
+        )
+        self.repo.record_telegram_delivery(mutated_candidate)
+
+        # 3. Verify absolute preservation of pre-repeat fields
+        after = self.repo.get_telegram_delivery(chat_id, message_key)
+        self.assertIsNotNone(after)
+        self.assertEqual(after.delivery_id, delivery_id)
+        self.assertEqual(after.status, DeliveryStatus.DELIVERY_UNCERTAIN)
+        self.assertEqual(after.attempt_count, 1)
+        self.assertEqual(after.max_attempts, 1)
+        self.assertEqual(after.error_message, original_error)
+        self.assertEqual(after.payload, payload)
+        self.assertEqual(after.created_at, t0)
+        self.assertEqual(after.updated_at, t0)
+        self.assertIsNone(after.sent_at)
+
+    def test_delivery_uncertain_status_update_replay_idempotency_and_preservation(self):
+        """Verifies update_telegram_delivery_status(..., DELIVERY_UNCERTAIN) replay returns True and preserves record."""
+        chat_id = "1000000001"
+        message_key = "digest_uncertain_status_002"
+        delivery_id = "deliv_unc_status_002"
+        payload = {"digest_hash": "hash_def_456"}
+        original_error = "ReadTimeout during Telegram HTTP transport"
+        t0 = self.now
+
+        # 1. Claim delivery first
+        claimed = self.repo.claim_telegram_delivery(
+            delivery_id=delivery_id,
+            message_key=message_key,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=chat_id,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            payload=payload,
+            max_attempts=1,
+        )
+        self.assertTrue(claimed)
+
+        # 2. Initial transition to DELIVERY_UNCERTAIN
+        upd1 = self.repo.update_telegram_delivery_status(
+            delivery_id=delivery_id,
+            status=DeliveryStatus.DELIVERY_UNCERTAIN,
+            error_message=original_error,
+        )
+        self.assertTrue(upd1)
+
+        stored = self.repo.get_telegram_delivery(chat_id, message_key)
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.status, DeliveryStatus.DELIVERY_UNCERTAIN)
+        self.assertEqual(stored.error_message, original_error)
+        self.assertEqual(stored.payload, payload)
+        self.assertIsNone(stored.sent_at)
+        updated_at_before = stored.updated_at
+        attempt_count_baseline = stored.attempt_count
+
+        # 3. Repeated call with status=DELIVERY_UNCERTAIN, different error, and attempted sent_at
+        t_attempted = t0 + timedelta(hours=3)
+        upd2 = self.repo.update_telegram_delivery_status(
+            delivery_id=delivery_id,
+            status=DeliveryStatus.DELIVERY_UNCERTAIN,
+            error_message="Should be ignored replay error",
+            sent_at=t_attempted,
+        )
+        self.assertTrue(upd2, "Repeated update_telegram_delivery_status to DELIVERY_UNCERTAIN must return True")
+
+        # 4. Verify all fields preserved intact (no attempt increment, no error overwrite, no sent_at leak)
+        after = self.repo.get_telegram_delivery(chat_id, message_key)
+        self.assertIsNotNone(after)
+        self.assertEqual(after.status, DeliveryStatus.DELIVERY_UNCERTAIN)
+        self.assertEqual(after.attempt_count, attempt_count_baseline, "attempt_count must not increment on idempotent replay")
+        self.assertEqual(after.error_message, original_error, "error_message must not be overwritten on replay")
+        self.assertEqual(after.payload, payload)
+        self.assertEqual(after.updated_at, updated_at_before, "updated_at must remain intact on replay")
+        self.assertIsNone(after.sent_at, "sent_at must remain None on DELIVERY_UNCERTAIN replay")
+
+    def test_delivery_uncertain_claim_rejected_no_new_dispatch(self):
+        """Verifies claim_telegram_delivery on DELIVERY_UNCERTAIN is rejected and does not mutate or dispatch."""
+        chat_id = "1000000001"
+        message_key = "digest_uncertain_claim_003"
+        delivery_id = "deliv_unc_claim_003"
+        payload = {"stories_count": 2}
+        t0 = self.now
+
+        # Initialize directly in DELIVERY_UNCERTAIN with max_attempts > attempt_count
+        rec = TelegramDeliveryRecord(
+            delivery_id=delivery_id,
+            message_key=message_key,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=chat_id,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            status=DeliveryStatus.DELIVERY_UNCERTAIN,
+            attempt_count=1,
+            max_attempts=3,
+            error_message="Network partition",
+            payload=payload,
+            created_at=t0,
+            updated_at=t0,
+            sent_at=None,
+        )
+        self.repo.record_telegram_delivery(rec)
+
+        # Attempt to claim with new delivery_id
+        claimed = self.repo.claim_telegram_delivery(
+            delivery_id="deliv_retry_unauthorized_999",
+            message_key=message_key,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=chat_id,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            payload={"fresh": "attempt"},
+            max_attempts=3,
+        )
+        self.assertFalse(claimed, "claim_telegram_delivery must return False on DELIVERY_UNCERTAIN record")
+
+        # Verify no new dispatch record exists and original record is not mutated
+        curr = self.repo.get_telegram_delivery(chat_id, message_key)
+        self.assertIsNotNone(curr)
+        self.assertEqual(curr.delivery_id, delivery_id, "delivery_id must not change to new claim ID")
+        self.assertEqual(curr.status, DeliveryStatus.DELIVERY_UNCERTAIN, "status must remain DELIVERY_UNCERTAIN")
+        self.assertEqual(curr.attempt_count, 1, "attempt_count must not increment on rejected claim")
+        self.assertEqual(curr.payload, payload, "payload must not be overwritten by new claim")
+
+    def test_delivery_uncertain_negative_scenarios_and_conflicts(self):
+        """Verifies identity conflict rejections and non-existent ID handling for DELIVERY_UNCERTAIN."""
+        chat_id = "1000000001"
+        message_key = "digest_uncertain_neg_004"
+        delivery_id = "deliv_unc_neg_004"
+
+        rec = TelegramDeliveryRecord(
+            delivery_id=delivery_id,
+            message_key=message_key,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=chat_id,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            status=DeliveryStatus.DELIVERY_UNCERTAIN,
+            attempt_count=1,
+            max_attempts=1,
+            error_message="Timeout",
+            payload={},
+            created_at=self.now,
+            updated_at=self.now,
+            sent_at=None,
+        )
+        self.repo.record_telegram_delivery(rec)
+
+        # 1. Conflicting recipient_role on record_telegram_delivery
+        conflicting_role_rec = TelegramDeliveryRecord(
+            delivery_id="deliv_other_001",
+            message_key=message_key,
+            recipient_role="SECONDARY_EDITOR",
+            recipient_chat_id=chat_id,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            status=DeliveryStatus.DELIVERY_UNCERTAIN,
+            attempt_count=1,
+            max_attempts=1,
+            error_message="Timeout",
+            payload={},
+            created_at=self.now,
+            updated_at=self.now,
+            sent_at=None,
+        )
+        with self.assertRaises(DeliveryIdentityConflictError):
+            self.repo.record_telegram_delivery(conflicting_role_rec)
+
+        # 2. Conflicting category on record_telegram_delivery
+        conflicting_cat_rec = TelegramDeliveryRecord(
+            delivery_id="deliv_other_002",
+            message_key=message_key,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=chat_id,
+            category=TelegramNotificationCategory.VERIFIED_BREAKING,
+            status=DeliveryStatus.DELIVERY_UNCERTAIN,
+            attempt_count=1,
+            max_attempts=1,
+            error_message="Timeout",
+            payload={},
+            created_at=self.now,
+            updated_at=self.now,
+            sent_at=None,
+        )
+        with self.assertRaises(DeliveryIdentityConflictError):
+            self.repo.record_telegram_delivery(conflicting_cat_rec)
+
+        # 3. Conflicting role on claim_telegram_delivery
+        with self.assertRaises(DeliveryIdentityConflictError):
+            self.repo.claim_telegram_delivery(
+                delivery_id="deliv_other_003",
+                message_key=message_key,
+                recipient_role="SECONDARY_EDITOR",
+                recipient_chat_id=chat_id,
+                category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            )
+
+        # 4. Conflicting category on claim_telegram_delivery
+        with self.assertRaises(DeliveryIdentityConflictError):
+            self.repo.claim_telegram_delivery(
+                delivery_id="deliv_other_004",
+                message_key=message_key,
+                recipient_role="PRIMARY_EDITOR",
+                recipient_chat_id=chat_id,
+                category=TelegramNotificationCategory.VERIFIED_BREAKING,
+            )
+
+        # 5. Non-existent delivery_id on update_telegram_delivery_status returns False
+        res = self.repo.update_telegram_delivery_status(
+            delivery_id="non_existent_id_xyz",
+            status=DeliveryStatus.DELIVERY_UNCERTAIN,
+        )
+        self.assertFalse(res)
+
+
 class TestSqliteRepositoryParity(unittest.TestCase, RepositoryContractTestMixin):
     def setUp(self):
         self.now = datetime(2026, 10, 11, 10, 0, tzinfo=timezone.utc)
@@ -534,7 +809,11 @@ class TestTursoRepositoryParity(unittest.TestCase, RepositoryContractTestMixin):
     def setUp(self):
         self.now = datetime(2026, 10, 11, 10, 0, tzinfo=timezone.utc)
         self.sqlite_conn = sqlite3.connect(":memory:")
-        self.mock_transport = create_mock_hrana_transport(self.sqlite_conn)
+        self.executed_statements: list[str] = []
+        self.mock_transport = create_mock_hrana_transport(
+            self.sqlite_conn,
+            executed_statements=self.executed_statements,
+        )
         self.repo = TursoStateRepository(
             database_url="libsql://efso-test.turso.io",
             auth_token="mock-token-xyz",
@@ -562,3 +841,77 @@ class TestTursoRepositoryParity(unittest.TestCase, RepositoryContractTestMixin):
 
         # Verify that test-art-rollback was ROLLED BACK and does NOT exist in processed_articles!
         self.assertFalse(self.repo.is_article_processed("test-art-rollback"))
+
+
+    def test_turso_delivery_uncertain_replay_executes_zero_mutating_sql(self):
+        """Verifies that idempotent replay of DELIVERY_UNCERTAIN records or updates sends zero mutating SQL to Turso."""
+        chat_id = "1000000001"
+        message_key = "turso_sql_uncertain_001"
+        delivery_id = "turso_deliv_unc_001"
+
+        rec = TelegramDeliveryRecord(
+            delivery_id=delivery_id,
+            message_key=message_key,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=chat_id,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+            status=DeliveryStatus.DELIVERY_UNCERTAIN,
+            attempt_count=1,
+            max_attempts=1,
+            error_message="Network timeout",
+            payload={"digest": "test"},
+            created_at=self.now,
+            updated_at=self.now,
+            sent_at=None,
+        )
+        self.repo.record_telegram_delivery(rec)
+
+        mutating_keywords = ("INSERT", "UPDATE", "DELETE", "REPLACE")
+
+        # 1. Replay record_telegram_delivery
+        self.executed_statements.clear()
+        self.repo.record_telegram_delivery(rec)
+        mutating_calls = [
+            sql for sql in self.executed_statements
+            if any(sql.upper().startswith(kw) for kw in mutating_keywords)
+        ]
+        self.assertEqual(
+            mutating_calls, [],
+            f"record_telegram_delivery replay must not send mutating SQL to Turso, sent: {mutating_calls}"
+        )
+
+        # 2. Replay update_telegram_delivery_status
+        self.executed_statements.clear()
+        res = self.repo.update_telegram_delivery_status(
+            delivery_id=delivery_id,
+            status=DeliveryStatus.DELIVERY_UNCERTAIN,
+            error_message="New error message",
+        )
+        self.assertTrue(res)
+        mutating_calls = [
+            sql for sql in self.executed_statements
+            if any(sql.upper().startswith(kw) for kw in mutating_keywords)
+        ]
+        self.assertEqual(
+            mutating_calls, [],
+            f"update_telegram_delivery_status replay must not send mutating SQL to Turso, sent: {mutating_calls}"
+        )
+
+        # 3. Attempt claim_telegram_delivery on existing DELIVERY_UNCERTAIN
+        self.executed_statements.clear()
+        claimed = self.repo.claim_telegram_delivery(
+            delivery_id="turso_claim_retry_002",
+            message_key=message_key,
+            recipient_role="PRIMARY_EDITOR",
+            recipient_chat_id=chat_id,
+            category=TelegramNotificationCategory.EDITORIAL_DIGEST,
+        )
+        self.assertFalse(claimed)
+        mutating_calls = [
+            sql for sql in self.executed_statements
+            if any(sql.upper().startswith(kw) for kw in mutating_keywords)
+        ]
+        self.assertEqual(
+            mutating_calls, [],
+            f"claim_telegram_delivery on DELIVERY_UNCERTAIN must not send mutating SQL to Turso, sent: {mutating_calls}"
+        )
