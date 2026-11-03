@@ -210,28 +210,22 @@ def detect_sensitive_health_content(*texts: Optional[str]) -> bool:
 
 
 def has_first_party_evidence(articles: list[Article]) -> bool:
-    """Check if supporting articles contain verified first-party provenance.
+    """Check if supporting articles contain authentic first-party provenance.
 
-    Untrusted article prose and unverified publisher metadata are rejected.
-    Only an explicitly authenticated provenance seam (test-only attestation)
-    is accepted until a live cryptographic/account verification contract exists.
+    Untrusted article prose and publisher-supplied metadata cannot self-assert provenance.
+    Until an independently authenticated cryptographic/account verification contract
+    exists in the pipeline, all external article inputs fail closed (return False) in production.
     """
-    for a in articles:
-        if a.raw_metadata.get("_trusted_test_evidence") in ("FIRST_PARTY", "FIRST_PARTY_STATEMENT"):
-            return True
     return False
 
 
 def has_official_confirmation_evidence(articles: list[Article]) -> bool:
-    """Check if supporting articles contain verified official confirmation.
+    """Check if supporting articles contain authentic official confirmation evidence.
 
-    Untrusted article prose and unverified publisher metadata are rejected.
-    Only an explicitly authenticated provenance seam (test-only attestation)
-    is accepted until a live document/agency verification contract exists.
+    Untrusted article prose and publisher-supplied metadata cannot self-assert provenance.
+    Until an independently authenticated document/agency verification contract
+    exists in the pipeline, all external article inputs fail closed (return False) in production.
     """
-    for a in articles:
-        if a.raw_metadata.get("_trusted_test_evidence") in ("OFFICIAL", "OFFICIAL_CONFIRMATION"):
-            return True
     return False
 
 

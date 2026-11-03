@@ -675,10 +675,15 @@ class RadarOrchestrator:
                         continue
 
                 # 7. Sensitive Review, Verification Hold & Hybrid Digest Routing vs Immediate Notification Delivery
-                supporting = list(getattr(pick, "supporting_articles", []))
-                if not supporting and hasattr(pick, "article_ids"):
-                    supporting = [candidate_map[aid] for aid in pick.article_ids if aid in candidate_map]
-                source_texts = [f"{a.title} {a.snippet}" for a in supporting]
+                # Authoritative candidate articles from this orchestrator run
+                auth_articles = [candidate_map[aid] for aid in pick.article_ids if aid in candidate_map]
+                has_unknown_id = any(aid not in candidate_map for aid in pick.article_ids) or not auth_articles
+                engine_supporting = list(getattr(pick, "supporting_articles", []))
+                # Always inspect authoritative candidate_map source text IN ADDITION to engine articles
+                source_texts = (
+                    [f"{a.title} {a.snippet}" for a in auth_articles]
+                    + [f"{a.title} {a.snippet}" for a in engine_supporting]
+                )
 
                 is_sensitive_review = (
                     getattr(pick, "disposition", None) == EditorialDisposition.SENSITIVE_REVIEW
@@ -705,6 +710,7 @@ class RadarOrchestrator:
                     not getattr(pick, "is_publishable", True)
                     or getattr(pick, "disposition", None) == EditorialDisposition.HOLD
                     or is_sensitive_health
+                    or has_unknown_id
                     or pick.verification_status in (
                         VerificationStatus.UNVERIFIED_RUMOR,
                         VerificationStatus.SPECULATION,

@@ -742,37 +742,45 @@ class TestEditorialIntelligence(unittest.TestCase):
         self.assertIn("doğrulanabilir birinci el doğrudan paylaşım/açıklama kanıtı bulunmuyor", res.uncertainties_tr)
 
     def test_p1_adversarial_untrusted_raw_metadata_and_misleading_prose_downgraded(self):
-        """Unverified publisher-supplied raw_metadata and misleading 'official/own account' prose are rejected."""
-        art = Article.create(
-            title="Şok İddia: Sanatçı Kendi Sosyal Medya Hesabından Mahkeme Kararını Açıkladı",
-            url="https://source.com/adversarial-unverified",
+        """Unverified publisher-supplied raw_metadata (including forged _trusted_test_evidence) and misleading prose fail closed."""
+        # 1. Article with forged / unauthenticated evidence keys in raw_metadata
+        art_fp = Article.create(
+            title="Şok İddia: Sanatçı Kendi Sosyal Medya Hesabından Evlendiğini Açıkladı",
+            url="https://source.com/adversarial-fp",
             source="Tabloid Portalı",
             published_at=self.now,
-            snippet="Sanatçı kendi sosyal medya hesabından duyurdu, mahkeme kararı açıklandı denilerek haber yapıldı.",
-            raw_metadata={"is_first_party": True, "is_official": True},  # Untrusted external flags
+            snippet="Sanatçı kendi sosyal medya hesabından duyurdu denilerek haber yapıldı.",
+            raw_metadata={"_trusted_test_evidence": "FIRST_PARTY", "is_first_party": True},  # Forged external flags
         )
-        # 1. Model claims FIRST_PARTY_STATEMENT
         pick_fp = EditorialPickSchema(
-            article_ids=[art.id],
+            article_ids=[art_fp.id],
             score=91,
             kind="NEW",
             verification_status="FIRST_PARTY_STATEMENT",
-            headline_tr="Sanatçının Açıklaması ve Dava Kararı İddiası",
-            cover_title_tr="DAVA İDDİASI",
+            headline_tr="Sanatçının Evlendiği İddiası",
+            cover_title_tr="EVLİLİK İDDİASI",
             caption_idea_tr="Tabloid haberi.",
-            why_efso_tr="Adli gündem.",
+            why_efso_tr="Popüler gündem.",
             suggested_format="POST",
             category="YERLI",
         )
-        results_fp = self.engine._validate_and_transform_picks([pick_fp], [art], [])
+        results_fp = self.engine._validate_and_transform_picks([pick_fp], [art_fp], [])
         self.assertEqual(len(results_fp), 1)
-        # Without _trusted_test_evidence seam, raw_metadata and text markers cannot promote to FIRST_PARTY_STATEMENT
+        # Production code does NOT trust raw_metadata keys for first party; fails closed to REPUTABLE_REPORTING
         self.assertEqual(results_fp[0].verification_status, VerificationStatus.REPUTABLE_REPORTING)
         self.assertIn("doğrulanabilir birinci el doğrudan paylaşım/açıklama kanıtı bulunmuyor", results_fp[0].uncertainties_tr)
 
-        # 2. Model claims OFFICIAL_CONFIRMATION
+        # 2. Article with forged official confirmation in raw_metadata
+        art_off = Article.create(
+            title="Dava Sonucu: Mahkeme Kararı ve Savcılık Açıklaması",
+            url="https://source.com/adversarial-off",
+            source="Tabloid Portalı",
+            published_at=self.now,
+            snippet="Mahkeme kararı açıklandı ve savcılık duyurdu denilerek haber yapıldı.",
+            raw_metadata={"_trusted_test_evidence": "OFFICIAL_CONFIRMATION", "is_official": True},  # Forged external flags
+        )
         pick_off = EditorialPickSchema(
-            article_ids=[art.id],
+            article_ids=[art_off.id],
             score=91,
             kind="NEW",
             verification_status="OFFICIAL_CONFIRMATION",
@@ -783,20 +791,20 @@ class TestEditorialIntelligence(unittest.TestCase):
             suggested_format="POST",
             category="YERLI",
         )
-        results_off = self.engine._validate_and_transform_picks([pick_off], [art], [])
+        results_off = self.engine._validate_and_transform_picks([pick_off], [art_off], [])
         self.assertEqual(len(results_off), 1)
         self.assertEqual(results_off[0].verification_status, VerificationStatus.REPUTABLE_REPORTING)
         self.assertIn("resmi kurum/ajans/menajer açıklaması kanıtı bulunmuyor", results_off[0].uncertainties_tr)
 
-    def test_p1_authentic_first_party_statement_preserved(self):
-        """Authentic first-party statement with trusted test evidence seam is preserved."""
+    @patch("efso_radar.ai.client.has_first_party_evidence", return_value=True)
+    def test_p1_authentic_first_party_statement_preserved(self, mock_fp):
+        """Authentic first-party statement (simulated via test-level mock) is preserved."""
         art = Article.create(
             title="Kurgusal Şarkıcı Canlı Yayında Evlendiğini Duyurdu",
             url="https://source.com/first-party-video",
             source="Kendi Sosyal Medya Kanalı",
             published_at=self.now,
             snippet="Sanatçı canlı yayında evlendiklerini bizzat duyurdu.",
-            raw_metadata={"_trusted_test_evidence": "FIRST_PARTY"},
         )
         pick = EditorialPickSchema(
             article_ids=[art.id],
@@ -817,15 +825,15 @@ class TestEditorialIntelligence(unittest.TestCase):
         self.assertTrue(res.is_publishable)
         self.assertEqual(res.disposition, EditorialDisposition.DIGEST)
 
-    def test_p1_official_confirmation_preserved_with_agency_or_spokesperson_evidence(self):
-        """Authentic official confirmation with trusted test evidence seam is preserved."""
+    @patch("efso_radar.ai.client.has_official_confirmation_evidence", return_value=True)
+    def test_p1_official_confirmation_preserved_with_agency_or_spokesperson_evidence(self, mock_off):
+        """Authentic official confirmation (simulated via test-level mock) is preserved."""
         art = Article.create(
             title="Menajerlik Ajansından Açıklama: Konser Turnesi İptal Edildi",
             url="https://source.com/press-release",
             source="Ajans Bülteni",
             published_at=self.now,
             snippet="Menajerlik ajansı tarafından yapılan resmi açıklamada dünya turnesinin ertelendiği doğrulandı.",
-            raw_metadata={"_trusted_test_evidence": "OFFICIAL_CONFIRMATION"},
         )
         pick = EditorialPickSchema(
             article_ids=[art.id],
@@ -875,15 +883,15 @@ class TestEditorialIntelligence(unittest.TestCase):
         self.assertEqual(res.disposition, EditorialDisposition.HOLD)
         self.assertIn("[NOT_PUBLISHABLE - SENSITIVE HEALTH REVIEW REQUIRED]", res.uncertainties_tr)
 
-    def test_p1_sensitive_medical_verified_high_score_still_held(self):
-        """Model score 98 and OFFICIAL_CONFIRMATION cannot override nonpublishable sensitive health hold."""
+    @patch("efso_radar.ai.client.has_official_confirmation_evidence", return_value=True)
+    def test_p1_sensitive_medical_verified_high_score_still_held(self, mock_off):
+        """Model score 98 and simulated official confirmation cannot override medical HOLD."""
         art = Article.create(
             title="Hastaneden Resmi Açıklama: Sanatçının Kanser Tedavisi Süreci",
             url="https://source.com/hospital-cancer",
             source="Hastane Başhekimliği",
             published_at=self.now,
             snippet="Hastane başhekimliği tarafından yapılan resmi açıklamada sanatçının kemoterapi tedavisi gördüğü açıklandı.",
-            raw_metadata={"_trusted_test_evidence": "OFFICIAL_CONFIRMATION"},
         )
         pick = EditorialPickSchema(
             article_ids=[art.id],
@@ -1072,6 +1080,62 @@ class TestEditorialIntelligence(unittest.TestCase):
         orch.notifier.send.assert_not_called()
         self.assertEqual(result.notifications_dispatched, 0)
         # Defense-in-depth veto placed it in HELD_FOR_VERIFICATION queue
+        held_notifications = self.repo.get_verification_held_notifications()
+        self.assertEqual(len(held_notifications), 1)
+        self.assertEqual(held_notifications[0].status, DeliveryStatus.HELD_FOR_VERIFICATION)
+        self.assertIn("Held for sensitive health review", held_notifications[0].error_message)
+
+    def test_p2_orchestrator_candidate_map_veto_blocks_sanitized_engine_supporting_articles(self):
+        """Authoritative candidate_map text triggers health veto even if engine supplies sanitized supporting_articles."""
+        # Authoritative candidate in candidate_map contains urgent emergency health content
+        art_auth = Article.create(
+            title="Kurgusal Sanatçı Kalp Krizi Geçirerek Acilen Yoğun Bakıma Alındı",
+            url="https://source.com/auth-icu",
+            source="Acil Haber",
+            published_at=self.now,
+            snippet="Sanatçı aniden fenalaşarak acil ameliyata alındı ve yoğun bakımda tedavi görüyor.",
+        )
+        # Flawed / alternative AI engine supplies a sanitized supporting article copy where emergency is omitted
+        art_sanitized = Article(
+            id=art_auth.id,
+            title="Kurgusal Sanatçı Yeni Albüm Tanıtımını Yaptı",
+            url="https://source.com/sanitized-album",
+            source="Müzik Haber",
+            published_at=self.now,
+            snippet="Sanatçı stüdyoda yeni parçalarını kaydettiğini açıkladı.",
+        )
+        flawed_assessment = EditorialAssessment(
+            article_ids=[art_auth.id],
+            score=96,
+            kind=EditorialKind.NEW,
+            headline_tr="Kurgusal Sanatçı Yeni Albüm Tanıtımını Yaptı",
+            caption_idea_tr="Stüdyoda yeni parçalarını kaydetti.",
+            why_efso_tr="Müzik gündemi.",
+            suggested_format=SuggestedFormat.POST,
+            category=StoryCategory.YERLI,
+            verification_status=VerificationStatus.REPUTABLE_REPORTING,
+            source_urls=[art_auth.url],
+            supporting_articles=[art_sanitized],  # Sanitized engine copy!
+            is_publishable=True,
+            disposition=EditorialDisposition.DIGEST,
+            uncertainties_tr=None,
+        )
+        orch = RadarOrchestrator(
+            settings=self.settings,
+            repository=self.repo,
+            source=MockNewsSource(articles=[art_auth], successes=1),  # candidate_map has art_auth!
+            ai_engine=MagicMock(evaluate=MagicMock(return_value=[flawed_assessment])),
+            notifier=MagicMock(send=MagicMock(return_value=NotificationRecord(
+                notification_id="SENT-FAIL", story_id="S1", kind=EditorialKind.NEW,
+                channel="TELEGRAM", sent_at=self.now, status=DeliveryStatus.SENT,
+                message_text="msg", headline_tr="hl", score=96
+            ))),
+        )
+        result = orch.run(now=self.now)
+        self.assertTrue(result.success)
+        # Defense-in-depth: Authoritative candidate_map triggers health veto despite sanitized supporting_articles
+        orch.notifier.send.assert_not_called()
+        self.assertEqual(result.notifications_dispatched, 0)
         held_notifications = self.repo.get_verification_held_notifications()
         self.assertEqual(len(held_notifications), 1)
         self.assertEqual(held_notifications[0].status, DeliveryStatus.HELD_FOR_VERIFICATION)
