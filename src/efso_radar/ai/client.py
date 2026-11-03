@@ -209,74 +209,28 @@ def detect_sensitive_health_content(*texts: Optional[str]) -> bool:
     return any(pat.search(combined) is not None for pat in COMPILED_HEALTH_PATTERNS)
 
 
-TR_FIRST_PARTY_EVIDENCE_PATTERNS = [
-    r"\bkendi\s+(?:sosyal\s+medya\s+)?hesab[ıi]ndan\b",
-    r"\bsosyal\s+medya\s+hesab[ıi]ndan\s+(?:yaptığı|yaptigi|paylaştığı|paylastigi)\b",
-    r"\bkendi\s+a(?:ç|c)[ıi]klamas[ıi]nda\b",
-    r"\bkendi\s+a(?:ğ|g)z[ıi]ndan\b",
-    r"\bbizzat\s+(?:a(?:ç|c)[ıi]klad[ıi]|duyurdu|payla(?:ş|s)t[ıi])\b",
-    r"\byapt[ıi](?:ğ|g)[ıi]\s+canl[ıi]\s+yay[ıi]nda\b",
-    r"\bresmi\s+(?:instagram|twitter|x|tiktok)\s+hesab[ıi]ndan\b",
-]
-
-EN_FIRST_PARTY_EVIDENCE_PATTERNS = [
-    r"\bon\s+(?:their|his|her)\s+official\s+(?:instagram|twitter|x|tiktok|account)\b",
-    r"\bposted\s+on\s+(?:their|his|her)\s+social\s+media\b",
-    r"\bin\s+a\s+personal\s+statement\b",
-    r"\bconfirmed\s+in\s+a\s+(?:video|livestream|post)\b",
-    r"\bdirectly\s+stated\b",
-]
-
-COMPILED_FIRST_PARTY_EVIDENCE_PATTERNS = [
-    re.compile(p, re.IGNORECASE) for p in (TR_FIRST_PARTY_EVIDENCE_PATTERNS + EN_FIRST_PARTY_EVIDENCE_PATTERNS)
-]
-
-
 def has_first_party_evidence(articles: list[Article]) -> bool:
-    """Check if supporting articles contain authentic first-party provenance or direct statements."""
+    """Check if supporting articles contain verified first-party provenance.
+
+    Untrusted article prose and unverified publisher metadata are rejected.
+    Only an explicitly authenticated provenance seam (test-only attestation)
+    is accepted until a live cryptographic/account verification contract exists.
+    """
     for a in articles:
-        if bool(a.raw_metadata.get("is_first_party") or a.raw_metadata.get("verified_first_party")):
-            return True
-        text = f"{a.title} {a.snippet}"
-        if any(pat.search(text) is not None for pat in COMPILED_FIRST_PARTY_EVIDENCE_PATTERNS):
+        if a.raw_metadata.get("_trusted_test_evidence") in ("FIRST_PARTY", "FIRST_PARTY_STATEMENT"):
             return True
     return False
 
 
-TR_OFFICIAL_EVIDENCE_PATTERNS = [
-    r"\bresm[iî]\s+bas[ıi]n\s+a(?:ç|c)[ıi]klamas[ıi]\b",
-    r"\bmenajerlik\s+ajans[ıi]\s+(?:taraf[ıi]ndan|do(?:ğ|g)rulad[ıi])\b",
-    r"\bmenajeri\s+do(?:ğ|g)rulad[ıi]\b",
-    r"\bavukat[ıi]\s+taraf[ıi]ndan\s+yap[ıi]lan\s+a(?:ç|c)[ıi]klama\b",
-    r"\bavukat[ıi]\s+do(?:ğ|g)rulad[ıi]\b",
-    r"\byap[ıi]m\s+(?:ş|s)irketi\s+resmi\s+duyuru\b",
-    r"\bsavc[ıi]l[ıi]k\s+a(?:ç|c)[ıi]klamas[ıi]\b",
-    r"\bhastane\s+ba(?:ş|s)hekimli(?:ğ|g)i\b",
-    r"\bmahkeme\s+karar[ıi]\b",
-    r"\bresmi\s+sözcüsü\s+do(?:ğ|g)rulad[ıi]\b",
-]
-
-EN_OFFICIAL_EVIDENCE_PATTERNS = [
-    r"\bofficial\s+press\s+release\b",
-    r"\bofficial\s+statement\s+issued\b",
-    r"\b(?:representative|manager|spokesperson)\s+confirmed\b",
-    r"\battorney\s+(?:stated|confirmed)\b",
-    r"\bpolice\s+department\s+statement\b",
-    r"\bcourt\s+documents\s+confirm\b",
-]
-
-COMPILED_OFFICIAL_EVIDENCE_PATTERNS = [
-    re.compile(p, re.IGNORECASE) for p in (TR_OFFICIAL_EVIDENCE_PATTERNS + EN_OFFICIAL_EVIDENCE_PATTERNS)
-]
-
-
 def has_official_confirmation_evidence(articles: list[Article]) -> bool:
-    """Check if supporting articles contain authentic official confirmation evidence."""
+    """Check if supporting articles contain verified official confirmation.
+
+    Untrusted article prose and unverified publisher metadata are rejected.
+    Only an explicitly authenticated provenance seam (test-only attestation)
+    is accepted until a live document/agency verification contract exists.
+    """
     for a in articles:
-        if bool(a.raw_metadata.get("is_official") or a.raw_metadata.get("verified_official")):
-            return True
-        text = f"{a.title} {a.snippet}"
-        if any(pat.search(text) is not None for pat in COMPILED_OFFICIAL_EVIDENCE_PATTERNS):
+        if a.raw_metadata.get("_trusted_test_evidence") in ("OFFICIAL", "OFFICIAL_CONFIRMATION"):
             return True
     return False
 
@@ -310,20 +264,54 @@ def has_social_interaction_content(*texts: Optional[str]) -> bool:
     return any(pat.search(combined) is not None for pat in COMPILED_SOCIAL_INTERACTION_PATTERNS)
 
 
+TR_SPECULATIVE_ROMANCE_PATTERNS = [
+    r"\ba(?:ş|s)k\s+(?:m[ıi]|iddias[ıi]|sinyali|m[ıi]\s+ba(?:ş|s)lad[ıi]|muammas[ıi])\b",
+    r"\bsevgili\s+mi(?:ler)?\b",
+    r"\bili(?:ş|s)ki\s+(?:iddias[ıi]|mi|mi\s+ya(?:ş|s)[ıi]yorlar)\b",
+    r"\bbuzlar\s+eridi\s+mi\b",
+    r"\bayr[ıi]l[ıi]k\s+(?:sinyali|iddias[ıi]|m[ıi])\b",
+    r"\bbar[ıi](?:ş|s)t[ıi]lar\s+m[ıi]\b",
+    r"\bgönlünü\s+(?:mü\s+)?kapt[ıi]rd[ıi]\b",
+    r"\byeni\s+bir\s+a(?:ş|s)k\b",
+    r"\ba(?:ş|s)k\s+m[ıi]\s+ya(?:ş|s)[ıi]yor(?:lar)?\b",
+    r"\bromantik\s+yak[ıi]nla(?:ş|s)ma\b",
+]
+
+EN_SPECULATIVE_ROMANCE_PATTERNS = [
+    r"\b(?:dating|romance|in\s+love)\s*\?\b",
+    r"\b(?:sparked|fueling)\s+(?:dating|romance)\s+rumors\b",
+    r"\bbreakup\s+rumors?\b",
+    r"\bgetting\s+back\s+together\b",
+    r"\bare\s+they\s+dating\b",
+]
+
+COMPILED_SPECULATIVE_ROMANCE_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in (TR_SPECULATIVE_ROMANCE_PATTERNS + EN_SPECULATIVE_ROMANCE_PATTERNS)
+]
+
+
+def has_speculative_romance_content(*texts: Optional[str]) -> bool:
+    """Detect speculative romantic, relationship, or motive inferences."""
+    combined = " ".join(t.strip() for t in texts if t and t.strip())
+    if not combined:
+        return False
+    return any(pat.search(combined) is not None for pat in COMPILED_SPECULATIVE_ROMANCE_PATTERNS)
+
+
 def ground_verification_status(
     claimed_status: str,
     supporting_articles: list[Article],
     headline: str = "",
     caption: str = "",
+    development: str = "",
 ) -> tuple[str, Optional[str]]:
     """Ground verification status against authentic evidence in supporting articles.
 
     Downgrades overconfident FIRST_PARTY_STATEMENT or OFFICIAL_CONFIRMATION when
     authentic first-party provenance or official statements are absent from the input.
+    Distinguishes neutral documented public social interactions from uncorroborated
+    speculative motive/romance inferences.
     """
-    if claimed_status not in ("FIRST_PARTY_STATEMENT", "OFFICIAL_CONFIRMATION"):
-        return claimed_status, None
-
     source_text = " ".join([f"{a.title} {a.snippet}" for a in supporting_articles]).lower()
     rumor_markers = [
         "iddia", "one suruldu", "öne sürüldü", "soylenti", "söylenti",
@@ -333,20 +321,28 @@ def ground_verification_status(
     has_source_rumor = any(m in source_text for m in rumor_markers)
     has_fp = has_first_party_evidence(supporting_articles)
     has_off = has_official_confirmation_evidence(supporting_articles)
-    has_social_eng = has_social_interaction_content(
-        headline,
-        caption,
-        *(f"{a.title} {a.snippet}" for a in supporting_articles),
-    )
 
+    all_texts = [headline, caption, development, *(f"{a.title} {a.snippet}" for a in supporting_articles)]
+    has_social_eng = has_social_interaction_content(*all_texts)
+    has_speculative_romance = has_speculative_romance_content(*all_texts)
+
+    # 1. Speculative romance / motive inferred from social media interaction
+    if has_social_eng and (has_speculative_romance or has_source_rumor):
+        return (
+            "SPECULATION",
+            "Teyit kanıtı eksik: Sosyal medya etkileşimi üzerinden türetilen doğrulanmamış "
+            "ilişki/niyet iddiası spekülasyon niteliğindedir; editoryal doğrulama bekletmesi (HOLD) gerektirir.",
+        )
+
+    # 2. Model claimed FIRST_PARTY_STATEMENT
     if claimed_status == "FIRST_PARTY_STATEMENT":
         if has_fp:
             return "FIRST_PARTY_STATEMENT", None
         if has_social_eng:
             return (
-                "SPECULATION",
-                "Teyit kanıtı eksik: Kaynak metninde birinci el beyan bulunmuyor; "
-                "sosyal medya etkileşimi (beğeni/takip) spekülasyon niteliğindedir.",
+                "REPUTABLE_REPORTING",
+                "Teyit kanıtı eksik: Sosyal medya etkileşimi (beğeni/takip) birinci el beyan niteliğinde "
+                "değildir; kamuya açık etkileşim haberi olarak değerlendirilmiştir.",
             )
         if has_source_rumor:
             return (
@@ -360,6 +356,7 @@ def ground_verification_status(
             "kanıtı bulunmuyor; üçüncü taraf haber aktarımı olarak değerlendirilmiştir.",
         )
 
+    # 3. Model claimed OFFICIAL_CONFIRMATION
     if claimed_status == "OFFICIAL_CONFIRMATION":
         if has_off:
             return "OFFICIAL_CONFIRMATION", None
@@ -694,6 +691,7 @@ class GeminiEditorialEngine(AIEditorialEngine):
                 supporting_articles,
                 headline=pick.headline_tr,
                 caption=pick.caption_idea_tr,
+                development=pick.development_tr or "",
             )
             uncertainties = pick.uncertainties_tr.strip() if pick.uncertainties_tr else ""
             if caution_msg:

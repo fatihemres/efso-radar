@@ -653,6 +653,7 @@ class RadarOrchestrator:
                     discovery_metrics=discovery_metrics,
                 )
             logger.info("Editorial evaluation approved %d stories", len(picks))
+            candidate_map = {a.id: a for a in candidates}
 
             for pick in picks:
                 if pick.kind == EditorialKind.UPDATE and pick.parent_story_id:
@@ -674,6 +675,11 @@ class RadarOrchestrator:
                         continue
 
                 # 7. Sensitive Review, Verification Hold & Hybrid Digest Routing vs Immediate Notification Delivery
+                supporting = list(getattr(pick, "supporting_articles", []))
+                if not supporting and hasattr(pick, "article_ids"):
+                    supporting = [candidate_map[aid] for aid in pick.article_ids if aid in candidate_map]
+                source_texts = [f"{a.title} {a.snippet}" for a in supporting]
+
                 is_sensitive_review = (
                     getattr(pick, "disposition", None) == EditorialDisposition.SENSITIVE_REVIEW
                     or (pick.uncertainties_tr and "SENSITIVE EDITORIAL REVIEW" in pick.uncertainties_tr)
@@ -682,6 +688,7 @@ class RadarOrchestrator:
                         pick.caption_idea_tr,
                         pick.relevance_reason_tr,
                         pick.why_efso_tr,
+                        *source_texts,
                     )
                 )
                 is_sensitive_health = (
@@ -691,6 +698,7 @@ class RadarOrchestrator:
                         pick.caption_idea_tr,
                         pick.relevance_reason_tr,
                         pick.why_efso_tr,
+                        *source_texts,
                     )
                 )
                 is_unverified = (
@@ -742,7 +750,11 @@ class RadarOrchestrator:
                         message_text=format_telegram_verification_hold(pick),
                         headline_tr=pick.headline_tr,
                         score=pick.score,
-                        error_message="Held for verification: unverified rumor or attributed claim",
+                        error_message=(
+                            "Held for sensitive health review: personal medical condition requires human editorial review"
+                            if is_sensitive_health
+                            else "Held for verification: unverified rumor or attributed claim"
+                        ),
                         category=TelegramNotificationCategory.HOLD_FOR_VERIFICATION,
                     )
                 elif should_queue_digest:

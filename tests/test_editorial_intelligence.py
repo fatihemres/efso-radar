@@ -596,34 +596,121 @@ class TestEditorialIntelligence(unittest.TestCase):
         ))
 
     def test_p1_social_media_like_downgraded_to_speculation_and_hold(self):
-        """Social media engagement (likes/follows) claimed as FIRST_PARTY is downgraded to SPECULATION and HOLD."""
+        """Social media engagement with speculative romance/motive claims is grounded to SPECULATION and HOLD."""
         art = Article.create(
             title="Kurgusal Fenomen A'dan B'nin Gönderisine Dikkat Çeken Beğeni",
             url="https://source.com/social-like",
             source="Magazin Blog",
             published_at=self.now,
-            snippet="Sosyal medyada eski sevgilisinin paylaştığı fotoğrafı beğendi ve gündem oldu.",
+            snippet="Sosyal medyada beğeni yaptı, aşk mı yaşıyorlar sorusu kulislerde konuşulmaya başlandı.",
         )
         pick = EditorialPickSchema(
             article_ids=[art.id],
             score=88,
             kind="NEW",
             verification_status="FIRST_PARTY_STATEMENT",  # Overconfident model claim
-            headline_tr="Fenomen A'dan Eski Sevgilisine Dikkat Çeken Beğeni",
-            cover_title_tr="DİKKAT ÇEKEN BEĞENİ",
-            caption_idea_tr="Sosyal medyada beğeni yaptı.",
-            why_efso_tr="Viral popüler kültür.",
+            headline_tr="Fenomen A'dan B'nin Fotoğrafına Beğeni: Yeni Bir Aşk mı Başladı?",
+            cover_title_tr="AŞK MI BAŞLADI",
+            caption_idea_tr="İkili aşk mı yaşıyor soruları gündeme geldi.",
+            why_efso_tr="Viral magazin ilişkisi.",
             suggested_format="POST",
             category="YERLI",
         )
         results = self.engine._validate_and_transform_picks([pick], [art], [])
         self.assertEqual(len(results), 1)
         res = results[0]
-        # Must NOT keep FIRST_PARTY_STATEMENT
+        # Must NOT keep FIRST_PARTY_STATEMENT; must be grounded to SPECULATION due to unverified romance motive
         self.assertEqual(res.verification_status, VerificationStatus.SPECULATION)
         self.assertFalse(res.is_publishable, "Speculative social media interaction must have is_publishable=False")
         self.assertEqual(res.disposition, EditorialDisposition.HOLD)
-        self.assertIn("birinci el beyan bulunmuyor", res.uncertainties_tr)
+        self.assertIn("Sosyal medya etkileşimi üzerinden türetilen doğrulanmamış ilişki/niyet iddiası", res.uncertainties_tr)
+
+    def test_p1_neutral_documented_public_like_is_publishable_digest(self):
+        """Neutral documented public social media interaction is downgraded from FIRST_PARTY to REPUTABLE_REPORTING and remains DIGEST."""
+        art = Article.create(
+            title="Kurgusal Oyuncu A'dan Rol Arkadaşı B'nin Paylaşımına Beğeni",
+            url="https://source.com/public-like",
+            source="Dizi Kulisi",
+            published_at=self.now,
+            snippet="Sosyal medyada rol arkadaşının yeni film afişi paylaşımını beğendi.",
+        )
+        pick = EditorialPickSchema(
+            article_ids=[art.id],
+            score=87,
+            kind="NEW",
+            verification_status="FIRST_PARTY_STATEMENT",  # Like is not a personal statement
+            headline_tr="Oyuncu A Rol Arkadaşı B'nin Paylaşımını Beğendi",
+            cover_title_tr="DESTEK BEĞENİSİ",
+            caption_idea_tr="Sosyal medyada rol arkadaşına beğeniyle destek verdi.",
+            why_efso_tr="Popüler kültür sosyal medya takibi.",
+            suggested_format="POST",
+            category="YERLI",
+        )
+        results = self.engine._validate_and_transform_picks([pick], [art], [])
+        self.assertEqual(len(results), 1)
+        res = results[0]
+        # Must be downgraded from statement to reputable reporting, but NOT held as speculation
+        self.assertEqual(res.verification_status, VerificationStatus.REPUTABLE_REPORTING)
+        self.assertTrue(res.is_publishable, "Neutral documented public like must be publishable")
+        self.assertEqual(res.disposition, EditorialDisposition.DIGEST)
+        self.assertIn("Sosyal medya etkileşimi (beğeni/takip) birinci el beyan niteliğinde değildir", res.uncertainties_tr)
+
+    def test_p1_neutral_like_with_reputable_reporting_stays_digest(self):
+        """When model assigns REPUTABLE_REPORTING to neutral documented public like, it stays publishable DIGEST."""
+        art = Article.create(
+            title="Kurgusal Oyuncu A'dan Rol Arkadaşı B'nin Paylaşımına Beğeni",
+            url="https://source.com/public-like-rep",
+            source="Dizi Kulisi",
+            published_at=self.now,
+            snippet="Sosyal medyada rol arkadaşının yeni film afişi paylaşımını beğendi.",
+        )
+        pick = EditorialPickSchema(
+            article_ids=[art.id],
+            score=87,
+            kind="NEW",
+            verification_status="REPUTABLE_REPORTING",  # Model chose REPUTABLE_REPORTING
+            headline_tr="Oyuncu A Rol Arkadaşı B'nin Paylaşımını Beğendi",
+            cover_title_tr="DESTEK BEĞENİSİ",
+            caption_idea_tr="Sosyal medyada beğeniyle destek verdi.",
+            why_efso_tr="Popüler kültür sosyal medya takibi.",
+            suggested_format="POST",
+            category="YERLI",
+        )
+        results = self.engine._validate_and_transform_picks([pick], [art], [])
+        self.assertEqual(len(results), 1)
+        res = results[0]
+        self.assertEqual(res.verification_status, VerificationStatus.REPUTABLE_REPORTING)
+        self.assertTrue(res.is_publishable)
+        self.assertEqual(res.disposition, EditorialDisposition.DIGEST)
+
+    def test_p1_romantic_speculation_with_reputable_reporting_grounded_to_speculation_and_hold(self):
+        """When model assigns REPUTABLE_REPORTING to romantic speculation, it is grounded to SPECULATION and HOLD."""
+        art = Article.create(
+            title="Kurgusal Fenomen A'dan B'nin Gönderisine Dikkat Çeken Beğeni",
+            url="https://source.com/social-like-romance",
+            source="Magazin Blog",
+            published_at=self.now,
+            snippet="Sosyal medyada beğeni yaptı, kulislerde aşk mı yaşıyorlar sorusu konuşuluyor.",
+        )
+        pick = EditorialPickSchema(
+            article_ids=[art.id],
+            score=88,
+            kind="NEW",
+            verification_status="REPUTABLE_REPORTING",  # Model attempted to tag speculative romance as reputable
+            headline_tr="Fenomen A'dan B'nin Fotoğrafına Beğeni: Yeni Bir Aşk mı Başladı?",
+            cover_title_tr="AŞK MI BAŞLADI",
+            caption_idea_tr="İkili aşk mı yaşıyor soruları gündeme geldi.",
+            why_efso_tr="Viral magazin ilişkisi.",
+            suggested_format="POST",
+            category="YERLI",
+        )
+        results = self.engine._validate_and_transform_picks([pick], [art], [])
+        self.assertEqual(len(results), 1)
+        res = results[0]
+        self.assertEqual(res.verification_status, VerificationStatus.SPECULATION)
+        self.assertFalse(res.is_publishable)
+        self.assertEqual(res.disposition, EditorialDisposition.HOLD)
+        self.assertIn("Sosyal medya etkileşimi üzerinden türetilen doğrulanmamış ilişki/niyet iddiası", res.uncertainties_tr)
 
     def test_p1_third_party_syndication_lacking_evidence_downgraded_to_reputable_reporting(self):
         """Third-party syndication without authentic first-party proof is downgraded to REPUTABLE_REPORTING."""
@@ -654,15 +741,62 @@ class TestEditorialIntelligence(unittest.TestCase):
         self.assertEqual(res.disposition, EditorialDisposition.DIGEST)
         self.assertIn("doğrulanabilir birinci el doğrudan paylaşım/açıklama kanıtı bulunmuyor", res.uncertainties_tr)
 
+    def test_p1_adversarial_untrusted_raw_metadata_and_misleading_prose_downgraded(self):
+        """Unverified publisher-supplied raw_metadata and misleading 'official/own account' prose are rejected."""
+        art = Article.create(
+            title="Şok İddia: Sanatçı Kendi Sosyal Medya Hesabından Mahkeme Kararını Açıkladı",
+            url="https://source.com/adversarial-unverified",
+            source="Tabloid Portalı",
+            published_at=self.now,
+            snippet="Sanatçı kendi sosyal medya hesabından duyurdu, mahkeme kararı açıklandı denilerek haber yapıldı.",
+            raw_metadata={"is_first_party": True, "is_official": True},  # Untrusted external flags
+        )
+        # 1. Model claims FIRST_PARTY_STATEMENT
+        pick_fp = EditorialPickSchema(
+            article_ids=[art.id],
+            score=91,
+            kind="NEW",
+            verification_status="FIRST_PARTY_STATEMENT",
+            headline_tr="Sanatçının Açıklaması ve Dava Kararı İddiası",
+            cover_title_tr="DAVA İDDİASI",
+            caption_idea_tr="Tabloid haberi.",
+            why_efso_tr="Adli gündem.",
+            suggested_format="POST",
+            category="YERLI",
+        )
+        results_fp = self.engine._validate_and_transform_picks([pick_fp], [art], [])
+        self.assertEqual(len(results_fp), 1)
+        # Without _trusted_test_evidence seam, raw_metadata and text markers cannot promote to FIRST_PARTY_STATEMENT
+        self.assertEqual(results_fp[0].verification_status, VerificationStatus.REPUTABLE_REPORTING)
+        self.assertIn("doğrulanabilir birinci el doğrudan paylaşım/açıklama kanıtı bulunmuyor", results_fp[0].uncertainties_tr)
+
+        # 2. Model claims OFFICIAL_CONFIRMATION
+        pick_off = EditorialPickSchema(
+            article_ids=[art.id],
+            score=91,
+            kind="NEW",
+            verification_status="OFFICIAL_CONFIRMATION",
+            headline_tr="Sanatçının Davasında Mahkeme Kararı Açıklandı",
+            cover_title_tr="MAHKEME KARARI",
+            caption_idea_tr="Mahkeme kararı haberi.",
+            why_efso_tr="Adli gündem.",
+            suggested_format="POST",
+            category="YERLI",
+        )
+        results_off = self.engine._validate_and_transform_picks([pick_off], [art], [])
+        self.assertEqual(len(results_off), 1)
+        self.assertEqual(results_off[0].verification_status, VerificationStatus.REPUTABLE_REPORTING)
+        self.assertIn("resmi kurum/ajans/menajer açıklaması kanıtı bulunmuyor", results_off[0].uncertainties_tr)
+
     def test_p1_authentic_first_party_statement_preserved(self):
-        """Authentic first-party statement (direct personal channel or verified metadata) is preserved."""
+        """Authentic first-party statement with trusted test evidence seam is preserved."""
         art = Article.create(
             title="Kurgusal Şarkıcı Canlı Yayında Evlendiğini Duyurdu",
             url="https://source.com/first-party-video",
             source="Kendi Sosyal Medya Kanalı",
             published_at=self.now,
-            snippet="Sanatçı kendi sosyal medya hesabından yaptığı paylaşımda 'Evlendik' diyerek haberi bizzat duyurdu.",
-            raw_metadata={"is_first_party": True},
+            snippet="Sanatçı canlı yayında evlendiklerini bizzat duyurdu.",
+            raw_metadata={"_trusted_test_evidence": "FIRST_PARTY"},
         )
         pick = EditorialPickSchema(
             article_ids=[art.id],
@@ -684,14 +818,14 @@ class TestEditorialIntelligence(unittest.TestCase):
         self.assertEqual(res.disposition, EditorialDisposition.DIGEST)
 
     def test_p1_official_confirmation_preserved_with_agency_or_spokesperson_evidence(self):
-        """Authentic official confirmation with agency / manager statement is preserved."""
+        """Authentic official confirmation with trusted test evidence seam is preserved."""
         art = Article.create(
             title="Menajerlik Ajansından Açıklama: Konser Turnesi İptal Edildi",
             url="https://source.com/press-release",
             source="Ajans Bülteni",
             published_at=self.now,
             snippet="Menajerlik ajansı tarafından yapılan resmi açıklamada dünya turnesinin ertelendiği doğrulandı.",
-            raw_metadata={"is_official": True},
+            raw_metadata={"_trusted_test_evidence": "OFFICIAL_CONFIRMATION"},
         )
         pick = EditorialPickSchema(
             article_ids=[art.id],
@@ -749,7 +883,7 @@ class TestEditorialIntelligence(unittest.TestCase):
             source="Hastane Başhekimliği",
             published_at=self.now,
             snippet="Hastane başhekimliği tarafından yapılan resmi açıklamada sanatçının kemoterapi tedavisi gördüğü açıklandı.",
-            raw_metadata={"is_official": True},
+            raw_metadata={"_trusted_test_evidence": "OFFICIAL_CONFIRMATION"},
         )
         pick = EditorialPickSchema(
             article_ids=[art.id],
@@ -894,6 +1028,54 @@ class TestEditorialIntelligence(unittest.TestCase):
         notifications = self.repo.get_verification_held_notifications()
         self.assertEqual(len(notifications), 1)
         self.assertEqual(notifications[0].status, DeliveryStatus.HELD_FOR_VERIFICATION)
+
+    def test_p2_orchestrator_source_text_health_veto_blocks_benign_assessment(self):
+        """Orchestrator defense-in-depth inspects supporting article text and blocks a benign-looking assessment with emergency health source."""
+        art = Article.create(
+            title="Kurgusal Sanatçı Kalp Krizi Geçirerek Acilen Yoğun Bakıma Alındı",
+            url="https://source.com/emergency-icu",
+            source="Sağlık Portalı",
+            published_at=self.now,
+            snippet="Sanatçı aniden rahatsızlanarak acil ameliyata alındı ve yoğun bakım ünitesinde tedavi görüyor.",
+        )
+        # Flawed / mock AI engine returning a completely benign headline and default publishable flags
+        flawed_assessment = EditorialAssessment(
+            article_ids=[art.id],
+            score=95,  # Above breaking alert min score
+            kind=EditorialKind.NEW,
+            headline_tr="Kurgusal Sanatçı Yeni Albüm Hazırlığına Başladı",  # Benign headline
+            caption_idea_tr="Stüdyo kayıtlarına odaklandı.",
+            why_efso_tr="Popüler müzik gündemi.",
+            suggested_format=SuggestedFormat.POST,
+            category=StoryCategory.YERLI,
+            verification_status=VerificationStatus.REPUTABLE_REPORTING,
+            source_urls=[art.url],
+            supporting_articles=[art],
+            is_publishable=True,  # Flawed engine declared publishable
+            disposition=EditorialDisposition.DIGEST,
+            uncertainties_tr=None,  # No health uncertainty from flawed engine
+        )
+        orch = RadarOrchestrator(
+            settings=self.settings,
+            repository=self.repo,
+            source=MockNewsSource(articles=[art], successes=1),
+            ai_engine=MagicMock(evaluate=MagicMock(return_value=[flawed_assessment])),
+            notifier=MagicMock(send=MagicMock(return_value=NotificationRecord(
+                notification_id="SENT-FAIL", story_id="S1", kind=EditorialKind.NEW,
+                channel="TELEGRAM", sent_at=self.now, status=DeliveryStatus.SENT,
+                message_text="msg", headline_tr="hl", score=95
+            ))),
+        )
+        result = orch.run(now=self.now)
+        self.assertTrue(result.success)
+        # Crucial defense-in-depth: Notifier.send must NOT be dispatched
+        orch.notifier.send.assert_not_called()
+        self.assertEqual(result.notifications_dispatched, 0)
+        # Defense-in-depth veto placed it in HELD_FOR_VERIFICATION queue
+        held_notifications = self.repo.get_verification_held_notifications()
+        self.assertEqual(len(held_notifications), 1)
+        self.assertEqual(held_notifications[0].status, DeliveryStatus.HELD_FOR_VERIFICATION)
+        self.assertIn("Held for sensitive health review", held_notifications[0].error_message)
 
 
 if __name__ == "__main__":
