@@ -343,24 +343,44 @@ class RadarOrchestrator:
                 *source_texts,
             )
         )
+        is_explicit_non_alertable = (
+            pick.kind in (EditorialKind.IGNORE, EditorialKind.DUPLICATE)
+            or getattr(pick, "disposition", None) in (EditorialDisposition.IGNORE, EditorialDisposition.RESERVE)
+        )
         is_unverified = (
-            is_sensitive_health
-            or has_unknown_id
+            not getattr(pick, "is_publishable", True)
             or getattr(pick, "disposition", None) == EditorialDisposition.HOLD
+            or is_sensitive_health
+            or has_unknown_id
             or pick.verification_status in (
                 VerificationStatus.UNVERIFIED_RUMOR,
                 VerificationStatus.SPECULATION,
                 VerificationStatus.ATTRIBUTED_CLAIM,
             )
         )
-        is_explicit_non_alertable = (
-            pick.kind in (EditorialKind.IGNORE, EditorialKind.DUPLICATE)
-            or getattr(pick, "disposition", None) in (EditorialDisposition.IGNORE, EditorialDisposition.RESERVE)
-            or not getattr(pick, "is_publishable", True)
-        )
 
-        # Precedence: SENSITIVE_REVIEW > HOLD > NON_ALERTABLE > normal publishable
-        if is_sensitive_review:
+        # Precedence:
+        # 1. Absolute non-alertable veto: kind IGNORE/DUPLICATE or disposition IGNORE/RESERVE
+        #    cannot enter any notification or hold queue, regardless of concurrent flags.
+        if is_explicit_non_alertable:
+            effective_is_publishable = False
+            is_non_alertable = True
+            is_unverified = False
+            is_sensitive_review = False
+            is_sensitive_health = False
+
+            if getattr(pick, "disposition", None) == EditorialDisposition.RESERVE:
+                effective_disposition = EditorialDisposition.RESERVE
+                effective_uncertainties = pick.uncertainties_tr or "RESERVE: İsteğe bağlı yedek içerik; doğrudan bildirim veya bültene gönderilmez."
+            elif pick.kind == EditorialKind.DUPLICATE:
+                effective_disposition = EditorialDisposition.IGNORE
+                effective_uncertainties = pick.uncertainties_tr or "SUPPRESSED (DUPLICATE): Mükerrer haber bildirime gönderilmez."
+            else:
+                effective_disposition = EditorialDisposition.IGNORE
+                effective_uncertainties = pick.uncertainties_tr or "SUPPRESSED: Uygunsuz veya eşik altı içerik genel bildirimden çıkarıldı."
+
+        # 2. Alertable candidates: SENSITIVE_REVIEW > HOLD > normal publishable
+        elif is_sensitive_review:
             effective_is_publishable = False
             effective_disposition = EditorialDisposition.SENSITIVE_REVIEW
             is_non_alertable = False
@@ -371,6 +391,7 @@ class RadarOrchestrator:
                     effective_uncertainties = pick.uncertainties_tr
             else:
                 effective_uncertainties = "SENSITIVE EDITORIAL REVIEW: Hassas trajedi/vefat içeriği Product Owner açık onayı gerektirir."
+
         elif is_unverified:
             effective_is_publishable = False
             effective_disposition = EditorialDisposition.HOLD
@@ -390,19 +411,7 @@ class RadarOrchestrator:
                     effective_uncertainties = "HOLD: Aday havuzunda bulunmayan makale ID'si tespit edildi."
             else:
                 effective_uncertainties = pick.uncertainties_tr or "Teyit bekliyor: Doğrulanmamış söylenti veya iddia."
-        elif is_explicit_non_alertable:
-            effective_is_publishable = False
-            is_non_alertable = True
-            is_unverified = False
-            if getattr(pick, "disposition", None) == EditorialDisposition.RESERVE:
-                effective_disposition = EditorialDisposition.RESERVE
-                effective_uncertainties = pick.uncertainties_tr or "RESERVE: İsteğe bağlı yedek içerik; doğrudan bildirim veya bültene gönderilmez."
-            elif pick.kind == EditorialKind.DUPLICATE:
-                effective_disposition = EditorialDisposition.IGNORE
-                effective_uncertainties = pick.uncertainties_tr or "SUPPRESSED (DUPLICATE): Mükerrer haber bildirime gönderilmez."
-            else:
-                effective_disposition = EditorialDisposition.IGNORE
-                effective_uncertainties = pick.uncertainties_tr or "SUPPRESSED: Uygunsuz veya eşik altı içerik genel bildirimden çıkarıldı."
+
         else:
             effective_is_publishable = True
             effective_disposition = pick.disposition or EditorialDisposition.DIGEST

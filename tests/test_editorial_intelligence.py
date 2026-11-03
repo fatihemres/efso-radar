@@ -1498,12 +1498,56 @@ class TestEditorialIntelligence(unittest.TestCase):
         self.assertFalse(eff_ign.is_publishable)
         self.assertEqual(eff_ign.disposition, EditorialDisposition.IGNORE)
 
-        # Case 5: Original pick object remains completely unmutated
+        # Case 5: Explicit non-alertable veto with concurrent health/tragedy markers
+        pick_ign_trag = EditorialAssessment(
+            article_ids=[art2.id],  # art2 has death/cenaze in snippet
+            score=95,
+            kind=EditorialKind.NEW,
+            headline_tr="Kurgusal Vefat Olayı",
+            suggested_format=SuggestedFormat.POST,
+            category=StoryCategory.YERLI,
+            verification_status=VerificationStatus.REPUTABLE_REPORTING,
+            is_publishable=True,
+            disposition=EditorialDisposition.IGNORE,  # Explicit IGNORE veto
+        )
+        eff_ign_trag, is_s_veto, is_h_veto, is_u_veto, is_na_veto = RadarOrchestrator.derive_effective_assessment(
+            pick_ign_trag, candidate_map
+        )
+        self.assertTrue(is_na_veto)
+        self.assertFalse(is_s_veto)
+        self.assertFalse(is_h_veto)
+        self.assertFalse(is_u_veto)
+        self.assertFalse(eff_ign_trag.is_publishable)
+        self.assertEqual(eff_ign_trag.disposition, EditorialDisposition.IGNORE)
+
+        # Case 6: Bare is_publishable=False without explicit IGNORE/RESERVE fails closed to HOLD
+        pick_bare_nonpub = EditorialAssessment(
+            article_ids=[art_benign.id],
+            score=85,
+            kind=EditorialKind.NEW,
+            headline_tr="Kurgusal Normal Gündem",
+            suggested_format=SuggestedFormat.POST,
+            category=StoryCategory.YERLI,
+            verification_status=VerificationStatus.REPUTABLE_REPORTING,
+            is_publishable=False,  # Bare is_publishable=False
+            disposition=EditorialDisposition.DIGEST,  # Not IGNORE / RESERVE
+        )
+        eff_bare, _, _, is_u_bare, is_na_bare = RadarOrchestrator.derive_effective_assessment(
+            pick_bare_nonpub, cmap_benign
+        )
+        self.assertFalse(is_na_bare)
+        self.assertTrue(is_u_bare)
+        self.assertFalse(eff_bare.is_publishable)
+        self.assertEqual(eff_bare.disposition, EditorialDisposition.HOLD)
+
+        # Case 7: Original pick objects remain completely unmutated
         self.assertTrue(pick_both.is_publishable)
         self.assertEqual(pick_both.disposition, EditorialDisposition.DIGEST)
         self.assertTrue(pick_health.is_publishable)
         self.assertEqual(pick_health.disposition, EditorialDisposition.DIGEST)
         self.assertTrue(pick_ign_benign.is_publishable)
+        self.assertTrue(pick_ign_trag.is_publishable)
+        self.assertFalse(pick_bare_nonpub.is_publishable)
 
     def test_p1_orchestrator_alternate_engine_ignore_and_duplicate_suppressed_no_send_no_queue(self):
         """P1: Alternate engine returning disposition=IGNORE with high score is suppressed: no alert, no digest queue."""
@@ -1713,6 +1757,216 @@ class TestEditorialIntelligence(unittest.TestCase):
         self.assertNotIn("https://forged-attacker-url.com/fake-news", effective_asm.source_urls)
         # Aggregator URL is not used because canonical_url is present
         self.assertNotIn("https://feed.aggregator.com/rss-link-9999", effective_asm.source_urls)
+
+    def test_p1_orchestrator_bare_non_publishable_held_not_ignored(self):
+        """P1 Block A: Bare is_publishable=False on alertable NEW/UPDATE is HELD_FOR_VERIFICATION, never silently IGNORE."""
+        art = Article.create(
+            title="Kurgusal Sanatçı Yeni Film Projesini Açıkladı",
+            url="https://source.com/film-announce",
+            source="Kültür Sanat",
+            published_at=self.now,
+            snippet="Sanatçı yeni projesinin senaryo çalışmalarının başladığını bildirdi.",
+        )
+        # Benign story with is_publishable=False but no explicit IGNORE/RESERVE/DUPLICATE
+        pick = EditorialAssessment(
+            article_ids=[art.id],
+            score=90,
+            kind=EditorialKind.NEW,
+            headline_tr="Kurgusal Sanatçı Yeni Film Projesini Açıkladı",
+            caption_idea_tr="Senaryo çalışmaları başladı.",
+            why_efso_tr="Kültür sanat haberi.",
+            suggested_format=SuggestedFormat.POST,
+            category=StoryCategory.YERLI,
+            verification_status=VerificationStatus.REPUTABLE_REPORTING,
+            source_urls=[art.url],
+            supporting_articles=[art],
+            is_publishable=False,  # Explicitly non-publishable from engine
+            disposition=EditorialDisposition.DIGEST,  # Not IGNORE, not RESERVE!
+            uncertainties_tr=None,
+        )
+        orch = RadarOrchestrator(
+            settings=self.settings,
+            repository=self.repo,
+            source=MockNewsSource(articles=[art], successes=1),
+            ai_engine=MagicMock(evaluate=MagicMock(return_value=[pick])),
+            notifier=MagicMock(send=MagicMock(return_value=NotificationRecord(
+                notification_id="SENT-FAIL", story_id="S1", kind=EditorialKind.NEW,
+                channel="TELEGRAM", sent_at=self.now, status=DeliveryStatus.SENT,
+                message_text="msg", headline_tr="hl", score=90
+            ))),
+        )
+        with patch.object(self.repo, "record_editorial_assessment", wraps=self.repo.record_editorial_assessment) as mock_rec:
+            result = orch.run(now=self.now)
+        self.assertTrue(result.success)
+        orch.notifier.send.assert_not_called()
+        self.assertEqual(result.notifications_dispatched, 0)
+
+        # Must be placed in HELD_FOR_VERIFICATION queue (never silently dropped as IGNORE)
+        held = self.repo.get_verification_held_notifications()
+        self.assertEqual(len(held), 1)
+        self.assertEqual(held[0].status, DeliveryStatus.HELD_FOR_VERIFICATION)
+        self.assertEqual(len(self.repo.get_queued_digest_notifications()), 0)
+
+        mock_rec.assert_called_once()
+        effective_asm = mock_rec.call_args[0][0]
+        self.assertFalse(effective_asm.is_publishable)
+        self.assertEqual(effective_asm.disposition, EditorialDisposition.HOLD)  # Must be HOLD, never IGNORE!
+
+    def test_p1_orchestrator_ignore_with_attributed_claim_vetoed_no_hold_queue(self):
+        """P1 Block B: Explicit disposition=IGNORE is an absolute veto even when verification_status is ATTRIBUTED_CLAIM."""
+        art = Article.create(
+            title="Kurgusal Fenomen Hakkında Yeni İddia",
+            url="https://source.com/claim-ignore",
+            source="Magazin Sitesi",
+            published_at=self.now,
+            snippet="Sosyal medyada yayılan söylentiler üzerine açıklama bekleniyor.",
+        )
+        pick = EditorialAssessment(
+            article_ids=[art.id],
+            score=70,
+            kind=EditorialKind.NEW,
+            headline_tr="Kurgusal Fenomen Hakkında Yeni İddia",
+            caption_idea_tr="Söylentiler konuşuluyor.",
+            why_efso_tr="Düşük değerli dedikodu.",
+            suggested_format=SuggestedFormat.POST,
+            category=StoryCategory.YERLI,
+            verification_status=VerificationStatus.ATTRIBUTED_CLAIM,  # Attributed claim
+            source_urls=[art.url],
+            supporting_articles=[art],
+            is_publishable=False,
+            disposition=EditorialDisposition.IGNORE,  # Explicit IGNORE
+            uncertainties_tr=None,
+        )
+        orch = RadarOrchestrator(
+            settings=self.settings,
+            repository=self.repo,
+            source=MockNewsSource(articles=[art], successes=1),
+            ai_engine=MagicMock(evaluate=MagicMock(return_value=[pick])),
+            notifier=MagicMock(send=MagicMock(return_value=NotificationRecord(
+                notification_id="SENT-FAIL", story_id="S1", kind=EditorialKind.NEW,
+                channel="TELEGRAM", sent_at=self.now, status=DeliveryStatus.SENT,
+                message_text="msg", headline_tr="hl", score=70
+            ))),
+        )
+        with patch.object(self.repo, "record_editorial_assessment", wraps=self.repo.record_editorial_assessment) as mock_rec:
+            result = orch.run(now=self.now)
+        self.assertTrue(result.success)
+        orch.notifier.send.assert_not_called()
+        self.assertEqual(result.notifications_dispatched, 0)
+
+        # Absolute veto: Zero notifications across all queues (including HELD_FOR_VERIFICATION)
+        self.assertEqual(len(self.repo.get_verification_held_notifications()), 0)
+        self.assertEqual(len(self.repo.get_queued_digest_notifications()), 0)
+        self.assertEqual(len(self.repo.get_sensitive_review_notifications()), 0)
+
+        mock_rec.assert_called_once()
+        effective_asm = mock_rec.call_args[0][0]
+        self.assertFalse(effective_asm.is_publishable)
+        self.assertEqual(effective_asm.disposition, EditorialDisposition.IGNORE)
+
+    def test_p1_orchestrator_duplicate_with_source_tragedy_vetoed_no_sensitive_queue(self):
+        """P1 Block B: Explicit kind=DUPLICATE is an absolute veto even when source contains tragedy."""
+        art_trag = Article.create(
+            title="Kurgusal Sanatçı Trafik Kazasında Hayatını Kaybetti",
+            url="https://source.com/dup-fatal",
+            source="Haber Ajansı",
+            published_at=self.now,
+            snippet="Trafik kazasında vefat eden sanatçının cenazesi defnedildi.",
+        )
+        pick_dup_trag = EditorialAssessment(
+            article_ids=[art_trag.id],
+            score=95,
+            kind=EditorialKind.DUPLICATE,  # Explicit DUPLICATE!
+            headline_tr="Kurgusal Sanatçı Kazada Vefat Etti",
+            caption_idea_tr="Daha önce alerted edilmişti.",
+            why_efso_tr="Mükerrer haber.",
+            suggested_format=SuggestedFormat.POST,
+            category=StoryCategory.YERLI,
+            verification_status=VerificationStatus.REPUTABLE_REPORTING,
+            source_urls=[art_trag.url],
+            supporting_articles=[art_trag],
+            is_publishable=True,
+            disposition=EditorialDisposition.DIGEST,
+            uncertainties_tr=None,
+        )
+        orch = RadarOrchestrator(
+            settings=self.settings,
+            repository=self.repo,
+            source=MockNewsSource(articles=[art_trag], successes=1),
+            ai_engine=MagicMock(evaluate=MagicMock(return_value=[pick_dup_trag])),
+            notifier=MagicMock(send=MagicMock(return_value=NotificationRecord(
+                notification_id="SENT-FAIL", story_id="S1", kind=EditorialKind.NEW,
+                channel="TELEGRAM", sent_at=self.now, status=DeliveryStatus.SENT,
+                message_text="msg", headline_tr="hl", score=95
+            ))),
+        )
+        with patch.object(self.repo, "record_editorial_assessment", wraps=self.repo.record_editorial_assessment) as mock_rec:
+            result = orch.run(now=self.now)
+        self.assertTrue(result.success)
+        orch.notifier.send.assert_not_called()
+        self.assertEqual(result.notifications_dispatched, 0)
+
+        # Absolute veto: Must NOT re-alert or queue duplicate tragedy
+        self.assertEqual(len(self.repo.get_sensitive_review_notifications()), 0)
+        self.assertEqual(len(self.repo.get_verification_held_notifications()), 0)
+        self.assertEqual(len(self.repo.get_queued_digest_notifications()), 0)
+
+        mock_rec.assert_called_once()
+        effective_asm = mock_rec.call_args[0][0]
+        self.assertFalse(effective_asm.is_publishable)
+        self.assertEqual(effective_asm.disposition, EditorialDisposition.IGNORE)
+
+    def test_p1_orchestrator_reserve_with_source_health_vetoed_no_hold_queue(self):
+        """P1 Block B: Explicit disposition=RESERVE is an absolute veto even when source contains health content."""
+        art_health = Article.create(
+            title="Kurgusal Sanatçı Ameliyat Sonrası Evinde Dinleniyor",
+            url="https://source.com/reserve-surgery",
+            source="Haber",
+            published_at=self.now,
+            snippet="Başarılı ameliyat sonrası sanatçı taburcu oldu ve evinde tedavi görüyor.",
+        )
+        pick_reserve_health = EditorialAssessment(
+            article_ids=[art_health.id],
+            score=72,
+            kind=EditorialKind.NEW,
+            headline_tr="Kurgusal Sanatçı Taburcu Oldu",
+            caption_idea_tr="Evinde dinleniyor.",
+            why_efso_tr="İsteğe bağlı yedek içerik.",
+            suggested_format=SuggestedFormat.POST,
+            category=StoryCategory.YERLI,
+            verification_status=VerificationStatus.REPUTABLE_REPORTING,
+            source_urls=[art_health.url],
+            supporting_articles=[art_health],
+            is_publishable=False,
+            disposition=EditorialDisposition.RESERVE,  # Explicit RESERVE!
+            uncertainties_tr=None,
+        )
+        orch = RadarOrchestrator(
+            settings=self.settings,
+            repository=self.repo,
+            source=MockNewsSource(articles=[art_health], successes=1),
+            ai_engine=MagicMock(evaluate=MagicMock(return_value=[pick_reserve_health])),
+            notifier=MagicMock(send=MagicMock(return_value=NotificationRecord(
+                notification_id="SENT-FAIL", story_id="S1", kind=EditorialKind.NEW,
+                channel="TELEGRAM", sent_at=self.now, status=DeliveryStatus.SENT,
+                message_text="msg", headline_tr="hl", score=72
+            ))),
+        )
+        with patch.object(self.repo, "record_editorial_assessment", wraps=self.repo.record_editorial_assessment) as mock_rec:
+            result = orch.run(now=self.now, use_hybrid_digest=True)
+        self.assertTrue(result.success)
+        orch.notifier.send.assert_not_called()
+        self.assertEqual(result.notifications_dispatched, 0)
+
+        # Absolute veto: Must not be pushed into verification hold or digest queue
+        self.assertEqual(len(self.repo.get_verification_held_notifications()), 0)
+        self.assertEqual(len(self.repo.get_queued_digest_notifications()), 0)
+        self.assertEqual(len(self.repo.get_sensitive_review_notifications()), 0)
+
+        mock_rec.assert_called_once()
+        effective_asm = mock_rec.call_args[0][0]
+        self.assertFalse(effective_asm.is_publishable)
+        self.assertEqual(effective_asm.disposition, EditorialDisposition.RESERVE)
 
 
 if __name__ == "__main__":
