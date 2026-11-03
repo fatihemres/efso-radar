@@ -16,6 +16,7 @@ from efso_radar.ai.client import (
     AIEvaluationError,
     AIEditorialEngine,
     GeminiEditorialEngine,
+    detect_sensitive_health_content,
     detect_sensitive_tragedy_content,
 )
 from efso_radar.config import Settings
@@ -652,6 +653,7 @@ class RadarOrchestrator:
                     discovery_metrics=discovery_metrics,
                 )
             logger.info("Editorial evaluation approved %d stories", len(picks))
+            candidate_map = {a.id: a for a in candidates}
 
             for pick in picks:
                 if pick.kind == EditorialKind.UPDATE and pick.parent_story_id:
@@ -673,6 +675,16 @@ class RadarOrchestrator:
                         continue
 
                 # 7. Sensitive Review, Verification Hold & Hybrid Digest Routing vs Immediate Notification Delivery
+                # Authoritative candidate articles from this orchestrator run
+                auth_articles = [candidate_map[aid] for aid in pick.article_ids if aid in candidate_map]
+                has_unknown_id = any(aid not in candidate_map for aid in pick.article_ids) or not auth_articles
+                engine_supporting = list(getattr(pick, "supporting_articles", []))
+                # Always inspect authoritative candidate_map source text IN ADDITION to engine articles
+                source_texts = (
+                    [f"{a.title} {a.snippet}" for a in auth_articles]
+                    + [f"{a.title} {a.snippet}" for a in engine_supporting]
+                )
+
                 is_sensitive_review = (
                     getattr(pick, "disposition", None) == EditorialDisposition.SENSITIVE_REVIEW
                     or (pick.uncertainties_tr and "SENSITIVE EDITORIAL REVIEW" in pick.uncertainties_tr)
@@ -681,12 +693,29 @@ class RadarOrchestrator:
                         pick.caption_idea_tr,
                         pick.relevance_reason_tr,
                         pick.why_efso_tr,
+                        *source_texts,
                     )
                 )
-                is_unverified = pick.verification_status in (
-                    VerificationStatus.UNVERIFIED_RUMOR,
-                    VerificationStatus.SPECULATION,
-                    VerificationStatus.ATTRIBUTED_CLAIM,
+                is_sensitive_health = (
+                    (pick.uncertainties_tr and "SENSITIVE HEALTH REVIEW" in pick.uncertainties_tr)
+                    or detect_sensitive_health_content(
+                        pick.headline_tr,
+                        pick.caption_idea_tr,
+                        pick.relevance_reason_tr,
+                        pick.why_efso_tr,
+                        *source_texts,
+                    )
+                )
+                is_unverified = (
+                    not getattr(pick, "is_publishable", True)
+                    or getattr(pick, "disposition", None) == EditorialDisposition.HOLD
+                    or is_sensitive_health
+                    or has_unknown_id
+                    or pick.verification_status in (
+                        VerificationStatus.UNVERIFIED_RUMOR,
+                        VerificationStatus.SPECULATION,
+                        VerificationStatus.ATTRIBUTED_CLAIM,
+                    )
                 )
                 should_queue_digest = (
                     (use_hybrid_digest or self.settings.notification_strategy == "DIGEST_ONLY")
@@ -727,7 +756,11 @@ class RadarOrchestrator:
                         message_text=format_telegram_verification_hold(pick),
                         headline_tr=pick.headline_tr,
                         score=pick.score,
-                        error_message="Held for verification: unverified rumor or attributed claim",
+                        error_message=(
+                            "Held for sensitive health review: personal medical condition requires human editorial review"
+                            if is_sensitive_health
+                            else "Held for verification: unverified rumor or attributed claim"
+                        ),
                         category=TelegramNotificationCategory.HOLD_FOR_VERIFICATION,
                     )
                 elif should_queue_digest:

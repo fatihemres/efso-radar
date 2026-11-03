@@ -139,6 +139,236 @@ def is_headline_too_similar(headline: str, existing_headline: str, threshold: fl
     return False
 
 
+TR_HEALTH_PATTERNS = [
+    r"\byoğun\s+bakım[a-zıiüöçşğ]*\b",
+    r"\byogun\s+bakim[a-zıiüöçşğ]*\b",
+    r"\bhastaneye\s+(?:kaldırıl|yatırıl|sevk\s+edil)[a-zıiüöçşğ]*\b",
+    r"\bhastaneye\s+(?:kaldiril|yatiril)[a-zıiüöçşğ]*\b",
+    r"\bhastanelik\s+ol[a-zıiüöçşğ]*\b",
+    r"\bhastanede\s+tedavi[a-zıiüöçşğ]*\b",
+    r"\bzorunlu\s+yatış\b",
+    r"\bzorunlu\s+yatis\b",
+    r"\bmüşahede\s+altına\s+alın[a-zıiüöçşğ]*\b",
+    r"\bmusahede\s+altina\s+alin[a-zıiüöçşğ]*\b",
+    r"\bacil\s+(?:servise\s+kaldırıl|ameliyata\s+alın)[a-zıiüöçşğ]*\b",
+    r"\bacil\s+(?:servise\s+kaldiril|ameliyata\s+alin)[a-zıiüöçşğ]*\b",
+    r"\b(?:sağlık|saglik)\s+durumu\s+(?:kritik|ağır|agir)\b",
+    r"\bhayati\s+tehlike[a-zıiüöçşğ]*\b",
+    r"\byaşam\s+savaşı\b",
+    r"\byasam\s+savasi\b",
+    r"\b(?:kanser|tümör|tumor)\s+(?:tedavi|teşhis|teshis)[a-zıiüöçşğ]*\b",
+    r"\bkemoterapi\b",
+    r"\bradyoterapi\b",
+    r"\bentübe\b",
+    r"\bentube\b",
+    r"\bfelç\s+geçir[a-zıiüöçşğ]*\b",
+    r"\bfelc\s+gecir[a-zıiüöçşğ]*\b",
+    r"\bkalp\s+krizi\s+geçir[a-zıiüöçşğ]*\b",
+    r"\bkalp\s+krizi\s+gecir[a-zıiüöçşğ]*\b",
+    r"\bbeyin\s+kanaması\b",
+    r"\bbeyin\s+kanamasi\b",
+    r"\bameliyata\s+alındı\b",
+    r"\bameliyata\s+alindi\b",
+    r"\bacil\s+ameliyat[a-zıiüöçşğ]*\b",
+    r"\b(?:rehabilitasyon|psikiyatri)\s+(?:merkezi|kliniği|tedavisi|hastanesi)[a-zıiüöçşğ]*\b",
+    r"\b(?:rehabilitasyon|psikiyatri)\s+(?:merkezi|klinigi|tedavisi|hastanesi)[a-zıiüöçşğ]*\b",
+]
+
+EN_HEALTH_PATTERNS = [
+    r"\b(?:intensive\s+care|icu)\b",
+    r"\b(?:hospitalized|hospitalised|hospitalization)\b",
+    r"\b(?:involuntary\s+admission|psychiatric\s+hold)\b",
+    r"\brushed\s+to\s+(?:the\s+)?hospital\b",
+    r"\btaken\s+to\s+(?:the\s+)?hospital\b",
+    r"\badmitted\s+to\s+(?:the\s+)?hospital\b",
+    r"\b(?:in\s+)?critical\s+condition\b",
+    r"\bfighting\s+for\s+(?:his|her|their)\s+life\b",
+    r"\blife-threatening\s+condition\b",
+    r"\b(?:cancer|tumor)\s+(?:treatment|diagnosis)\b",
+    r"\bundergoing\s+chemotherapy\b",
+    r"\bintubated\b",
+    r"\bsuffered\s+a\s+(?:stroke|heart\s+attack|brain\s+hemorrhage)\b",
+    r"\bemergency\s+surgery\b",
+    r"\bunderwent\s+(?:emergency\s+)?surgery\b",
+    r"\bundergoing\s+(?:emergency\s+)?surgery\b",
+    r"\b(?:rehab|psychiatric)\s+(?:facility|clinic|treatment|hospital)\b",
+]
+
+COMPILED_HEALTH_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in (TR_HEALTH_PATTERNS + EN_HEALTH_PATTERNS)
+]
+
+
+def detect_sensitive_health_content(*texts: Optional[str]) -> bool:
+    """Independent defense-in-depth safety detector identifying sensitive personal medical,
+    health intervention, emergency hospitalization, intensive care, cancer treatment,
+    or psychiatric confinement conditions."""
+    combined = " ".join(t.strip() for t in texts if t and t.strip())
+    if not combined:
+        return False
+    return any(pat.search(combined) is not None for pat in COMPILED_HEALTH_PATTERNS)
+
+
+def has_first_party_evidence(articles: list[Article]) -> bool:
+    """Check if supporting articles contain authentic first-party provenance.
+
+    Untrusted article prose and publisher-supplied metadata cannot self-assert provenance.
+    Until an independently authenticated cryptographic/account verification contract
+    exists in the pipeline, all external article inputs fail closed (return False) in production.
+    """
+    return False
+
+
+def has_official_confirmation_evidence(articles: list[Article]) -> bool:
+    """Check if supporting articles contain authentic official confirmation evidence.
+
+    Untrusted article prose and publisher-supplied metadata cannot self-assert provenance.
+    Until an independently authenticated document/agency verification contract
+    exists in the pipeline, all external article inputs fail closed (return False) in production.
+    """
+    return False
+
+
+TR_SOCIAL_INTERACTION_PATTERNS = [
+    r"\bbe(?:ğ|g)endi\b",
+    r"\bbe(?:ğ|g)eni\s+yapt[ıi]\b",
+    r"\bbe(?:ğ|g)eni\s+att[ıi]\b",
+    r"\bbe(?:ğ|g)enisi\b",
+    r"\btakibe\s+ald[ıi]\b",
+    r"\btakipten\s+(?:çıktı|cikti)\b",
+    r"\btakiple(?:ş|s)ti\b",
+]
+
+EN_SOCIAL_INTERACTION_PATTERNS = [
+    r"\bliked\s+(?:a\s+)?(?:post|photo|picture|video)\b",
+    r"\bfollowed\s+on\s+instagram\b",
+    r"\bunfollowed\b",
+]
+
+COMPILED_SOCIAL_INTERACTION_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in (TR_SOCIAL_INTERACTION_PATTERNS + EN_SOCIAL_INTERACTION_PATTERNS)
+]
+
+
+def has_social_interaction_content(*texts: Optional[str]) -> bool:
+    """Detect social media interaction markers (likes, follows, unfollows)."""
+    combined = " ".join(t.strip() for t in texts if t and t.strip())
+    if not combined:
+        return False
+    return any(pat.search(combined) is not None for pat in COMPILED_SOCIAL_INTERACTION_PATTERNS)
+
+
+TR_SPECULATIVE_ROMANCE_PATTERNS = [
+    r"\ba(?:ş|s)k\s+(?:m[ıi]|iddias[ıi]|sinyali|m[ıi]\s+ba(?:ş|s)lad[ıi]|muammas[ıi])\b",
+    r"\bsevgili\s+mi(?:ler)?\b",
+    r"\bili(?:ş|s)ki\s+(?:iddias[ıi]|mi|mi\s+ya(?:ş|s)[ıi]yorlar)\b",
+    r"\bbuzlar\s+eridi\s+mi\b",
+    r"\bayr[ıi]l[ıi]k\s+(?:sinyali|iddias[ıi]|m[ıi])\b",
+    r"\bbar[ıi](?:ş|s)t[ıi]lar\s+m[ıi]\b",
+    r"\bgönlünü\s+(?:mü\s+)?kapt[ıi]rd[ıi]\b",
+    r"\byeni\s+bir\s+a(?:ş|s)k\b",
+    r"\ba(?:ş|s)k\s+m[ıi]\s+ya(?:ş|s)[ıi]yor(?:lar)?\b",
+    r"\bromantik\s+yak[ıi]nla(?:ş|s)ma\b",
+]
+
+EN_SPECULATIVE_ROMANCE_PATTERNS = [
+    r"\b(?:dating|romance|in\s+love)\s*\?\b",
+    r"\b(?:sparked|fueling)\s+(?:dating|romance)\s+rumors\b",
+    r"\bbreakup\s+rumors?\b",
+    r"\bgetting\s+back\s+together\b",
+    r"\bare\s+they\s+dating\b",
+]
+
+COMPILED_SPECULATIVE_ROMANCE_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in (TR_SPECULATIVE_ROMANCE_PATTERNS + EN_SPECULATIVE_ROMANCE_PATTERNS)
+]
+
+
+def has_speculative_romance_content(*texts: Optional[str]) -> bool:
+    """Detect speculative romantic, relationship, or motive inferences."""
+    combined = " ".join(t.strip() for t in texts if t and t.strip())
+    if not combined:
+        return False
+    return any(pat.search(combined) is not None for pat in COMPILED_SPECULATIVE_ROMANCE_PATTERNS)
+
+
+def ground_verification_status(
+    claimed_status: str,
+    supporting_articles: list[Article],
+    headline: str = "",
+    caption: str = "",
+    development: str = "",
+) -> tuple[str, Optional[str]]:
+    """Ground verification status against authentic evidence in supporting articles.
+
+    Downgrades overconfident FIRST_PARTY_STATEMENT or OFFICIAL_CONFIRMATION when
+    authentic first-party provenance or official statements are absent from the input.
+    Distinguishes neutral documented public social interactions from uncorroborated
+    speculative motive/romance inferences.
+    """
+    source_text = " ".join([f"{a.title} {a.snippet}" for a in supporting_articles]).lower()
+    rumor_markers = [
+        "iddia", "one suruldu", "öne sürüldü", "soylenti", "söylenti",
+        "kulislere gore", "kulis", "blind item", "tabloid", "allegedly",
+        "rumor", "claimed", "sources claim"
+    ]
+    has_source_rumor = any(m in source_text for m in rumor_markers)
+    has_fp = has_first_party_evidence(supporting_articles)
+    has_off = has_official_confirmation_evidence(supporting_articles)
+
+    all_texts = [headline, caption, development, *(f"{a.title} {a.snippet}" for a in supporting_articles)]
+    has_social_eng = has_social_interaction_content(*all_texts)
+    has_speculative_romance = has_speculative_romance_content(*all_texts)
+
+    # 1. Speculative romance / motive inferred from social media interaction
+    if has_social_eng and (has_speculative_romance or has_source_rumor):
+        return (
+            "SPECULATION",
+            "Teyit kanıtı eksik: Sosyal medya etkileşimi üzerinden türetilen doğrulanmamış "
+            "ilişki/niyet iddiası spekülasyon niteliğindedir; editoryal doğrulama bekletmesi (HOLD) gerektirir.",
+        )
+
+    # 2. Model claimed FIRST_PARTY_STATEMENT
+    if claimed_status == "FIRST_PARTY_STATEMENT":
+        if has_fp:
+            return "FIRST_PARTY_STATEMENT", None
+        if has_social_eng:
+            return (
+                "REPUTABLE_REPORTING",
+                "Teyit kanıtı eksik: Sosyal medya etkileşimi (beğeni/takip) birinci el beyan niteliğinde "
+                "değildir; kamuya açık etkileşim haberi olarak değerlendirilmiştir.",
+            )
+        if has_source_rumor:
+            return (
+                "ATTRIBUTED_CLAIM",
+                "Teyit kanıtı eksik: Kaynak metninde birinci el beyan bulunmuyor; "
+                "haber iddia/söylenti niteliğindedir.",
+            )
+        return (
+            "REPUTABLE_REPORTING",
+            "Teyit kanıtı eksik: Kaynak metninde doğrulanabilir birinci el doğrudan paylaşım/açıklama "
+            "kanıtı bulunmuyor; üçüncü taraf haber aktarımı olarak değerlendirilmiştir.",
+        )
+
+    # 3. Model claimed OFFICIAL_CONFIRMATION
+    if claimed_status == "OFFICIAL_CONFIRMATION":
+        if has_off:
+            return "OFFICIAL_CONFIRMATION", None
+        if has_source_rumor:
+            return (
+                "ATTRIBUTED_CLAIM",
+                "Teyit kanıtı eksik: Kaynak metninde resmi doğrulama bulunmuyor; "
+                "haber iddia/söylenti niteliğindedir.",
+            )
+        return (
+            "REPUTABLE_REPORTING",
+            "Teyit kanıtı eksik: Kaynak metninde resmi kurum/ajans/menajer açıklaması kanıtı "
+            "bulunmuyor; üçüncü taraf haber aktarımı olarak değerlendirilmiştir.",
+        )
+
+    return claimed_status, None
+
+
 class GeminiEditorialEngine(AIEditorialEngine):
     """Google Gemini AI client with Structured Outputs and application-level verification."""
 
@@ -450,28 +680,28 @@ class GeminiEditorialEngine(AIEditorialEngine):
             norm_headline = normalize_text(pick.headline_tr)
 
             # 4. Factual Grounding: Source vs Model Verification Cross-Check
-            rumor_markers = ["iddia", "one suruldu", "öne sürüldü", "soylenti", "söylenti", "kulislere gore", "kulis", "blind item", "tabloid", "allegedly", "rumor", "claimed", "sources claim"]
-            official_markers = ["resmi aciklama", "resmî açıklama", "resmen", "acikladi", "açıkladı", "duyurdu", "dogruladi", "doğruladı", "avukati", "avukatı", "menajeri", "confirmed", "announced", "official statement", "yalanladi", "yalanlandı"]
-
-            has_source_rumor = any(m in source_text for m in rumor_markers)
-            has_source_official = any(m in source_text for m in official_markers)
-
-            grounded_verification_status = pick.verification_status
+            grounded_verification_status, caution_msg = ground_verification_status(
+                pick.verification_status,
+                supporting_articles,
+                headline=pick.headline_tr,
+                caption=pick.caption_idea_tr,
+                development=pick.development_tr or "",
+            )
             uncertainties = pick.uncertainties_tr.strip() if pick.uncertainties_tr else ""
+            if caution_msg:
+                uncertainties = f"{caution_msg} {uncertainties}".strip() if uncertainties else caution_msg
 
-            # Guard against model hallucinating official status when source only states rumors
-            if has_source_rumor and not has_source_official:
-                if pick.verification_status in ("OFFICIAL_CONFIRMATION", "FIRST_PARTY_STATEMENT"):
-                    logger.info("Downgrading ungrounded verification status '%s' to ATTRIBUTED_CLAIM for pick '%s'", pick.verification_status, pick.headline_tr)
-                    grounded_verification_status = "ATTRIBUTED_CLAIM"
-                    caution_msg = "Kaynak metninde resmi doğrulama bulunmuyor; haber iddia/söylenti niteliğindedir."
-                    uncertainties = f"{caution_msg} {uncertainties}".strip()
+            has_source_official = has_official_confirmation_evidence(supporting_articles)
 
             # 5. Definitive Assertion Guard: Allegations cannot become definitive factual headlines
             if grounded_verification_status in ("UNVERIFIED_RUMOR", "SPECULATION", "ATTRIBUTED_CLAIM") and not has_source_official:
                 has_caution_marker = any(
                     marker in norm_headline
-                    for marker in ["iddia", "one surulen", "konusulan", "soylenti", "iddiasi", "iddialari", "yalanlandi", "tartismasi"]
+                    for marker in [
+                        "iddia", "one surulen", "konusulan", "soylenti", "iddiasi", "iddialari",
+                        "yalanlandi", "tartismasi", "etkilesimi", "begeni", "beğeni", "takip",
+                        "begenisi", "beğenisi", "takiplesmesi", "takipten"
+                    ]
                 )
                 if not has_caution_marker:
                     logger.warning(
@@ -480,17 +710,68 @@ class GeminiEditorialEngine(AIEditorialEngine):
                     )
                     continue
 
-            # 6. Sensitive Allegations Conservative Handling (Death, crime, assault, infidelity)
-            sensitive_topics = ["vefat", "olum", "ölüm", "intihar", "uyusturucu", "uyuşturucu", "taciz", "saldiri", "saldırı", "darp", "aldatma", "hirsizlik", "hırsızlık", "dolandiricilik", "dolandırıcılık", "tutuklandi", "tutuklandı", "gozalti", "gözaltı"]
-            touches_sensitive_topic = any(topic in norm_headline for topic in sensitive_topics)
-            if touches_sensitive_topic:
+            # 6. Sensitive Health & Tragedy Independent Safety Veto
+            candidate_texts = [f"{a.title} {a.snippet}" for a in supporting_articles]
+            is_sensitive_tragedy = detect_sensitive_tragedy_content(
+                pick.headline_tr,
+                pick.caption_idea_tr,
+                pick.development_tr,
+                *candidate_texts,
+            )
+            is_sensitive_health = detect_sensitive_health_content(
+                pick.headline_tr,
+                pick.caption_idea_tr,
+                pick.development_tr,
+                *candidate_texts,
+            )
+
+            # Traditional sensitive crime/assault/infidelity topics on unverified rumors
+            sensitive_crime_topics = [
+                "uyusturucu", "uyuşturucu", "taciz", "saldiri", "saldırı", "darp", "aldatma",
+                "hirsizlik", "hırsızlık", "dolandiricilik", "dolandırıcılık", "tutuklandi",
+                "tutuklandı", "gozalti", "gözaltı"
+            ]
+            touches_crime_topic = any(topic in norm_headline for topic in sensitive_crime_topics) or any(
+                any(topic in normalize_text(txt) for topic in sensitive_crime_topics) for txt in candidate_texts
+            )
+            if touches_crime_topic:
                 if grounded_verification_status in ("UNVERIFIED_RUMOR", "SPECULATION"):
                     logger.warning("Rejected pick '%s': Sensitive topic on unverified rumor/speculation", pick.headline_tr)
                     continue
                 if grounded_verification_status == "ATTRIBUTED_CLAIM":
-                    sens_msg = "Hassas adli/yaşam iddiası: Yayınlamadan önce resmi kaynak ve adli kayıtlar teyit edilmelidir."
+                    sens_msg = "Hassas adli iddia: Yayınlamadan önce resmi kaynak ve adli kayıtlar teyit edilmelidir."
                     if sens_msg not in uncertainties:
                         uncertainties = f"{sens_msg} {uncertainties}".strip()
+
+            # Determine publication eligibility and disposition
+            if is_sensitive_tragedy:
+                is_publishable = False
+                disposition = EditorialDisposition.SENSITIVE_REVIEW
+                trag_msg = (
+                    "[NOT_PUBLISHABLE - SENSITIVE EDITORIAL REVIEW REQUIRED] "
+                    "Hassas vefat/cenaze/taziye haberi: Product Owner onayı olmadan yayınlanamaz."
+                )
+                if trag_msg not in uncertainties:
+                    uncertainties = f"{trag_msg} {uncertainties}".strip() if uncertainties else trag_msg
+            elif is_sensitive_health:
+                is_publishable = False
+                disposition = EditorialDisposition.HOLD
+                health_msg = (
+                    "[NOT_PUBLISHABLE - SENSITIVE HEALTH REVIEW REQUIRED] "
+                    "Hassas sağlık/tedavi/hastaneye yatış durumu: Kişisel sağlık verisi ve hasta mahremiyeti "
+                    "nedeniyle otomatik yayınlanamaz; insan editoryal incelemesi (HOLD) zorunludur."
+                )
+                if health_msg not in uncertainties:
+                    uncertainties = f"{health_msg} {uncertainties}".strip() if uncertainties else health_msg
+            elif grounded_verification_status in ("UNVERIFIED_RUMOR", "SPECULATION"):
+                is_publishable = False
+                disposition = EditorialDisposition.HOLD
+                hold_msg = "[NOT_PUBLISHABLE - MANUAL VERIFICATION REQUIRED] Doğrulama bekletmesinde: Teyit gerektiren söylenti/spekülasyon."
+                if "[NOT_PUBLISHABLE - MANUAL VERIFICATION REQUIRED]" not in uncertainties:
+                    uncertainties = f"{hold_msg} {uncertainties}".strip() if uncertainties else hold_msg
+            else:
+                is_publishable = True
+                disposition = EditorialDisposition.DIGEST
 
             # 7. Unsupported Quotations Guard
             import re
@@ -554,6 +835,8 @@ class GeminiEditorialEngine(AIEditorialEngine):
                 verification_status=VerificationStatus(grounded_verification_status),
                 source_urls=source_urls,
                 supporting_articles=supporting_articles,
+                is_publishable=is_publishable,
+                disposition=disposition,
             )
 
             approved.append(assessment)
@@ -681,7 +964,13 @@ def project_diagnostic_decisions_to_assessments(
             continue
 
         cat = StoryCategory.YERLI if art.market == Market.TR else StoryCategory.GLOBAL
-        is_unverified = d.verification_status in ("UNVERIFIED_RUMOR", "SPECULATION")
+        grounded_v_status, v_caution = ground_verification_status(
+            d.verification_status,
+            [art],
+            headline=d.headline_tr,
+            caption=d.rationale_tr,
+        )
+        is_unverified = grounded_v_status in ("UNVERIFIED_RUMOR", "SPECULATION")
         is_hold = (d.disposition == "HOLD" or is_unverified)
 
         # 3. Independent Defense-in-Depth Sensitivity Veto:
@@ -695,6 +984,12 @@ def project_diagnostic_decisions_to_assessments(
                 d.headline_tr,
                 d.rationale_tr,
             )
+        )
+        is_sensitive_health = detect_sensitive_health_content(
+            art.title,
+            art.snippet,
+            d.headline_tr,
+            d.rationale_tr,
         )
 
         if is_sensitive:
@@ -732,11 +1027,43 @@ def project_diagnostic_decisions_to_assessments(
                 uncertainties_tr=uncertainties_msg,
                 suggested_format=SuggestedFormat.POST,
                 category=cat,
-                verification_status=VerificationStatus(d.verification_status),
+                verification_status=VerificationStatus(grounded_v_status),
                 source_urls=[art.url],
                 supporting_articles=[art],
                 is_publishable=False,
                 disposition=EditorialDisposition.SENSITIVE_REVIEW,
+            )
+            assessments.append(assessment)
+            continue
+
+        if is_sensitive_health:
+            if not include_manual_holds and not include_sensitive_reviews:
+                continue
+            raw_headline = d.headline_tr.strip() if d.headline_tr and d.headline_tr.strip() else art.title
+            cleaned_headline = sanitize_sensitive_headline(raw_headline)
+            assessment = EditorialAssessment(
+                article_ids=[art.id],
+                score=d.score,
+                kind=EditorialKind(d.kind),
+                parent_story_id=None,
+                development_tr=None,
+                headline_tr=cleaned_headline[:200],
+                cover_title_tr=cleaned_headline[:80],
+                caption_idea_tr=d.rationale_tr[:800],
+                relevance_reason_tr=d.rationale_tr[:500],
+                why_efso_tr=d.rationale_tr[:500],
+                uncertainties_tr=(
+                    "[NOT_PUBLISHABLE - SENSITIVE HEALTH REVIEW REQUIRED] "
+                    "Hassas sağlık/tedavi/hastaneye yatış durumu: Kişisel sağlık verisi ve hasta mahremiyeti "
+                    "nedeniyle otomatik yayınlanamaz; insan editoryal incelemesi (HOLD) zorunludur."
+                ),
+                suggested_format=SuggestedFormat.POST,
+                category=cat,
+                verification_status=VerificationStatus(grounded_v_status),
+                source_urls=[art.url],
+                supporting_articles=[art],
+                is_publishable=False,
+                disposition=EditorialDisposition.HOLD,
             )
             assessments.append(assessment)
             continue
@@ -760,7 +1087,7 @@ def project_diagnostic_decisions_to_assessments(
                 uncertainties_tr="[NOT_PUBLISHABLE - MANUAL VERIFICATION REQUIRED] Doğrulama bekletmesinde: Teyit gerektiren iddia/söylenti.",
                 suggested_format=SuggestedFormat.POST,
                 category=cat,
-                verification_status=VerificationStatus(d.verification_status),
+                verification_status=VerificationStatus(grounded_v_status),
                 source_urls=[art.url],
                 supporting_articles=[art],
                 is_publishable=False,
@@ -799,7 +1126,7 @@ def project_diagnostic_decisions_to_assessments(
             uncertainties_tr=None,
             suggested_format=SuggestedFormat.POST,
             category=cat,
-            verification_status=VerificationStatus(d.verification_status),
+            verification_status=VerificationStatus(grounded_v_status),
             source_urls=[art.url],
             supporting_articles=[art],
             is_publishable=True,

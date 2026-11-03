@@ -555,6 +555,8 @@ class OneShotShadowOperatorRunner:
                 "category": asm.category.value,
                 "format": asm.suggested_format.value,
                 "verification_status": asm.verification_status.value,
+                "is_publishable": asm.is_publishable,
+                "disposition": asm.disposition.value if asm.disposition else None,
                 "why_efso_tr": sanitize_report_text(asm.why_efso_tr),
                 "uncertainties_tr": sanitize_report_text(asm.uncertainties_tr) if asm.uncertainties_tr else None,
             })
