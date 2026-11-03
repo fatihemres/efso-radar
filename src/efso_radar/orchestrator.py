@@ -16,6 +16,7 @@ from efso_radar.ai.client import (
     AIEvaluationError,
     AIEditorialEngine,
     GeminiEditorialEngine,
+    detect_sensitive_health_content,
     detect_sensitive_tragedy_content,
 )
 from efso_radar.config import Settings
@@ -683,10 +684,24 @@ class RadarOrchestrator:
                         pick.why_efso_tr,
                     )
                 )
-                is_unverified = pick.verification_status in (
-                    VerificationStatus.UNVERIFIED_RUMOR,
-                    VerificationStatus.SPECULATION,
-                    VerificationStatus.ATTRIBUTED_CLAIM,
+                is_sensitive_health = (
+                    (pick.uncertainties_tr and "SENSITIVE HEALTH REVIEW" in pick.uncertainties_tr)
+                    or detect_sensitive_health_content(
+                        pick.headline_tr,
+                        pick.caption_idea_tr,
+                        pick.relevance_reason_tr,
+                        pick.why_efso_tr,
+                    )
+                )
+                is_unverified = (
+                    not getattr(pick, "is_publishable", True)
+                    or getattr(pick, "disposition", None) == EditorialDisposition.HOLD
+                    or is_sensitive_health
+                    or pick.verification_status in (
+                        VerificationStatus.UNVERIFIED_RUMOR,
+                        VerificationStatus.SPECULATION,
+                        VerificationStatus.ATTRIBUTED_CLAIM,
+                    )
                 )
                 should_queue_digest = (
                     (use_hybrid_digest or self.settings.notification_strategy == "DIGEST_ONLY")
