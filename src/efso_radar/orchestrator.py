@@ -298,17 +298,20 @@ class RadarOrchestrator:
     def derive_effective_assessment(
         pick: EditorialAssessment,
         candidate_map: dict[str, Article],
-    ) -> tuple[EditorialAssessment, bool, bool, bool]:
+    ) -> tuple[EditorialAssessment, bool, bool, bool, bool]:
         """Derive an authoritative, normalized EditorialAssessment and safety flags.
 
         Evaluates source grounding against candidate_map, detects sensitive tragedy
         or health content, checks for unknown article IDs or unverified statuses,
         and enforces safety precedence:
-        - SENSITIVE_REVIEW > HOLD > normal publishable
+        - SENSITIVE_REVIEW > HOLD > NON_ALERTABLE (IGNORE / RESERVE / DUPLICATE) > normal publishable
         - If held or sensitive, is_publishable is ALWAYS False and disposition is
           SENSITIVE_REVIEW or HOLD.
+        - If non-alertable (kind IGNORE/DUPLICATE, disposition IGNORE/RESERVE, or not is_publishable),
+          is_publishable is ALWAYS False and disposition is IGNORE or RESERVE.
         - supporting_articles and source_urls are derived from authoritative candidate_map
-          articles to prevent engine spoofing or leaking unvalidated candidate data.
+          articles (using canonical_url or url priority) to prevent engine spoofing or
+          leaking unvalidated candidate data.
         """
         auth_articles = [candidate_map[aid] for aid in pick.article_ids if aid in candidate_map]
         has_unknown_id = any(aid not in candidate_map for aid in pick.article_ids) or not auth_articles
@@ -341,21 +344,26 @@ class RadarOrchestrator:
             )
         )
         is_unverified = (
-            not getattr(pick, "is_publishable", True)
-            or getattr(pick, "disposition", None) == EditorialDisposition.HOLD
-            or is_sensitive_health
+            is_sensitive_health
             or has_unknown_id
+            or getattr(pick, "disposition", None) == EditorialDisposition.HOLD
             or pick.verification_status in (
                 VerificationStatus.UNVERIFIED_RUMOR,
                 VerificationStatus.SPECULATION,
                 VerificationStatus.ATTRIBUTED_CLAIM,
             )
         )
+        is_explicit_non_alertable = (
+            pick.kind in (EditorialKind.IGNORE, EditorialKind.DUPLICATE)
+            or getattr(pick, "disposition", None) in (EditorialDisposition.IGNORE, EditorialDisposition.RESERVE)
+            or not getattr(pick, "is_publishable", True)
+        )
 
-        # Precedence: SENSITIVE_REVIEW > HOLD > normal publishable
+        # Precedence: SENSITIVE_REVIEW > HOLD > NON_ALERTABLE > normal publishable
         if is_sensitive_review:
             effective_is_publishable = False
             effective_disposition = EditorialDisposition.SENSITIVE_REVIEW
+            is_non_alertable = False
             if pick.uncertainties_tr:
                 if "SENSITIVE EDITORIAL REVIEW" not in pick.uncertainties_tr:
                     effective_uncertainties = f"SENSITIVE EDITORIAL REVIEW: {pick.uncertainties_tr}"
@@ -366,6 +374,7 @@ class RadarOrchestrator:
         elif is_unverified:
             effective_is_publishable = False
             effective_disposition = EditorialDisposition.HOLD
+            is_non_alertable = False
             if is_sensitive_health:
                 if pick.uncertainties_tr:
                     if "SENSITIVE HEALTH REVIEW" not in pick.uncertainties_tr:
@@ -381,15 +390,34 @@ class RadarOrchestrator:
                     effective_uncertainties = "HOLD: Aday havuzunda bulunmayan makale ID'si tespit edildi."
             else:
                 effective_uncertainties = pick.uncertainties_tr or "Teyit bekliyor: Doğrulanmamış söylenti veya iddia."
+        elif is_explicit_non_alertable:
+            effective_is_publishable = False
+            is_non_alertable = True
+            is_unverified = False
+            if getattr(pick, "disposition", None) == EditorialDisposition.RESERVE:
+                effective_disposition = EditorialDisposition.RESERVE
+                effective_uncertainties = pick.uncertainties_tr or "RESERVE: İsteğe bağlı yedek içerik; doğrudan bildirim veya bültene gönderilmez."
+            elif pick.kind == EditorialKind.DUPLICATE:
+                effective_disposition = EditorialDisposition.IGNORE
+                effective_uncertainties = pick.uncertainties_tr or "SUPPRESSED (DUPLICATE): Mükerrer haber bildirime gönderilmez."
+            else:
+                effective_disposition = EditorialDisposition.IGNORE
+                effective_uncertainties = pick.uncertainties_tr or "SUPPRESSED: Uygunsuz veya eşik altı içerik genel bildirimden çıkarıldı."
         else:
             effective_is_publishable = True
             effective_disposition = pick.disposition or EditorialDisposition.DIGEST
             effective_uncertainties = pick.uncertainties_tr
+            is_non_alertable = False
+            is_unverified = False
 
-        # Authoritative candidates replace engine-supplied copies
+        # Authoritative candidates replace engine-supplied copies, preferring canonical_url over url
         if auth_articles:
             effective_supporting = list(auth_articles)
-            effective_urls = [a.url for a in auth_articles if a.url]
+            effective_urls = [
+                ((a.canonical_url or "").strip() or (a.url or "").strip())
+                for a in auth_articles
+                if ((a.canonical_url or "").strip() or (a.url or "").strip())
+            ]
         else:
             effective_supporting = []
             effective_urls = [] if has_unknown_id else list(getattr(pick, "source_urls", []))
@@ -403,7 +431,7 @@ class RadarOrchestrator:
                 "source_urls": effective_urls,
             }
         )
-        return effective_assessment, is_sensitive_review, is_sensitive_health, is_unverified
+        return effective_assessment, is_sensitive_review, is_sensitive_health, is_unverified, is_non_alertable
 
     def run(
         self,
@@ -773,6 +801,7 @@ class RadarOrchestrator:
                     is_sensitive_review,
                     is_sensitive_health,
                     is_unverified,
+                    is_non_alertable,
                 ) = self.derive_effective_assessment(pick, candidate_map)
 
                 if effective_assessment.kind == EditorialKind.UPDATE and effective_assessment.parent_story_id:
@@ -782,6 +811,20 @@ class RadarOrchestrator:
                     primary_article_id = effective_assessment.article_ids[0][:8]
                     story_id = f"EFSO-{now.strftime('%Y%m%d')}-{primary_article_id}"
                     update_id = None
+
+                # Non-alertable boundary guard: IGNORE/DUPLICATE kinds and IGNORE/RESERVE dispositions
+                # must NOT enter immediate notifications, verification hold alerts, or queued digests.
+                if is_non_alertable:
+                    logger.info(
+                        "Pick %s is non-alertable (kind=%s, disposition=%s); suppressing notification",
+                        story_id,
+                        effective_assessment.kind,
+                        effective_assessment.disposition,
+                    )
+                    if not dry_run:
+                        self.repository.record_editorial_assessment(effective_assessment, story_id)
+                        self.repository.mark_articles_processed(effective_assessment.supporting_articles)
+                    continue
 
                 # Idempotency check: Guard against duplicate alert if already notified or in-flight
                 if effective_assessment.kind == EditorialKind.UPDATE:
