@@ -294,6 +294,154 @@ class RadarOrchestrator:
         )
         return 1
 
+    @staticmethod
+    def derive_effective_assessment(
+        pick: EditorialAssessment,
+        candidate_map: dict[str, Article],
+    ) -> tuple[EditorialAssessment, bool, bool, bool, bool]:
+        """Derive an authoritative, normalized EditorialAssessment and safety flags.
+
+        Evaluates source grounding against candidate_map, detects sensitive tragedy
+        or health content, checks for unknown article IDs or unverified statuses,
+        and enforces safety precedence:
+        - SENSITIVE_REVIEW > HOLD > NON_ALERTABLE (IGNORE / RESERVE / DUPLICATE) > normal publishable
+        - If held or sensitive, is_publishable is ALWAYS False and disposition is
+          SENSITIVE_REVIEW or HOLD.
+        - If non-alertable (kind IGNORE/DUPLICATE, disposition IGNORE/RESERVE, or not is_publishable),
+          is_publishable is ALWAYS False and disposition is IGNORE or RESERVE.
+        - supporting_articles and source_urls are derived from authoritative candidate_map
+          articles (using canonical_url or url priority) to prevent engine spoofing or
+          leaking unvalidated candidate data.
+        """
+        auth_articles = [candidate_map[aid] for aid in pick.article_ids if aid in candidate_map]
+        has_unknown_id = any(aid not in candidate_map for aid in pick.article_ids) or not auth_articles
+        engine_supporting = list(getattr(pick, "supporting_articles", []))
+        # Always inspect authoritative candidate_map source text IN ADDITION to engine articles
+        source_texts = (
+            [f"{a.title} {a.snippet}" for a in auth_articles]
+            + [f"{a.title} {a.snippet}" for a in engine_supporting]
+        )
+
+        is_sensitive_review = (
+            getattr(pick, "disposition", None) == EditorialDisposition.SENSITIVE_REVIEW
+            or (pick.uncertainties_tr and "SENSITIVE EDITORIAL REVIEW" in pick.uncertainties_tr)
+            or detect_sensitive_tragedy_content(
+                pick.headline_tr,
+                pick.caption_idea_tr,
+                pick.relevance_reason_tr,
+                pick.why_efso_tr,
+                *source_texts,
+            )
+        )
+        is_sensitive_health = (
+            (pick.uncertainties_tr and "SENSITIVE HEALTH REVIEW" in pick.uncertainties_tr)
+            or detect_sensitive_health_content(
+                pick.headline_tr,
+                pick.caption_idea_tr,
+                pick.relevance_reason_tr,
+                pick.why_efso_tr,
+                *source_texts,
+            )
+        )
+        is_explicit_non_alertable = (
+            pick.kind in (EditorialKind.IGNORE, EditorialKind.DUPLICATE)
+            or getattr(pick, "disposition", None) in (EditorialDisposition.IGNORE, EditorialDisposition.RESERVE)
+        )
+        is_unverified = (
+            not getattr(pick, "is_publishable", True)
+            or getattr(pick, "disposition", None) == EditorialDisposition.HOLD
+            or is_sensitive_health
+            or has_unknown_id
+            or pick.verification_status in (
+                VerificationStatus.UNVERIFIED_RUMOR,
+                VerificationStatus.SPECULATION,
+                VerificationStatus.ATTRIBUTED_CLAIM,
+            )
+        )
+
+        # Precedence:
+        # 1. Absolute non-alertable veto: kind IGNORE/DUPLICATE or disposition IGNORE/RESERVE
+        #    cannot enter any notification or hold queue, regardless of concurrent flags.
+        if is_explicit_non_alertable:
+            effective_is_publishable = False
+            is_non_alertable = True
+            is_unverified = False
+            is_sensitive_review = False
+            is_sensitive_health = False
+
+            if getattr(pick, "disposition", None) == EditorialDisposition.RESERVE:
+                effective_disposition = EditorialDisposition.RESERVE
+                effective_uncertainties = pick.uncertainties_tr or "RESERVE: İsteğe bağlı yedek içerik; doğrudan bildirim veya bültene gönderilmez."
+            elif pick.kind == EditorialKind.DUPLICATE:
+                effective_disposition = EditorialDisposition.IGNORE
+                effective_uncertainties = pick.uncertainties_tr or "SUPPRESSED (DUPLICATE): Mükerrer haber bildirime gönderilmez."
+            else:
+                effective_disposition = EditorialDisposition.IGNORE
+                effective_uncertainties = pick.uncertainties_tr or "SUPPRESSED: Uygunsuz veya eşik altı içerik genel bildirimden çıkarıldı."
+
+        # 2. Alertable candidates: SENSITIVE_REVIEW > HOLD > normal publishable
+        elif is_sensitive_review:
+            effective_is_publishable = False
+            effective_disposition = EditorialDisposition.SENSITIVE_REVIEW
+            is_non_alertable = False
+            if pick.uncertainties_tr:
+                if "SENSITIVE EDITORIAL REVIEW" not in pick.uncertainties_tr:
+                    effective_uncertainties = f"SENSITIVE EDITORIAL REVIEW: {pick.uncertainties_tr}"
+                else:
+                    effective_uncertainties = pick.uncertainties_tr
+            else:
+                effective_uncertainties = "SENSITIVE EDITORIAL REVIEW: Hassas trajedi/vefat içeriği Product Owner açık onayı gerektirir."
+
+        elif is_unverified:
+            effective_is_publishable = False
+            effective_disposition = EditorialDisposition.HOLD
+            is_non_alertable = False
+            if is_sensitive_health:
+                if pick.uncertainties_tr:
+                    if "SENSITIVE HEALTH REVIEW" not in pick.uncertainties_tr:
+                        effective_uncertainties = f"SENSITIVE HEALTH REVIEW: {pick.uncertainties_tr}"
+                    else:
+                        effective_uncertainties = pick.uncertainties_tr
+                else:
+                    effective_uncertainties = "SENSITIVE HEALTH REVIEW: Kişisel sağlık/tedavi durumu editoryal inceleme gerektirir."
+            elif has_unknown_id:
+                if pick.uncertainties_tr:
+                    effective_uncertainties = f"HOLD (Geçersiz aday ID): {pick.uncertainties_tr}"
+                else:
+                    effective_uncertainties = "HOLD: Aday havuzunda bulunmayan makale ID'si tespit edildi."
+            else:
+                effective_uncertainties = pick.uncertainties_tr or "Teyit bekliyor: Doğrulanmamış söylenti veya iddia."
+
+        else:
+            effective_is_publishable = True
+            effective_disposition = pick.disposition or EditorialDisposition.DIGEST
+            effective_uncertainties = pick.uncertainties_tr
+            is_non_alertable = False
+            is_unverified = False
+
+        # Authoritative candidates replace engine-supplied copies, preferring canonical_url over url
+        if auth_articles:
+            effective_supporting = list(auth_articles)
+            effective_urls = [
+                ((a.canonical_url or "").strip() or (a.url or "").strip())
+                for a in auth_articles
+                if ((a.canonical_url or "").strip() or (a.url or "").strip())
+            ]
+        else:
+            effective_supporting = []
+            effective_urls = [] if has_unknown_id else list(getattr(pick, "source_urls", []))
+
+        effective_assessment = pick.model_copy(
+            update={
+                "is_publishable": effective_is_publishable,
+                "disposition": effective_disposition,
+                "uncertainties_tr": effective_uncertainties,
+                "supporting_articles": effective_supporting,
+                "source_urls": effective_urls,
+            }
+        )
+        return effective_assessment, is_sensitive_review, is_sensitive_health, is_unverified, is_non_alertable
+
     def run(
         self,
         dry_run: bool = False,
@@ -656,17 +804,40 @@ class RadarOrchestrator:
             candidate_map = {a.id: a for a in candidates}
 
             for pick in picks:
-                if pick.kind == EditorialKind.UPDATE and pick.parent_story_id:
-                    story_id = pick.parent_story_id
+                # 7. Derive authoritative, normalized EditorialAssessment and safety flags
+                (
+                    effective_assessment,
+                    is_sensitive_review,
+                    is_sensitive_health,
+                    is_unverified,
+                    is_non_alertable,
+                ) = self.derive_effective_assessment(pick, candidate_map)
+
+                if effective_assessment.kind == EditorialKind.UPDATE and effective_assessment.parent_story_id:
+                    story_id = effective_assessment.parent_story_id
                     update_id = f"UPD-{now.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:4]}"
                 else:
-                    primary_article_id = pick.article_ids[0][:8]
+                    primary_article_id = effective_assessment.article_ids[0][:8]
                     story_id = f"EFSO-{now.strftime('%Y%m%d')}-{primary_article_id}"
                     update_id = None
 
+                # Non-alertable boundary guard: IGNORE/DUPLICATE kinds and IGNORE/RESERVE dispositions
+                # must NOT enter immediate notifications, verification hold alerts, or queued digests.
+                if is_non_alertable:
+                    logger.info(
+                        "Pick %s is non-alertable (kind=%s, disposition=%s); suppressing notification",
+                        story_id,
+                        effective_assessment.kind,
+                        effective_assessment.disposition,
+                    )
+                    if not dry_run:
+                        self.repository.record_editorial_assessment(effective_assessment, story_id)
+                        self.repository.mark_articles_processed(effective_assessment.supporting_articles)
+                    continue
+
                 # Idempotency check: Guard against duplicate alert if already notified or in-flight
-                if pick.kind == EditorialKind.UPDATE:
-                    if self.repository.has_story_been_alerted(story_id, kind=EditorialKind.UPDATE, development_tr=pick.development_tr):
+                if effective_assessment.kind == EditorialKind.UPDATE:
+                    if self.repository.has_story_been_alerted(story_id, kind=EditorialKind.UPDATE, development_tr=effective_assessment.development_tr):
                         logger.info("Development for story %s already alerted; skipping duplicate", story_id)
                         continue
                 else:
@@ -674,56 +845,13 @@ class RadarOrchestrator:
                         logger.info("Story %s has already been alerted; skipping duplicate notification", story_id)
                         continue
 
-                # 7. Sensitive Review, Verification Hold & Hybrid Digest Routing vs Immediate Notification Delivery
-                # Authoritative candidate articles from this orchestrator run
-                auth_articles = [candidate_map[aid] for aid in pick.article_ids if aid in candidate_map]
-                has_unknown_id = any(aid not in candidate_map for aid in pick.article_ids) or not auth_articles
-                engine_supporting = list(getattr(pick, "supporting_articles", []))
-                # Always inspect authoritative candidate_map source text IN ADDITION to engine articles
-                source_texts = (
-                    [f"{a.title} {a.snippet}" for a in auth_articles]
-                    + [f"{a.title} {a.snippet}" for a in engine_supporting]
-                )
-
-                is_sensitive_review = (
-                    getattr(pick, "disposition", None) == EditorialDisposition.SENSITIVE_REVIEW
-                    or (pick.uncertainties_tr and "SENSITIVE EDITORIAL REVIEW" in pick.uncertainties_tr)
-                    or detect_sensitive_tragedy_content(
-                        pick.headline_tr,
-                        pick.caption_idea_tr,
-                        pick.relevance_reason_tr,
-                        pick.why_efso_tr,
-                        *source_texts,
-                    )
-                )
-                is_sensitive_health = (
-                    (pick.uncertainties_tr and "SENSITIVE HEALTH REVIEW" in pick.uncertainties_tr)
-                    or detect_sensitive_health_content(
-                        pick.headline_tr,
-                        pick.caption_idea_tr,
-                        pick.relevance_reason_tr,
-                        pick.why_efso_tr,
-                        *source_texts,
-                    )
-                )
-                is_unverified = (
-                    not getattr(pick, "is_publishable", True)
-                    or getattr(pick, "disposition", None) == EditorialDisposition.HOLD
-                    or is_sensitive_health
-                    or has_unknown_id
-                    or pick.verification_status in (
-                        VerificationStatus.UNVERIFIED_RUMOR,
-                        VerificationStatus.SPECULATION,
-                        VerificationStatus.ATTRIBUTED_CLAIM,
-                    )
-                )
                 should_queue_digest = (
                     (use_hybrid_digest or self.settings.notification_strategy == "DIGEST_ONLY")
                     and not is_unverified
                     and not is_sensitive_review
                     and (
                         self.settings.notification_strategy == "DIGEST_ONLY"
-                        or pick.score < self.settings.breaking_alert_min_score
+                        or effective_assessment.score < self.settings.breaking_alert_min_score
                     )
                 )
 
@@ -733,13 +861,13 @@ class RadarOrchestrator:
                         notification_id=f"HOLD-SENSITIVE-{notif_suffix}",
                         story_id=story_id,
                         update_id=update_id,
-                        kind=pick.kind,
+                        kind=effective_assessment.kind,
                         channel="TELEGRAM_SENSITIVE_REVIEW",
                         sent_at=now,
                         status=DeliveryStatus.HELD_FOR_SENSITIVE_REVIEW,
-                        message_text=format_telegram_sensitive_review(pick),
-                        headline_tr=pick.headline_tr,
-                        score=pick.score,
+                        message_text=format_telegram_sensitive_review(effective_assessment),
+                        headline_tr=effective_assessment.headline_tr,
+                        score=effective_assessment.score,
                         error_message="Held for sensitive review: requires explicit Product Owner approval",
                         category=TelegramNotificationCategory.SENSITIVE_EDITORIAL_REVIEW,
                     )
@@ -749,13 +877,13 @@ class RadarOrchestrator:
                         notification_id=f"HOLD-VERIF-{notif_suffix}",
                         story_id=story_id,
                         update_id=update_id,
-                        kind=pick.kind,
+                        kind=effective_assessment.kind,
                         channel="TELEGRAM",
                         sent_at=now,
                         status=DeliveryStatus.HELD_FOR_VERIFICATION,
-                        message_text=format_telegram_verification_hold(pick),
-                        headline_tr=pick.headline_tr,
-                        score=pick.score,
+                        message_text=format_telegram_verification_hold(effective_assessment),
+                        headline_tr=effective_assessment.headline_tr,
+                        score=effective_assessment.score,
                         error_message=(
                             "Held for sensitive health review: personal medical condition requires human editorial review"
                             if is_sensitive_health
@@ -769,19 +897,19 @@ class RadarOrchestrator:
                         notification_id=f"DIGEST-Q-{notif_suffix}",
                         story_id=story_id,
                         update_id=update_id,
-                        kind=pick.kind,
+                        kind=effective_assessment.kind,
                         channel="TELEGRAM_DIGEST",
                         sent_at=now,
                         status=DeliveryStatus.QUEUED_FOR_DIGEST,
-                        message_text=format_telegram_alert(pick),
-                        headline_tr=pick.headline_tr,
-                        score=pick.score,
+                        message_text=format_telegram_alert(effective_assessment),
+                        headline_tr=effective_assessment.headline_tr,
+                        score=effective_assessment.score,
                         category=TelegramNotificationCategory.EDITORIAL_DIGEST,
                     )
                 else:
                     try:
                         record = self.notifier.send(
-                            pick,
+                            effective_assessment,
                             story_id,
                             update_id=update_id,
                             category=TelegramNotificationCategory.VERIFIED_BREAKING,
@@ -790,42 +918,42 @@ class RadarOrchestrator:
                         )
                     except TypeError:
                         try:
-                            record = self.notifier.send(pick, story_id, update_id=update_id, dry_run=dry_run, now=now)
+                            record = self.notifier.send(effective_assessment, story_id, update_id=update_id, dry_run=dry_run, now=now)
                         except TypeError:
-                            record = self.notifier.send(pick, story_id, dry_run=dry_run, now=now)
+                            record = self.notifier.send(effective_assessment, story_id, dry_run=dry_run, now=now)
                     if record.status in (DeliveryStatus.SENT, DeliveryStatus.HELD_QUIET_HOURS):
                         notifications_dispatched += 1
 
                 # 8. Record in state repository atomically
                 if not dry_run:
                     self.repository.record_notification(record)
-                    self.repository.record_editorial_assessment(pick, story_id)
+                    self.repository.record_editorial_assessment(effective_assessment, story_id)
 
-                    if pick.kind == EditorialKind.NEW:
+                    if effective_assessment.kind == EditorialKind.NEW:
                         story = Story(
                             story_id=story_id,
-                            headline_tr=pick.headline_tr,
-                            category=pick.category,
+                            headline_tr=effective_assessment.headline_tr,
+                            category=effective_assessment.category,
                             first_seen_at=now,
                             last_updated_at=now,
-                            article_ids=pick.article_ids,
+                            article_ids=effective_assessment.article_ids,
                             update_count=0,
                             is_active=True,
                         )
-                        self.repository.record_new_story(story, pick)
-                    elif pick.kind == EditorialKind.UPDATE and pick.parent_story_id and update_id:
+                        self.repository.record_new_story(story, effective_assessment)
+                    elif effective_assessment.kind == EditorialKind.UPDATE and effective_assessment.parent_story_id and update_id:
                         update = StoryUpdate(
                             update_id=update_id,
-                            story_id=pick.parent_story_id,
-                            development_tr=pick.development_tr or "",
+                            story_id=effective_assessment.parent_story_id,
+                            development_tr=effective_assessment.development_tr or "",
                             detected_at=now,
-                            article_ids=pick.article_ids,
-                            significance_score=pick.score,
+                            article_ids=effective_assessment.article_ids,
+                            significance_score=effective_assessment.score,
                         )
-                        self.repository.record_story_update(update, pick)
+                        self.repository.record_story_update(update, effective_assessment)
 
                     # Mark supporting articles as processed immediately
-                    self.repository.mark_articles_processed(pick.supporting_articles)
+                    self.repository.mark_articles_processed(effective_assessment.supporting_articles)
 
             # 8b. Flush consolidated digest if due
             if use_hybrid_digest or self.settings.notification_strategy == "DIGEST_ONLY":
