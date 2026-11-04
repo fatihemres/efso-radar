@@ -1015,6 +1015,74 @@ class TestOrchestrator(unittest.TestCase):
             ).fetchone()
             self.assertEqual(row_high["status"], "QUEUED")
 
+    def test_repository_typeerror_fails_closed_without_retrying_weaker_parameters(self):
+        """Targeted regression test (Issue #75 Review Remediation):
+        Verifies that RadarOrchestrator does NOT catch TypeError and retry
+        expire_stale_backlog_candidates or get_pending_candidates with weaker
+        parameters (omitting limit or min_update_priority).
+        Any signature mismatch or internal TypeError must fail closed immediately
+        without a second/fallback call."""
+        # 1. Test get_pending_candidates non-retry
+        call_history_pending = []
+
+        class FailingPendingRepo(SqliteStateRepository):
+            def get_pending_candidates(self, *args, **kwargs):
+                call_history_pending.append((args, kwargs))
+                raise TypeError("Simulated signature mismatch or internal TypeError in get_pending_candidates")
+
+        settings = Settings(
+            sqlite_db_path=self.db_path,
+            ai_evaluation_enabled=True,
+            telegram_delivery_enabled=False,
+        )
+        orch_pending = RadarOrchestrator(
+            settings=settings,
+            repository=FailingPendingRepo(self.db_path),
+            source=MockNewsSource(articles=[
+                Article.create("Haber 1", "https://haber.com/1", "Kaynak", self.now, snippet="Özet")
+            ], successes=1),
+            ai_engine=MockAIEngine(),
+            notifier=MockNotifier(),
+        )
+
+        with self.assertRaises(TypeError):
+            orch_pending.run(now=self.now)
+
+        # Must have been called exactly once with the mandatory limit and min_update_priority
+        self.assertEqual(len(call_history_pending), 1, "Must not retry get_pending_candidates with weaker parameters")
+        _, kwargs_pending = call_history_pending[0]
+        self.assertIn("limit", kwargs_pending, "First and only call must enforce limit")
+        self.assertIn("min_update_priority", kwargs_pending, "First and only call must enforce min_update_priority")
+        self.assertEqual(kwargs_pending["limit"], settings.max_candidates * 2)
+        self.assertEqual(kwargs_pending["min_update_priority"], settings.min_discovery_priority_for_ai)
+
+        # 2. Test expire_stale_backlog_candidates non-retry
+        call_history_expire = []
+
+        class FailingExpireRepo(SqliteStateRepository):
+            def expire_stale_backlog_candidates(self, *args, **kwargs):
+                call_history_expire.append((args, kwargs))
+                raise TypeError("Simulated signature mismatch or internal TypeError in expire_stale_backlog_candidates")
+
+        orch_expire = RadarOrchestrator(
+            settings=settings,
+            repository=FailingExpireRepo(self.db_path),
+            source=MockNewsSource(articles=[
+                Article.create("Haber 2", "https://haber.com/2", "Kaynak", self.now, snippet="Özet")
+            ], successes=1),
+            ai_engine=MockAIEngine(),
+            notifier=MockNotifier(),
+        )
+
+        with self.assertRaises(TypeError):
+            orch_expire.run(now=self.now)
+
+        # Must have been called exactly once with the mandatory min_update_priority
+        self.assertEqual(len(call_history_expire), 1, "Must not retry expire_stale_backlog_candidates with weaker parameters")
+        _, kwargs_expire = call_history_expire[0]
+        self.assertIn("min_update_priority", kwargs_expire, "First and only call must enforce min_update_priority")
+        self.assertEqual(kwargs_expire["min_update_priority"], settings.min_discovery_priority_for_ai)
+
 
 if __name__ == "__main__":
     unittest.main()
