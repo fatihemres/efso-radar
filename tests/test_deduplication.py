@@ -448,5 +448,114 @@ class TestDeduplication(unittest.TestCase):
         self.assertEqual(peacock_rep.raw_metadata.get("cluster_size", 1), 1)
 
 
+
+    def test_cross_publisher_identical_title_retains_evidence_and_consensus_bonus(self):
+        """Fix A (Issue 73): Two distinct publishers publishing identical titles
+        must collapse into 1 cluster, retain both article IDs and publishers,
+        and receive cross_publisher_consensus bonus."""
+        a1 = Article.create(
+            "Christopher Nolan yeni filmi için Universal ile anlaştı",
+            "https://variety.com/nolan-universal-deal",
+            "Variety",
+            self.now,
+            snippet="Yönetmen Christopher Nolan yeni projesi için Universal Pictures ile anlaştı.",
+        )
+        a2 = Article.create(
+            "Christopher Nolan yeni filmi için Universal ile anlaştı",
+            "https://hollywoodreporter.com/nolan-universal-deal",
+            "The Hollywood Reporter",
+            self.now,
+            snippet="Warner Bros yerine Universal ile devam eden Nolan yeni filmini duyurdu.",
+        )
+        candidates = self.engine.filter_fresh_candidates([a1, a2])
+        self.assertEqual(len(candidates), 1)
+        rep = candidates[0]
+        meta = rep.raw_metadata
+        self.assertEqual(meta.get("cluster_size"), 2)
+        self.assertEqual(set(meta.get("cluster_article_ids", [])), {a1.id, a2.id})
+        self.assertEqual(set(meta.get("cluster_publishers", [])), {"Variety", "The Hollywood Reporter"})
+        reasons = meta.get("priority_reasons", [])
+        self.assertIn("cross_publisher_consensus(2)", reasons)
+
+    def test_same_publisher_identical_title_suppressed_at_level1(self):
+        """Fix A (Issue 73): Same publisher emitting duplicate identical title
+        must be suppressed at Level 1, resulting in cluster_size=1."""
+        a1 = Article.create(
+            "Christopher Nolan yeni filmi için Universal ile anlaştı",
+            "https://variety.com/nolan-universal-deal-1",
+            "Variety",
+            self.now,
+            snippet="Yönetmen Christopher Nolan yeni projesi için Universal Pictures ile anlaştı.",
+        )
+        a2 = Article.create(
+            "Christopher Nolan yeni filmi için Universal ile anlaştı",
+            "https://variety.com/nolan-universal-deal-2",
+            "Variety",
+            self.now,
+            snippet="Yönetmen Christopher Nolan yeni projesi için Universal Pictures ile anlaştı.",
+        )
+        candidates = self.engine.filter_fresh_candidates([a1, a2])
+        self.assertEqual(len(candidates), 1)
+        rep = candidates[0]
+        meta = rep.raw_metadata
+        self.assertEqual(meta.get("cluster_size", 1), 1)
+        self.assertEqual(meta.get("cluster_article_ids", []), [a1.id])
+        self.assertEqual(meta.get("cluster_publishers", []), ["Variety"])
+
+    def test_different_events_behind_generic_identical_title_remain_separate(self):
+        """Fix A (Issue 73): Distinct events sharing a generic identical headline
+        with contradictory entities (e.g. streaming platforms or person names)
+        must remain separate clusters."""
+        netflix_art = Article.create(
+            "Yeni Sezon Tarihi Belli Oldu",
+            "https://haber-a.com/netflix-sezon",
+            "Haber A",
+            self.now,
+            snippet="Netflix yeni sezon yayın tarihini resmi olarak açıkladı.",
+        )
+        disney_art = Article.create(
+            "Yeni Sezon Tarihi Belli Oldu",
+            "https://haber-b.com/disney-sezon",
+            "Haber B",
+            self.now,
+            snippet="Disney+ yeni sezon yayın tarihini resmi olarak duyurdu.",
+        )
+        candidates = self.engine.filter_fresh_candidates([netflix_art, disney_art])
+        self.assertEqual(
+            len(candidates),
+            2,
+            f"Expected distinct platform streaming stories with identical title to remain separate, got {len(candidates)}",
+        )
+
+
+
+    def test_unknown_fictional_subjects_sharing_identical_generic_titles_remain_separate(self):
+        """Regression A (PR #74 review): Fictional series/people absent from HIGH_AFFINITY_ENTITIES
+        sharing an identical generic headline ('Yeni Sezon Tarihi Belli Oldu') across distinct
+        publishers with distinct subjects in snippets and URL slugs must NOT merge."""
+        art_karanlik = Article.create(
+            "Yeni Sezon Tarihi Belli Oldu",
+            "https://dizihaber.com/karanlik-sirlar-sezon-2",
+            "Dizi Haber",
+            self.now,
+            snippet="Karanlık Sırlar dizisinin merakla beklenen 2. sezon yayın tarihi yapımcı tarafından açıklandı.",
+        )
+        art_mavi = Article.create(
+            "Yeni Sezon Tarihi Belli Oldu",
+            "https://sinemadunyasi.com/mavi-ruzgar-sezon-3",
+            "Sinema Dünyası",
+            self.now,
+            snippet="Mavi Rüzgar dizisinin yeni sezon bölümleri kış aylarında ekrana gelecek.",
+        )
+        candidates = self.engine.filter_fresh_candidates([art_karanlik, art_mavi])
+        self.assertEqual(
+            len(candidates),
+            2,
+            f"Expected 2 separate candidate clusters for distinct fictional series, but got {len(candidates)}: {[c.title for c in candidates]}",
+        )
+        cluster_sizes = [c.raw_metadata.get("cluster_size", 1) for c in candidates]
+        self.assertEqual(cluster_sizes, [1, 1])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -442,6 +442,52 @@ class RadarOrchestrator:
         )
         return effective_assessment, is_sensitive_review, is_sensitive_health, is_unverified, is_non_alertable
 
+    @staticmethod
+    def is_out_of_scope_candidate(article: Article, reasons: list[str]) -> bool:
+        """Identify unequivocally out-of-scope noise candidates for pre-AI filtering.
+
+        Harmonizes exact 'out_of_scope_or_grim_news_dampened' and annotated reason
+        variants (e.g. politics_policy, religion_clerical, sports_watch_guide,
+        non_celebrity_blotter_or_geo, generic_essay_or_b2b).
+
+        Defends against indiscriminate bulk-dropping of editorially relevant tragic,
+        health, or celebrity legal news:
+        - Excludes 'tragic_local_mortality' from noise dropping so genuine tragedy
+          reaches AI evaluation or SENSITIVE_REVIEW / HOLD safety paths.
+        - Counterexample veto: Any candidate with detected sensitive tragedy or
+          sensitive health content is NEVER dropped as noise.
+        - Celebrity legal veto: Editorially relevant celebrity legal developments
+          grounded in affinity entities or core entertainment verticals containing
+          incidental policy terminology (e.g. 'vergi düzenlemesi') are preserved
+          for AI evaluation and not dropped as unrelated politics/policy noise.
+        """
+        has_noise_reason = any(
+            r == "out_of_scope_or_grim_news_dampened"
+            or (
+                r.startswith("out_of_scope_or_grim_news_dampened(")
+                and not r.endswith("(tragic_local_mortality)")
+            )
+            for r in reasons
+        )
+        if not has_noise_reason:
+            return False
+
+        # Guard against falsely discarding sensitive tragedy or health content
+        if detect_sensitive_tragedy_content(article.title, article.snippet):
+            return False
+        if detect_sensitive_health_content(article.title, article.snippet):
+            return False
+
+        # Guard against falsely discarding relevant celebrity legal developments containing incidental policy phrasing
+        is_celebrity_legal = any("celebrity_statement_legal" in r for r in reasons) and (
+            any(r.startswith("high_affinity_entity") for r in reasons)
+            or any(r in ("core_turkish_entertainment", "core_global_entertainment") for r in reasons)
+        )
+        if is_celebrity_legal:
+            return False
+
+        return True
+
     def run(
         self,
         dry_run: bool = False,
@@ -717,7 +763,7 @@ class RadarOrchestrator:
             for c in candidates:
                 reasons = c.raw_metadata.get("priority_reasons", [])
                 p_score = float(c.raw_metadata.get("priority_score", 10.0))
-                if "out_of_scope_or_grim_news_dampened" in reasons or (
+                if self.is_out_of_scope_candidate(c, reasons) or (
                     len(candidates) > self.settings.ai_batch_size
                     and p_score < self.settings.min_discovery_priority_for_ai
                 ):
