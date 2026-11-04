@@ -257,26 +257,35 @@ class TursoStateRepository(StateRepository):
         ]
         self.client.execute_transaction(stmts)
 
-    def get_pending_candidates(self, max_age_hours: int = 24, now: Optional[datetime] = None) -> list[Article]:
+    def get_pending_candidates(
+        self,
+        max_age_hours: int = 24,
+        now: Optional[datetime] = None,
+        limit: Optional[int] = None,
+        min_update_priority: float = 0.0,
+    ) -> list[Article]:
         """Retrieve unexpired candidates from backlog that are still awaiting evaluation.
         
-        Preserves candidates within max_age_hours, plus any genuine UPDATE candidates regardless of age.
+        Preserves candidates within max_age_hours, plus high-priority UPDATE candidates regardless of age.
         """
         ref_now = now or utc_now()
         cutoff = (ref_now - timedelta(hours=max_age_hours)).isoformat()
-        res = self.client.execute(
-            """
+        query = """
             SELECT cb.article_id, cb.url, cb.canonical_url, cb.title, cb.source, cb.market,
                    cb.category_hint, cb.snippet, cb.image_url, cb.published_at, cb.priority_score
             FROM candidate_backlog cb
             LEFT JOIN processed_articles pa ON cb.article_id = pa.article_id
             WHERE cb.status = 'QUEUED'
-              AND (cb.published_at >= ? OR cb.category_hint = 'UPDATE')
+              AND (cb.published_at >= ? OR (cb.category_hint = 'UPDATE' AND cb.priority_score >= ?))
               AND pa.article_id IS NULL
-            ORDER BY cb.priority_score DESC, cb.published_at DESC
-            """,
-            [cutoff],
-        )
+            ORDER BY cb.priority_score DESC, cb.published_at DESC, cb.article_id ASC
+        """
+        params: list[Any] = [cutoff, float(min_update_priority)]
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(int(limit))
+
+        res = self.client.execute(query, params)
         return [
             Article(
                 id=r["article_id"],
@@ -305,7 +314,12 @@ class TursoStateRepository(StateRepository):
         ]
         self.client.execute_transaction(stmts)
 
-    def expire_stale_backlog_candidates(self, max_age_hours: int = 24, now: Optional[datetime] = None) -> int:
+    def expire_stale_backlog_candidates(
+        self,
+        max_age_hours: int = 24,
+        now: Optional[datetime] = None,
+        min_update_priority: float = 0.0,
+    ) -> int:
         """Transition candidates older than max_age_hours to EXPIRED status, preserving legitimate UPDATEs."""
         self._assert_writable()
         ref_now = now or utc_now()
@@ -316,9 +330,9 @@ class TursoStateRepository(StateRepository):
             SET status = 'EXPIRED'
             WHERE status = 'QUEUED'
               AND published_at < ?
-              AND (category_hint IS NULL OR category_hint != 'UPDATE')
+              AND (category_hint IS NULL OR category_hint != 'UPDATE' OR priority_score < ?)
             """,
-            [cutoff],
+            [cutoff, float(min_update_priority)],
         )
         return res.affected_row_count
 

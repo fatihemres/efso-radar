@@ -549,12 +549,19 @@ class RadarOrchestrator:
                     logger.info("Purged %d expired article records from repository", purged)
                 try:
                     expired_backlog = self.repository.expire_stale_backlog_candidates(
-                        max_age_hours=effective_backlog_hours, now=now
+                        max_age_hours=effective_backlog_hours,
+                        now=now,
+                        min_update_priority=self.settings.min_discovery_priority_for_ai,
                     )
                 except TypeError:
-                    expired_backlog = self.repository.expire_stale_backlog_candidates(
-                        max_age_hours=effective_backlog_hours
-                    )
+                    try:
+                        expired_backlog = self.repository.expire_stale_backlog_candidates(
+                            max_age_hours=effective_backlog_hours, now=now
+                        )
+                    except TypeError:
+                        expired_backlog = self.repository.expire_stale_backlog_candidates(
+                            max_age_hours=effective_backlog_hours
+                        )
                 if expired_backlog > 0:
                     logger.info(
                         "Expired %d stale candidates from backlog (>%dh old)",
@@ -693,14 +700,23 @@ class RadarOrchestrator:
 
             # 4b. Retrieve unexpired pending candidates from durable backlog to prevent feed-rotation loss
             if not scan_only:
+                effective_backlog_limit = self.settings.max_candidates * 2
                 try:
                     pending_backlog = self.repository.get_pending_candidates(
-                        max_age_hours=effective_backlog_hours, now=now
+                        max_age_hours=effective_backlog_hours,
+                        now=now,
+                        limit=effective_backlog_limit,
+                        min_update_priority=self.settings.min_discovery_priority_for_ai,
                     )
                 except TypeError:
-                    pending_backlog = self.repository.get_pending_candidates(
-                        max_age_hours=effective_backlog_hours
-                    )
+                    try:
+                        pending_backlog = self.repository.get_pending_candidates(
+                            max_age_hours=effective_backlog_hours, now=now
+                        )
+                    except TypeError:
+                        pending_backlog = self.repository.get_pending_candidates(
+                            max_age_hours=effective_backlog_hours
+                        )
                 if pending_backlog:
                     logger.info("Retrieved %d pending candidates from durable backlog", len(pending_backlog))
                     seen_ids = {a.id for a in articles}

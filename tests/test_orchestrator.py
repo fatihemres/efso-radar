@@ -880,10 +880,11 @@ class TestOrchestrator(unittest.TestCase):
 
 
     def test_negative_regression_soft_deferred_candidate_with_update_hint_escapes_24h_expiration(self):
-        """Negative regression (Issue #75 Review B): An in-scope candidate that happens to have
-        an UPDATE hint (e.g. source_category='UPDATE') but scores below min_discovery_priority_for_ai
-        is soft-deferred under pressure. Because of the repository's UPDATE SQL exemption, moving
-        time beyond T+24h leaves it QUEUED and eligible, escaping the 24-hour expiration boundary."""
+        """Acceptance test (Issue #75 Review B & PO Decision A.1+B.3):
+        Verifies that soft-deferred candidates with an UPDATE hint but persisted priority below
+        effective min_discovery_priority_for_ai strictly expire after the normal 24-hour window,
+        while high-priority UPDATE candidates (priority >= min_discovery_priority_for_ai) retain
+        their age exemption."""
         settings = Settings(
             ai_batch_size=10,
             min_discovery_priority_for_ai=5.5,
@@ -927,6 +928,17 @@ class TestOrchestrator(unittest.TestCase):
             source_category="UPDATE",
         )
 
+        # High-scoring candidate with an UPDATE hint (score 8.0 >= 5.5)
+        high_priority_update_art = Article.create(
+            "Festival Programı İptal Güncellemesi",
+            "https://haber.com/festival-update",
+            "Festival Haber",
+            self.now,
+            snippet="Daha önce duyurulan festival programında son dakika değişikliği yapıldı.",
+            source_category="UPDATE",
+            raw_metadata={"priority_score": 8.0},
+        )
+
         class MockAI(AIEditorialEngine):
             def evaluate(self, candidates, recent_stories, now):
                 return []
@@ -944,12 +956,21 @@ class TestOrchestrator(unittest.TestCase):
         self.assertEqual(res1.candidates_evaluated, 10)
         self.assertFalse(self.repo.is_article_processed(low_priority_update_art.id))
 
-        # Confirmed: It was soft-deferred into candidate_backlog with status QUEUED
-        pending_t0 = self.repo.get_pending_candidates(max_age_hours=24, now=self.now)
-        self.assertIn(low_priority_update_art.id, {a.id for a in pending_t0})
+        # Also register high_priority_update_art into backlog at T=0h
+        self.repo.save_pending_candidates([high_priority_update_art])
+
+        # Confirmed: Both were soft-deferred/persisted into candidate_backlog with status QUEUED
+        pending_t0 = self.repo.get_pending_candidates(
+            max_age_hours=24,
+            now=self.now,
+            min_update_priority=settings.min_discovery_priority_for_ai,
+        )
+        pending_t0_ids = {a.id for a in pending_t0}
+        self.assertIn(low_priority_update_art.id, pending_t0_ids)
+        self.assertIn(high_priority_update_art.id, pending_t0_ids)
 
         # Run 2 at T=26h: Synthetic time moves beyond 24h retention window (>24h).
-        # High volume of fresh news arrives; low_priority_update_art is NOT in the new RSS batch.
+        # High volume of fresh news arrives; neither update candidate is in the new RSS batch.
         t_26h = self.now + timedelta(hours=26)
         orch2 = RadarOrchestrator(
             settings=settings,
@@ -961,21 +982,38 @@ class TestOrchestrator(unittest.TestCase):
         res2 = orch2.run(now=t_26h)
         self.assertTrue(res2.success)
 
-        # Regression check: Because category_hint='UPDATE', expire_stale_backlog_candidates exempted it,
-        # and get_pending_candidates retrieved it even though it was published 26 hours ago!
-        # Thus, it STILL remains QUEUED and eligible in candidate_backlog.
-        pending_t26 = self.repo.get_pending_candidates(max_age_hours=24, now=t_26h)
-        self.assertIn(
-            low_priority_update_art.id,
-            {a.id for a in pending_t26},
-            "Candidate with UPDATE hint escapes 24h expiration due to SQL exemption",
+        # Acceptance check (B.3):
+        # 1. low_priority_update_art (score 4.5 < 5.5) must be EXPIRED and omitted from pending
+        # 2. high_priority_update_art (score 8.0 >= 5.5) retains genuine UPDATE age exemption
+        pending_t26 = self.repo.get_pending_candidates(
+            max_age_hours=24,
+            now=t_26h,
+            min_update_priority=settings.min_discovery_priority_for_ai,
         )
+        pending_t26_ids = {a.id for a in pending_t26}
+        self.assertNotIn(
+            low_priority_update_art.id,
+            pending_t26_ids,
+            "Low-priority candidate with UPDATE hint must expire after 24 hours",
+        )
+        self.assertIn(
+            high_priority_update_art.id,
+            pending_t26_ids,
+            "High-priority candidate with UPDATE hint must retain age exemption",
+        )
+
         with self.repo._connection() as conn:
-            row = conn.execute(
+            row_low = conn.execute(
                 "SELECT status FROM candidate_backlog WHERE article_id = ?",
                 (low_priority_update_art.id,),
             ).fetchone()
-            self.assertEqual(row["status"], "QUEUED")
+            self.assertEqual(row_low["status"], "EXPIRED")
+
+            row_high = conn.execute(
+                "SELECT status FROM candidate_backlog WHERE article_id = ?",
+                (high_priority_update_art.id,),
+            ).fetchone()
+            self.assertEqual(row_high["status"], "QUEUED")
 
 
 if __name__ == "__main__":
