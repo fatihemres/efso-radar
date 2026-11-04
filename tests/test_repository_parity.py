@@ -523,6 +523,32 @@ class RepositoryContractTestMixin:
         self.assertNotIn(art1.id, pending_after_eval_ids)
         self.assertIn(art2.id, pending_after_eval_ids)
 
+    def test_candidate_backlog_expired_reinsert_never_resets_age_or_status_parity(self):
+        """Verifies that re-inserting an already expired candidate via save_pending_candidates
+        does NOT reset its status back to QUEUED or modify its discovery age in SQLite or Turso."""
+        art_expired = Article.create(
+            title="Süresi Dolan Bağımsız Haber",
+            url="https://haber.com/suresi-dolan",
+            source="TestFeed",
+            published_at=self.now - timedelta(hours=25),
+            raw_metadata={"priority_score": 4.5},
+        )
+        self.repo.save_pending_candidates([art_expired])
+        # Expire it
+        expired_count = self.repo.expire_stale_backlog_candidates(max_age_hours=24, now=self.now)
+        self.assertEqual(expired_count, 1)
+
+        # Confirm not pending
+        pending = self.repo.get_pending_candidates(max_age_hours=24, now=self.now)
+        self.assertNotIn(art_expired.id, {a.id for a in pending})
+
+        # Attempt to re-insert (e.g. from repeat RSS feed ingestion)
+        self.repo.save_pending_candidates([art_expired])
+
+        # Confirm still not pending and remains expired
+        pending_after = self.repo.get_pending_candidates(max_age_hours=24, now=self.now)
+        self.assertNotIn(art_expired.id, {a.id for a in pending_after})
+
 
     def test_delivery_uncertain_record_replay_idempotency_and_preservation(self):
         """Verifies record_telegram_delivery replay on DELIVERY_UNCERTAIN is a safe no-op preserving all fields."""

@@ -757,28 +757,44 @@ class RadarOrchestrator:
                     discovery_metrics=discovery_metrics,
                 )
 
-            # Filter out explicitly dampened out-of-scope / grim news before AI evaluation to save tokens
+            # Filter out explicitly dampened out-of-scope / grim news before AI evaluation to save tokens.
+            # Distinct outcomes (Issue #75 Option A):
+            # 1. Hard rejection: Confirmed out-of-scope candidates retain suppression and are marked processed.
+            # 2. Soft deferral: In-scope candidates excluded solely due to volume (> ai_batch_size) and low priority
+            #    (< min_discovery_priority_for_ai) enter the existing durable candidate_backlog as QUEUED without
+            #    prematurely marking them processed, preserving an evaluation opportunity within the 24h retention window.
             ai_candidates: list[Article] = []
-            noise_dropped: list[Article] = []
+            hard_rejected: list[Article] = []
+            soft_deferred: list[Article] = []
             for c in candidates:
                 reasons = c.raw_metadata.get("priority_reasons", [])
                 p_score = float(c.raw_metadata.get("priority_score", 10.0))
-                if self.is_out_of_scope_candidate(c, reasons) or (
+                if self.is_out_of_scope_candidate(c, reasons):
+                    hard_rejected.append(c)
+                elif (
                     len(candidates) > self.settings.ai_batch_size
                     and p_score < self.settings.min_discovery_priority_for_ai
                 ):
-                    noise_dropped.append(c)
+                    soft_deferred.append(c)
                 else:
                     ai_candidates.append(c)
 
-            if noise_dropped and not dry_run:
-                self.repository.mark_articles_processed(noise_dropped)
+            if hard_rejected and not dry_run:
+                self.repository.mark_articles_processed(hard_rejected)
 
             candidates = ai_candidates
 
-            # Persist deprioritized candidates into durable backlog so they survive RSS feed expiration
-            if not dry_run and deprioritized:
-                self.repository.save_pending_candidates(deprioritized)
+            # Persist deprioritized candidates and soft-deferred candidates into durable backlog
+            # so they survive RSS feed expiration without premature marking as processed.
+            backlog_to_save: list[Article] = []
+            seen_backlog_ids: set[str] = set()
+            for item in list(deprioritized) + list(soft_deferred):
+                if item.id not in seen_backlog_ids:
+                    seen_backlog_ids.add(item.id)
+                    backlog_to_save.append(item)
+
+            if not dry_run and backlog_to_save:
+                self.repository.save_pending_candidates(backlog_to_save)
 
             if discovery_metrics:
                 discovery_metrics.story_clusters_formed = getattr(self.deduper, "last_clusters_count", len(candidates))
