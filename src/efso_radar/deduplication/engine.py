@@ -686,7 +686,7 @@ class DeduplicationEngine:
         then deterministically prioritizes top candidates.
         """
         fresh_unprocessed: list[Article] = []
-        seen_exact_titles: set[str] = set()
+        seen_exact_titles: set[tuple[str, str]] = set()
 
         for a in articles:
             # Level 1: Skip if already in persistent repository
@@ -694,10 +694,11 @@ class DeduplicationEngine:
                 continue
 
             norm_title = normalize_text(a.title)
-            if not norm_title or norm_title in seen_exact_titles:
+            pub_key = (a.source or "").strip().lower()
+            if not norm_title or (norm_title, pub_key) in seen_exact_titles:
                 continue
 
-            seen_exact_titles.add(norm_title)
+            seen_exact_titles.add((norm_title, pub_key))
             fresh_unprocessed.append(a)
 
         if not fresh_unprocessed:

@@ -365,5 +365,169 @@ class TestOrchestrator(unittest.TestCase):
         self.assertEqual(res3.notifications_dispatched, 1)
 
 
+
+    def test_pre_ai_noise_drop_filters_annotated_out_of_scope_reasons(self):
+        """Fix B (Issue 73): Pre-AI noise filter drops both exact and annotated out-of-scope news."""
+        settings = Settings(
+            ai_batch_size=20,
+            min_discovery_priority_for_ai=4.0,
+            ai_evaluation_enabled=True,
+            telegram_delivery_enabled=False,
+        )
+        # Articles triggering annotated out-of-scope dampening
+        art_politics = Article.create(
+            "Kabine Toplantısı Sona Erdi",
+            "https://news.com/politics-1",
+            "Haber A",
+            self.now,
+            snippet="Cumhurbaşkanlığı Kabinesi toplantısı sonrası yeni vergi düzenlemesi ve enflasyon kararları açıklandı.",
+        )
+        art_sports = Article.create(
+            "Where to Watch Champions League Final Game Online Free",
+            "https://news.com/sports-1",
+            "Haber B",
+            self.now,
+            snippet="Live stream guide, where to watch, and starting lineup details.",
+        )
+        art_religion = Article.create(
+            "Vatikan'dan Yeni Genelge Açıklandı",
+            "https://news.com/religion-1",
+            "Haber C",
+            self.now,
+            snippet="Katolik dünyası ve Papa yeni doktrin genelgesini yayımladı.",
+        )
+        art_blotter = Article.create(
+            "Metro Hattı İhalesi Tamamlandı",
+            "https://news.com/blotter-1",
+            "Haber D",
+            self.now,
+            snippet="Şehir içi metro hattı ihalesi tamamlandı ve çeyrek bilançosu açıklandı.",
+        )
+        art_essay = Article.create(
+            "What Second Acts Can Teach You About Life",
+            "https://news.com/essay-1",
+            "Haber E",
+            self.now,
+            snippet="How corporate executives can teach you about second acts in life.",
+        )
+        # Valid entertainment article that must survive
+        art_valid = Article.create(
+            "Hadise Yeni Albümünü ve Turnesini Resmen Açıkladı",
+            "https://news.com/ent-valid",
+            "Haber F",
+            self.now,
+            snippet="Ünlü şarkıcı Hadise yeni pop albümünü ve Avrupa turne tarihlerini duyurdu.",
+        )
+
+        all_articles = [art_politics, art_sports, art_religion, art_blotter, art_essay, art_valid]
+        evaluated_candidates = []
+        class RecordingAIEngine(AIEditorialEngine):
+            def evaluate(self, candidates, recent_stories, now):
+                evaluated_candidates.extend(candidates)
+                return []
+
+        orch = RadarOrchestrator(
+            settings=settings,
+            repository=self.repo,
+            source=MockNewsSource(articles=all_articles, successes=1),
+            ai_engine=RecordingAIEngine(),
+            notifier=MockNotifier(),
+        )
+
+        result = orch.run(now=self.now)
+        self.assertTrue(result.success)
+
+        # Only art_valid should reach AI evaluation; all 5 out-of-scope articles are dropped as noise
+        evaluated_ids = {c.id for c in evaluated_candidates}
+        self.assertIn(art_valid.id, evaluated_ids, "Valid entertainment article should reach AI evaluation")
+        for noise_art in [art_politics, art_sports, art_religion, art_blotter, art_essay]:
+            self.assertNotIn(
+                noise_art.id,
+                evaluated_ids,
+                f"Expected {noise_art.title} to be filtered out before AI evaluation",
+            )
+        self.assertEqual(result.candidates_evaluated, 1)
+
+    def test_pre_ai_noise_drop_preserves_sensitive_tragedy_and_health_counterexamples(self):
+        """Fix B (Issue 73): Pre-AI noise filter must NOT drop sensitive tragedy or health news,
+        allowing them to reach AI and SENSITIVE_REVIEW / HOLD queues."""
+        settings = Settings(
+            ai_batch_size=20,
+            min_discovery_priority_for_ai=4.0,
+            ai_evaluation_enabled=True,
+            telegram_delivery_enabled=False,
+        )
+        art_tragedy = Article.create(
+            "Liam Payne 3. kattan düşerek hayatını kaybetti",
+            "https://news.com/liam-payne",
+            "Haber A",
+            self.now,
+            snippet="One Direction grubunun eski üyesi otel balkonundan düşerek yaşamını yitirdi.",
+        )
+        art_funeral = Article.create(
+            "Usta sanatçının cenaze töreni yarın Teşvikiye Camii'nde yapılacak",
+            "https://news.com/usta-cenaze",
+            "Haber B",
+            self.now,
+            snippet="Sanat dünyası acı haberle sarsıldı; cenaze töreni yarın öğle namazını müteakip düzenlenecek.",
+        )
+        art_health = Article.create(
+            "Kurgusal Sanatçı Kalp Krizi Geçirerek Acilen Yoğun Bakıma Alındı",
+            "https://news.com/sanatci-icu",
+            "Haber C",
+            self.now,
+            snippet="Sanatçı aniden fenalaşarak acil ameliyata alındı ve yoğun bakımda tedavi görüyor.",
+        )
+
+        evaluated_candidates = []
+        class RecordingAIEngine(AIEditorialEngine):
+            def evaluate(self, candidates, recent_stories, now):
+                evaluated_candidates.extend(candidates)
+                return []
+
+        orch = RadarOrchestrator(
+            settings=settings,
+            repository=self.repo,
+            source=MockNewsSource(articles=[art_tragedy, art_funeral, art_health], successes=1),
+            ai_engine=RecordingAIEngine(),
+            notifier=MockNotifier(),
+        )
+
+        result = orch.run(now=self.now)
+        self.assertTrue(result.success)
+
+        # All 3 sensitive articles must have reached AI evaluation
+        evaluated_ids = {c.id for c in evaluated_candidates}
+        for art in [art_tragedy, art_funeral, art_health]:
+            self.assertIn(art.id, evaluated_ids, f"{art.title} was omitted from AI evaluation")
+        self.assertEqual(result.candidates_evaluated, 3)
+
+    def test_is_out_of_scope_candidate_unit_contract(self):
+        """Fix B (Issue 73): Unit contract for RadarOrchestrator.is_out_of_scope_candidate."""
+        normal_art = Article.create("Hadise Klip Çekti", "https://a.com/1", "A", self.now, snippet="Normal klip.")
+        politics_art = Article.create("Enflasyon Açıklandı", "https://a.com/2", "A", self.now, snippet="Bakanlık açıkladı.")
+        tragedy_art = Article.create("Liam Payne hayatını kaybetti", "https://a.com/3", "A", self.now, snippet="Otelden düşerek yaşamını yitirdi.")
+        health_art = Article.create("Sanatçı yoğun bakıma alındı", "https://a.com/4", "A", self.now, snippet="Acil servise kaldırıldı ve entübe edildi.")
+
+        # Exact and annotated out-of-scope noise without sensitive keywords -> True
+        self.assertTrue(RadarOrchestrator.is_out_of_scope_candidate(politics_art, ["out_of_scope_or_grim_news_dampened"]))
+        self.assertTrue(RadarOrchestrator.is_out_of_scope_candidate(politics_art, ["out_of_scope_or_grim_news_dampened(politics_policy)"]))
+        self.assertTrue(RadarOrchestrator.is_out_of_scope_candidate(politics_art, ["out_of_scope_or_grim_news_dampened(religion_clerical)"]))
+        self.assertTrue(RadarOrchestrator.is_out_of_scope_candidate(politics_art, ["out_of_scope_or_grim_news_dampened(sports_watch_guide)"]))
+        self.assertTrue(RadarOrchestrator.is_out_of_scope_candidate(politics_art, ["out_of_scope_or_grim_news_dampened(non_celebrity_blotter_or_geo)"]))
+        self.assertTrue(RadarOrchestrator.is_out_of_scope_candidate(politics_art, ["out_of_scope_or_grim_news_dampened(generic_essay_or_b2b)"]))
+
+        # tragic_local_mortality alone must NOT be classified as noise
+        self.assertFalse(RadarOrchestrator.is_out_of_scope_candidate(normal_art, ["out_of_scope_or_grim_news_dampened(tragic_local_mortality)"]))
+
+        # Sensitive tragedy and health content must NEVER be dropped as noise even if reason present
+        self.assertFalse(RadarOrchestrator.is_out_of_scope_candidate(tragedy_art, ["out_of_scope_or_grim_news_dampened"]))
+        self.assertFalse(RadarOrchestrator.is_out_of_scope_candidate(tragedy_art, ["out_of_scope_or_grim_news_dampened(non_celebrity_blotter_or_geo)"]))
+        self.assertFalse(RadarOrchestrator.is_out_of_scope_candidate(health_art, ["out_of_scope_or_grim_news_dampened"]))
+
+        # Regular entertainment news -> False
+        self.assertFalse(RadarOrchestrator.is_out_of_scope_candidate(normal_art, ["core_turkish_entertainment", "has_visual_image"]))
+
+
 if __name__ == "__main__":
     unittest.main()
