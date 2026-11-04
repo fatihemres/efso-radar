@@ -523,6 +523,195 @@ class RepositoryContractTestMixin:
         self.assertNotIn(art1.id, pending_after_eval_ids)
         self.assertIn(art2.id, pending_after_eval_ids)
 
+    def test_candidate_backlog_expired_reinsert_never_resets_age_or_status_parity(self):
+        """Verifies that re-inserting an already expired candidate via save_pending_candidates
+        does NOT reset its status back to QUEUED or modify its discovery age in SQLite or Turso."""
+        art_expired = Article.create(
+            title="Süresi Dolan Bağımsız Haber",
+            url="https://haber.com/suresi-dolan",
+            source="TestFeed",
+            published_at=self.now - timedelta(hours=25),
+            raw_metadata={"priority_score": 4.5},
+        )
+        self.repo.save_pending_candidates([art_expired])
+        # Expire it
+        expired_count = self.repo.expire_stale_backlog_candidates(max_age_hours=24, now=self.now)
+        self.assertEqual(expired_count, 1)
+
+        # Confirm not pending
+        pending = self.repo.get_pending_candidates(max_age_hours=24, now=self.now)
+        self.assertNotIn(art_expired.id, {a.id for a in pending})
+
+        # Attempt to re-insert (e.g. from repeat RSS feed ingestion)
+        self.repo.save_pending_candidates([art_expired])
+
+        # Confirm still not pending and remains expired
+        pending_after = self.repo.get_pending_candidates(max_age_hours=24, now=self.now)
+        self.assertNotIn(art_expired.id, {a.id for a in pending_after})
+
+    def test_bounded_backlog_retrieval_and_deterministic_tie_breaker_parity(self):
+        """Verifies bounded backlog retrieval (A.1):
+        1. When pending candidates exceed limit (e.g. 150 articles with limit=110),
+           get_pending_candidates strictly returns exactly 110 articles.
+        2. Unfetched records remain QUEUED and eligible until normal expiry.
+        3. Sorting is deterministic: priority_score DESC, published_at DESC, article_id ASC tie-breaker.
+        4. Applies identically in SQLite and Turso.
+        """
+        articles = []
+        for i in range(150):
+            score = 8.0 if i < 50 else (6.0 if i < 100 else 4.0)
+            pub_offset = (i % 10)
+            pub_time = self.now - timedelta(minutes=pub_offset)
+            art = Article(
+                id=f"art_{i:04d}",
+                title=f"Aday Haber {i}",
+                url=f"https://haber.com/aday-{i}",
+                source="TestFeed",
+                published_at=pub_time,
+                raw_metadata={"priority_score": score},
+            )
+            articles.append(art)
+
+        self.repo.save_pending_candidates(articles)
+
+        # Retrieve with limit=110
+        pending = self.repo.get_pending_candidates(max_age_hours=24, now=self.now, limit=110)
+        self.assertEqual(len(pending), 110)
+
+        # Verify ordering contract:
+        for j in range(len(pending) - 1):
+            curr_art = pending[j]
+            next_art = pending[j + 1]
+            curr_score = float(curr_art.raw_metadata.get("priority_score", 0.0))
+            next_score = float(next_art.raw_metadata.get("priority_score", 0.0))
+            self.assertGreaterEqual(curr_score, next_score)
+            if curr_score == next_score:
+                self.assertGreaterEqual(curr_art.published_at, next_art.published_at)
+                if curr_art.published_at == next_art.published_at:
+                    self.assertLess(curr_art.id, next_art.id)
+
+        # Verify that all 40 unfetched articles remain in backlog with status QUEUED
+        fetched_ids = {a.id for a in pending}
+        unfetched_ids = {a.id for a in articles} - fetched_ids
+        self.assertEqual(len(unfetched_ids), 40)
+
+        # If we fetch without limit, all 150 are returned
+        all_pending = self.repo.get_pending_candidates(max_age_hours=24, now=self.now, limit=None)
+        self.assertEqual(len(all_pending), 150)
+
+    def test_priority_gated_update_expiration_boundaries_and_threshold_parity(self):
+        """Verifies priority-gated UPDATE expiration (B.3):
+        1. Exact age boundaries: Candidate at T+23h59m is NOT expired; at T+24h01m expires unless UPDATE with score >= threshold.
+        2. Threshold equality: score == 5.5 is retained (NOT expired); score == 5.49 expires.
+        3. Non-default threshold: passing min_update_priority=7.0 expires an UPDATE candidate with score 6.0,
+           while retaining one with score 7.0.
+        4. Parity between SQLite and Turso.
+        """
+        # Exactly 23 hours 59 minutes ago (within 24h window)
+        art_fresh = Article(
+            id="art_fresh_23h59m",
+            title="Taze Haber 23h59m",
+            url="https://haber.com/fresh",
+            source="TestFeed",
+            published_at=self.now - timedelta(hours=23, minutes=59),
+            source_category="UPDATE",
+            raw_metadata={"priority_score": 3.0},
+        )
+        # Exactly 24 hours 1 minute ago (beyond 24h window), low priority UPDATE (score 5.49 < 5.5)
+        art_below_threshold = Article(
+            id="art_stale_549",
+            title="Eski Haber 5.49",
+            url="https://haber.com/549",
+            source="TestFeed",
+            published_at=self.now - timedelta(hours=24, minutes=1),
+            source_category="UPDATE",
+            raw_metadata={"priority_score": 5.49},
+        )
+        # Exactly 24 hours 1 minute ago (beyond 24h window), exact threshold equality (score 5.50 == 5.5)
+        art_exact_threshold = Article(
+            id="art_stale_550",
+            title="Eski Haber 5.50",
+            url="https://haber.com/550",
+            source="TestFeed",
+            published_at=self.now - timedelta(hours=24, minutes=1),
+            source_category="UPDATE",
+            raw_metadata={"priority_score": 5.50},
+        )
+        # Exactly 24 hours 1 minute ago, non-update ordinary article with high score 9.0 (should expire)
+        art_ordinary_high = Article(
+            id="art_ord_high",
+            title="Eski Sıradan Haber 9.0",
+            url="https://haber.com/ord-high",
+            source="TestFeed",
+            published_at=self.now - timedelta(hours=24, minutes=1),
+            source_category="GENERAL",
+            raw_metadata={"priority_score": 9.0},
+        )
+        # Exactly 24 hours 1 minute ago, UPDATE with score 6.0
+        art_score_60 = Article(
+            id="art_stale_60",
+            title="Eski Haber 6.0",
+            url="https://haber.com/60",
+            source="TestFeed",
+            published_at=self.now - timedelta(hours=24, minutes=1),
+            source_category="UPDATE",
+            raw_metadata={"priority_score": 6.0},
+        )
+        # Exactly 24 hours 1 minute ago, UPDATE with score 7.0
+        art_score_70 = Article(
+            id="art_stale_70",
+            title="Eski Haber 7.0",
+            url="https://haber.com/70",
+            source="TestFeed",
+            published_at=self.now - timedelta(hours=24, minutes=1),
+            source_category="UPDATE",
+            raw_metadata={"priority_score": 7.0},
+        )
+
+        test_batch = [
+            art_fresh,
+            art_below_threshold,
+            art_exact_threshold,
+            art_ordinary_high,
+            art_score_60,
+            art_score_70,
+        ]
+        self.repo.save_pending_candidates(test_batch)
+
+        # First expire pass with default threshold min_update_priority=5.5
+        expired_count = self.repo.expire_stale_backlog_candidates(
+            max_age_hours=24, now=self.now, min_update_priority=5.5
+        )
+        self.assertEqual(expired_count, 2)
+
+        # Check pending candidates at threshold 5.5
+        pending_55 = self.repo.get_pending_candidates(
+            max_age_hours=24, now=self.now, min_update_priority=5.5
+        )
+        pending_55_ids = {a.id for a in pending_55}
+
+        self.assertIn(art_fresh.id, pending_55_ids)
+        self.assertIn(art_exact_threshold.id, pending_55_ids)
+        self.assertIn(art_score_60.id, pending_55_ids)
+        self.assertIn(art_score_70.id, pending_55_ids)
+        self.assertNotIn(art_below_threshold.id, pending_55_ids)
+        self.assertNotIn(art_ordinary_high.id, pending_55_ids)
+
+        # Second pass: Non-default configured threshold min_update_priority=7.0
+        expired_count_70 = self.repo.expire_stale_backlog_candidates(
+            max_age_hours=24, now=self.now, min_update_priority=7.0
+        )
+        self.assertEqual(expired_count_70, 2)
+
+        pending_70 = self.repo.get_pending_candidates(
+            max_age_hours=24, now=self.now, min_update_priority=7.0
+        )
+        pending_70_ids = {a.id for a in pending_70}
+        self.assertIn(art_fresh.id, pending_70_ids, "Fresh candidate remains pending regardless of threshold")
+        self.assertIn(art_score_70.id, pending_70_ids, "Candidate meeting threshold 7.0 remains pending")
+        self.assertNotIn(art_score_60.id, pending_70_ids, "Candidate below threshold 7.0 is no longer pending")
+        self.assertNotIn(art_exact_threshold.id, pending_70_ids, "Candidate below threshold 7.0 is no longer pending")
+
 
     def test_delivery_uncertain_record_replay_idempotency_and_preservation(self):
         """Verifies record_telegram_delivery replay on DELIVERY_UNCERTAIN is a safe no-op preserving all fields."""

@@ -66,7 +66,13 @@ class StateRepository(ABC):
         pass
 
     @abstractmethod
-    def get_pending_candidates(self, max_age_hours: int = 16, now: Optional[datetime] = None) -> list[Article]:
+    def get_pending_candidates(
+        self,
+        max_age_hours: int = 16,
+        now: Optional[datetime] = None,
+        limit: Optional[int] = None,
+        min_update_priority: float = 0.0,
+    ) -> list[Article]:
         """Retrieve unexpired candidates from backlog that are still awaiting evaluation."""
         pass
 
@@ -76,7 +82,12 @@ class StateRepository(ABC):
         pass
 
     @abstractmethod
-    def expire_stale_backlog_candidates(self, max_age_hours: int = 24, now: Optional[datetime] = None) -> int:
+    def expire_stale_backlog_candidates(
+        self,
+        max_age_hours: int = 24,
+        now: Optional[datetime] = None,
+        min_update_priority: float = 0.0,
+    ) -> int:
         """Transition candidates older than max_age_hours to EXPIRED status, preserving legitimate UPDATEs."""
         pass
 
