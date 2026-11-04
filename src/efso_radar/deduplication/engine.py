@@ -288,6 +288,8 @@ GENERIC_HEADLINE_WORDS: set[str] = {
     "series", "films", "season", "episode", "release", "releases",
     "here", "full", "list", "lineup", "schedule", "dates", "date",
     "tv", "video", "photos", "photo", "exclusive", "first", "look", "new",
+    # Turkish generic headline tokens
+    "sezon", "sezonu", "tarih", "tarihi", "tarihleri", "belli", "oldu",
 }
 
 
@@ -787,8 +789,7 @@ class DeduplicationEngine:
                 if conflicting_affinity_entities or conflicting_person_names:
                     is_same_event = False
                 elif disjoint_named_entities:
-                    # Articles naming completely different people/entities only merge on near-exact title match (e.g. minor typo)
-                    is_same_event = char_sim >= 0.92
+                    is_same_event = False
                 else:
                     is_same_event = (
                         (title_overlap >= similarity_threshold and (not shared_entities or non_entity_overlap >= 0.25))

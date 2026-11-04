@@ -450,12 +450,16 @@ class RadarOrchestrator:
         variants (e.g. politics_policy, religion_clerical, sports_watch_guide,
         non_celebrity_blotter_or_geo, generic_essay_or_b2b).
 
-        Defends against indiscriminate bulk-dropping of editorially relevant tragic
-        or sensitive news:
+        Defends against indiscriminate bulk-dropping of editorially relevant tragic,
+        health, or celebrity legal news:
         - Excludes 'tragic_local_mortality' from noise dropping so genuine tragedy
           reaches AI evaluation or SENSITIVE_REVIEW / HOLD safety paths.
         - Counterexample veto: Any candidate with detected sensitive tragedy or
           sensitive health content is NEVER dropped as noise.
+        - Celebrity legal veto: Editorially relevant celebrity legal developments
+          grounded in affinity entities or core entertainment verticals containing
+          incidental policy terminology (e.g. 'vergi düzenlemesi') are preserved
+          for AI evaluation and not dropped as unrelated politics/policy noise.
         """
         has_noise_reason = any(
             r == "out_of_scope_or_grim_news_dampened"
@@ -472,6 +476,14 @@ class RadarOrchestrator:
         if detect_sensitive_tragedy_content(article.title, article.snippet):
             return False
         if detect_sensitive_health_content(article.title, article.snippet):
+            return False
+
+        # Guard against falsely discarding relevant celebrity legal developments containing incidental policy phrasing
+        is_celebrity_legal = any("celebrity_statement_legal" in r for r in reasons) and (
+            any(r.startswith("high_affinity_entity") for r in reasons)
+            or any(r in ("core_turkish_entertainment", "core_global_entertainment") for r in reasons)
+        )
+        if is_celebrity_legal:
             return False
 
         return True

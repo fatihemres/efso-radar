@@ -528,5 +528,34 @@ class TestDeduplication(unittest.TestCase):
         )
 
 
+
+    def test_unknown_fictional_subjects_sharing_identical_generic_titles_remain_separate(self):
+        """Regression A (PR #74 review): Fictional series/people absent from HIGH_AFFINITY_ENTITIES
+        sharing an identical generic headline ('Yeni Sezon Tarihi Belli Oldu') across distinct
+        publishers with distinct subjects in snippets and URL slugs must NOT merge."""
+        art_karanlik = Article.create(
+            "Yeni Sezon Tarihi Belli Oldu",
+            "https://dizihaber.com/karanlik-sirlar-sezon-2",
+            "Dizi Haber",
+            self.now,
+            snippet="Karanlık Sırlar dizisinin merakla beklenen 2. sezon yayın tarihi yapımcı tarafından açıklandı.",
+        )
+        art_mavi = Article.create(
+            "Yeni Sezon Tarihi Belli Oldu",
+            "https://sinemadunyasi.com/mavi-ruzgar-sezon-3",
+            "Sinema Dünyası",
+            self.now,
+            snippet="Mavi Rüzgar dizisinin yeni sezon bölümleri kış aylarında ekrana gelecek.",
+        )
+        candidates = self.engine.filter_fresh_candidates([art_karanlik, art_mavi])
+        self.assertEqual(
+            len(candidates),
+            2,
+            f"Expected 2 separate candidate clusters for distinct fictional series, but got {len(candidates)}: {[c.title for c in candidates]}",
+        )
+        cluster_sizes = [c.raw_metadata.get("cluster_size", 1) for c in candidates]
+        self.assertEqual(cluster_sizes, [1, 1])
+
+
 if __name__ == "__main__":
     unittest.main()

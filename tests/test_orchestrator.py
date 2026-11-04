@@ -529,5 +529,63 @@ class TestOrchestrator(unittest.TestCase):
         self.assertFalse(RadarOrchestrator.is_out_of_scope_candidate(normal_art, ["core_turkish_entertainment", "has_visual_image"]))
 
 
+
+    def test_celebrity_legal_development_with_policy_phrase_survives_pre_ai_filter(self):
+        """Regression B (PR #74 review): Editorially relevant celebrity legal news
+        containing incidental policy wording ('vergi düzenlemesi') must NOT be dropped
+        as noise before AI evaluation; it must reach AI evaluation while preserving
+        downstream post-AI processing contracts."""
+        settings = Settings(
+            ai_batch_size=20,
+            min_discovery_priority_for_ai=4.0,
+            ai_evaluation_enabled=True,
+            telegram_delivery_enabled=False,
+        )
+        # Celebrity legal story with a policy phrase ("vergi düzenlemesi")
+        art_legal = Article.create(
+            "Ünlü Komedyen Cem Yılmaz Hakkında Vergi Düzenlemesi Davası: Mahkemeden Karar Çıktı",
+            "https://haber.com/cem-yilmaz-vergi-davasi-karar",
+            "Haber Türk",
+            self.now,
+            snippet="Cem Yılmaz'ın şirketine yönelik vergi düzenlemesi davasında mahkeme beraat kararı verdi.",
+        )
+        # Unrelated general politics article that MUST still be dropped
+        art_unrelated_politics = Article.create(
+            "Hazine ve Maliye Bakanlığı Vergi Düzenlemesi Paketini Açıkladı",
+            "https://haber.com/bakanlik-vergi-paketi",
+            "Ekonomi Haber",
+            self.now,
+            snippet="Yeni vergi düzenlemesi ile gelir vergisi dilimleri ve kurumlar vergisi oranları güncellendi.",
+        )
+
+        evaluated_candidates = []
+        class RecordingAIEngine(AIEditorialEngine):
+            def evaluate(self, candidates, recent_stories, now):
+                evaluated_candidates.extend(candidates)
+                return []
+
+        orch = RadarOrchestrator(
+            settings=settings,
+            repository=self.repo,
+            source=MockNewsSource(articles=[art_legal, art_unrelated_politics], successes=1),
+            ai_engine=RecordingAIEngine(),
+            notifier=MockNotifier(),
+        )
+
+        result = orch.run(now=self.now)
+        self.assertTrue(result.success)
+
+        # 1. Before AI evaluation: art_legal must NOT be filtered out through noise_dropped; it must reach AI!
+        evaluated_ids = {c.id for c in evaluated_candidates}
+        self.assertIn(art_legal.id, evaluated_ids, "Celebrity legal story must reach AI evaluation!")
+
+        # Unrelated general politics must be filtered out before AI
+        self.assertNotIn(art_unrelated_politics.id, evaluated_ids, "Unrelated politics must be filtered before AI")
+
+        # 2. After AI evaluation: art_legal was evaluated, so repository marked it processed as an evaluated candidate
+        self.assertTrue(self.repo.is_article_processed(art_legal.id), "Evaluated article should be marked processed at step 9")
+        self.assertEqual(result.candidates_evaluated, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
