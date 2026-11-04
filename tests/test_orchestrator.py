@@ -879,5 +879,104 @@ class TestOrchestrator(unittest.TestCase):
         self.assertIn(art_update.id, pending_ids, "UPDATE candidate must be retained despite age")
 
 
+    def test_negative_regression_soft_deferred_candidate_with_update_hint_escapes_24h_expiration(self):
+        """Negative regression (Issue #75 Review B): An in-scope candidate that happens to have
+        an UPDATE hint (e.g. source_category='UPDATE') but scores below min_discovery_priority_for_ai
+        is soft-deferred under pressure. Because of the repository's UPDATE SQL exemption, moving
+        time beyond T+24h leaves it QUEUED and eligible, escaping the 24-hour expiration boundary."""
+        settings = Settings(
+            ai_batch_size=10,
+            min_discovery_priority_for_ai=5.5,
+            ai_evaluation_enabled=True,
+            telegram_delivery_enabled=False,
+            max_candidates=55,
+        )
+
+        titles_10 = [
+            ("Tarkan Yeni Pop Şarkısını Çıkardı", "Tarkan"),
+            ("Hadise Harbiye Açıkhava Sahnesinde Konser Verdi", "Hadise"),
+            ("Kıvanç Tatlıtuğ Başrollü Sinema Filmi Vizyona Girdi", "Kıvanç Tatlıtuğ"),
+            ("Serenay Sarıkaya Moda Haftasında Kırmızı Halıda Yürüdü", "Serenay Sarıkaya"),
+            ("Kenan İmirzalıoğlu Yeni Televizyon Sezonu İçin Anlaştı", "Kenan İmirzalıoğlu"),
+            ("Ezhel Avrupa Turnesi Kapsamında Berlin'de Sahne Aldı", "Ezhel"),
+            ("Cem Yılmaz Yeni Stand-up Gösterisinin Prömiyerini Yaptı", "Cem Yılmaz"),
+            ("Ata Demirer Komedi Filminin Çekimlerini Tamamladı", "Ata Demirer"),
+            ("Mabel Matiz Klip Çekimleri İçin Kapadokya'ya Gitti", "Mabel Matiz"),
+            ("Zeynep Bastık Akustik Konser Kayıtlarını Tamamladı", "Zeynep Bastık"),
+        ]
+
+        def make_high_priority_batch(now_time, run_index):
+            return [
+                Article.create(
+                    f"{title} - Kaynak Haber {run_index}",
+                    f"https://haber.com/hp-r{run_index}-{i}",
+                    f"Kaynak {i}",
+                    now_time,
+                    snippet=f"{name} yeni çalışmaları hakkında açıklama yaptı.",
+                )
+                for i, (title, name) in enumerate(titles_10)
+            ]
+
+        # In-scope, low-scoring candidate with an UPDATE hint (score 4.5 < 5.5)
+        low_priority_update_art = Article.create(
+            "Bağımsız Kısa Film Gösterimi Hafta Sonu Başlıyor",
+            "https://haber.com/bagimsiz-kisa-film-gosterimi-update",
+            "Kültür Sanat Bülteni",
+            self.now,
+            snippet="Genç yönetmenlerin kısa film çalışmaları hafta sonu sinemaseverlerle buluşuyor.",
+            source_category="UPDATE",
+        )
+
+        class MockAI(AIEditorialEngine):
+            def evaluate(self, candidates, recent_stories, now):
+                return []
+
+        # Run 1 at T=0h: 10 high priority + 1 low priority with UPDATE hint
+        orch1 = RadarOrchestrator(
+            settings=settings,
+            repository=self.repo,
+            source=MockNewsSource(articles=make_high_priority_batch(self.now, 1) + [low_priority_update_art], successes=1),
+            ai_engine=MockAI(),
+            notifier=MockNotifier(),
+        )
+        res1 = orch1.run(now=self.now)
+        self.assertTrue(res1.success)
+        self.assertEqual(res1.candidates_evaluated, 10)
+        self.assertFalse(self.repo.is_article_processed(low_priority_update_art.id))
+
+        # Confirmed: It was soft-deferred into candidate_backlog with status QUEUED
+        pending_t0 = self.repo.get_pending_candidates(max_age_hours=24, now=self.now)
+        self.assertIn(low_priority_update_art.id, {a.id for a in pending_t0})
+
+        # Run 2 at T=26h: Synthetic time moves beyond 24h retention window (>24h).
+        # High volume of fresh news arrives; low_priority_update_art is NOT in the new RSS batch.
+        t_26h = self.now + timedelta(hours=26)
+        orch2 = RadarOrchestrator(
+            settings=settings,
+            repository=self.repo,
+            source=MockNewsSource(articles=make_high_priority_batch(t_26h, 2), successes=1),
+            ai_engine=MockAI(),
+            notifier=MockNotifier(),
+        )
+        res2 = orch2.run(now=t_26h)
+        self.assertTrue(res2.success)
+
+        # Regression check: Because category_hint='UPDATE', expire_stale_backlog_candidates exempted it,
+        # and get_pending_candidates retrieved it even though it was published 26 hours ago!
+        # Thus, it STILL remains QUEUED and eligible in candidate_backlog.
+        pending_t26 = self.repo.get_pending_candidates(max_age_hours=24, now=t_26h)
+        self.assertIn(
+            low_priority_update_art.id,
+            {a.id for a in pending_t26},
+            "Candidate with UPDATE hint escapes 24h expiration due to SQL exemption",
+        )
+        with self.repo._connection() as conn:
+            row = conn.execute(
+                "SELECT status FROM candidate_backlog WHERE article_id = ?",
+                (low_priority_update_art.id,),
+            ).fetchone()
+            self.assertEqual(row["status"], "QUEUED")
+
+
 if __name__ == "__main__":
     unittest.main()
