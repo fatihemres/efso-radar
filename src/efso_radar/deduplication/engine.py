@@ -324,6 +324,11 @@ MEDIA_ATTRIBUTION_MARKERS: set[str] = {
 }
 
 
+def normalize_publisher_identity(source: Optional[str]) -> str:
+    """Normalize publisher / outlet source string for stable identity matching (whitespace and casefold)."""
+    return (source or "").strip().casefold()
+
+
 def extract_proper_name_bigrams(text: str) -> set[str]:
     """Extract capitalized proper-name bigrams and individual proper nouns from raw text."""
     chunks = re.split(r"[:!?;,\.\n\(\)\[\]\"“”/]+", text)
@@ -555,12 +560,11 @@ def compute_candidate_priority_baseline(
         score += 0.5
         reasons.append("has_informative_snippet")
 
-    # 6. Cross-Publisher Consensus Cluster Bonus
-    consensus_count = distinct_publisher_count if distinct_publisher_count is not None else cluster_size
-    if consensus_count >= 3:
+    # 6. Cross-Publisher Consensus Cluster Bonus (strictly requires distinct reporting publishers)
+    if distinct_publisher_count is not None and distinct_publisher_count >= 3:
         score += 3.0
         reasons.append("cross_publisher_consensus(3+)")
-    elif consensus_count == 2:
+    elif distinct_publisher_count is not None and distinct_publisher_count == 2:
         score += 1.5
         reasons.append("cross_publisher_consensus(2)")
 
@@ -687,12 +691,11 @@ def compute_candidate_priority(
         score += 0.4
         reasons.append("informative_snippet")
 
-    # 7. Cross-Publisher Consensus (requires distinct reporting publishers)
-    consensus_count = distinct_publisher_count if distinct_publisher_count is not None else cluster_size
-    if consensus_count >= 3:
+    # 7. Cross-Publisher Consensus (strictly requires distinct reporting publishers)
+    if distinct_publisher_count is not None and distinct_publisher_count >= 3:
         score += 1.8
         reasons.append("cross_publisher_consensus(3+)")
-    elif consensus_count == 2:
+    elif distinct_publisher_count is not None and distinct_publisher_count == 2:
         score += 1.0
         reasons.append("cross_publisher_consensus(2)")
 
@@ -886,7 +889,16 @@ class DeduplicationEngine:
         now_ref = max((a.published_at for a in fresh_unprocessed), default=None)
 
         for cluster in clusters:
-            distinct_pubs_cluster = len(dict.fromkeys(x.source for x in cluster))
+            seen_pub_identities: set[str] = set()
+            cluster_display_publishers: list[str] = []
+            for a in cluster:
+                norm_pub = normalize_publisher_identity(a.source)
+                if norm_pub and norm_pub not in seen_pub_identities:
+                    seen_pub_identities.add(norm_pub)
+                    cluster_display_publishers.append(a.source.strip())
+
+            distinct_pubs_cluster = len(seen_pub_identities) if seen_pub_identities else (1 if cluster else 0)
+
             best_article = max(
                 cluster,
                 key=lambda a: (
@@ -904,7 +916,9 @@ class DeduplicationEngine:
             best_article_dict = best_article.model_dump()
             best_article_dict["raw_metadata"]["cluster_article_ids"] = [a.id for a in cluster]
             best_article_dict["raw_metadata"]["cluster_size"] = len(cluster)
-            best_article_dict["raw_metadata"]["cluster_publishers"] = list(dict.fromkeys(a.source for a in cluster))
+            best_article_dict["raw_metadata"]["cluster_publishers"] = (
+                cluster_display_publishers if cluster_display_publishers else [best_article.source.strip()]
+            )
             best_article_dict["raw_metadata"]["cluster_headlines"] = [a.title for a in cluster[:4]]
             representatives.append(Article(**best_article_dict))
 
@@ -915,11 +929,15 @@ class DeduplicationEngine:
         scored_reps: list[tuple[float, Article]] = []
 
         for art in representatives:
-            pub_key = art.source.lower()
+            pub_key = normalize_publisher_identity(art.source)
             publisher_counts[pub_key] += 1
             cluster_size = art.raw_metadata.get("cluster_size", 1)
             cluster_pubs = art.raw_metadata.get("cluster_publishers", [art.source])
-            distinct_pub_count = len(cluster_pubs) if cluster_pubs else 1
+            distinct_pub_count = (
+                len({normalize_publisher_identity(p) for p in cluster_pubs if normalize_publisher_identity(p)})
+                if cluster_pubs
+                else 1
+            )
             p_score, reasons = compute_candidate_priority(
                 article=art,
                 cluster_size=cluster_size,

@@ -7,7 +7,10 @@ from pathlib import Path
 from efso_radar.deduplication.engine import (
     DeduplicationEngine,
     calculate_token_overlap,
+    compute_candidate_priority,
+    compute_candidate_priority_baseline,
     extract_key_tokens,
+    normalize_publisher_identity,
 )
 from efso_radar.domain import Article, Market
 from efso_radar.repositories.sqlite import SqliteStateRepository
@@ -687,6 +690,191 @@ class TestDeduplication(unittest.TestCase):
         self.assertEqual(set(rep.raw_metadata.get("cluster_publishers", [])), {"Variety", "The Hollywood Reporter"})
         reasons = rep.raw_metadata.get("priority_reasons", [])
         self.assertTrue(any("cross_publisher_consensus(2)" in r for r in reasons))
+
+
+    def test_priority_scorers_fail_conservative_when_publisher_count_missing_r78_01(self):
+        """Direct scorer test for Finding R78-01:
+        Both compute_candidate_priority and compute_candidate_priority_baseline must fail
+        conservatively when distinct_publisher_count is None or < 2.
+        Unknown publisher count must never be treated as independent corroboration solely
+        because cluster_size >= 2.
+        """
+        art = Article.create(
+            "Dua Lipa büyük konser vereceğini resmen duyurdu",
+            "https://variety.com/dualipa-tour",
+            "Variety",
+            self.now,
+            snippet="Dua Lipa yeni dunya turnesi kapsaminda stadyum konserleri verecek.",
+            image_url="https://images.com/dualipa.jpg",
+            source_category="MUSIC_GLOBAL",
+        )
+
+        # Baseline & calibrated scorers with distinct_publisher_count=None (even if cluster_size=2 or 5)
+        for c_size in (2, 5):
+            score_calib, reasons_calib = compute_candidate_priority(
+                art, cluster_size=c_size, publisher_seen_count=1, reference_time=self.now, distinct_publisher_count=None
+            )
+            self.assertFalse(
+                any("cross_publisher_consensus" in r for r in reasons_calib),
+                f"Calibrated scorer must not award consensus when distinct_publisher_count is None (c_size={c_size}), got {reasons_calib}",
+            )
+
+            score_base, reasons_base = compute_candidate_priority_baseline(
+                art, cluster_size=c_size, publisher_seen_count=1, reference_time=self.now, distinct_publisher_count=None
+            )
+            self.assertFalse(
+                any("cross_publisher_consensus" in r for r in reasons_base),
+                f"Baseline scorer must not award consensus when distinct_publisher_count is None (c_size={c_size}), got {reasons_base}",
+            )
+
+        # distinct_publisher_count=1 (single publisher, multi-article cluster)
+        score_calib_1, reasons_calib_1 = compute_candidate_priority(
+            art, cluster_size=3, publisher_seen_count=1, reference_time=self.now, distinct_publisher_count=1
+        )
+        self.assertFalse(any("cross_publisher_consensus" in r for r in reasons_calib_1))
+        score_base_1, reasons_base_1 = compute_candidate_priority_baseline(
+            art, cluster_size=3, publisher_seen_count=1, reference_time=self.now, distinct_publisher_count=1
+        )
+        self.assertFalse(any("cross_publisher_consensus" in r for r in reasons_base_1))
+
+        # distinct_publisher_count=2: positive consensus bonus (+1.0 calibrated, +1.5 baseline)
+        score_calib_2, reasons_calib_2 = compute_candidate_priority(
+            art, cluster_size=2, publisher_seen_count=1, reference_time=self.now, distinct_publisher_count=2
+        )
+        self.assertTrue(any("cross_publisher_consensus(2)" in r for r in reasons_calib_2))
+        self.assertAlmostEqual(score_calib_2 - score_calib_1, 1.0, places=2)
+
+        score_base_2, reasons_base_2 = compute_candidate_priority_baseline(
+            art, cluster_size=2, publisher_seen_count=1, reference_time=self.now, distinct_publisher_count=2
+        )
+        self.assertTrue(any("cross_publisher_consensus(2)" in r for r in reasons_base_2))
+        self.assertAlmostEqual(score_base_2 - score_base_1, 1.5, places=2)
+
+        # distinct_publisher_count=3: positive consensus bonus (+1.8 calibrated, +3.0 baseline)
+        score_calib_3, reasons_calib_3 = compute_candidate_priority(
+            art, cluster_size=3, publisher_seen_count=1, reference_time=self.now, distinct_publisher_count=3
+        )
+        self.assertTrue(any("cross_publisher_consensus(3+)" in r for r in reasons_calib_3))
+        self.assertAlmostEqual(score_calib_3 - score_calib_1, 1.8, places=2)
+
+        score_base_3, reasons_base_3 = compute_candidate_priority_baseline(
+            art, cluster_size=3, publisher_seen_count=1, reference_time=self.now, distinct_publisher_count=3
+        )
+        self.assertTrue(any("cross_publisher_consensus(3+)" in r for r in reasons_base_3))
+        self.assertAlmostEqual(score_base_3 - score_base_1, 3.0, places=2)
+
+    def test_normalize_publisher_identity_contract_r78_02(self):
+        """Unit test for Finding R78-02:
+        normalize_publisher_identity must strip whitespace and casefold for stable identity matching
+        without altering original input strings.
+        """
+        self.assertEqual(normalize_publisher_identity("HaberTek"), "habertek")
+        self.assertEqual(normalize_publisher_identity("  habertek  \t"), "habertek")
+        self.assertEqual(normalize_publisher_identity("HABERTÜRK"), "habertürk")
+        self.assertEqual(normalize_publisher_identity(""), "")
+        self.assertEqual(normalize_publisher_identity(None), "")
+        self.assertEqual(normalize_publisher_identity("   "), "")
+
+    def test_same_publisher_casing_and_whitespace_variants_do_not_get_consensus_bonus_r78_02(self):
+        """Regression test for Finding R78-02:
+        Two articles from the SAME publisher with casing and whitespace variants
+        ('HaberTek' vs '  habertek  ') must merge, display the human-readable outlet name,
+        and strictly count distinct_publisher_count == 1 without awarding cross_publisher_consensus.
+        """
+        art1 = Article.create(
+            "Tarkan yeni dünya turnesini resmen duyurdu",
+            "https://habertek.com/tarkan-turne-1",
+            "HaberTek",
+            self.now,
+            snippet="Tarkan yeni dünya turnesi kapsamında stadyum konserleri vereceğini duyurdu.",
+        )
+        art2 = Article.create(
+            "Tarkan dünya turnesi stadyum konserlerini duyurdu",
+            "https://habertek.com/tarkan-turne-2",
+            "  habertek  ",
+            self.now,
+            snippet="Tarkan yeni turne programı ile stadyumlarda hayranlarıyla buluşacak.",
+        )
+
+        candidates = self.engine.filter_fresh_candidates([art1, art2])
+        self.assertEqual(len(candidates), 1)
+        rep = candidates[0]
+        self.assertEqual(rep.raw_metadata.get("cluster_size"), 2)
+        # Verify human-readable display string is preserved without duplicate unnormalized entries
+        self.assertEqual(rep.raw_metadata.get("cluster_publishers"), ["HaberTek"])
+        reasons = rep.raw_metadata.get("priority_reasons", [])
+        self.assertFalse(
+            any("cross_publisher_consensus" in r for r in reasons),
+            f"Variants of the same outlet must not receive cross_publisher_consensus bonus, got {reasons}",
+        )
+
+    def test_legitimate_subject_names_with_attribution_tokens_merge_across_publishers_r78_03(self):
+        """Positive control test for Finding R78-03:
+        Legitimate person or artist names whose tokens overlap with media attribution entities
+        (e.g., 'Kemal Sabah' with 'Sabah', or 'Hollywood Vampires' with 'Hollywood')
+        must NOT be incorrectly suppressed or split when reported across distinct publishers.
+        """
+        # Case 1: Turkish artist with 'Sabah' in surname
+        sabah_art1 = Article.create(
+            "Kemal Sabah yeni dünya turnesini resmen duyurdu",
+            "https://ntv.com.tr/kemal-sabah-turne",
+            "NTV",
+            self.now,
+            snippet="Ünlü müzisyen Kemal Sabah dünya turnesi kapsamında konser tarihlerini açıkladı.",
+        )
+        sabah_art2 = Article.create(
+            "Kemal Sabah dünya turnesi konser tarihlerini duyurdu",
+            "https://haberturk.com/kemal-sabah-turne",
+            "Habertürk",
+            self.now,
+            snippet="Kemal Sabah yeni konser takvimi ile hayranlarıyla buluşacak.",
+        )
+
+        cands_sabah = self.engine.filter_fresh_candidates([sabah_art1, sabah_art2])
+        self.assertEqual(
+            len(cands_sabah),
+            1,
+            f"Expected legitimate artist 'Kemal Sabah' to merge across publishers, got {len(cands_sabah)}: {[c.title for c in cands_sabah]}",
+        )
+        rep_sabah = cands_sabah[0]
+        self.assertEqual(rep_sabah.raw_metadata.get("cluster_size"), 2)
+        self.assertEqual(set(rep_sabah.raw_metadata.get("cluster_publishers", [])), {"NTV", "Habertürk"})
+        reasons_sabah = rep_sabah.raw_metadata.get("priority_reasons", [])
+        self.assertTrue(
+            any("cross_publisher_consensus(2)" in r for r in reasons_sabah),
+            f"Expected cross_publisher_consensus(2) for distinct publishers, got {reasons_sabah}",
+        )
+
+        # Case 2: Global group with 'Hollywood' in name
+        vamp_art1 = Article.create(
+            "Hollywood Vampires yeni turnesini duyurdu",
+            "https://variety.com/hollywood-vampires-tour",
+            "Variety",
+            self.now,
+            snippet="Hollywood Vampires grubu Avrupa turnesi kapsamında konser verecek.",
+        )
+        vamp_art2 = Article.create(
+            "Hollywood Vampires konser turnesi takvimini açıkladı",
+            "https://hollywoodreporter.com/music/vampires-tour",
+            "The Hollywood Reporter",
+            self.now,
+            snippet="Hollywood Vampires grubu yeni konser takvimini hayranlarına duyurdu.",
+        )
+
+        cands_vamp = self.engine.filter_fresh_candidates([vamp_art1, vamp_art2])
+        self.assertEqual(
+            len(cands_vamp),
+            1,
+            f"Expected 'Hollywood Vampires' to merge across publishers, got {len(cands_vamp)}: {[c.title for c in cands_vamp]}",
+        )
+        rep_vamp = cands_vamp[0]
+        self.assertEqual(rep_vamp.raw_metadata.get("cluster_size"), 2)
+        self.assertEqual(set(rep_vamp.raw_metadata.get("cluster_publishers", [])), {"Variety", "The Hollywood Reporter"})
+        reasons_vamp = rep_vamp.raw_metadata.get("priority_reasons", [])
+        self.assertTrue(
+            any("cross_publisher_consensus(2)" in r for r in reasons_vamp),
+            f"Expected cross_publisher_consensus(2) for distinct publishers, got {reasons_vamp}",
+        )
 
 
 if __name__ == "__main__":
