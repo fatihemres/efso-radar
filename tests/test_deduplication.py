@@ -890,6 +890,28 @@ class TestIssue80BaharAffinityAndEssayRouting(unittest.TestCase):
     def setUp(self):
         self.now = datetime(2026, 10, 11, 15, 7, tzinfo=timezone.utc)
 
+    def test_seasonal_and_unrelated_bahar_with_tv_terms_does_not_match_series_affinity(self):
+        """Seasonal or non-series 'bahar' mentions accompanied by unrelated TV terminology
+        (e.g. 'yeni sezon dizileri', 'fragman', 'dizi oyuncuları') must NOT trigger the
+        high-affinity TV series entity 'bahar' (Issue #80 review finding).
+        """
+        cases = [
+            "Bahar ayında yeni sezon dizilerinin fragmanları yayımlanacak",
+            "Bahar festivalinde yeni dizilerin fragmanı gösterildi",
+            "Bahar Demirtaş yeni dizinin kadrosuna katıldı",
+            "Şarkıcı Bahar Demirtaş yeni televizyon dizisi için imza attı",
+            "Bahar tatilinde izlenecek en iyi 10 dizi listesi",
+            "Bahar konserinde sevilen dizilerin oyuncuları sahneye çıktı",
+            "Bahar döneminde ekrana gelecek yeni diziler belli oldu",
+        ]
+        for text in cases:
+            matched = find_matched_affinity_entities(text)
+            self.assertNotIn(
+                "bahar",
+                matched,
+                f"Seasonal/unrelated text with TV words falsely matched 'bahar': '{text}' -> {matched}",
+            )
+
     def test_figurative_and_seasonal_bahar_does_not_match_tv_series_affinity(self):
         """Figurative phrases (e.g. 'ikinci bahar') and seasonal spring vocabulary
         must NOT trigger the high-affinity entity 'bahar'.
