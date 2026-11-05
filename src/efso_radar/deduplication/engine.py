@@ -435,15 +435,21 @@ def calculate_token_overlap(set_a: set[str], set_b: set[str]) -> float:
     return 0.4 * jaccard + 0.6 * containment
 
 
-# Context pattern for disambiguating the 'Bahar' TV series from figurative phrases,
-# seasonal spring vocabulary, and non-TV personal names. Requires an actual syntactic reference
-# to the series (e.g. 'Bahar dizisi', 'Bahar yeni bölüm/sezon/fragman', 'Bahar'da ayrılık/sezon finali'),
-# rather than ungrounded co-occurrence of 'bahar' with generic TV terms elsewhere in the text.
+# Context pattern for disambiguating the 'Bahar' TV series from figurative phrases ('ikinci bahar'),
+# seasonal retail/weather phrases ('bahar sezonu', 'bahar aylari'), and personal names ('dizi oyuncusu Bahar').
+# Requires a direct, title-specific syntactic show reference:
+# 1) Direct title compound: 'Bahar dizisi', 'dizisi/dizisinde Bahar'
+# 2) Direct episode reference: 'Bahar yeni bolum', 'Bahar 10. bolum'
+# 3) Direct series season trailer/finale: 'Bahar sezon finali', 'Bahar sezon fragmani'
+# 4) Inflected series name with TV noun: "Bahar'da sezon finali", "Bahar'in yeni bolumu", "Bahar'da yeni dizi"
+# When attribution is ambiguous, fail-closed by withholding the affinity bonus rather than generating false positives.
 BAHAR_SERIES_PATTERN: re.Pattern[str] = re.compile(
     r"\b(?:"
-    r"bahar\s+dizi\w*|dizi\w*\s+(?:\w+\s+){0,2}bahar"
-    r"|bahar\s+(?:(?:yeni|son|\d+\.?)\s+)*(?:dizi|sezon|bolum|fragman|tanitim|basrol|oyuncu|kadro|karakter)\w*"
-    r"|(?:bahar\s+(?:da|de|in|un|a|e|dan|den)|baharda|baharde|baharin|baharun|bahara|bahare|bahardan|baharden)\s+(?:\w+\s+){0,3}(?:sezon|bolum|fragman|tanitim|ayrilik|veda|kadro|basrol|oyuncu|karakter|final|ekip|set|transfer|reyting)\w*"
+    r"bahar\s+dizi\w*"
+    r"|(?:dizisi|dizisinde)\s+bahar"
+    r"|bahar\s+(?:(?:yeni|son|\d+\.?)\s+)*bolum\w*"
+    r"|bahar\s+(?:(?:yeni|son)\s+)*(?:sezon\s+final\w*|sezon\s+fragman\w*)"
+    r"|(?:bahar\s+(?:da|de|in|un)|baharda|baharde|baharin|baharun)\s+(?:\w+\s+){0,3}(?:sezon\s+final\w*|bolum\w*|dizi\w*)"
     r")\b",
     re.IGNORECASE,
 )

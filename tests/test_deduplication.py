@@ -890,6 +890,44 @@ class TestIssue80BaharAffinityAndEssayRouting(unittest.TestCase):
     def setUp(self):
         self.now = datetime(2026, 10, 11, 15, 7, tzinfo=timezone.utc)
 
+    def test_p2_review_remediation_actor_and_retail_bahar_phrases_do_not_match_series(self):
+        """Synthetic regression tests for Issue #80 P2 review remediation:
+        Actors with first name 'Bahar' in other shows/movies or retail spring collections
+        must NOT be recognized as the Bahar TV series.
+        """
+        negative_cases = [
+            "Dizi oyuncusu Bahar Demirtaş yeni filminde rol aldı",
+            "Yeni dizinin oyuncusu Bahar Demirtaş açıklama yaptı",
+            "Bahar sezonu indirimleri başladı",
+            "Bahar yeni sezon koleksiyonunu tanıttı",
+            "Bahar ayında yeni sezon dizilerinin fragmanları yayımlanacak",
+        ]
+        for text in negative_cases:
+            matched = find_matched_affinity_entities(text)
+            self.assertNotIn(
+                "bahar",
+                matched,
+                f"Actor/retail text falsely matched 'bahar': '{text}' -> {matched}",
+            )
+
+    def test_p2_review_remediation_genuine_bahar_series_retains_affinity(self):
+        """Synthetic verification for Issue #80 P2 review remediation:
+        Genuine Bahar series references must consistently match 'bahar'.
+        """
+        positive_cases = [
+            "Bahar dizisinin yeni sezon fragmanı yayımlandı",
+            "Bahar dizisinde şok ayrılık yaşandı",
+            "Show TV ekranlarının fenomen dizisi Bahar reyting rekoru kırdı",
+            "Bahar dizisinin yeni sezon çekimleri bahar aylarında tamamlandı",
+        ]
+        for text in positive_cases:
+            matched = find_matched_affinity_entities(text)
+            self.assertIn(
+                "bahar",
+                matched,
+                f"Genuine Bahar series text failed to match 'bahar': '{text}' -> {matched}",
+            )
+
     def test_seasonal_and_unrelated_bahar_with_tv_terms_does_not_match_series_affinity(self):
         """Seasonal or non-series 'bahar' mentions accompanied by unrelated TV terminology
         (e.g. 'yeni sezon dizileri', 'fragman', 'dizi oyuncuları') must NOT trigger the
