@@ -1,8 +1,20 @@
 # Efso Radar — Verification Ledger
 
-**Checkpoint:** 2026-10-29. This ledger separates direct GitHub CI evidence, implementation-agent local runs, historical pilot acceptance and missing validations. Earlier dated reviewer entries retain their original scope. Evidence is not a release certificate.
+**Latest GitHub checkpoint:** 2026-11-05. This ledger separates direct GitHub CI evidence, implementation-agent local runs, historical pilot acceptance and missing validations. Earlier dated reviewer entries retain their original scope. Evidence is not a release certificate.
 
-## 2026-10-29 Issue #47 — Editorial Product Acceptance Scorecard (Offline Quality Audit)
+## 2026-11-05 — Integrated offline editorial fixes and finite issue closures
+
+| Evidence / status | Verified result and scope boundary |
+| --- | --- |
+| Protected `main` at `8fdab126d75a0a78f234b965f565c20c2855382d` | [Exact-main GitHub Actions #41997240442](https://github.com/fatihemres/efso-radar/actions/runs/41997240442) **4/4 SUCCESS**: Linux `test (3.11)`, Linux `test (3.12)`, `windows-smoke (3.12)`, `static-safety`. Github-hosted evidence, not proof of live service. |
+| [PR #53](https://github.com/fatihemres/efso-radar/pull/53) / [Issue #52](https://github.com/fatihemres/efso-radar/issues/52) | Test-only Hypothesis property QA and narrow dedup collision guard **INTEGRATED**; original post-merge [CI #41178231471](https://github.com/fatihemres/efso-radar/actions/runs/41178231471) **4/4 PASS**; Issue #52 **CLOSED** on explicit PO GO for offline spike only. |
+| [PR #76](https://github.com/fatihemres/efso-radar/pull/76) / [Issue #75](https://github.com/fatihemres/efso-radar/issues/75) | Bounded low-priority candidate backlog/soft deferral integrated; original exact-main [CI #41836423395](https://github.com/fatihemres/efso-radar/actions/runs/41836423395) **4/4 PASS**. No production queue correctness implied. |
+| [PR #78](https://github.com/fatihemres/efso-radar/pull/78) / [Issue #77](https://github.com/fatihemres/efso-radar/issues/77) | Source-attribution false-event merge and normalized distinct-publisher consensus safeguards **INTEGRATED**; PR-head [CI #41995074809](https://github.com/fatihemres/efso-radar/actions/runs/41995074809) **4/4 PASS**; issue closed after merge. |
+| [Issue #49](https://github.com/fatihemres/efso-radar/issues/49) | **CLOSED on explicit PO GO as bounded historic offline news preview/replay**. Agent reports Oct 30 historical 218 feed items, 30 fresh and dedup evolution; archived XML/JSON and full local replay **not independently rerun or inspected by this reviewer**. Earlier human editor 13/13 approval concerns manually chosen, separate input. `NOT_GEMINI_RECOMMENDATIONS`, `AI_RESULT_NOT_AVAILABLE`, `EDITORIAL_PRECISION_NOT_MEASURED`, real Recall@K NOT MEASURED. |
+
+**Non-operational gate:** Current `.env.example` and `src/efso_radar/config.py` monetary defaults are `0.00 USD` and AI evaluation disabled ([Issue #21](https://github.com/fatihemres/efso-radar/issues/21) closed). Provider billing/Free Tier absolute-zero controls are **not proven**. No new live RSS, Gemini, Qwen, Telegram, real Turso (even read), cron, release or publishing authorized by these closures; proprietary ownership and third-party rights audit [Issue #17](https://github.com/fatihemres/efso-radar/issues/17) remain separate. Absolute **$0.00 / 0 TRY**.
+
+## 2026-10-29 Issue #47 — Editorial Product Acceptance Scorecard (Offline Quality Audit; historical entry)
 
 Isolated worktree/branch `feat/issue-47-editorial-scorecard`, baseline `589cf85045f73463515d8912205d82e0194f1501` (verified `main` with PR #46 integrated). Implementation-agent local evidence is separate from independent review and exact-head CI; no PO acceptance or live activation is claimed.
 
@@ -271,7 +283,7 @@ python -m pytest tests -v
 python -W error -m efso_radar.staging.runner --help
 ```
 
-CI source: [.github/workflows/ci.yml](.github/workflows/ci.yml); currently `ubuntu-latest`, Python 3.11 and 3.12, requirements from `requirements-dev.txt`, `python -m pytest tests -v`. No separate lint, typecheck, coverage, CodeQL, Windows Actions matrix or release pipeline was found in the inspected repository tree. Do not claim these checks exist or pass.
+CI source: [.github/workflows/ci.yml](.github/workflows/ci.yml). **2026-11-05 observed CI:** hosted Linux Python 3.11/3.12 pytest matrix, Windows smoke Python 3.12 and `static-safety` (Ruff), all PASS at [exact-main run #41997240442](https://github.com/fatihemres/efso-radar/actions/runs/41997240442). Earlier comments about no Windows job describe a historical inspection, NOT the current workflow. Do not assert standalone CodeQL, release pipeline or unobserved checks.
 
 ## Release and validation gates
 
