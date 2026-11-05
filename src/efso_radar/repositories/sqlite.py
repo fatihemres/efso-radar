@@ -37,6 +37,7 @@ from efso_radar.domain import (
     SuggestedFormat,
     TelegramDeliveryRecord,
     TelegramNotificationCategory,
+    mask_chat_id,
     normalize_text,
     utc_now,
     validate_delivery_status_transition,
@@ -309,27 +310,36 @@ class SqliteStateRepository(StateRepository):
                 records,
             )
 
-    def get_pending_candidates(self, max_age_hours: int = 24, now: Optional[datetime] = None) -> list[Article]:
+    def get_pending_candidates(
+        self,
+        max_age_hours: int = 24,
+        now: Optional[datetime] = None,
+        limit: Optional[int] = None,
+        min_update_priority: float = 0.0,
+    ) -> list[Article]:
         """Retrieve unexpired candidates from backlog that are still awaiting evaluation.
 
-        Preserves candidates within max_age_hours, plus any genuine UPDATE candidates regardless of age.
+        Preserves candidates within max_age_hours, plus high-priority UPDATE candidates regardless of age.
         """
         ref_now = now or utc_now()
         cutoff = (ref_now - timedelta(hours=max_age_hours)).isoformat()
+        query = """
+            SELECT cb.article_id, cb.url, cb.canonical_url, cb.title, cb.source, cb.market,
+                   cb.category_hint, cb.snippet, cb.image_url, cb.published_at, cb.priority_score
+            FROM candidate_backlog cb
+            LEFT JOIN processed_articles pa ON cb.article_id = pa.article_id
+            WHERE cb.status = 'QUEUED'
+              AND (cb.published_at >= ? OR (cb.category_hint = 'UPDATE' AND cb.priority_score >= ?))
+              AND pa.article_id IS NULL
+            ORDER BY cb.priority_score DESC, cb.published_at DESC, cb.article_id ASC
+        """
+        params: list[Any] = [cutoff, float(min_update_priority)]
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(int(limit))
+
         with self._connection() as conn:
-            cursor = conn.execute(
-                """
-                SELECT cb.article_id, cb.url, cb.canonical_url, cb.title, cb.source, cb.market,
-                       cb.category_hint, cb.snippet, cb.image_url, cb.published_at, cb.priority_score
-                FROM candidate_backlog cb
-                LEFT JOIN processed_articles pa ON cb.article_id = pa.article_id
-                WHERE cb.status = 'QUEUED'
-                  AND (cb.published_at >= ? OR cb.category_hint = 'UPDATE')
-                  AND pa.article_id IS NULL
-                ORDER BY cb.priority_score DESC, cb.published_at DESC
-                """,
-                (cutoff,),
-            )
+            cursor = conn.execute(query, tuple(params))
             rows = cursor.fetchall()
             return [
                 Article(
@@ -358,7 +368,12 @@ class SqliteStateRepository(StateRepository):
                 [(aid,) for aid in article_ids],
             )
 
-    def expire_stale_backlog_candidates(self, max_age_hours: int = 24, now: Optional[datetime] = None) -> int:
+    def expire_stale_backlog_candidates(
+        self,
+        max_age_hours: int = 24,
+        now: Optional[datetime] = None,
+        min_update_priority: float = 0.0,
+    ) -> int:
         """Transition candidates older than max_age_hours to EXPIRED status, preserving legitimate UPDATEs."""
         ref_now = now or utc_now()
         cutoff = (ref_now - timedelta(hours=max_age_hours)).isoformat()
@@ -369,9 +384,9 @@ class SqliteStateRepository(StateRepository):
                 SET status = 'EXPIRED'
                 WHERE status = 'QUEUED'
                   AND published_at < ?
-                  AND (category_hint IS NULL OR category_hint != 'UPDATE')
+                  AND (category_hint IS NULL OR category_hint != 'UPDATE' OR priority_score < ?)
                 """,
-                (cutoff,),
+                (cutoff, float(min_update_priority)),
             )
             return cursor.rowcount
 
@@ -1193,12 +1208,12 @@ class SqliteStateRepository(StateRepository):
                 # 1. Reject conflicting identities
                 if existing["recipient_role"] != recipient_role:
                     raise DeliveryIdentityConflictError(
-                        f"Conflicting recipient role for {recipient_chat_id}:{message_key}: "
+                        f"Conflicting recipient role for {mask_chat_id(recipient_chat_id)}:{message_key}: "
                         f"existing '{existing['recipient_role']}' vs new '{recipient_role}'"
                     )
                 if existing["category"] != category.value:
                     raise DeliveryIdentityConflictError(
-                        f"Conflicting notification category for {recipient_chat_id}:{message_key}: "
+                        f"Conflicting notification category for {mask_chat_id(recipient_chat_id)}:{message_key}: "
                         f"existing '{existing['category']}' vs new '{category.value}'"
                     )
 
@@ -1374,11 +1389,15 @@ class SqliteStateRepository(StateRepository):
                     error_message = ?,
                     updated_at = ?,
                     sent_at = COALESCE(sent_at, ?),
-                    attempt_count = attempt_count + 1
+                    attempt_count = CASE
+                        WHEN status IN ('PENDING', 'HELD_QUIET_HOURS', 'HELD_FOR_VERIFICATION', 'HELD_FOR_SENSITIVE_REVIEW', 'FAILED')
+                             AND ? IN ('SENT', 'FAILED', 'DELIVERY_UNCERTAIN') THEN MAX(attempt_count, 1)
+                        ELSE attempt_count
+                    END
                 WHERE delivery_id = ?
                   AND status NOT IN ('SENT', 'DELIVERY_UNCERTAIN')
                 """,
-                (status.value, error_message, now_iso, sent_iso, delivery_id),
+                (status.value, error_message, now_iso, sent_iso, status.value, delivery_id),
             )
             return cursor.rowcount > 0
 
@@ -1546,6 +1565,117 @@ class SqliteStateRepository(StateRepository):
                 (recipient_chat_id, message_key),
             )
             return cursor.fetchone() is not None
+
+    def find_legacy_editorial_delivery(
+        self,
+        recipient_chat_id: str,
+        stable_digest_id: str,
+        category: TelegramNotificationCategory = TelegramNotificationCategory.EDITORIAL_DIGEST,
+        batch_size: int = 100,
+    ) -> Optional[TelegramDeliveryRecord]:
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be a positive integer, got {batch_size}")
+        last_created_at: Optional[str] = None
+        last_delivery_id: Optional[str] = None
+        legacy_matches: list[TelegramDeliveryRecord] = []
+
+        with self._connection() as conn:
+            while True:
+                if last_created_at is None or last_delivery_id is None:
+                    cursor = conn.execute(
+                        """
+                        SELECT delivery_id, message_key, recipient_role, recipient_chat_id,
+                               category, status, attempt_count, max_attempts, error_message,
+                               payload_json, created_at, updated_at, sent_at
+                        FROM telegram_delivery_records
+                        WHERE recipient_chat_id = ? AND category = ?
+                        ORDER BY created_at DESC, delivery_id DESC
+                        LIMIT ?
+                        """,
+                        (recipient_chat_id, category.value, batch_size),
+                    )
+                else:
+                    cursor = conn.execute(
+                        """
+                        SELECT delivery_id, message_key, recipient_role, recipient_chat_id,
+                               category, status, attempt_count, max_attempts, error_message,
+                               payload_json, created_at, updated_at, sent_at
+                        FROM telegram_delivery_records
+                        WHERE recipient_chat_id = ? AND category = ?
+                          AND (created_at < ? OR (created_at = ? AND delivery_id < ?))
+                        ORDER BY created_at DESC, delivery_id DESC
+                        LIMIT ?
+                        """,
+                        (
+                            recipient_chat_id,
+                            category.value,
+                            last_created_at,
+                            last_created_at,
+                            last_delivery_id,
+                            batch_size,
+                        ),
+                    )
+                rows = cursor.fetchall()
+                if not rows:
+                    break
+
+                for row in rows:
+                    raw_payload = row["payload_json"]
+                    try:
+                        payload = json.loads(raw_payload or "{}")
+                        if not isinstance(payload, dict):
+                            raise ValueError(f"Payload in delivery record '{row['delivery_id']}' is not a valid JSON object.")
+                    except Exception as exc:
+                        raise ValueError(
+                            f"Corrupted delivery record detected for recipient '{mask_chat_id(recipient_chat_id)}': "
+                            f"record '{row['delivery_id']}' has unparseable payload_json ({exc})."
+                        ) from exc
+
+                    rec_stable_id = payload.get("stable_digest_id")
+                    rec_key = row["message_key"]
+
+                    if rec_stable_id == stable_digest_id or rec_key == stable_digest_id:
+                        # Exclude modern records with canonical_outbox_key from legacy unkeyed matches
+                        if payload.get("canonical_outbox_key") is not None:
+                            continue
+
+                        deliv_rec = TelegramDeliveryRecord(
+                            delivery_id=row["delivery_id"],
+                            message_key=row["message_key"],
+                            recipient_role=row["recipient_role"],
+                            recipient_chat_id=row["recipient_chat_id"],
+                            category=TelegramNotificationCategory(row["category"]),
+                            status=DeliveryStatus(row["status"]),
+                            attempt_count=int(row["attempt_count"]),
+                            max_attempts=int(row["max_attempts"]),
+                            error_message=row["error_message"],
+                            payload=payload,
+                            created_at=datetime.fromisoformat(row["created_at"]),
+                            updated_at=datetime.fromisoformat(row["updated_at"]),
+                            sent_at=datetime.fromisoformat(row["sent_at"]) if row["sent_at"] else None,
+                        )
+                        legacy_matches.append(deliv_rec)
+
+                last_created_at = rows[-1]["created_at"]
+                last_delivery_id = rows[-1]["delivery_id"]
+
+                if len(rows) < batch_size:
+                    break
+
+        if not legacy_matches:
+            return None
+
+        # Prioritize blocking legacy records: SENT > DELIVERY_UNCERTAIN > DISPATCHING > PENDING > others
+        status_priority = {
+            DeliveryStatus.SENT: 1,
+            DeliveryStatus.DELIVERY_UNCERTAIN: 2,
+            DeliveryStatus.DISPATCHING: 3,
+            DeliveryStatus.PENDING: 4,
+        }
+        legacy_matches.sort(
+            key=lambda r: (status_priority.get(r.status, 99), -r.created_at.timestamp())
+        )
+        return legacy_matches[0]
 
     def get_pending_telegram_deliveries(self, limit: int = 50) -> list[TelegramDeliveryRecord]:
         with self._connection() as conn:

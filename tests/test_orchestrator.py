@@ -1,7 +1,7 @@
 """Tests for RadarOrchestrator pipeline."""
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from efso_radar.ai.client import AIEditorialEngine
@@ -363,6 +363,725 @@ class TestOrchestrator(unittest.TestCase):
         self.assertTrue(res3.success)
         self.assertEqual(res3.picks_approved, 1)
         self.assertEqual(res3.notifications_dispatched, 1)
+
+
+
+    def test_pre_ai_noise_drop_filters_annotated_out_of_scope_reasons(self):
+        """Fix B (Issue 73): Pre-AI noise filter drops both exact and annotated out-of-scope news."""
+        settings = Settings(
+            ai_batch_size=20,
+            min_discovery_priority_for_ai=4.0,
+            ai_evaluation_enabled=True,
+            telegram_delivery_enabled=False,
+        )
+        # Articles triggering annotated out-of-scope dampening
+        art_politics = Article.create(
+            "Kabine Toplantısı Sona Erdi",
+            "https://news.com/politics-1",
+            "Haber A",
+            self.now,
+            snippet="Cumhurbaşkanlığı Kabinesi toplantısı sonrası yeni vergi düzenlemesi ve enflasyon kararları açıklandı.",
+        )
+        art_sports = Article.create(
+            "Where to Watch Champions League Final Game Online Free",
+            "https://news.com/sports-1",
+            "Haber B",
+            self.now,
+            snippet="Live stream guide, where to watch, and starting lineup details.",
+        )
+        art_religion = Article.create(
+            "Vatikan'dan Yeni Genelge Açıklandı",
+            "https://news.com/religion-1",
+            "Haber C",
+            self.now,
+            snippet="Katolik dünyası ve Papa yeni doktrin genelgesini yayımladı.",
+        )
+        art_blotter = Article.create(
+            "Metro Hattı İhalesi Tamamlandı",
+            "https://news.com/blotter-1",
+            "Haber D",
+            self.now,
+            snippet="Şehir içi metro hattı ihalesi tamamlandı ve çeyrek bilançosu açıklandı.",
+        )
+        art_essay = Article.create(
+            "What Second Acts Can Teach You About Life",
+            "https://news.com/essay-1",
+            "Haber E",
+            self.now,
+            snippet="How corporate executives can teach you about second acts in life.",
+        )
+        # Valid entertainment article that must survive
+        art_valid = Article.create(
+            "Hadise Yeni Albümünü ve Turnesini Resmen Açıkladı",
+            "https://news.com/ent-valid",
+            "Haber F",
+            self.now,
+            snippet="Ünlü şarkıcı Hadise yeni pop albümünü ve Avrupa turne tarihlerini duyurdu.",
+        )
+
+        all_articles = [art_politics, art_sports, art_religion, art_blotter, art_essay, art_valid]
+        evaluated_candidates = []
+        class RecordingAIEngine(AIEditorialEngine):
+            def evaluate(self, candidates, recent_stories, now):
+                evaluated_candidates.extend(candidates)
+                return []
+
+        orch = RadarOrchestrator(
+            settings=settings,
+            repository=self.repo,
+            source=MockNewsSource(articles=all_articles, successes=1),
+            ai_engine=RecordingAIEngine(),
+            notifier=MockNotifier(),
+        )
+
+        result = orch.run(now=self.now)
+        self.assertTrue(result.success)
+
+        # Only art_valid should reach AI evaluation; all 5 out-of-scope articles are dropped as noise
+        evaluated_ids = {c.id for c in evaluated_candidates}
+        self.assertIn(art_valid.id, evaluated_ids, "Valid entertainment article should reach AI evaluation")
+        for noise_art in [art_politics, art_sports, art_religion, art_blotter, art_essay]:
+            self.assertNotIn(
+                noise_art.id,
+                evaluated_ids,
+                f"Expected {noise_art.title} to be filtered out before AI evaluation",
+            )
+        self.assertEqual(result.candidates_evaluated, 1)
+
+    def test_pre_ai_noise_drop_preserves_sensitive_tragedy_and_health_counterexamples(self):
+        """Fix B (Issue 73): Pre-AI noise filter must NOT drop sensitive tragedy or health news,
+        allowing them to reach AI and SENSITIVE_REVIEW / HOLD queues."""
+        settings = Settings(
+            ai_batch_size=20,
+            min_discovery_priority_for_ai=4.0,
+            ai_evaluation_enabled=True,
+            telegram_delivery_enabled=False,
+        )
+        art_tragedy = Article.create(
+            "Liam Payne 3. kattan düşerek hayatını kaybetti",
+            "https://news.com/liam-payne",
+            "Haber A",
+            self.now,
+            snippet="One Direction grubunun eski üyesi otel balkonundan düşerek yaşamını yitirdi.",
+        )
+        art_funeral = Article.create(
+            "Usta sanatçının cenaze töreni yarın Teşvikiye Camii'nde yapılacak",
+            "https://news.com/usta-cenaze",
+            "Haber B",
+            self.now,
+            snippet="Sanat dünyası acı haberle sarsıldı; cenaze töreni yarın öğle namazını müteakip düzenlenecek.",
+        )
+        art_health = Article.create(
+            "Kurgusal Sanatçı Kalp Krizi Geçirerek Acilen Yoğun Bakıma Alındı",
+            "https://news.com/sanatci-icu",
+            "Haber C",
+            self.now,
+            snippet="Sanatçı aniden fenalaşarak acil ameliyata alındı ve yoğun bakımda tedavi görüyor.",
+        )
+
+        evaluated_candidates = []
+        class RecordingAIEngine(AIEditorialEngine):
+            def evaluate(self, candidates, recent_stories, now):
+                evaluated_candidates.extend(candidates)
+                return []
+
+        orch = RadarOrchestrator(
+            settings=settings,
+            repository=self.repo,
+            source=MockNewsSource(articles=[art_tragedy, art_funeral, art_health], successes=1),
+            ai_engine=RecordingAIEngine(),
+            notifier=MockNotifier(),
+        )
+
+        result = orch.run(now=self.now)
+        self.assertTrue(result.success)
+
+        # All 3 sensitive articles must have reached AI evaluation
+        evaluated_ids = {c.id for c in evaluated_candidates}
+        for art in [art_tragedy, art_funeral, art_health]:
+            self.assertIn(art.id, evaluated_ids, f"{art.title} was omitted from AI evaluation")
+        self.assertEqual(result.candidates_evaluated, 3)
+
+    def test_is_out_of_scope_candidate_unit_contract(self):
+        """Fix B (Issue 73): Unit contract for RadarOrchestrator.is_out_of_scope_candidate."""
+        normal_art = Article.create("Hadise Klip Çekti", "https://a.com/1", "A", self.now, snippet="Normal klip.")
+        politics_art = Article.create("Enflasyon Açıklandı", "https://a.com/2", "A", self.now, snippet="Bakanlık açıkladı.")
+        tragedy_art = Article.create("Liam Payne hayatını kaybetti", "https://a.com/3", "A", self.now, snippet="Otelden düşerek yaşamını yitirdi.")
+        health_art = Article.create("Sanatçı yoğun bakıma alındı", "https://a.com/4", "A", self.now, snippet="Acil servise kaldırıldı ve entübe edildi.")
+
+        # Exact and annotated out-of-scope noise without sensitive keywords -> True
+        self.assertTrue(RadarOrchestrator.is_out_of_scope_candidate(politics_art, ["out_of_scope_or_grim_news_dampened"]))
+        self.assertTrue(RadarOrchestrator.is_out_of_scope_candidate(politics_art, ["out_of_scope_or_grim_news_dampened(politics_policy)"]))
+        self.assertTrue(RadarOrchestrator.is_out_of_scope_candidate(politics_art, ["out_of_scope_or_grim_news_dampened(religion_clerical)"]))
+        self.assertTrue(RadarOrchestrator.is_out_of_scope_candidate(politics_art, ["out_of_scope_or_grim_news_dampened(sports_watch_guide)"]))
+        self.assertTrue(RadarOrchestrator.is_out_of_scope_candidate(politics_art, ["out_of_scope_or_grim_news_dampened(non_celebrity_blotter_or_geo)"]))
+        self.assertTrue(RadarOrchestrator.is_out_of_scope_candidate(politics_art, ["out_of_scope_or_grim_news_dampened(generic_essay_or_b2b)"]))
+
+        # tragic_local_mortality alone must NOT be classified as noise
+        self.assertFalse(RadarOrchestrator.is_out_of_scope_candidate(normal_art, ["out_of_scope_or_grim_news_dampened(tragic_local_mortality)"]))
+
+        # Sensitive tragedy and health content must NEVER be dropped as noise even if reason present
+        self.assertFalse(RadarOrchestrator.is_out_of_scope_candidate(tragedy_art, ["out_of_scope_or_grim_news_dampened"]))
+        self.assertFalse(RadarOrchestrator.is_out_of_scope_candidate(tragedy_art, ["out_of_scope_or_grim_news_dampened(non_celebrity_blotter_or_geo)"]))
+        self.assertFalse(RadarOrchestrator.is_out_of_scope_candidate(health_art, ["out_of_scope_or_grim_news_dampened"]))
+
+        # Regular entertainment news -> False
+        self.assertFalse(RadarOrchestrator.is_out_of_scope_candidate(normal_art, ["core_turkish_entertainment", "has_visual_image"]))
+
+
+
+    def test_celebrity_legal_development_with_policy_phrase_survives_pre_ai_filter(self):
+        """Regression B (PR #74 review): Editorially relevant celebrity legal news
+        containing incidental policy wording ('vergi düzenlemesi') must NOT be dropped
+        as noise before AI evaluation; it must reach AI evaluation while preserving
+        downstream post-AI processing contracts."""
+        settings = Settings(
+            ai_batch_size=20,
+            min_discovery_priority_for_ai=4.0,
+            ai_evaluation_enabled=True,
+            telegram_delivery_enabled=False,
+        )
+        # Celebrity legal story with a policy phrase ("vergi düzenlemesi")
+        art_legal = Article.create(
+            "Ünlü Komedyen Cem Yılmaz Hakkında Vergi Düzenlemesi Davası: Mahkemeden Karar Çıktı",
+            "https://haber.com/cem-yilmaz-vergi-davasi-karar",
+            "Haber Türk",
+            self.now,
+            snippet="Cem Yılmaz'ın şirketine yönelik vergi düzenlemesi davasında mahkeme beraat kararı verdi.",
+        )
+        # Unrelated general politics article that MUST still be dropped
+        art_unrelated_politics = Article.create(
+            "Hazine ve Maliye Bakanlığı Vergi Düzenlemesi Paketini Açıkladı",
+            "https://haber.com/bakanlik-vergi-paketi",
+            "Ekonomi Haber",
+            self.now,
+            snippet="Yeni vergi düzenlemesi ile gelir vergisi dilimleri ve kurumlar vergisi oranları güncellendi.",
+        )
+
+        evaluated_candidates = []
+        class RecordingAIEngine(AIEditorialEngine):
+            def evaluate(self, candidates, recent_stories, now):
+                evaluated_candidates.extend(candidates)
+                return []
+
+        orch = RadarOrchestrator(
+            settings=settings,
+            repository=self.repo,
+            source=MockNewsSource(articles=[art_legal, art_unrelated_politics], successes=1),
+            ai_engine=RecordingAIEngine(),
+            notifier=MockNotifier(),
+        )
+
+        result = orch.run(now=self.now)
+        self.assertTrue(result.success)
+
+        # 1. Before AI evaluation: art_legal must NOT be filtered out through noise_dropped; it must reach AI!
+        evaluated_ids = {c.id for c in evaluated_candidates}
+        self.assertIn(art_legal.id, evaluated_ids, "Celebrity legal story must reach AI evaluation!")
+
+        # Unrelated general politics must be filtered out before AI
+        self.assertNotIn(art_unrelated_politics.id, evaluated_ids, "Unrelated politics must be filtered before AI")
+
+        # 2. After AI evaluation: art_legal was evaluated, so repository marked it processed as an evaluated candidate
+        self.assertTrue(self.repo.is_article_processed(art_legal.id), "Evaluated article should be marked processed at step 9")
+        self.assertEqual(result.candidates_evaluated, 1)
+
+
+
+    def test_in_scope_low_priority_candidate_soft_deferred_not_prematurely_processed(self):
+        """Issue #75: An in-scope entertainment candidate excluded solely due to high
+        volume (> ai_batch_size) and low priority score (< min_discovery_priority_for_ai)
+        must enter candidate_backlog as QUEUED and NOT be marked processed prematurely.
+        When competition decreases on a subsequent run, it must be recovered and evaluated."""
+        settings = Settings(
+            ai_batch_size=10,
+            min_discovery_priority_for_ai=5.5,
+            ai_evaluation_enabled=True,
+            telegram_delivery_enabled=False,
+            max_candidates=55,
+        )
+
+        # 10 high-priority entertainment candidates with strong affinity entities (score > 6.0)
+        titles = [
+            ("Tarkan Yeni Şarkısını Duyurdu", "Tarkan"),
+            ("Hadise Harbiye Açıkhava Konseri İçin Hazırlanıyor", "Hadise"),
+            ("Kıvanç Tatlıtuğ Başrollü Yeni Dizi Başlıyor", "Kıvanç Tatlıtuğ"),
+            ("Serenay Sarıkaya Paris Moda Haftasında Boy Gösterdi", "Serenay Sarıkaya"),
+            ("Kenan İmirzalıoğlu Yeni Sezon Açıklaması Yaptı", "Kenan İmirzalıoğlu"),
+            ("Ezhel Dünya Turnesi Tarihlerini Açıkladı", "Ezhel"),
+            ("Cem Yılmaz Stand-up Turnesi Başlıyor", "Cem Yılmaz"),
+            ("Ata Demirer Yeni Komedi Filmi Çekimlerine Başladı", "Ata Demirer"),
+            ("Mabel Matiz Yeni Şarkı Klibini Yayınladı", "Mabel Matiz"),
+            ("Zeynep Bastık Yeni Akustik Albümünü Duyurdu", "Zeynep Bastık"),
+        ]
+        high_priority_articles = [
+            Article.create(
+                title,
+                f"https://haber.com/hp-{i}",
+                f"Kaynak {i}",
+                self.now,
+                snippet=f"{name} yeni çalışmaları hakkında açıklama yaptı.",
+            )
+            for i, (title, name) in enumerate(titles)
+        ]
+
+        # 1 in-scope entertainment candidate with low priority (score < 5.5, e.g. unknown indie film note)
+        low_priority_in_scope = Article.create(
+            "Bağımsız Kısa Film Gösterimi Hafta Sonu Başlıyor",
+            "https://haber.com/bagimsiz-kisa-film-gosterimi",
+            "Kültür Sanat Bülteni",
+            self.now,
+            snippet="Genç yönetmenlerin kısa film çalışmaları hafta sonu sinemaseverlerle buluşuyor.",
+        )
+
+        # 1 genuinely out-of-scope candidate (politics/policy)
+        out_of_scope_politics = Article.create(
+            "Hazine ve Maliye Bakanlığı Vergi Düzenlemesi Paketini Açıkladı",
+            "https://haber.com/bakanlik-vergi-paketi",
+            "Ekonomi Haber",
+            self.now,
+            snippet="Yeni vergi düzenlemesi ile gelir vergisi dilimleri ve kurumlar vergisi oranları güncellendi.",
+        )
+
+        all_articles = high_priority_articles + [low_priority_in_scope, out_of_scope_politics]
+
+        evaluated_run1 = []
+        class RecordingAIEngineRun1(AIEditorialEngine):
+            def evaluate(self, candidates, recent_stories, now):
+                evaluated_run1.extend(candidates)
+                return []
+
+        orch1 = RadarOrchestrator(
+            settings=settings,
+            repository=self.repo,
+            source=MockNewsSource(articles=all_articles, successes=1),
+            ai_engine=RecordingAIEngineRun1(),
+            notifier=MockNotifier(),
+        )
+
+        res1 = orch1.run(now=self.now)
+        self.assertTrue(res1.success)
+
+        # 1. Exactly 10 high priority articles were evaluated by AI in Run 1
+        self.assertEqual(res1.candidates_evaluated, 10)
+        self.assertEqual(len(evaluated_run1), 10)
+
+        # 2. Out-of-scope politics article was hard-rejected and marked processed
+        self.assertTrue(self.repo.is_article_processed(out_of_scope_politics.id))
+
+        # 3. Low-priority in-scope article must NOT be marked processed prematurely!
+        self.assertFalse(
+            self.repo.is_article_processed(low_priority_in_scope.id),
+            "In-scope low priority candidate must NOT be marked processed before AI evaluation",
+        )
+
+        # 4. Low-priority in-scope article must be persisted in durable backlog as QUEUED!
+        pending = self.repo.get_pending_candidates(max_age_hours=24, now=self.now)
+        pending_ids = {a.id for a in pending}
+        self.assertIn(
+            low_priority_in_scope.id,
+            pending_ids,
+            "In-scope low priority candidate must be queued in candidate_backlog",
+        )
+        self.assertNotIn(
+            out_of_scope_politics.id,
+            pending_ids,
+            "Out-of-scope politics article must NOT be queued in candidate_backlog",
+        )
+
+        # 5. Run 2: Publisher feed returns NO new articles. Competition drops.
+        # The queued in-scope article is recovered from backlog and evaluated!
+        evaluated_run2 = []
+        class RecordingAIEngineRun2(AIEditorialEngine):
+            def evaluate(self, candidates, recent_stories, now):
+                evaluated_run2.extend(candidates)
+                return []
+
+        orch2 = RadarOrchestrator(
+            settings=settings,
+            repository=self.repo,
+            source=MockNewsSource(articles=[], successes=1),
+            ai_engine=RecordingAIEngineRun2(),
+            notifier=MockNotifier(),
+        )
+
+        res2 = orch2.run(now=self.now)
+        self.assertTrue(res2.success)
+        self.assertEqual(res2.candidates_evaluated, 1)
+        self.assertEqual(len(evaluated_run2), 1)
+        self.assertEqual(evaluated_run2[0].id, low_priority_in_scope.id)
+
+        # 6. After evaluation in Run 2, it is marked processed and evaluated
+        self.assertTrue(self.repo.is_article_processed(low_priority_in_scope.id))
+        pending_after_run2 = self.repo.get_pending_candidates(max_age_hours=24, now=self.now)
+        self.assertNotIn(low_priority_in_scope.id, {a.id for a in pending_after_run2})
+
+        # 7. Run 3: Remained silent, no double evaluation
+        evaluated_run3 = []
+        class RecordingAIEngineRun3(AIEditorialEngine):
+            def evaluate(self, candidates, recent_stories, now):
+                evaluated_run3.extend(candidates)
+                return []
+
+        orch3 = RadarOrchestrator(
+            settings=settings,
+            repository=self.repo,
+            source=MockNewsSource(articles=[], successes=1),
+            ai_engine=RecordingAIEngineRun3(),
+            notifier=MockNotifier(),
+        )
+        res3 = orch3.run(now=self.now)
+        self.assertTrue(res3.success)
+        self.assertEqual(res3.candidates_evaluated, 0)
+        self.assertEqual(len(evaluated_run3), 0)
+
+
+
+    def test_sustained_high_volume_deferred_candidate_expires_after_24h_without_infinite_loop(self):
+        """Safety contract: Under sustained high-volume candidate input (> ai_batch_size),
+        in-scope low-priority candidates remain deferred without entering an infinite evaluation loop.
+        Once 24 hours have elapsed since their publication, they naturally expire and exit the backlog."""
+        settings = Settings(
+            ai_batch_size=10,
+            min_discovery_priority_for_ai=5.5,
+            ai_evaluation_enabled=True,
+            telegram_delivery_enabled=False,
+            max_candidates=55,
+        )
+
+        titles_10 = [
+            ("Tarkan Yeni Pop Şarkısını Çıkardı", "Tarkan"),
+            ("Hadise Harbiye Açıkhava Sahnesinde Konser Verdi", "Hadise"),
+            ("Kıvanç Tatlıtuğ Başrollü Sinema Filmi Vizyona Girdi", "Kıvanç Tatlıtuğ"),
+            ("Serenay Sarıkaya Moda Haftasında Kırmızı Halıda Yürüdü", "Serenay Sarıkaya"),
+            ("Kenan İmirzalıoğlu Yeni Televizyon Sezonu İçin Anlaştı", "Kenan İmirzalıoğlu"),
+            ("Ezhel Avrupa Turnesi Kapsamında Berlin'de Sahne Aldı", "Ezhel"),
+            ("Cem Yılmaz Yeni Stand-up Gösterisinin Prömiyerini Yaptı", "Cem Yılmaz"),
+            ("Ata Demirer Komedi Filminin Çekimlerini Tamamladı", "Ata Demirer"),
+            ("Mabel Matiz Klip Çekimleri İçin Kapadokya'ya Gitti", "Mabel Matiz"),
+            ("Zeynep Bastık Akustik Konser Kayıtlarını Tamamladı", "Zeynep Bastık"),
+        ]
+
+        def make_high_priority_batch(now_time, run_index):
+            return [
+                Article.create(
+                    f"{title} - Kaynak Haber {run_index}",
+                    f"https://haber.com/hp-r{run_index}-{i}",
+                    f"Kaynak {i}",
+                    now_time,
+                    snippet=f"{name} yeni çalışmaları hakkında açıklama yaptı.",
+                )
+                for i, (title, name) in enumerate(titles_10)
+            ]
+
+        # In-scope low priority candidate published at T=0
+        low_priority_art = Article.create(
+            "Bağımsız Kısa Film Gösterimi Hafta Sonu Başlıyor",
+            "https://haber.com/bagimsiz-kisa-film-gosterimi-loop",
+            "Kültür Sanat Bülteni",
+            self.now,
+            snippet="Genç yönetmenlerin kısa film çalışmaları hafta sonu sinemaseverlerle buluşuyor.",
+        )
+
+        evaluated_ids = set()
+        class RecordingAIEngine(AIEditorialEngine):
+            def evaluate(self, candidates, recent_stories, now):
+                evaluated_ids.update(c.id for c in candidates)
+                return []
+
+        # Run 1 at T=0h: High volume (10 high priority) + 1 low priority art (total 11)
+        orch1 = RadarOrchestrator(
+            settings=settings,
+            repository=self.repo,
+            source=MockNewsSource(articles=make_high_priority_batch(self.now, 1) + [low_priority_art], successes=1),
+            ai_engine=RecordingAIEngine(),
+            notifier=MockNotifier(),
+        )
+        res1 = orch1.run(now=self.now)
+        self.assertTrue(res1.success)
+        self.assertEqual(res1.candidates_evaluated, 10)
+        self.assertNotIn(low_priority_art.id, evaluated_ids)
+        self.assertFalse(self.repo.is_article_processed(low_priority_art.id))
+
+        # Run 2 at T=12h: High volume continues. Source delivers new articles; backlog retains low_priority_art.
+        # It is still deferred because competition is >= 10 and priority < 5.5.
+        t_12h = self.now + timedelta(hours=12)
+        orch2 = RadarOrchestrator(
+            settings=settings,
+            repository=self.repo,
+            source=MockNewsSource(articles=make_high_priority_batch(t_12h, 2), successes=1),
+            ai_engine=RecordingAIEngine(),
+            notifier=MockNotifier(),
+        )
+        res2 = orch2.run(now=t_12h)
+        self.assertTrue(res2.success)
+        self.assertEqual(res2.candidates_evaluated, 10)
+        self.assertNotIn(low_priority_art.id, evaluated_ids)
+        self.assertFalse(self.repo.is_article_processed(low_priority_art.id))
+
+        # Run 3 at T=25h: Stale backlog candidates are expired in Step 2 (>24h).
+        # low_priority_art transitions to EXPIRED and is not selected for evaluation.
+        t_25h = self.now + timedelta(hours=25)
+        orch3 = RadarOrchestrator(
+            settings=settings,
+            repository=self.repo,
+            source=MockNewsSource(articles=make_high_priority_batch(t_25h, 3), successes=1),
+            ai_engine=RecordingAIEngine(),
+            notifier=MockNotifier(),
+        )
+        res3 = orch3.run(now=t_25h)
+        self.assertTrue(res3.success)
+        self.assertNotIn(low_priority_art.id, evaluated_ids)
+
+        # Confirm candidate is expired in backlog and no longer pending
+        pending = self.repo.get_pending_candidates(max_age_hours=24, now=t_25h)
+        self.assertNotIn(low_priority_art.id, {a.id for a in pending})
+
+    def test_ordinary_deferred_candidate_cannot_piggyback_on_update_retention(self):
+        """Verifies that an ordinary deferred entertainment candidate cannot bypass the
+        24-hour expiration rule, unlike genuine editorial UPDATE candidates."""
+        settings = Settings(
+            ai_batch_size=10,
+            min_discovery_priority_for_ai=5.5,
+            ai_evaluation_enabled=True,
+            telegram_delivery_enabled=False,
+            max_candidates=55,
+        )
+
+        # Ordinary deferred candidate published 30 hours ago
+        art_ordinary = Article.create(
+            "Eski Dizi Bölüm Değerlendirmesi",
+            "https://haber.com/eski-dizi",
+            "Dizi Bülteni",
+            self.now - timedelta(hours=30),
+            snippet="Eski dizinin geçmiş sezon bölümlerine ilişkin değerlendirme.",
+            raw_metadata={"priority_score": 4.0},
+        )
+        # Legitimate UPDATE candidate published 30 hours ago
+        art_update = Article.create(
+            "Festival Programı İptal Güncellemesi",
+            "https://haber.com/festival-update",
+            "Festival Haber",
+            self.now - timedelta(hours=30),
+            snippet="Daha önce duyurulan festival programında son dakika değişikliği yapıldı.",
+            raw_metadata={"kind": "UPDATE", "priority_score": 10.0},
+        )
+
+        self.repo.save_pending_candidates([art_ordinary, art_update])
+
+        # Expire stale candidates at max_age_hours=24
+        expired = self.repo.expire_stale_backlog_candidates(max_age_hours=24, now=self.now)
+        self.assertEqual(expired, 1)
+
+        pending = self.repo.get_pending_candidates(max_age_hours=24, now=self.now)
+        pending_ids = {a.id for a in pending}
+        self.assertNotIn(art_ordinary.id, pending_ids, "Ordinary candidate >24h must be expired")
+        self.assertIn(art_update.id, pending_ids, "UPDATE candidate must be retained despite age")
+
+
+    def test_negative_regression_soft_deferred_candidate_with_update_hint_escapes_24h_expiration(self):
+        """Acceptance test (Issue #75 Review B & PO Decision A.1+B.3):
+        Verifies that soft-deferred candidates with an UPDATE hint but persisted priority below
+        effective min_discovery_priority_for_ai strictly expire after the normal 24-hour window,
+        while high-priority UPDATE candidates (priority >= min_discovery_priority_for_ai) retain
+        their age exemption."""
+        settings = Settings(
+            ai_batch_size=10,
+            min_discovery_priority_for_ai=5.5,
+            ai_evaluation_enabled=True,
+            telegram_delivery_enabled=False,
+            max_candidates=55,
+        )
+
+        titles_10 = [
+            ("Tarkan Yeni Pop Şarkısını Çıkardı", "Tarkan"),
+            ("Hadise Harbiye Açıkhava Sahnesinde Konser Verdi", "Hadise"),
+            ("Kıvanç Tatlıtuğ Başrollü Sinema Filmi Vizyona Girdi", "Kıvanç Tatlıtuğ"),
+            ("Serenay Sarıkaya Moda Haftasında Kırmızı Halıda Yürüdü", "Serenay Sarıkaya"),
+            ("Kenan İmirzalıoğlu Yeni Televizyon Sezonu İçin Anlaştı", "Kenan İmirzalıoğlu"),
+            ("Ezhel Avrupa Turnesi Kapsamında Berlin'de Sahne Aldı", "Ezhel"),
+            ("Cem Yılmaz Yeni Stand-up Gösterisinin Prömiyerini Yaptı", "Cem Yılmaz"),
+            ("Ata Demirer Komedi Filminin Çekimlerini Tamamladı", "Ata Demirer"),
+            ("Mabel Matiz Klip Çekimleri İçin Kapadokya'ya Gitti", "Mabel Matiz"),
+            ("Zeynep Bastık Akustik Konser Kayıtlarını Tamamladı", "Zeynep Bastık"),
+        ]
+
+        def make_high_priority_batch(now_time, run_index):
+            return [
+                Article.create(
+                    f"{title} - Kaynak Haber {run_index}",
+                    f"https://haber.com/hp-r{run_index}-{i}",
+                    f"Kaynak {i}",
+                    now_time,
+                    snippet=f"{name} yeni çalışmaları hakkında açıklama yaptı.",
+                )
+                for i, (title, name) in enumerate(titles_10)
+            ]
+
+        # In-scope, low-scoring candidate with an UPDATE hint (score 4.5 < 5.5)
+        low_priority_update_art = Article.create(
+            "Bağımsız Kısa Film Gösterimi Hafta Sonu Başlıyor",
+            "https://haber.com/bagimsiz-kisa-film-gosterimi-update",
+            "Kültür Sanat Bülteni",
+            self.now,
+            snippet="Genç yönetmenlerin kısa film çalışmaları hafta sonu sinemaseverlerle buluşuyor.",
+            source_category="UPDATE",
+        )
+
+        # High-scoring candidate with an UPDATE hint (score 8.0 >= 5.5)
+        high_priority_update_art = Article.create(
+            "Festival Programı İptal Güncellemesi",
+            "https://haber.com/festival-update",
+            "Festival Haber",
+            self.now,
+            snippet="Daha önce duyurulan festival programında son dakika değişikliği yapıldı.",
+            source_category="UPDATE",
+            raw_metadata={"priority_score": 8.0},
+        )
+
+        class MockAI(AIEditorialEngine):
+            def evaluate(self, candidates, recent_stories, now):
+                return []
+
+        # Run 1 at T=0h: 10 high priority + 1 low priority with UPDATE hint
+        orch1 = RadarOrchestrator(
+            settings=settings,
+            repository=self.repo,
+            source=MockNewsSource(articles=make_high_priority_batch(self.now, 1) + [low_priority_update_art], successes=1),
+            ai_engine=MockAI(),
+            notifier=MockNotifier(),
+        )
+        res1 = orch1.run(now=self.now)
+        self.assertTrue(res1.success)
+        self.assertEqual(res1.candidates_evaluated, 10)
+        self.assertFalse(self.repo.is_article_processed(low_priority_update_art.id))
+
+        # Also register high_priority_update_art into backlog at T=0h
+        self.repo.save_pending_candidates([high_priority_update_art])
+
+        # Confirmed: Both were soft-deferred/persisted into candidate_backlog with status QUEUED
+        pending_t0 = self.repo.get_pending_candidates(
+            max_age_hours=24,
+            now=self.now,
+            min_update_priority=settings.min_discovery_priority_for_ai,
+        )
+        pending_t0_ids = {a.id for a in pending_t0}
+        self.assertIn(low_priority_update_art.id, pending_t0_ids)
+        self.assertIn(high_priority_update_art.id, pending_t0_ids)
+
+        # Run 2 at T=26h: Synthetic time moves beyond 24h retention window (>24h).
+        # High volume of fresh news arrives; neither update candidate is in the new RSS batch.
+        t_26h = self.now + timedelta(hours=26)
+        orch2 = RadarOrchestrator(
+            settings=settings,
+            repository=self.repo,
+            source=MockNewsSource(articles=make_high_priority_batch(t_26h, 2), successes=1),
+            ai_engine=MockAI(),
+            notifier=MockNotifier(),
+        )
+        res2 = orch2.run(now=t_26h)
+        self.assertTrue(res2.success)
+
+        # Acceptance check (B.3):
+        # 1. low_priority_update_art (score 4.5 < 5.5) must be EXPIRED and omitted from pending
+        # 2. high_priority_update_art (score 8.0 >= 5.5) retains genuine UPDATE age exemption
+        pending_t26 = self.repo.get_pending_candidates(
+            max_age_hours=24,
+            now=t_26h,
+            min_update_priority=settings.min_discovery_priority_for_ai,
+        )
+        pending_t26_ids = {a.id for a in pending_t26}
+        self.assertNotIn(
+            low_priority_update_art.id,
+            pending_t26_ids,
+            "Low-priority candidate with UPDATE hint must expire after 24 hours",
+        )
+        self.assertIn(
+            high_priority_update_art.id,
+            pending_t26_ids,
+            "High-priority candidate with UPDATE hint must retain age exemption",
+        )
+
+        with self.repo._connection() as conn:
+            row_low = conn.execute(
+                "SELECT status FROM candidate_backlog WHERE article_id = ?",
+                (low_priority_update_art.id,),
+            ).fetchone()
+            self.assertEqual(row_low["status"], "EXPIRED")
+
+            row_high = conn.execute(
+                "SELECT status FROM candidate_backlog WHERE article_id = ?",
+                (high_priority_update_art.id,),
+            ).fetchone()
+            self.assertEqual(row_high["status"], "QUEUED")
+
+    def test_repository_typeerror_fails_closed_without_retrying_weaker_parameters(self):
+        """Targeted regression test (Issue #75 Review Remediation):
+        Verifies that RadarOrchestrator does NOT catch TypeError and retry
+        expire_stale_backlog_candidates or get_pending_candidates with weaker
+        parameters (omitting limit or min_update_priority).
+        Any signature mismatch or internal TypeError must fail closed immediately
+        without a second/fallback call."""
+        # 1. Test get_pending_candidates non-retry
+        call_history_pending = []
+
+        class FailingPendingRepo(SqliteStateRepository):
+            def get_pending_candidates(self, *args, **kwargs):
+                call_history_pending.append((args, kwargs))
+                raise TypeError("Simulated signature mismatch or internal TypeError in get_pending_candidates")
+
+        settings = Settings(
+            sqlite_db_path=self.db_path,
+            ai_evaluation_enabled=True,
+            telegram_delivery_enabled=False,
+        )
+        orch_pending = RadarOrchestrator(
+            settings=settings,
+            repository=FailingPendingRepo(self.db_path),
+            source=MockNewsSource(articles=[
+                Article.create("Haber 1", "https://haber.com/1", "Kaynak", self.now, snippet="Özet")
+            ], successes=1),
+            ai_engine=MockAIEngine(),
+            notifier=MockNotifier(),
+        )
+
+        with self.assertRaises(TypeError):
+            orch_pending.run(now=self.now)
+
+        # Must have been called exactly once with the mandatory limit and min_update_priority
+        self.assertEqual(len(call_history_pending), 1, "Must not retry get_pending_candidates with weaker parameters")
+        _, kwargs_pending = call_history_pending[0]
+        self.assertIn("limit", kwargs_pending, "First and only call must enforce limit")
+        self.assertIn("min_update_priority", kwargs_pending, "First and only call must enforce min_update_priority")
+        self.assertEqual(kwargs_pending["limit"], settings.max_candidates * 2)
+        self.assertEqual(kwargs_pending["min_update_priority"], settings.min_discovery_priority_for_ai)
+
+        # 2. Test expire_stale_backlog_candidates non-retry
+        call_history_expire = []
+
+        class FailingExpireRepo(SqliteStateRepository):
+            def expire_stale_backlog_candidates(self, *args, **kwargs):
+                call_history_expire.append((args, kwargs))
+                raise TypeError("Simulated signature mismatch or internal TypeError in expire_stale_backlog_candidates")
+
+        orch_expire = RadarOrchestrator(
+            settings=settings,
+            repository=FailingExpireRepo(self.db_path),
+            source=MockNewsSource(articles=[
+                Article.create("Haber 2", "https://haber.com/2", "Kaynak", self.now, snippet="Özet")
+            ], successes=1),
+            ai_engine=MockAIEngine(),
+            notifier=MockNotifier(),
+        )
+
+        with self.assertRaises(TypeError):
+            orch_expire.run(now=self.now)
+
+        # Must have been called exactly once with the mandatory min_update_priority
+        self.assertEqual(len(call_history_expire), 1, "Must not retry expire_stale_backlog_candidates with weaker parameters")
+        _, kwargs_expire = call_history_expire[0]
+        self.assertIn("min_update_priority", kwargs_expire, "First and only call must enforce min_update_priority")
+        self.assertEqual(kwargs_expire["min_update_priority"], settings.min_discovery_priority_for_ai)
 
 
 if __name__ == "__main__":

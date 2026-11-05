@@ -1,6 +1,6 @@
 # Efso Radar — Roadmap and Acceptance Gates
 
-**Snapshot 2026-10-29** — roadmap records intent, not permission for live execution. Status meanings and quality gates: [Engineering Governance](docs/ENGINEERING_GOVERNANCE.md). PO alone closes milestones.
+**Latest status reconciliation: 2026-11-05** at protected `main` `8fdab126d75a0a78f234b965f565c20c2855382d`, [post-merge CI 4/4 PASS](https://github.com/fatihemres/efso-radar/actions/runs/41997240442). Older dated checkpoint sections below preserve historical status. This roadmap records intent, not live-operation permission or product acceptance; PO owns milestone/release decisions. See [Engineering Governance](docs/ENGINEERING_GOVERNANCE.md).
 
 | Milestone | Scope & acceptance target | Evidence | Current classification |
 | --- | --- | --- | --- |
@@ -15,11 +15,19 @@
 | Phase 5B.3G-A | Controlled live staging *specification*, without live execution | [PR #14](https://github.com/fatihemres/efso-radar/pull/14) | **INTEGRATED (DESIGN)** |
 | Phase 5B.3G-B | Hermetic eight-step mock staging runner, strict safety barriers | [PR #16](https://github.com/fatihemres/efso-radar/pull/16) | **INTEGRATED / OFFLINE VERIFIED** |
 | Phase 5B.3G-C | Controlled staging safeguards, manifest store, offline recovery, DACL evidence, durability and cross-runner recovery contract | [Issue #13](https://github.com/fatihemres/efso-radar/issues/13), [Issue #41](https://github.com/fatihemres/efso-radar/issues/41), [Issue #43](https://github.com/fatihemres/efso-radar/issues/43), [Issue #45](https://github.com/fatihemres/efso-radar/issues/45), [plan](docs/PHASE5B3G_LIVE_STAGING_RELIABILITY_PLAN.md) | **PR #35/#36/#38/#40/#42/#44/#46 INTEGRATED (OFFLINE) / LIVE BLOCKED** |
-| Editorial Product Acceptance | Honest offline quality scorecard, benchmark self-oracle disclaimer, and measured vs unmeasured audit | [Issue #47](https://github.com/fatihemres/efso-radar/issues/47), [Verification](VERIFICATION.md) | **ISSUE #47 CANDIDATE / OFFLINE AUDIT ONLY** |
+| Editorial Product Acceptance (offline guardrails) | Synthetic scorecard disclaimer, measurement vs. self-oracle separation; no real model acceptance | [Issue #47](https://github.com/fatihemres/efso-radar/issues/47), [PR #48](https://github.com/fatihemres/efso-radar/pull/48), [Verification](VERIFICATION.md) | **INTEGRATED / CI VERIFIED — OFFLINE ONLY; NOT EDITORIAL PRODUCT ACCEPTED** |
+| Discovery quality follow-ups | Dedup false-merge protection, test-only property QA, low-priority backlog fairness, distinct-publisher consensus, finite historical observation | [PR #53](https://github.com/fatihemres/efso-radar/pull/53), [PR #76](https://github.com/fatihemres/efso-radar/pull/76), [PR #78](https://github.com/fatihemres/efso-radar/pull/78); [Issues #49](https://github.com/fatihemres/efso-radar/issues/49), [#52](https://github.com/fatihemres/efso-radar/issues/52) | **INTEGRATED / CI VERIFIED (OFFLINE); bounded Issues CLOSED, real AI/editorial quality NOT MEASURED** |
 | Follow-on cloud cutover & unattended operations | Cloud parity, backups, zero-cost controls, human editorial recipient tests, PO release decision | Existing Phase 5 architecture; future issue required | **DISCOVERY / NOT AUTHORIZED** |
 | Rights and distribution | Review third-party origins and decide visibility/distribution | [Issue #17](https://github.com/fatihemres/efso-radar/issues/17) | **IN PROGRESS (AUDIT)** |
 
-## 2026-10-29 Editorial Product Acceptance Scorecard Checkpoint (Issue #47)
+## 2026-11-05 Offline editorial-quality integration / bounded closure
+
+- Current protected `main` at `8fdab126d75a0a78f234b965f565c20c2855382d` with [exact-main CI 4/4 PASS](https://github.com/fatihemres/efso-radar/actions/runs/41997240442): Linux Python 3.11, 3.12, Windows smoke 3.12 and static-safety.
+- [Issue #49](https://github.com/fatihemres/efso-radar/issues/49) closed by explicit PO GO as a **finite historical offline observation**, [Issue #52](https://github.com/fatihemres/efso-radar/issues/52) as a **completed offline property-based dedup QA spike**; neither is a PO acceptance of editorial model precision/recall. Historical archived news replay and agent-run Windows tests were not independently repeated.
+- PRs [#53](https://github.com/fatihemres/efso-radar/pull/53) (test-only Hypothesis + dedup guard), [#76](https://github.com/fatihemres/efso-radar/pull/76) (candidate queue fairness), [#78](https://github.com/fatihemres/efso-radar/pull/78) (publisher-attribution and normalized distinct-source consensus) are integrated. Runtime AI, fresh RSS, Telegram, real Turso, scheduled cron, cloud backup and releases remain **OFF / require independent PO GO**. Strict $0.00 / 0 TRY.
+- The 2026-10-29 recommendation below to collect 50–100 new editor labels is **historical, not a current assignment**: PO declined repeating the completed 50-item calibration. Next real AI quality or owner feedback assessment needs a separately scoped decision, without silently re-running old calibration.
+
+## 2026-10-29 Editorial Product Acceptance Scorecard Checkpoint (Issue #47; historical)
 
 Offline editorial quality scorecard and benchmark self-oracle disclaimer implemented in `src/efso_radar/ai/benchmark.py` and `VERIFICATION.md`:
 - Formally distinguished synthetic rule conformance from genuinely measured editorial quality across all 6 news pipeline stages.

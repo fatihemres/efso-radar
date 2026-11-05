@@ -66,7 +66,13 @@ class StateRepository(ABC):
         pass
 
     @abstractmethod
-    def get_pending_candidates(self, max_age_hours: int = 16, now: Optional[datetime] = None) -> list[Article]:
+    def get_pending_candidates(
+        self,
+        max_age_hours: int = 16,
+        now: Optional[datetime] = None,
+        limit: Optional[int] = None,
+        min_update_priority: float = 0.0,
+    ) -> list[Article]:
         """Retrieve unexpired candidates from backlog that are still awaiting evaluation."""
         pass
 
@@ -76,7 +82,12 @@ class StateRepository(ABC):
         pass
 
     @abstractmethod
-    def expire_stale_backlog_candidates(self, max_age_hours: int = 24, now: Optional[datetime] = None) -> int:
+    def expire_stale_backlog_candidates(
+        self,
+        max_age_hours: int = 24,
+        now: Optional[datetime] = None,
+        min_update_priority: float = 0.0,
+    ) -> int:
         """Transition candidates older than max_age_hours to EXPIRED status, preserving legitimate UPDATEs."""
         pass
 
@@ -320,6 +331,22 @@ class StateRepository(ABC):
     @abstractmethod
     def is_digest_delivered_to_recipient(self, recipient_chat_id: str, message_key: str) -> bool:
         """Check if a specific digest has already been delivered to this recipient."""
+        pass
+
+    @abstractmethod
+    def find_legacy_editorial_delivery(
+        self,
+        recipient_chat_id: str,
+        stable_digest_id: str,
+        category: TelegramNotificationCategory = TelegramNotificationCategory.EDITORIAL_DIGEST,
+        batch_size: int = 100,
+    ) -> Optional[TelegramDeliveryRecord]:
+        """Exhaustively find a delivery record matching stable_digest_id within recipient and category scope.
+
+        Performs provably complete, batch-paginated inspection across all matching historical records.
+        Returns the first matching TelegramDeliveryRecord if found.
+        Raises ValueError if any historical record in the recipient scope contains unparseable or corrupted payload JSON.
+        """
         pass
 
     @abstractmethod
