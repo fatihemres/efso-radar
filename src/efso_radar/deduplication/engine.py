@@ -436,20 +436,24 @@ def calculate_token_overlap(set_a: set[str], set_b: set[str]) -> float:
 
 
 # Context pattern for disambiguating the 'Bahar' TV series from figurative phrases ('ikinci bahar'),
-# seasonal retail/weather phrases ('bahar sezonu', 'bahar aylari'), and personal names ('dizi oyuncusu Bahar').
-# Requires a direct, title-specific syntactic show reference:
-# 1) Direct title compound: 'Bahar dizisi', 'dizisi/dizisinde Bahar'
-# 2) Direct episode reference: 'Bahar yeni bolum', 'Bahar 10. bolum'
-# 3) Direct series season trailer/finale: 'Bahar sezon finali', 'Bahar sezon fragmani'
-# 4) Inflected series name with TV noun: "Bahar'da sezon finali", "Bahar'in yeni bolumu", "Bahar'da yeni dizi"
+# seasonal retail/weather phrases ('bahar sezonu', 'bahar aylari'), personal names ('dizi oyuncusu Bahar',
+# "Bahar'ın yeni dizisi"), bare production references ('Bahar dizi ekibi'), and plural spring shows ('bahar dizileri').
+# Implements a conservative positive-match grammar requiring explicit evidence that 'Bahar' is the actual series title:
+# 1) Direct compound with 3rd-person possessive head 'dizisi' (singular only: 'Bahar dizisi', 'Bahar dizisinin',
+#    'Bahar dizisinde', 'Bahar dizisinden', 'Bahar dizisini', 'Bahar dizisine', 'Bahar dizisiyle').
+# 2) Reverse apposition where show descriptor precedes the proper title: 'fenomen dizisi Bahar', 'sevilen dizisinde Bahar'.
+# 3) Direct episode reference starting with Bahar: 'Bahar yeni bölüm', 'Bahar 25. bölüm fragmanı', 'Bahar son bölüm'.
+# 4) Direct season finale or trailer starting with Bahar: 'Bahar sezon finali', 'Bahar yeni sezon fragmanı'.
+# 5) Unambiguous locative series context (Bahar'da / baharda) followed by episode, finale or trailer noun:
+#    e.g. "Bahar'da nefes kesen sezon finali", "Bahar'da yeni bölüm".
 # When attribution is ambiguous, fail-closed by withholding the affinity bonus rather than generating false positives.
 BAHAR_SERIES_PATTERN: re.Pattern[str] = re.compile(
     r"\b(?:"
-    r"bahar\s+dizi\w*"
+    r"bahar\s+dizisi(?:n(?:in|de|den|i|e)|yle)?"
     r"|(?:dizisi|dizisinde)\s+bahar"
     r"|bahar\s+(?:(?:yeni|son|\d+\.?)\s+)*bolum\w*"
     r"|bahar\s+(?:(?:yeni|son)\s+)*(?:sezon\s+final\w*|sezon\s+fragman\w*)"
-    r"|(?:bahar\s+(?:da|de|in|un)|baharda|baharde|baharin|baharun)\s+(?:\w+\s+){0,3}(?:sezon\s+final\w*|bolum\w*|dizi\w*)"
+    r"|(?:bahar\s+da|baharda)\s+(?:\w+\s+){0,3}(?:sezon\s+final\w*|bolum\w*|fragman\w*)"
     r")\b",
     re.IGNORECASE,
 )

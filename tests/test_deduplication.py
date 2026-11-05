@@ -892,33 +892,55 @@ class TestIssue80BaharAffinityAndEssayRouting(unittest.TestCase):
 
     def test_p2_review_remediation_actor_and_retail_bahar_phrases_do_not_match_series(self):
         """Synthetic regression tests for Issue #80 P2 review remediation:
-        Actors with first name 'Bahar' in other shows/movies or retail spring collections
+        Actors with first name 'Bahar' in other shows/movies, retail spring collections,
+        plural seasonal TV shows, and possessive personal names
         must NOT be recognized as the Bahar TV series.
         """
         negative_cases = [
+            # User & Reviewer specified negative acceptance cases:
+            "Bahar dizileri yaz ekranında izleyiciyle buluşacak",
+            "Bahar dizilerinin yeni sezon tarihleri belli oldu",
+            "Şarkıcı Bahar'ın yeni dizisi gündem oldu",
+            "Bahar'ın yeni dizisi çok yakında başlıyor",
+            "Bahar dizi ekibiyle buluştu",
             "Dizi oyuncusu Bahar Demirtaş yeni filminde rol aldı",
             "Yeni dizinin oyuncusu Bahar Demirtaş açıklama yaptı",
             "Bahar sezonu indirimleri başladı",
             "Bahar yeni sezon koleksiyonunu tanıttı",
             "Bahar ayında yeni sezon dizilerinin fragmanları yayımlanacak",
+            # Independently constructed adversarial variants (plural, possessive, seasonal):
+            "Kanalın sevilen bahar dizileri tatile giriyor",
+            "Oyuncu Bahar'ın yeni projesi ve dizisi merak konusu",
+            "Ünlü sunucu Bahar'ın sunduğu dizi programı reyting topladı",
+            "Bahar aylarında yayına girecek 5 yeni dizi",
+            "Televizyon dünyasında bahar temizliği: Hangi diziler final yapıyor?",
+            "Bahar aylarında yeni dizi fragmanları yayınlanacak",
         ]
         for text in negative_cases:
             matched = find_matched_affinity_entities(text)
             self.assertNotIn(
                 "bahar",
                 matched,
-                f"Actor/retail text falsely matched 'bahar': '{text}' -> {matched}",
+                f"Negative test falsely matched 'bahar': '{text}' -> {matched}",
             )
 
     def test_p2_review_remediation_genuine_bahar_series_retains_affinity(self):
         """Synthetic verification for Issue #80 P2 review remediation:
-        Genuine Bahar series references must consistently match 'bahar'.
+        Genuine Bahar series references and adversarial positive controls must consistently match 'bahar'.
         """
         positive_cases = [
+            # User specified positive acceptance cases:
             "Bahar dizisinin yeni sezon fragmanı yayımlandı",
             "Bahar dizisinde şok ayrılık yaşandı",
             "Show TV ekranlarının fenomen dizisi Bahar reyting rekoru kırdı",
+            "Bahar'da nefes kesen sezon finali",
+            "Bahar yeni bölüm fragmanı ekranlara geldi",
             "Bahar dizisinin yeni sezon çekimleri bahar aylarında tamamlandı",
+            # Independently constructed adversarial positive variants:
+            "Kanalın sevilen dizisi Bahar bu akşam ekranda",
+            "Bahar dizisi oyuncularının yeni projesi açıklandı",
+            "Bahar 25. bölüm fragmanı yayınlandı",
+            "Bahar dizisinde nefesler tutuldu: Sezon finali bu akşam",
         ]
         for text in positive_cases:
             matched = find_matched_affinity_entities(text)
