@@ -293,6 +293,42 @@ GENERIC_HEADLINE_WORDS: set[str] = {
 }
 
 
+MEDIA_ATTRIBUTION_ENTITIES: set[str] = {
+    # Turkish press supplements & entertainment desks
+    "sabah gunaydin",
+    "hurriyet kelebek",
+    "milliyet cadde",
+    "posta karnaval",
+    "aksam life",
+    "haberturk magazin",
+    "sozcu sik",
+    "cumhuriyet pazar",
+    # Press agencies and wire services
+    "anadolu ajansi",
+    "demiroren haber",
+    "ihlas haber",
+    "anka haber",
+    "associated press",
+    # Global entertainment trade press
+    "hollywood reporter",
+    "page six",
+}
+
+MEDIA_ATTRIBUTION_MARKERS: set[str] = {
+    "eki", "ekine", "ekinde", "ekinden",
+    "gazetesi", "gazetesine", "gazetesinde", "gazetesinden",
+    "dergisi", "dergisine", "dergisinde", "dergisinden",
+    "ajansi", "ajansina", "ajansinda", "ajansindan",
+    "muhabiri", "muhabirine", "muhabirinden",
+    "televizyonu", "televizyonuna",
+}
+
+
+def normalize_publisher_identity(source: Optional[str]) -> str:
+    """Normalize publisher / outlet source string for stable identity matching (whitespace and casefold)."""
+    return (source or "").strip().casefold()
+
+
 def extract_proper_name_bigrams(text: str) -> set[str]:
     """Extract capitalized proper-name bigrams and individual proper nouns from raw text."""
     chunks = re.split(r"[:!?;,\.\n\(\)\[\]\"“”/]+", text)
@@ -317,6 +353,13 @@ def extract_proper_name_bigrams(text: str) -> set[str]:
             a2 = _ascii_norm(_strip_tr_possessive(w2))
             if a1 in CALENDAR_MONTHS or a2 in CALENDAR_MONTHS:
                 continue
+            if i + 2 < len(words):
+                w3_norm = _ascii_norm(_strip_tr_possessive(words[i + 2]))
+                if w3_norm in MEDIA_ATTRIBUTION_MARKERS:
+                    continue
+            bg = f"{a1} {a2}"
+            if bg in MEDIA_ATTRIBUTION_ENTITIES:
+                continue
             if (
                 a1 not in generic_starters
                 and a2 not in generic_starters
@@ -325,8 +368,9 @@ def extract_proper_name_bigrams(text: str) -> set[str]:
                 and a1 not in GENERIC_HEADLINE_WORDS
                 and a2 not in GENERIC_HEADLINE_WORDS
             ):
-                bigrams.add(f"{a1} {a2}")
+                bigrams.add(bg)
 
+    attribution_tokens = {tok for mae in MEDIA_ATTRIBUTION_ENTITIES for tok in mae.split()}
     all_words = re.findall(r"\b[A-Za-zÇĞİÖŞÜa-zçğıöşü0-9\'-]+\b", text)
     bigram_words = {tok for bg in bigrams for tok in bg.split()}
     for w in all_words:
@@ -337,7 +381,14 @@ def extract_proper_name_bigrams(text: str) -> set[str]:
         a = _ascii_norm(_strip_tr_possessive(w))
         if a in bigram_words:
             continue
-        if a in CALENDAR_MONTHS or a in STOP_WORDS or a in generic_starters or a in GENERIC_HEADLINE_WORDS:
+        if (
+            a in CALENDAR_MONTHS
+            or a in STOP_WORDS
+            or a in generic_starters
+            or a in GENERIC_HEADLINE_WORDS
+            or a in MEDIA_ATTRIBUTION_MARKERS
+            or a in attribution_tokens
+        ):
             continue
         bigrams.add(a)
 
@@ -442,6 +493,7 @@ def compute_candidate_priority_baseline(
     cluster_size: int = 1,
     publisher_seen_count: int = 1,
     reference_time: Optional[datetime] = None,
+    distinct_publisher_count: Optional[int] = None,
 ) -> tuple[float, list[str]]:
     """
     Untuned Phase 3C-2A baseline candidate prioritization algorithm.
@@ -508,11 +560,11 @@ def compute_candidate_priority_baseline(
         score += 0.5
         reasons.append("has_informative_snippet")
 
-    # 6. Cross-Publisher Consensus Cluster Bonus
-    if cluster_size >= 3:
+    # 6. Cross-Publisher Consensus Cluster Bonus (strictly requires distinct reporting publishers)
+    if distinct_publisher_count is not None and distinct_publisher_count >= 3:
         score += 3.0
         reasons.append("cross_publisher_consensus(3+)")
-    elif cluster_size == 2:
+    elif distinct_publisher_count is not None and distinct_publisher_count == 2:
         score += 1.5
         reasons.append("cross_publisher_consensus(2)")
 
@@ -524,6 +576,7 @@ def compute_candidate_priority(
     cluster_size: int = 1,
     publisher_seen_count: int = 1,
     reference_time: Optional[datetime] = None,
+    distinct_publisher_count: Optional[int] = None,
 ) -> tuple[float, list[str]]:
     """
     Calibrated Phase 3C-2B deterministic candidate prioritization strategy.
@@ -638,11 +691,11 @@ def compute_candidate_priority(
         score += 0.4
         reasons.append("informative_snippet")
 
-    # 7. Cross-Publisher Consensus
-    if cluster_size >= 3:
+    # 7. Cross-Publisher Consensus (strictly requires distinct reporting publishers)
+    if distinct_publisher_count is not None and distinct_publisher_count >= 3:
         score += 1.8
         reasons.append("cross_publisher_consensus(3+)")
-    elif cluster_size == 2:
+    elif distinct_publisher_count is not None and distinct_publisher_count == 2:
         score += 1.0
         reasons.append("cross_publisher_consensus(2)")
 
@@ -732,10 +785,25 @@ class DeduplicationEngine:
                 ).ratio()
 
                 shared_entities = ents & cluster_entities[idx]
+                shared_subject_entities = {
+                    e for e in shared_entities
+                    if e not in MEDIA_ATTRIBUTION_ENTITIES
+                    and not any(e.endswith(f" {m}") for m in MEDIA_ATTRIBUTION_MARKERS)
+                }
 
                 # Check conflicting multiword person names sharing a token (e.g. "Ryan Reynolds" vs "Ryan Gosling")
-                multi_a = {e for e in ents if len(e.split()) >= 2}
-                multi_b = {e for e in cluster_entities[idx] if len(e.split()) >= 2}
+                subject_ents = {
+                    e for e in ents
+                    if e not in MEDIA_ATTRIBUTION_ENTITIES
+                    and not any(e.endswith(f" {m}") for m in MEDIA_ATTRIBUTION_MARKERS)
+                }
+                cluster_subject_ents = {
+                    e for e in cluster_entities[idx]
+                    if e not in MEDIA_ATTRIBUTION_ENTITIES
+                    and not any(e.endswith(f" {m}") for m in MEDIA_ATTRIBUTION_MARKERS)
+                }
+                multi_a = {e for e in subject_ents if len(e.split()) >= 2}
+                multi_b = {e for e in cluster_subject_ents if len(e.split()) >= 2}
                 shared_multi = multi_a & multi_b
                 shared_multi_tokens = {tok for sm in shared_multi for tok in sm.split()}
                 conflicting_person_names = False
@@ -758,8 +826,9 @@ class DeduplicationEngine:
                         break
 
                 # Check shared individual name tokens to avoid false disjoint classification on partial name matches
-                ent_toks_a = {tok for e in ents for tok in e.split() if len(tok) >= 3}
-                ent_toks_b = {tok for e in cluster_entities[idx] for tok in e.split() if len(tok) >= 3}
+                attr_tokens = {tok for mae in MEDIA_ATTRIBUTION_ENTITIES for tok in mae.split()}
+                ent_toks_a = {tok for e in subject_ents for tok in e.split() if len(tok) >= 3 and tok not in attr_tokens}
+                ent_toks_b = {tok for e in cluster_subject_ents for tok in e.split() if len(tok) >= 3 and tok not in attr_tokens}
                 shared_name_tokens = ent_toks_a & ent_toks_b
 
                 # Check conflicting high-affinity entities (e.g. Netflix vs Disney+)
@@ -769,9 +838,9 @@ class DeduplicationEngine:
                     conflicting_affinity_entities
                     or conflicting_person_names
                     or (
-                        bool(ents)
-                        and bool(cluster_entities[idx])
-                        and not shared_entities
+                        bool(subject_ents)
+                        and bool(cluster_subject_ents)
+                        and not shared_subject_entities
                         and not shared_name_tokens
                     )
                 )
@@ -780,7 +849,7 @@ class DeduplicationEngine:
                 # Compute non-entity event token overlap so sharing only a celebrity's name
                 # across two unrelated stories does not inflate event_overlap.
                 entity_word_tokens: set[str] = set()
-                for ent_name in (shared_entities | shared_name_tokens):
+                for ent_name in (shared_subject_entities | shared_name_tokens):
                     entity_word_tokens.update(extract_key_tokens(ent_name))
                 non_ent_a = {t for t in e_tokens if t not in entity_word_tokens and not t.startswith("_evt_")}
                 non_ent_b = {t for t in cluster_event_tokens[idx] if t not in entity_word_tokens and not t.startswith("_evt_")}
@@ -792,10 +861,10 @@ class DeduplicationEngine:
                     is_same_event = False
                 else:
                     is_same_event = (
-                        (title_overlap >= similarity_threshold and (not shared_entities or non_entity_overlap >= 0.25))
+                        (title_overlap >= similarity_threshold and (not shared_subject_entities or non_entity_overlap >= 0.25))
                         or char_sim >= 0.72
-                        or (bool(shared_entities) and bool(shared_semantic_tags))
-                        or (bool(shared_entities) and non_entity_overlap >= 0.30)
+                        or (bool(shared_subject_entities) and bool(shared_semantic_tags))
+                        or (bool(shared_subject_entities) and non_entity_overlap >= 0.30)
                     )
 
                 if is_same_event:
@@ -820,11 +889,26 @@ class DeduplicationEngine:
         now_ref = max((a.published_at for a in fresh_unprocessed), default=None)
 
         for cluster in clusters:
+            seen_pub_identities: set[str] = set()
+            cluster_display_publishers: list[str] = []
+            for a in cluster:
+                norm_pub = normalize_publisher_identity(a.source)
+                if norm_pub and norm_pub not in seen_pub_identities:
+                    seen_pub_identities.add(norm_pub)
+                    cluster_display_publishers.append(a.source.strip())
+
+            distinct_pubs_cluster = len(seen_pub_identities) if seen_pub_identities else (1 if cluster else 0)
+
             best_article = max(
                 cluster,
                 key=lambda a: (
                     headline_subject_clarity_score(a),
-                    compute_candidate_priority(a, cluster_size=len(cluster), reference_time=now_ref)[0],
+                    compute_candidate_priority(
+                        a,
+                        cluster_size=len(cluster),
+                        distinct_publisher_count=distinct_pubs_cluster,
+                        reference_time=now_ref,
+                    )[0],
                     article_priority_score(a),
                     a.published_at.timestamp(),
                 ),
@@ -832,7 +916,9 @@ class DeduplicationEngine:
             best_article_dict = best_article.model_dump()
             best_article_dict["raw_metadata"]["cluster_article_ids"] = [a.id for a in cluster]
             best_article_dict["raw_metadata"]["cluster_size"] = len(cluster)
-            best_article_dict["raw_metadata"]["cluster_publishers"] = list(dict.fromkeys(a.source for a in cluster))
+            best_article_dict["raw_metadata"]["cluster_publishers"] = (
+                cluster_display_publishers if cluster_display_publishers else [best_article.source.strip()]
+            )
             best_article_dict["raw_metadata"]["cluster_headlines"] = [a.title for a in cluster[:4]]
             representatives.append(Article(**best_article_dict))
 
@@ -843,14 +929,21 @@ class DeduplicationEngine:
         scored_reps: list[tuple[float, Article]] = []
 
         for art in representatives:
-            pub_key = art.source.lower()
+            pub_key = normalize_publisher_identity(art.source)
             publisher_counts[pub_key] += 1
             cluster_size = art.raw_metadata.get("cluster_size", 1)
+            cluster_pubs = art.raw_metadata.get("cluster_publishers", [art.source])
+            distinct_pub_count = (
+                len({normalize_publisher_identity(p) for p in cluster_pubs if normalize_publisher_identity(p)})
+                if cluster_pubs
+                else 1
+            )
             p_score, reasons = compute_candidate_priority(
                 article=art,
                 cluster_size=cluster_size,
                 publisher_seen_count=publisher_counts[pub_key],
                 reference_time=now_ref,
+                distinct_publisher_count=distinct_pub_count,
             )
             art_dict = art.model_dump()
             art_dict["raw_metadata"]["priority_score"] = p_score

@@ -373,7 +373,11 @@ class TestMultiSourceDiscoveryEngine(unittest.TestCase):
             source_category="MUSIC_GLOBAL",
         )
         score_rich, reasons_rich = compute_candidate_priority(
-            art_fresh_rich, cluster_size=2, publisher_seen_count=1, reference_time=self.now
+            art_fresh_rich,
+            cluster_size=2,
+            publisher_seen_count=1,
+            reference_time=self.now,
+            distinct_publisher_count=2,
         )
         self.assertGreater(score_rich, 5.0)
         self.assertTrue(any("signal_keywords" in r for r in reasons_rich))
