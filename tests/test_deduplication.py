@@ -1,7 +1,7 @@
 """Tests for DeduplicationEngine and cross-publisher clustering."""
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from efso_radar.deduplication.engine import (
@@ -10,9 +10,11 @@ from efso_radar.deduplication.engine import (
     compute_candidate_priority,
     compute_candidate_priority_baseline,
     extract_key_tokens,
+    find_matched_affinity_entities,
     normalize_publisher_identity,
 )
 from efso_radar.domain import Article, Market
+from efso_radar.orchestrator import RadarOrchestrator
 from efso_radar.repositories.sqlite import SqliteStateRepository
 
 
@@ -875,6 +877,294 @@ class TestDeduplication(unittest.TestCase):
             any("cross_publisher_consensus(2)" in r for r in reasons_vamp),
             f"Expected cross_publisher_consensus(2) for distinct publishers, got {reasons_vamp}",
         )
+
+
+
+
+class TestIssue80BaharAffinityAndEssayRouting(unittest.TestCase):
+    """Synthetic characterization and regression tests for Issue #80:
+    1. Disambiguation of 'bahar' TV series from figurative/seasonal expressions.
+    2. Characterization of original vs paraphrased essay headlines and legitimate entertainment news.
+    """
+
+    def setUp(self):
+        self.now = datetime(2026, 10, 11, 15, 7, tzinfo=timezone.utc)
+
+    def test_p2_review_remediation_actor_and_retail_bahar_phrases_do_not_match_series(self):
+        """Synthetic regression tests for Issue #80 P2 review remediation:
+        Actors with first name 'Bahar' in other shows/movies, retail spring collections,
+        plural seasonal TV shows, and possessive personal names
+        must NOT be recognized as the Bahar TV series.
+        """
+        negative_cases = [
+            # User & Reviewer specified negative acceptance cases:
+            "Yeni dizisi Bahar Demirtaş'ı heyecanlandırdı",
+            "Yeni dizisi Bahar Yılmaz tarafından tanıtıldı",
+            "Bahar dizileri yaz ekranında izleyiciyle buluşacak",
+            "Bahar dizilerinin yeni sezon tarihleri belli oldu",
+            "Şarkıcı Bahar'ın yeni dizisi gündem oldu",
+            "Bahar'ın yeni dizisi çok yakında başlıyor",
+            "Bahar dizi ekibiyle buluştu",
+            "Dizi oyuncusu Bahar Demirtaş yeni filminde rol aldı",
+            "Yeni dizinin oyuncusu Bahar Demirtaş açıklama yaptı",
+            "Bahar sezonu indirimleri başladı",
+            "Bahar yeni sezon koleksiyonunu tanıttı",
+            "Bahar ayında yeni sezon dizilerinin fragmanları yayımlanacak",
+            # Independently constructed adversarial variants (plural, possessive, seasonal):
+            "Kanalın sevilen bahar dizileri tatile giriyor",
+            "Oyuncu Bahar'ın yeni projesi ve dizisi merak konusu",
+            "Ünlü sunucu Bahar'ın sunduğu dizi programı reyting topladı",
+            "Bahar aylarında yayına girecek 5 yeni dizi",
+            "Televizyon dünyasında bahar temizliği: Hangi diziler final yapıyor?",
+            "Bahar aylarında yeni dizi fragmanları yayınlanacak",
+        ]
+        for text in negative_cases:
+            matched = find_matched_affinity_entities(text)
+            self.assertNotIn(
+                "bahar",
+                matched,
+                f"Negative test falsely matched 'bahar': '{text}' -> {matched}",
+            )
+
+    def test_p2_review_remediation_genuine_bahar_series_retains_affinity(self):
+        """Synthetic verification for Issue #80 P2 review remediation:
+        Genuine Bahar series references and adversarial positive controls must consistently match 'bahar'.
+        """
+        positive_cases = [
+            # User specified positive acceptance cases:
+            "Bahar dizisinin yeni bölüm fragmanı yayımlandı",
+            "Bahar dizisinin yeni sezon fragmanı yayımlandı",
+            "Bahar dizisinde şok ayrılık yaşandı",
+            "Bahar'da nefes kesen sezon finali",
+            "Bahar yeni bölüm fragmanı ekranlara geldi",
+            "Bahar dizisinin yeni sezon çekimleri bahar aylarında tamamlandı",
+            # Independently constructed adversarial positive variants:
+            "Bahar dizisi oyuncularının yeni projesi açıklandı",
+            "Bahar 25. bölüm fragmanı yayınlandı",
+            "Bahar dizisinde nefesler tutuldu: Sezon finali bu akşam",
+        ]
+        for text in positive_cases:
+            matched = find_matched_affinity_entities(text)
+            self.assertIn(
+                "bahar",
+                matched,
+                f"Genuine Bahar series text failed to match 'bahar': '{text}' -> {matched}",
+            )
+
+    def test_reverse_apposition_fail_closed_tradeoff_characterization(self):
+        """Characterization and regression test for Issue #80 review gate 1:
+        Reverse-apposition syntax (e.g. '... dizisi Bahar') cannot be distinguished
+        from personal names (e.g. 'Yeni dizisi Bahar Demirtaş'ı heyecanlandırdı')
+        without maintaining brittle surname dictionaries.
+
+        Under the fail-closed contract:
+        1) Ambiguous personal names MUST NOT match the series entity.
+        2) Uninflected reverse appositions without compound markers withhold the
+           extra entity bonus (documented deliberate false-negative tradeoff).
+        """
+        # Negative personal-name controls must never trigger TV series affinity:
+        name_cases = [
+            "Yeni dizisi Bahar Demirtaş'ı heyecanlandırdı",
+            "Yeni dizisi Bahar Yılmaz tarafından tanıtıldı",
+        ]
+        for text in name_cases:
+            matched = find_matched_affinity_entities(text)
+            self.assertNotIn("bahar", matched, f"Personal name falsely matched 'bahar': '{text}'")
+
+    def test_seasonal_and_unrelated_bahar_with_tv_terms_does_not_match_series_affinity(self):
+        """Seasonal or non-series 'bahar' mentions accompanied by unrelated TV terminology
+        (e.g. 'yeni sezon dizileri', 'fragman', 'dizi oyuncuları') must NOT trigger the
+        high-affinity TV series entity 'bahar' (Issue #80 review finding).
+        """
+        cases = [
+            "Bahar ayında yeni sezon dizilerinin fragmanları yayımlanacak",
+            "Bahar festivalinde yeni dizilerin fragmanı gösterildi",
+            "Bahar Demirtaş yeni dizinin kadrosuna katıldı",
+            "Şarkıcı Bahar Demirtaş yeni televizyon dizisi için imza attı",
+            "Bahar tatilinde izlenecek en iyi 10 dizi listesi",
+            "Bahar konserinde sevilen dizilerin oyuncuları sahneye çıktı",
+            "Bahar döneminde ekrana gelecek yeni diziler belli oldu",
+        ]
+        for text in cases:
+            matched = find_matched_affinity_entities(text)
+            self.assertNotIn(
+                "bahar",
+                matched,
+                f"Seasonal/unrelated text with TV words falsely matched 'bahar': '{text}' -> {matched}",
+            )
+
+    def test_figurative_and_seasonal_bahar_does_not_match_tv_series_affinity(self):
+        """Figurative phrases (e.g. 'ikinci bahar') and seasonal spring vocabulary
+        must NOT trigger the high-affinity entity 'bahar'.
+        """
+        figurative_texts = [
+            "Genç yazarların kariyerinde ikinci bahar başladı",
+            "Kişisel gelişim ve ikinci bahar dersleri",
+            "Bahar aylarında doğa yürüyüşü ve sağlıklı beslenme rehberi",
+            "Evde bahar temizliği için 10 pratik yöntem",
+            "Erken gelen bahar havası tüm yurdu etkisi altına aldı",
+            "Bahar geldi, parklar ve bahçeler doldu taştı",
+            "Nostaljik şarkılarla ikinci bahar esintisi",
+            "Bahar mevsiminde enerjinizi yükseltecek ipuçları",
+        ]
+        for text in figurative_texts:
+            matched = find_matched_affinity_entities(text)
+            self.assertNotIn(
+                "bahar",
+                matched,
+                f"Figurative/seasonal text falsely matched 'bahar': '{text}' -> {matched}",
+            )
+
+    def test_genuine_bahar_tv_series_retains_affinity(self):
+        """Unmistakable TV series context (dizi, sezon, bölüm, fragman, başrol, Show TV)
+        must properly retain 'bahar' high-affinity entity recognition.
+        """
+        tv_series_texts = [
+            "Bahar dizisinin yeni sezon fragmanı yayımlandı",
+            "Bahar dizisinde şok ayrılık: Başrol oyuncusu kadrodan ayrıldı",
+            "Bahar yeni bölüm fragmanı ekranlara geldi",
+            "Bahar dizisi oyuncuları yeni sezon tanıtımında buluştu",
+            "Bahar'da nefes kesen sezon finali",
+            "Bahar dizisinin yeni bölümünde sürpriz karakter",
+        ]
+        for text in tv_series_texts:
+            matched = find_matched_affinity_entities(text)
+            self.assertIn(
+                "bahar",
+                matched,
+                f"Genuine TV series text failed to match 'bahar': '{text}' -> {matched}",
+            )
+
+    def test_mixed_text_tv_series_with_seasonal_wording_matches_bahar(self):
+        """When a genuine TV series article also happens to mention seasonal spring wording,
+        it must still be recognized as the TV series 'bahar'.
+        """
+        mixed_text = "Bahar dizisinin yeni sezon çekimleri bahar aylarında tamamlandı"
+        matched = find_matched_affinity_entities(mixed_text)
+        self.assertIn("bahar", matched, f"Mixed TV/seasonal text should match 'bahar', got {matched}")
+
+    def test_unrelated_personal_name_does_not_match_bahar_tv_series(self):
+        """An ordinary person/singer named Bahar without TV series framing
+        must NOT trigger the TV franchise 'bahar'.
+        """
+        non_tv_text = "Şarkıcı Bahar Demirtaş hakkında savcılık tarafından soruşturma açıldı"
+        matched = find_matched_affinity_entities(non_tv_text)
+        self.assertNotIn("bahar", matched, f"Non-TV personal name matched 'bahar': {matched}")
+
+    def test_unrelated_high_affinity_entities_preserved(self):
+        """Preserve all other artist, franchise, and series recognition intact."""
+        samples = {
+            "Tarkan yeni dünya turnesi konser tarihlerini duyurdu": "tarkan",
+            "Kızılcık Şerbeti yeni bölüm tanıtımı yayımlandı": "kizilcik serbeti",
+            "The Raconteurs Jack White Nashville konserinde buluştu": "jack white",
+            "Doğukan Güngör ödül töreninde açıklama yaptı": "dogukan gungor",
+            "Yalı Çapkını dizisinde yeni sezon gelişmesi": "yali capkini",
+        }
+        for text, expected in samples.items():
+            matched = find_matched_affinity_entities(text)
+            self.assertIn(expected, matched, f"Entity '{expected}' not matched in '{text}': {matched}")
+
+    def test_figurative_bahar_priority_cascade_neutralized_against_control(self):
+        """Compare priority score of figurative 'bahar' headline against identical control headline.
+        Figurative 'bahar' must NOT receive false affinity, false subject clarity bonus,
+        or false inferred entertainment vertical uplift.
+        """
+        art_bahar = Article.create(
+            title="Genç yazarların kariyerinde ikinci bahar başladı",
+            url="https://example.com/bahar-figurative-1",
+            source="Kurgusal Bülten",
+            published_at=self.now - timedelta(hours=1),
+            discovered_at=self.now,
+            market=Market.TR,
+            snippet="Yazarlar kişisel gelişim üzerine deneyimlerini paylaştı.",
+        )
+        art_control = Article.create(
+            title="Genç yazarların kariyerinde ikinci dönem başladı",
+            url="https://example.com/bahar-control-1",
+            source="Kurgusal Bülten",
+            published_at=self.now - timedelta(hours=1),
+            discovered_at=self.now,
+            market=Market.TR,
+            snippet="Yazarlar kişisel gelişim üzerine deneyimlerini paylaştı.",
+        )
+        art_tv = Article.create(
+            title="Bahar dizisinin yeni sezon fragmanı yayımlandı",
+            url="https://example.com/bahar-tv-1",
+            source="Kurgusal Bülten",
+            published_at=self.now - timedelta(hours=1),
+            discovered_at=self.now,
+            market=Market.TR,
+            source_category="FILM_TV_GLOBAL",
+            snippet="Kurgusal kanal Bahar dizisinin yeni sezon tanıtımını duyurdu.",
+        )
+
+        score_bahar, reasons_bahar = compute_candidate_priority(art_bahar, reference_time=self.now)
+        score_control, reasons_control = compute_candidate_priority(art_control, reference_time=self.now)
+        score_tv, reasons_tv = compute_candidate_priority(art_tv, reference_time=self.now)
+
+        self.assertFalse(
+            any("high_affinity_entity" in r for r in reasons_bahar),
+            f"Expected no affinity entity for figurative bahar, got {reasons_bahar}",
+        )
+        self.assertNotIn("inferred_entertainment_vertical", reasons_bahar)
+        self.assertEqual(
+            score_bahar,
+            score_control,
+            f"Figurative bahar score ({score_bahar}) should match control ({score_control})",
+        )
+        self.assertTrue(any("high_affinity_entity(bahar)" in r for r in reasons_tv))
+        self.assertGreaterEqual(score_tv, 9.5)
+
+    def test_original_vs_paraphrased_essay_and_legitimate_entertainment_characterization(self):
+        """Characterization test for Issue #80:
+        Demonstrates that exact headline regexes catch original essays, while reworded essays
+        bypass brittle static regexes without being hard-rejected. Confirms legitimate entertainment
+        interviews and analyses are not dropped as noise.
+        """
+        art_exact_essay = Article.create(
+            title="What Vintage Jazz Bands Can Teach You About Second Acts",
+            url="https://synthetic.radar.internal/jazz-essay-1",
+            source="Synthetic Lifestyle Journal",
+            published_at=self.now - timedelta(hours=1),
+            discovered_at=self.now,
+            snippet="Generic opinion essay about managing career transitions.",
+        )
+        art_reworded_essay = Article.create(
+            title="Lessons From Classic Jazz Bands for Your Next Career Chapter",
+            url="https://synthetic.radar.internal/jazz-essay-2",
+            source="Synthetic Lifestyle Journal",
+            published_at=self.now - timedelta(hours=1),
+            discovered_at=self.now,
+            snippet="Generic opinion essay about managing career transitions.",
+        )
+        art_legit_interview = Article.create(
+            title="Ünlü yönetmen yeni sinema filminin kamera arkası ve yapım serüvenini anlattı",
+            url="https://synthetic.radar.internal/film-interview-1",
+            source="Fictitious Cine News",
+            published_at=self.now - timedelta(hours=1),
+            discovered_at=self.now,
+            market=Market.TR,
+            snippet="Yönetmen yeni sinema filminin festival prömiyeri öncesi kamera arkası detaylarını paylaştı.",
+        )
+
+        score_exact, reasons_exact = compute_candidate_priority(art_exact_essay, reference_time=self.now)
+        oos_exact = RadarOrchestrator.is_out_of_scope_candidate(art_exact_essay, reasons_exact)
+
+        score_reworded, reasons_reworded = compute_candidate_priority(art_reworded_essay, reference_time=self.now)
+        oos_reworded = RadarOrchestrator.is_out_of_scope_candidate(art_reworded_essay, reasons_reworded)
+
+        score_legit, reasons_legit = compute_candidate_priority(art_legit_interview, reference_time=self.now)
+        oos_legit = RadarOrchestrator.is_out_of_scope_candidate(art_legit_interview, reasons_legit)
+
+        self.assertTrue(oos_exact)
+        self.assertIn("out_of_scope_or_grim_news_dampened(generic_essay_or_b2b)", reasons_exact)
+
+        self.assertFalse(oos_reworded)
+        self.assertLess(score_reworded, 5.5)
+
+        self.assertFalse(oos_legit)
+        self.assertGreaterEqual(score_legit, 5.5)
+        self.assertTrue(any("film_tv_project" in r for r in reasons_legit))
 
 
 if __name__ == "__main__":

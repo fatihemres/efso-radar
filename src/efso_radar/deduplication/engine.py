@@ -435,14 +435,45 @@ def calculate_token_overlap(set_a: set[str], set_b: set[str]) -> float:
     return 0.4 * jaccard + 0.6 * containment
 
 
+# Context pattern for disambiguating the 'Bahar' TV series from figurative phrases ('ikinci bahar'),
+# seasonal retail/weather phrases ('bahar sezonu', 'bahar aylari'), personal names ('dizi oyuncusu Bahar',
+# "Bahar'ın yeni dizisi", "Yeni dizisi Bahar Demirtaş'ı heyecanlandırdı"), bare production references
+# ('Bahar dizi ekibi'), and plural spring shows ('bahar dizileri').
+# Implements a conservative positive-match grammar requiring explicit evidence that 'Bahar' is the actual series title:
+# 1) Direct compound with 3rd-person possessive head 'dizisi' (singular only: 'Bahar dizisi', 'Bahar dizisinin',
+#    'Bahar dizisinde', 'Bahar dizisinden', 'Bahar dizisini', 'Bahar dizisine', 'Bahar dizisiyle').
+# 2) Direct episode reference starting with Bahar: 'Bahar yeni bölüm', 'Bahar 25. bölüm fragmanı', 'Bahar son bölüm'.
+# 3) Direct season finale or trailer starting with Bahar: 'Bahar sezon finali', 'Bahar yeni sezon fragmanı'.
+# 4) Unambiguous locative series context (Bahar'da / baharda) followed by episode, finale or trailer noun:
+#    e.g. "Bahar'da nefes kesen sezon finali", "Bahar'da yeni bölüm".
+# Ambiguous reverse appositions (e.g. '... dizisi Bahar [Soyadı]') are deliberately excluded without brittle surname
+# blacklists; under the fail-closed contract, uncertain affinity bonuses are withheld rather than risking false positives.
+BAHAR_SERIES_PATTERN: re.Pattern[str] = re.compile(
+    r"\b(?:"
+    r"bahar\s+dizisi(?:n(?:in|de|den|i|e)|yle)?"
+    r"|bahar\s+(?:(?:yeni|son|\d+\.?)\s+)*bolum\w*"
+    r"|bahar\s+(?:(?:yeni|son)\s+)*(?:sezon\s+final\w*|sezon\s+fragman\w*)"
+    r"|(?:bahar\s+da|baharda)\s+(?:\w+\s+){0,3}(?:sezon\s+final\w*|bolum\w*|fragman\w*)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
 def find_matched_affinity_entities(text: str) -> list[str]:
     """Return high-affinity entities matched with strict word boundaries on ASCII-normalized text."""
     ascii_text = _ascii_norm(text)
     matched: list[str] = []
     for ent in HIGH_AFFINITY_ENTITIES:
         ent_ascii = _ascii_norm(ent)
-        if re.search(rf"\b{re.escape(ent_ascii)}\b", ascii_text):
-            matched.append(ent_ascii)
+        if ent_ascii == "bahar":
+            # Disambiguate 'Bahar' television series by requiring a direct syntactic series reference,
+            # avoiding false positives on seasonal spring vocabulary or unrelated people
+            # co-occurring with generic TV terms.
+            if BAHAR_SERIES_PATTERN.search(ascii_text):
+                matched.append(ent_ascii)
+        else:
+            if re.search(rf"\b{re.escape(ent_ascii)}\b", ascii_text):
+                matched.append(ent_ascii)
     return sorted(set(matched))
 
 

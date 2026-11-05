@@ -1084,5 +1084,165 @@ class TestOrchestrator(unittest.TestCase):
         self.assertEqual(kwargs_expire["min_update_priority"], settings.min_discovery_priority_for_ai)
 
 
+
+    def test_issue_80_orchestrator_routing_small_and_crowded_batches(self):
+        """Issue #80 Acceptance: Verify full Orchestrator.run() routing with mock source,
+        recording AI, deny-all notifier and owned temporary SQLite.
+        Covers:
+        1. Small batch (<= ai_batch_size): in-scope candidates (including priority < 5.5)
+           are evaluated by AI and not soft-deferred; hard out-of-scope candidates are marked processed.
+        2. Crowded batch (> ai_batch_size): candidates with priority < 5.5 are soft-deferred into
+           durable backlog (status QUEUED) without being marked processed; hard out-of-scope candidates
+           are marked processed; AI evaluates top in-scope candidates.
+        """
+        class DenyAllNotifier(NotificationChannel):
+            def __init__(self):
+                self.send_count = 0
+            def send(self, *args, **kwargs):
+                self.send_count += 1
+                raise AssertionError("Notification MUST NEVER be sent in offline audit")
+            def send_digest_batch(self, *args, **kwargs):
+                self.send_count += 1
+                raise AssertionError("Digest MUST NEVER be sent in offline audit")
+
+        class RecordingAIEngine(AIEditorialEngine):
+            def __init__(self):
+                self.calls = []
+            def evaluate(self, candidates, recent_stories, now):
+                self.calls.append(list(candidates))
+                return []
+
+        # --- Subtest 1: Small batch (<= ai_batch_size=10) ---
+        ai_small = RecordingAIEngine()
+        notif_small = DenyAllNotifier()
+
+        # In-scope high priority article (score >= 9.0)
+        c_high = Article.create(
+            "Tarkan yeni stadyum konserlerini duyurdu",
+            "https://test.invalid/tarkan-1",
+            "MuzikHaber",
+            self.now,
+            snippet="Şarkıcı Tarkan yeni stadyum konseri turne takvimini açıkladı.",
+        )
+        # In-scope low-priority article (score ~4.1 < 5.5, not hard out-of-scope)
+        c_low = Article.create(
+            "Lessons From Classic Pop Groups for Your Next Career Chapter",
+            "https://test.invalid/pop-essay-1",
+            "EssayWorld",
+            self.now,
+            snippet="Generic opinion essay about managing a late-career change.",
+        )
+        # Hard out-of-scope article (politics)
+        c_oos = Article.create(
+            "Kabine toplantısı kararları açıklandı",
+            "https://test.invalid/politics-1",
+            "PolitikaHaber",
+            self.now,
+            snippet="Bakanlık yeni vergi düzenlemesi ve resmi gazete kararlarını duyurdu.",
+        )
+
+        orch_small = RadarOrchestrator(
+            settings=self.settings,
+            repository=self.repo,
+            source=MockNewsSource(articles=[c_high, c_low, c_oos], successes=1),
+            ai_engine=ai_small,
+            notifier=notif_small,
+        )
+
+        res_small = orch_small.run(now=self.now, dry_run=False, scan_only=False)
+        self.assertTrue(res_small.success)
+        self.assertEqual(notif_small.send_count, 0)
+        self.assertEqual(res_small.notifications_dispatched, 0)
+        self.assertEqual(res_small.picks_approved, 0)
+
+        # In small batch, c_oos is hard rejected; both c_high and c_low enter AI
+        self.assertEqual(len(ai_small.calls), 1)
+        evaluated_ids_small = {c.id for c in ai_small.calls[0]}
+        self.assertEqual(evaluated_ids_small, {c_high.id, c_low.id})
+        self.assertTrue(self.repo.is_article_processed(c_oos.id))
+        self.assertTrue(self.repo.is_article_processed(c_low.id))
+        self.assertTrue(self.repo.is_article_processed(c_high.id))
+        self.assertEqual(len(self.repo.get_pending_candidates(now=self.now)), 0)
+
+        # --- Subtest 2: Crowded batch (> ai_batch_size=10) with owned clean DB ---
+        db_crowded = Path(self.temp_dir.name) / "test_crowded.db"
+        repo_crowded = SqliteStateRepository(db_crowded)
+        ai_crowded = RecordingAIEngine()
+        notif_crowded = DenyAllNotifier()
+
+        # Generate 10 distinct high-priority in-scope candidates
+        artists = [
+            "Tarkan", "Hadise", "Gulsen", "Zeynep Bastik", "Mabel Matiz",
+            "Semicenk", "Edis", "Demet Akalin", "Derya Ulug", "Murat Boz",
+        ]
+        events = [
+            "stadyum turnesi konser tarihlerini acikladi",
+            "yeni solo album calismasini duyurdu",
+            "avrupa turnesi icin bilet satisina basladi",
+            "duet sarkisi tum platformlarda yayinlandi",
+            "muzik odulleri toreninde yilin sarkicisi secildi",
+            "harbiye acikhava konseri biletleri tukendi",
+            "akustik konser serisinin ilkini gerceklestirdi",
+            "yaz turnesi kapsaminda on iki sehir gezecek",
+            "klip cekimlerini tamamladigini hayranlarina bildirdi",
+            "festival sahnesinde unlu konuklarla sarki soyledi",
+        ]
+        high_candidates = [
+            Article.create(
+                f"{artist} {events[i]}",
+                f"https://test.invalid/high-{i}",
+                f"Kanal {i}",
+                self.now,
+                snippet=f"{artist} yeni gelismeleri hayranlarina duyurdu.",
+            )
+            for i, artist in enumerate(artists)
+        ]
+        # 1 in-scope low-priority candidate (< 5.5)
+        c_low_crowded = Article.create(
+            "Lessons From Classic Pop Groups for Your Next Career Chapter",
+            "https://test.invalid/pop-essay-crowded",
+            "EssayWorld",
+            self.now,
+            snippet="Generic opinion essay about managing a late-career change.",
+        )
+        # 1 hard out-of-scope candidate (politics)
+        c_oos_crowded = Article.create(
+            "Kabine toplantısı kararları açıklandı",
+            "https://test.invalid/politics-crowded",
+            "PolitikaHaber",
+            self.now,
+            snippet="Bakanlık yeni vergi düzenlemesi ve resmi gazete kararlarını duyurdu.",
+        )
+
+        all_crowded_articles = high_candidates + [c_low_crowded, c_oos_crowded]
+        orch_crowded = RadarOrchestrator(
+            settings=Settings(sqlite_db_path=db_crowded, ai_evaluation_enabled=True, ai_batch_size=10, min_discovery_priority_for_ai=5.5),
+            repository=repo_crowded,
+            source=MockNewsSource(articles=all_crowded_articles, successes=1),
+            ai_engine=ai_crowded,
+            notifier=notif_crowded,
+        )
+
+        res_crowded = orch_crowded.run(now=self.now, dry_run=False, scan_only=False)
+        self.assertTrue(res_crowded.success)
+        self.assertEqual(notif_crowded.send_count, 0)
+        self.assertEqual(res_crowded.notifications_dispatched, 0)
+        self.assertEqual(res_crowded.picks_approved, 0)
+
+        # In crowded batch (>10 in-scope):
+        # - c_oos_crowded is hard-rejected and marked processed
+        # - c_low_crowded (priority < 5.5) is soft-deferred into durable backlog (QUEUED) and NOT marked processed
+        # - exactly the 10 top candidates are sent to AI
+        self.assertEqual(len(ai_crowded.calls), 1)
+        self.assertEqual(len(ai_crowded.calls[0]), 10)
+        self.assertNotIn(c_low_crowded.id, {c.id for c in ai_crowded.calls[0]})
+        self.assertNotIn(c_oos_crowded.id, {c.id for c in ai_crowded.calls[0]})
+
+        self.assertTrue(repo_crowded.is_article_processed(c_oos_crowded.id))
+        self.assertFalse(repo_crowded.is_article_processed(c_low_crowded.id))
+        pending_ids = {c.id for c in repo_crowded.get_pending_candidates(now=self.now)}
+        self.assertIn(c_low_crowded.id, pending_ids)
+
+
 if __name__ == "__main__":
     unittest.main()
