@@ -435,14 +435,32 @@ def calculate_token_overlap(set_a: set[str], set_b: set[str]) -> float:
     return 0.4 * jaccard + 0.6 * containment
 
 
+# Context patterns for disambiguating ambiguous entities (e.g. 'Bahar' TV series vs figurative/seasonal usage)
+BAHAR_TV_CONTEXT_PATTERN: re.Pattern[str] = re.compile(
+    r"\b(dizi\w*|fragman\w*|sezon\w*|bolum\w*|basrol\w*|oyuncu\w*|kadro\w*|karakter\w*|show\s+tv|tanitim\w*|ekran\w*|reyting\w*|yapim\w*|setinde)\b",
+    re.IGNORECASE,
+)
+BAHAR_FIGURATIVE_OR_SEASONAL_PATTERN: re.Pattern[str] = re.compile(
+    r"\b(?:ikinci\s+bahar\w*|bahar\s+(?:aylar\w*|havas\w*|temizli\w*|esinti\w*|mevsim\w*|donem\w*|geldi|geliyor|gelisi|yagmur\w*|cicek\w*|gunler\w*)|(?:ilk|son)\s*bahar\w*|erken\s+gelen\s+bahar\w*)\b",
+    re.IGNORECASE,
+)
+
+
 def find_matched_affinity_entities(text: str) -> list[str]:
     """Return high-affinity entities matched with strict word boundaries on ASCII-normalized text."""
     ascii_text = _ascii_norm(text)
     matched: list[str] = []
     for ent in HIGH_AFFINITY_ENTITIES:
         ent_ascii = _ascii_norm(ent)
-        if re.search(rf"\b{re.escape(ent_ascii)}\b", ascii_text):
-            matched.append(ent_ascii)
+        if ent_ascii == "bahar":
+            # Disambiguate 'Bahar' television series from figurative phrases ('ikinci bahar'),
+            # ordinary seasonal spring vocabulary, and non-TV personal names.
+            cleaned = BAHAR_FIGURATIVE_OR_SEASONAL_PATTERN.sub(" ", ascii_text)
+            if re.search(r"\bbahar\b", cleaned) and BAHAR_TV_CONTEXT_PATTERN.search(ascii_text):
+                matched.append(ent_ascii)
+        else:
+            if re.search(rf"\b{re.escape(ent_ascii)}\b", ascii_text):
+                matched.append(ent_ascii)
     return sorted(set(matched))
 
 

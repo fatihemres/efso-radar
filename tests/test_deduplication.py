@@ -1,7 +1,7 @@
 """Tests for DeduplicationEngine and cross-publisher clustering."""
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from efso_radar.deduplication.engine import (
@@ -10,9 +10,11 @@ from efso_radar.deduplication.engine import (
     compute_candidate_priority,
     compute_candidate_priority_baseline,
     extract_key_tokens,
+    find_matched_affinity_entities,
     normalize_publisher_identity,
 )
 from efso_radar.domain import Article, Market
+from efso_radar.orchestrator import RadarOrchestrator
 from efso_radar.repositories.sqlite import SqliteStateRepository
 
 
@@ -875,6 +877,192 @@ class TestDeduplication(unittest.TestCase):
             any("cross_publisher_consensus(2)" in r for r in reasons_vamp),
             f"Expected cross_publisher_consensus(2) for distinct publishers, got {reasons_vamp}",
         )
+
+
+
+
+class TestIssue80BaharAffinityAndEssayRouting(unittest.TestCase):
+    """Synthetic characterization and regression tests for Issue #80:
+    1. Disambiguation of 'bahar' TV series from figurative/seasonal expressions.
+    2. Characterization of original vs paraphrased essay headlines and legitimate entertainment news.
+    """
+
+    def setUp(self):
+        self.now = datetime(2026, 10, 11, 15, 7, tzinfo=timezone.utc)
+
+    def test_figurative_and_seasonal_bahar_does_not_match_tv_series_affinity(self):
+        """Figurative phrases (e.g. 'ikinci bahar') and seasonal spring vocabulary
+        must NOT trigger the high-affinity entity 'bahar'.
+        """
+        figurative_texts = [
+            "Genç yazarların kariyerinde ikinci bahar başladı",
+            "Kişisel gelişim ve ikinci bahar dersleri",
+            "Bahar aylarında doğa yürüyüşü ve sağlıklı beslenme rehberi",
+            "Evde bahar temizliği için 10 pratik yöntem",
+            "Erken gelen bahar havası tüm yurdu etkisi altına aldı",
+            "Bahar geldi, parklar ve bahçeler doldu taştı",
+            "Nostaljik şarkılarla ikinci bahar esintisi",
+            "Bahar mevsiminde enerjinizi yükseltecek ipuçları",
+        ]
+        for text in figurative_texts:
+            matched = find_matched_affinity_entities(text)
+            self.assertNotIn(
+                "bahar",
+                matched,
+                f"Figurative/seasonal text falsely matched 'bahar': '{text}' -> {matched}",
+            )
+
+    def test_genuine_bahar_tv_series_retains_affinity(self):
+        """Unmistakable TV series context (dizi, sezon, bölüm, fragman, başrol, Show TV)
+        must properly retain 'bahar' high-affinity entity recognition.
+        """
+        tv_series_texts = [
+            "Bahar dizisinin yeni sezon fragmanı yayımlandı",
+            "Bahar dizisinde şok ayrılık: Başrol oyuncusu kadrodan ayrıldı",
+            "Bahar yeni bölüm fragmanı ekranlara geldi",
+            "Show TV ekranlarının fenomen dizisi Bahar reyting rekoru kırdı",
+            "Bahar dizisi oyuncuları yeni sezon tanıtımında buluştu",
+            "Bahar'da nefes kesen sezon finali",
+            "Bahar dizisinin yeni bölümünde sürpriz karakter",
+        ]
+        for text in tv_series_texts:
+            matched = find_matched_affinity_entities(text)
+            self.assertIn(
+                "bahar",
+                matched,
+                f"Genuine TV series text failed to match 'bahar': '{text}' -> {matched}",
+            )
+
+    def test_mixed_text_tv_series_with_seasonal_wording_matches_bahar(self):
+        """When a genuine TV series article also happens to mention seasonal spring wording,
+        it must still be recognized as the TV series 'bahar'.
+        """
+        mixed_text = "Bahar dizisinin yeni sezon çekimleri bahar aylarında tamamlandı"
+        matched = find_matched_affinity_entities(mixed_text)
+        self.assertIn("bahar", matched, f"Mixed TV/seasonal text should match 'bahar', got {matched}")
+
+    def test_unrelated_personal_name_does_not_match_bahar_tv_series(self):
+        """An ordinary person/singer named Bahar without TV series framing
+        must NOT trigger the TV franchise 'bahar'.
+        """
+        non_tv_text = "Şarkıcı Bahar Demirtaş hakkında savcılık tarafından soruşturma açıldı"
+        matched = find_matched_affinity_entities(non_tv_text)
+        self.assertNotIn("bahar", matched, f"Non-TV personal name matched 'bahar': {matched}")
+
+    def test_unrelated_high_affinity_entities_preserved(self):
+        """Preserve all other artist, franchise, and series recognition intact."""
+        samples = {
+            "Tarkan yeni dünya turnesi konser tarihlerini duyurdu": "tarkan",
+            "Kızılcık Şerbeti yeni bölüm tanıtımı yayımlandı": "kizilcik serbeti",
+            "The Raconteurs Jack White Nashville konserinde buluştu": "jack white",
+            "Doğukan Güngör ödül töreninde açıklama yaptı": "dogukan gungor",
+            "Yalı Çapkını dizisinde yeni sezon gelişmesi": "yali capkini",
+        }
+        for text, expected in samples.items():
+            matched = find_matched_affinity_entities(text)
+            self.assertIn(expected, matched, f"Entity '{expected}' not matched in '{text}': {matched}")
+
+    def test_figurative_bahar_priority_cascade_neutralized_against_control(self):
+        """Compare priority score of figurative 'bahar' headline against identical control headline.
+        Figurative 'bahar' must NOT receive false affinity, false subject clarity bonus,
+        or false inferred entertainment vertical uplift.
+        """
+        art_bahar = Article.create(
+            title="Genç yazarların kariyerinde ikinci bahar başladı",
+            url="https://example.com/bahar-figurative-1",
+            source="Kurgusal Bülten",
+            published_at=self.now - timedelta(hours=1),
+            discovered_at=self.now,
+            market=Market.TR,
+            snippet="Yazarlar kişisel gelişim üzerine deneyimlerini paylaştı.",
+        )
+        art_control = Article.create(
+            title="Genç yazarların kariyerinde ikinci dönem başladı",
+            url="https://example.com/bahar-control-1",
+            source="Kurgusal Bülten",
+            published_at=self.now - timedelta(hours=1),
+            discovered_at=self.now,
+            market=Market.TR,
+            snippet="Yazarlar kişisel gelişim üzerine deneyimlerini paylaştı.",
+        )
+        art_tv = Article.create(
+            title="Bahar dizisinin yeni sezon fragmanı yayımlandı",
+            url="https://example.com/bahar-tv-1",
+            source="Kurgusal Bülten",
+            published_at=self.now - timedelta(hours=1),
+            discovered_at=self.now,
+            market=Market.TR,
+            source_category="FILM_TV_GLOBAL",
+            snippet="Kurgusal kanal Bahar dizisinin yeni sezon tanıtımını duyurdu.",
+        )
+
+        score_bahar, reasons_bahar = compute_candidate_priority(art_bahar, reference_time=self.now)
+        score_control, reasons_control = compute_candidate_priority(art_control, reference_time=self.now)
+        score_tv, reasons_tv = compute_candidate_priority(art_tv, reference_time=self.now)
+
+        self.assertFalse(
+            any("high_affinity_entity" in r for r in reasons_bahar),
+            f"Expected no affinity entity for figurative bahar, got {reasons_bahar}",
+        )
+        self.assertNotIn("inferred_entertainment_vertical", reasons_bahar)
+        self.assertEqual(
+            score_bahar,
+            score_control,
+            f"Figurative bahar score ({score_bahar}) should match control ({score_control})",
+        )
+        self.assertTrue(any("high_affinity_entity(bahar)" in r for r in reasons_tv))
+        self.assertGreaterEqual(score_tv, 9.5)
+
+    def test_original_vs_paraphrased_essay_and_legitimate_entertainment_characterization(self):
+        """Characterization test for Issue #80:
+        Demonstrates that exact headline regexes catch original essays, while reworded essays
+        bypass brittle static regexes without being hard-rejected. Confirms legitimate entertainment
+        interviews and analyses are not dropped as noise.
+        """
+        art_exact_abba = Article.create(
+            title="What ABBA Can Teach You About Second Acts",
+            url="https://example.com/abba-essay-1",
+            source="That Eric Alper",
+            published_at=self.now - timedelta(hours=1),
+            discovered_at=self.now,
+            snippet="Generic opinion essay about managing a late-career change.",
+        )
+        art_reworded_abba = Article.create(
+            title="Lessons From Classic Pop Groups for Your Next Career Chapter",
+            url="https://example.com/abba-essay-2",
+            source="That Eric Alper",
+            published_at=self.now - timedelta(hours=1),
+            discovered_at=self.now,
+            snippet="Generic opinion essay about managing a late-career change.",
+        )
+        art_legit_interview = Article.create(
+            title="Ünlü yönetmen yeni sinema filminin kamera arkası ve yapım serüvenini anlattı",
+            url="https://example.com/film-interview-1",
+            source="FilmDergisi",
+            published_at=self.now - timedelta(hours=1),
+            discovered_at=self.now,
+            market=Market.TR,
+            snippet="Yönetmen yeni sinema filminin Londra festivali prömiyeri öncesi kamera arkası detaylarını paylaştı.",
+        )
+
+        score_exact, reasons_exact = compute_candidate_priority(art_exact_abba, reference_time=self.now)
+        oos_exact = RadarOrchestrator.is_out_of_scope_candidate(art_exact_abba, reasons_exact)
+
+        score_reworded, reasons_reworded = compute_candidate_priority(art_reworded_abba, reference_time=self.now)
+        oos_reworded = RadarOrchestrator.is_out_of_scope_candidate(art_reworded_abba, reasons_reworded)
+
+        score_legit, reasons_legit = compute_candidate_priority(art_legit_interview, reference_time=self.now)
+        oos_legit = RadarOrchestrator.is_out_of_scope_candidate(art_legit_interview, reasons_legit)
+
+        self.assertTrue(oos_exact)
+        self.assertIn("out_of_scope_or_grim_news_dampened(generic_essay_or_b2b)", reasons_exact)
+
+        self.assertFalse(oos_reworded)
+        self.assertLess(score_reworded, 5.5)
+
+        self.assertFalse(oos_legit)
+        self.assertGreaterEqual(score_legit, 5.5)
+        self.assertTrue(any("film_tv_project" in r for r in reasons_legit))
 
 
 if __name__ == "__main__":
