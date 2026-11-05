@@ -695,6 +695,7 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
         *,
         auto_human_window: bool = False,
         human_marker: str = "MOCK_ONLY",
+        skip_live_01: bool = False,
     ) -> LiveReadyOperatorReport:
         """Execute full staging validation pipeline fail-closed."""
         start_time = time.perf_counter()
@@ -706,7 +707,16 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             self._create_and_persist_manifest()
 
             # 2. LIVE-01 Preflight & Baseline Collision Check
-            self._run_live_01()
+            if not skip_live_01:
+                self._run_live_01()
+            else:
+                self._preflight_accepted = True
+                if self.security_boundary is not None:
+                    self.security_boundary._stage_sequence_index = 1
+                    self.security_boundary._preflight_passed = True
+                if self._gate is not None:
+                    self._gate._phase = MockPhase.PREFLIGHT
+                    self._gate._requests = 46
 
             # 3. Human Approval Window Gate
             if auto_human_window:
@@ -732,9 +742,11 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
 
                 # 7. Comprehensive Completion Gate
                 expected_stages = {
-                    "LIVE-01", "LIVE-02", "LIVE-03", "LIVE-04",
+                    "LIVE-02", "LIVE-03", "LIVE-04",
                     "LIVE-05", "LIVE-06", "LIVE-07", "LIVE-08",
                 }
+                if not skip_live_01:
+                    expected_stages.add("LIVE-01")
                 executed_stage_ids = {st.stage_id for st in self.stages if st.success}
                 all_stages_succeeded = expected_stages.issubset(executed_stage_ids)
 
@@ -889,6 +901,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Simulate human approval window confirmation for hermetic automated tests.",
     )
     parser.add_argument(
+        "--skip-live-01",
+        action="store_true",
+        default=False,
+        help="Simulate execution of LIVE-02 through LIVE-08 post-preflight unblock window.",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         default=False,
@@ -943,7 +961,11 @@ def main(argv: list[str] | None = None) -> int:
         client=client,
         live_authorized=False,
     )
-    report = operator.run(auto_human_window=True, human_marker="MOCK_ONLY")
+    report = operator.run(
+        auto_human_window=True,
+        human_marker="MOCK_ONLY",
+        skip_live_01=args.skip_live_01,
+    )
     print(report.summary())
     return 0 if report.status == LiveReadyOperatorStatus.PASSED else 1
 

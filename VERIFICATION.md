@@ -2,6 +2,19 @@
 
 **Latest GitHub checkpoint:** 2026-11-05. This ledger separates direct GitHub CI evidence, implementation-agent local runs, historical pilot acceptance and missing validations. Earlier dated reviewer entries retain their original scope. Evidence is not a release certificate.
 
+## 2026-11-06 — Controlled Staging Runner Offline Slice (Issue #82 / Issue #13 First Engineering Slice)
+
+| Evidence / status | Verified result and scope boundary |
+| --- | --- |
+| Protected `main` baseline `8caeefd624eb4f288fe622c9e981248c0017d5ea` | Exact-main CI [#42107231638](https://github.com/fatihemres/efso-radar/actions/runs/42107231638) 4/4 PASS. Task worktree `feat/issue-13-staging-runner-offline-slice`. |
+| Transport-injected controlled staging slice (`src/efso_radar/staging/runner.py`, `live_ready_operator.py`) | Implemented `execute_controlled_staging` supporting concrete mock transport injection, ahead-of-time manifest persistence, exact destination allowlist, and `skip_live_01=True` executing LIVE-02..08 directly (32 calls). |
+| Dedicated test suite: `tests/test_phase5b3g_c_controlled_staging_slice.py` | **18 passed, 18 subtests passed in 2.18s** on Windows Python 3.12.10. Verified nominal slice (32 requests), nominal full session (78 requests), COMMIT timeouts, connection drops, HTTP 500/502/503/504, statement errors, rollback persistence tracking, contradictory outcomes, inspection failures, ownership mismatches (`OWNERSHIP_MISMATCH_HALT`), audit failures, real-network transport rejection, CLI live flag fail-closed (code 2), and `LiveReadyStagingOperator` coherence. |
+| Full Phase 5B.3G staging test suite | **628 passed, 4 skipped in 36.44s** on Windows Python 3.12.10. |
+| Full hermetic pytest suite | **1291 passed, 18 skipped, 294 subtests passed in 160.11s** on Windows Python 3.12.10. |
+| Static safety: Ruff 0.13.3 (`E9,F63,F7,F82`) | **All checks passed!** |
+| Non-proof contract & ERD-017 boundary | Hermetic mock tests do **NOT** prove remote cloud reliability, network latency/socket behavior, or unattended cross-runner recovery across ephemeral runner VM teardowns. ERD-017 cross-runner recovery choice remains OPEN / REQUIRES PO DECISION. |
+| Hard operational boundaries | Strictly **$0.00 / 0 TRY**. Zero live network calls, zero Turso connections (including reads), Block Writes on staging strictly ON, zero credentials created. |
+
 ## 2026-11-05 — Integrated offline editorial fixes and finite issue closures
 
 | Evidence / status | Verified result and scope boundary |

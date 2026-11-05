@@ -638,6 +638,27 @@ Before any cross-runner live recovery mechanism can be implemented, the Product 
 > [!NOTE]
 > Antigravity does **not** choose, assume, or silently implement any live backend option. Live writes remain permanently blocked.
 
+### 5.10. Launch Readiness — Controlled Staging Runner Offline Slice (2026-11-06; Issue #82 / Issue #13)
+
+**Offline engineering slice only; strictly mock transport, zero cloud connections, and $0.00 / 0 TRY spending ceiling.**
+
+#### 1. Transport-Injected Controlled-Staging Slice Execution Path
+To prepare the controlled Turso staging runner for a future separately authorized reliability session, a dedicated transport-injected execution path was implemented across `src/efso_radar/staging/runner.py` and `live_ready_operator.py`:
+- **`execute_controlled_staging`:** Top-level runner entrypoint in `efso_radar.staging.runner` (and exported from `efso_radar.staging`). Supports injecting concrete hermetic mock transports (`mock_transport: Optional[httpx.BaseTransport] = None`), enforcing exact destination allowlisting, and rejecting real network transports (`httpx.HTTPTransport`, `httpx.AsyncHTTPTransport`) fail-closed.
+- **Dedicated LIVE-02..08 Slice (`skip_live_01=True`):** Supports executing the controlled write and cleanup stages directly (32 HTTP requests nominal), modeling the post-LIVE-01 write-unblock window where read-only preflight and collision checks were already confirmed under Block Writes: ON.
+- **Ahead-of-Time Ownership Manifest:** Enforces durable registration of all 5 synthetic entities (`processed_articles`: `_01` & `_02_rollback`, `stories`: `_01`, `run_locks`, `durable_recovery_state`) written and sealed to disk *before* any mutating write is dispatched.
+- **Strict Request Ceiling & Cleanup Reserve:** Enforces single hard ceiling (<100 requests) and cleanup planning reserve (20 requests; nominal cleanup uses 14 requests).
+- **Ambiguous COMMIT Fail-Closed:** Network errors, timeouts, or 500-series responses during COMMIT mark outcome `UNKNOWN`, permanently halt further mutating writes, skip automated cleanup, and retain the on-disk manifest for manual investigation.
+- **Parameterized Conditional Cleanup & 3-State Audit (LIVE-08):** Conditional deletion requires exact primary key AND synthetic ownership attributes, verifying `affected_row_count == 1`. Three-state audit (`CLEAN` / `RESIDUAL` / `UNKNOWN`) inspects all 5 entities. Manifest is unlinked if and only if strictly `CLEAN`; preserved on `RESIDUAL`, `UNKNOWN`, or `OWNERSHIP_MISMATCH_HALT`.
+
+#### 2. Architecture Boundary & ERD-017 Non-Proof Disclaimer
+- **Persistent-Host Staging (Mode a) vs. Ephemeral Cloud Actions (Mode b):** Passing hermetic tests on an owner-operated workstation with local filesystem persistence proves process-crash resilience for controlled one-off staging. It **does NOT prove or certify unattended cross-runner recovery** on ephemeral GitHub Actions VMs where local disks and temporary directories vanish upon runner decommission.
+- **ERD-017 Architecture Choice Remains OPEN:** The architectural decision for cross-runner recovery remains unresolved and requires explicit Product Owner choice:
+  - **Option A:** Persistent-Host Staging Only (keep GitHub Actions offline-only).
+  - **Option B:** Dedicated Remote Ownership Journal Table (Schema v7 migration).
+  - **Option C:** Single-Transaction Atomic Batching (Hrana pipeline transaction coupling; potentially complementary with Option B).
+- **Hard Runtime Gate:** Real Turso staging writes remain permanently blocked. CLI live execution flags (`--live`, `--execute`, `--enable-writes`, etc.) fail closed immediately.
+
 ---
 
 ## 6. Separation of Software Cleanup vs. Manual Dashboard Operations
