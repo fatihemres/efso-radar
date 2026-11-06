@@ -2,6 +2,21 @@
 
 **Latest GitHub checkpoint:** 2026-11-05. This ledger separates direct GitHub CI evidence, implementation-agent local runs, historical pilot acceptance and missing validations. Earlier dated reviewer entries retain their original scope. Evidence is not a release certificate.
 
+## 2026-11-06 — Launch G2 / ERD-017 Offline Staging Ownership Journal Implementation (Issue #90 / Parent Issue #82 G2)
+
+| Evidence / status | Verified result and scope boundary |
+| --- | --- |
+| Protected `main` baseline `193c4e2f3d356414f357ee3e3bc535901d8d2590` | Exact-main CI [#42233491043](https://github.com/fatihemres/efso-radar/actions/runs/42233491043) 4/4 PASS. Task worktree `feat/issue-90-erd017-staging-journal`. |
+| Offline engineering deliverable (`src/efso_radar/staging/journal.py`) | Implemented `StagingOwnershipJournal` offline manager and candidate Schema v7 prototype DDL following ERD-017 (Option B + Option C). Strictly in-memory/temp SQLite; decoupled from live Turso, live cloud endpoints, and production migrations. Default `CURRENT_SCHEMA_VERSION` in `schema.py` remains strictly 6; `MIGRATIONS` unchanged at 6 steps. |
+| Authoritative fencing & Option B+C atomic batching | Proved atomic transaction coupling: journal fence CAS increment (1 -> 2), entity mutations (`processed_articles`, `stories`), and effect status confirmation (`EFFECT_COMMITTED`) execute inside one atomic block. Fencing races or stale token checks verify `affected_rows == 0`, immediately aborting and rolling back mutations. |
+| Adversarial test coverage (8 PO-mandated cases) | (1) Concurrent duplicate run_ids fail closed (`ActiveWorkloadCollisionError`); (2) distinct run_ids targeting the same workload fail closed via `run_locks` lease or active journal scan (`ActiveWorkloadCollisionError`); (3) stale/foreign runner owners fail closed (`StaleOwnerError`); (4) fencing token races fail closed (`FencingConflictError`); (5) tampered manifest seals or target inventory mutations fail closed (`ManifestTamperedError`, `TargetInventoryViolationError`); (6) ambiguous commits mark status `UNKNOWN`, permanently halt automated execution, and preserve records; (7) crash/rollback mid-transaction cleanly rolls back both entity and journal changes; (8) parameterized cleanup requires matching attributes and rowcount == 1, halting fail-closed on 0 rows, with 3-state audit preserving records upon residual entities. |
+| Operator-only forensic tools & non-destructive rollback | Scoped inspection (`inspect_run`), unresolved run discovery (`list_unresolved_runs`), and manual reconciliation (`operator_reconcile_run`) requiring explicit `is_po_approved=True` and monotonic token increment. Automated takeover is strictly forbidden. Operational rollback is strictly non-destructive (no `DROP TABLE`). |
+| Dedicated test suite: `tests/test_staging_ownership_journal_offline.py` | **30 passed in 1.13s** on Windows. |
+| Combined staging test suites | **274 passed in 16.35s** on Windows (`test_staging_ownership_journal_offline.py`, `test_phase5b3g_c_controlled_staging_slice.py`, `test_phase5b3g_c_cross_runner_recovery_offline.py`, `test_phase5b3g_c_offline_recovery_evidence.py`, `test_phase5b3g_c_persistent_manifest_store_offline.py`). |
+| Hermetic repository test suite | **1,378 passed in 185s** on Windows. Zero regressions. |
+| Static safety: Python 3.12 py_compile & git diff --check | **Clean 0 return code.** Zero trailing whitespace or syntax errors. |
+| Hard operational boundaries | Strictly **$0.00 / 0 TRY**. Zero live network calls, zero Turso connections (including reads), zero credentials created, zero operational file access. STOP at Draft PR for independent review. |
+
 ## 2026-11-06 — Launch G3 Gemini Activation Safety Contract & Integration Plan (Issue #88 / Parent Issue #82 G1/G3/G6)
 
 | Evidence / status | Verified result and scope boundary |

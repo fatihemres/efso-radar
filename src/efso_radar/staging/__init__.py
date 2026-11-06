@@ -69,6 +69,27 @@ if TYPE_CHECKING:
         LiveReadyOperatorReport,
         LiveReadyOperatorStatus,
     )
+    from efso_radar.staging.journal import (
+        SCHEMA_V7_STAGING_JOURNAL_DDL,
+        apply_candidate_schema_v7,
+        JournalStatus,
+        ReadProvenance,
+        JournalExecutionPattern,
+        StagingJournalEntry,
+        StagingOwnershipJournal,
+        JournalError,
+        InvalidRunIdError,
+        InvalidJournalTransitionError,
+        FencingConflictError,
+        StaleOwnerError,
+        ManifestTamperedError,
+        AmbiguousCommitError,
+        ActiveWorkloadCollisionError,
+        TargetInventoryViolationError,
+        UnauthorizedTakeoverError,
+        validate_status_transition,
+        canonical_inventory_json,
+    )
 
 __all__ = [
     "CloudPreflightValidator",
@@ -117,6 +138,25 @@ __all__ = [
     "LiveReadyStagingOperator",
     "LiveReadyOperatorReport",
     "LiveReadyOperatorStatus",
+    "SCHEMA_V7_STAGING_JOURNAL_DDL",
+    "apply_candidate_schema_v7",
+    "JournalStatus",
+    "ReadProvenance",
+    "JournalExecutionPattern",
+    "StagingJournalEntry",
+    "StagingOwnershipJournal",
+    "JournalError",
+    "InvalidRunIdError",
+    "InvalidJournalTransitionError",
+    "FencingConflictError",
+    "StaleOwnerError",
+    "ManifestTamperedError",
+    "AmbiguousCommitError",
+    "ActiveWorkloadCollisionError",
+    "TargetInventoryViolationError",
+    "UnauthorizedTakeoverError",
+    "validate_status_transition",
+    "canonical_inventory_json",
 ]
 
 _RUNNER_EXPORTS = frozenset({
@@ -175,6 +215,28 @@ _OPERATOR_EXPORTS = frozenset({
     "LiveReadyOperatorStatus",
 })
 
+_JOURNAL_EXPORTS = frozenset({
+    "SCHEMA_V7_STAGING_JOURNAL_DDL",
+    "apply_candidate_schema_v7",
+    "JournalStatus",
+    "ReadProvenance",
+    "JournalExecutionPattern",
+    "StagingJournalEntry",
+    "StagingOwnershipJournal",
+    "JournalError",
+    "InvalidRunIdError",
+    "InvalidJournalTransitionError",
+    "FencingConflictError",
+    "StaleOwnerError",
+    "ManifestTamperedError",
+    "AmbiguousCommitError",
+    "ActiveWorkloadCollisionError",
+    "TargetInventoryViolationError",
+    "UnauthorizedTakeoverError",
+    "validate_status_transition",
+    "canonical_inventory_json",
+})
+
 
 def __getattr__(name: str) -> Any:
     if name in _CONNECTION_EXPORTS:
@@ -202,4 +264,7 @@ def __getattr__(name: str) -> Any:
     if name in _OPERATOR_EXPORTS:
         import efso_radar.staging.live_ready_operator as op_mod
         return getattr(op_mod, name)
+    if name in _JOURNAL_EXPORTS:
+        import efso_radar.staging.journal as journal_mod
+        return getattr(journal_mod, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
