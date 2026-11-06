@@ -54,6 +54,7 @@ class MockGateSnapshot:
     next_stage: str | None
     manifest_preserved: bool
     lockdown_recorded: bool
+    preflight_assumed: bool = False
 
 
 class OfflineSessionGate:
@@ -79,6 +80,7 @@ class OfflineSessionGate:
         self._audit = MockAudit.UNVERIFIED
         self._requests = 0
         self._lockdown_recorded = False
+        self._preflight_assumed = False
 
     def _read_clock(self) -> float:
         tick = self._clock()
@@ -143,6 +145,27 @@ class OfflineSessionGate:
         ):
             self._deny("PREFLIGHT_EVIDENCE")
         self._consume(request_count, cleanup=False)
+        self._phase = MockPhase.PREFLIGHT
+
+    def record_simulated_preflight_assumption(
+        self,
+        *,
+        manifest_sha256: str,
+        marker: str = "OFFLINE_SIMULATED_PREFLIGHT_ASSUMPTION",
+    ) -> None:
+        """Record an explicit mock-only assumption that preflight was executed separately.
+
+        SAFETY NOTICE:
+        - Never validates remote database state, schema integrity, or collision checks.
+        - Strictly valid for hermetic offline testing only.
+        - Does NOT add phantom requests to the HTTP budget.
+        """
+        self._ensure_active(MockPhase.NEW)
+        if manifest_sha256 != self._digest:
+            self._deny("MANIFEST_MISMATCH")
+        if marker != "OFFLINE_SIMULATED_PREFLIGHT_ASSUMPTION":
+            self._deny("INVALID_PREFLIGHT_ASSUMPTION_MARKER")
+        self._preflight_assumed = True
         self._phase = MockPhase.PREFLIGHT
 
     def record_simulated_human_window(self, *, marker: str) -> None:
@@ -214,4 +237,5 @@ class OfflineSessionGate:
             next_stage=next_stage,
             manifest_preserved=self._audit != MockAudit.CLEAN,
             lockdown_recorded=self._lockdown_recorded,
+            preflight_assumed=self._preflight_assumed,
         )

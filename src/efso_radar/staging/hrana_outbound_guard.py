@@ -587,6 +587,7 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
 
         # Wire-level gate and stage tracking (cannot be escalated via public boolean)
         self._preflight_passed: bool = False
+        self._preflight_assumed_offline: bool = False
         self._human_window_confirmed: bool = False
         self._active_stage: str | None = None
         self._stage_sequence_index: int = 0
@@ -686,9 +687,38 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
             self._deny("SESSION_HALTED")
         if self._preflight_queries_count < 10 or len(self._preflight_collision_checks) < 5:
             self._deny("PREFLIGHT_EVIDENCE_MISSING")
-        if self._preflight_passed:
+        if self._preflight_passed or self._preflight_assumed_offline:
             self._deny("PREFLIGHT_ALREADY_RECORDED")
         self._preflight_passed = True
+        self._stage_sequence_index = 1
+
+    def record_simulated_preflight_assumption(
+        self,
+        *,
+        manifest_sha256: str,
+        marker: str = "OFFLINE_SIMULATED_PREFLIGHT_ASSUMPTION",
+    ) -> None:
+        """Record an explicit mock-only assumption that preflight was executed separately.
+
+        SAFETY NOTICE:
+        - NEVER allows live execution or remote network transports.
+        - Preflight is NOT marked as verified remote preflight (_preflight_passed remains False).
+        - Explicitly marks _preflight_assumed_offline = True for hermetic test execution.
+        - Advances stage sequence index from 0 to 1 strictly under sealed manifest assertion.
+        """
+        self._seal.assert_unchanged()
+        if manifest_sha256 != self._seal.sha256:
+            self._deny("MANIFEST_MISMATCH")
+        if self._session_closed or self.halted:
+            self._deny("SESSION_HALTED")
+        if marker != "OFFLINE_SIMULATED_PREFLIGHT_ASSUMPTION":
+            self._deny("INVALID_PREFLIGHT_ASSUMPTION_MARKER")
+        if self._stage_sequence_index != 0:
+            self._deny("OUT_OF_ORDER_STAGE")
+        if self._preflight_passed or self._preflight_assumed_offline:
+            self._deny("PREFLIGHT_ALREADY_RECORDED")
+
+        self._preflight_assumed_offline = True
         self._stage_sequence_index = 1
 
     def record_human_window_confirmed(
@@ -716,7 +746,7 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
             self._deny("MANIFEST_MISMATCH")
         if self._session_closed or self.halted:
             self._deny("SESSION_HALTED")
-        if not self._preflight_passed:
+        if not (self._preflight_passed or self._preflight_assumed_offline):
             self._deny("PREFLIGHT_REQUIRED")
         if self._human_window_confirmed:
             self._deny("HUMAN_WINDOW_ALREADY_CONFIRMED")
@@ -724,7 +754,14 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
             self._deny("OUT_OF_ORDER_STAGE")
         if marker != "MOCK_ONLY":
             self._deny("INVALID_HUMAN_MARKER")
-        if op is None or not getattr(op, "_preflight_accepted", False) or getattr(op, "halt_before_cleanup", False):
+        if (
+            op is None
+            or not (
+                getattr(op, "_preflight_accepted", False)
+                or getattr(op, "_preflight_assumed_offline", False)
+            )
+            or getattr(op, "halt_before_cleanup", False)
+        ):
             self._deny("OPERATOR_PREFLIGHT_NOT_ACCEPTED")
         if getattr(op, "security_boundary", None) is not self:
             self._deny("OPERATOR_BOUNDARY_MISMATCH")
@@ -770,14 +807,14 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
             if self._stage_sequence_index != 0:
                 self._deny("OUT_OF_ORDER_STAGE")
         elif stage_id == "LIVE-02":
-            if not self._preflight_passed:
+            if not (self._preflight_passed or self._preflight_assumed_offline):
                 self._deny("PREFLIGHT_REQUIRED")
             if not self._human_window_confirmed:
                 self._deny("HUMAN_WINDOW_REQUIRED")
             if self._stage_sequence_index != 2:
                 self._deny("OUT_OF_ORDER_STAGE")
         elif stage_id == "LIVE-08":
-            if not self._preflight_passed:
+            if not (self._preflight_passed or self._preflight_assumed_offline):
                 self._deny("PREFLIGHT_REQUIRED")
             if not self._human_window_confirmed:
                 self._deny("HUMAN_WINDOW_REQUIRED")
@@ -826,7 +863,7 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
         spec = _MUTATING_TEMPLATES.get(norm_sql)
         if spec is not None:
             # Wire-level gate checks before any mutation dispatch
-            if not self._preflight_passed:
+            if not (self._preflight_passed or self._preflight_assumed_offline):
                 self._deny("PREFLIGHT_REQUIRED")
             if not self._human_window_confirmed:
                 self._deny("HUMAN_WINDOW_REQUIRED")

@@ -39,6 +39,7 @@ if TYPE_CHECKING:
         EXACT_STAGING_DESTINATION,
         EXACT_STAGING_HOSTNAME,
         recover_manifest_offline,
+        execute_controlled_staging,
     )
     from efso_radar.staging.manifest_seal import (
         OfflineManifestSeal,
@@ -93,6 +94,7 @@ __all__ = [
     "EXACT_STAGING_DESTINATION",
     "EXACT_STAGING_HOSTNAME",
     "recover_manifest_offline",
+    "execute_controlled_staging",
     "OfflineManifestSeal",
     "ManifestSealViolation",
     "PersistentManifestStore",
@@ -133,6 +135,7 @@ _RUNNER_EXPORTS = frozenset({
     "EXACT_STAGING_DESTINATION",
     "EXACT_STAGING_HOSTNAME",
     "recover_manifest_offline",
+    "execute_controlled_staging",
 })
 
 _SEAL_EXPORTS = frozenset({

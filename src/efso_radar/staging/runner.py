@@ -497,6 +497,9 @@ class StagingRunnerReport(BaseModel):
     stages: list[StageResult] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    preflight_passed: bool = False
+    preflight_assumed: bool = False
+    preflight_provenance: str = "NOT_RUN"
 
     def summary(self) -> str:
         lines = [
@@ -504,6 +507,7 @@ class StagingRunnerReport(BaseModel):
             f"Run ID: {self.run_id}",
             f"Destination: {mask_turso_url(self.destination_url)}",
             f"Audit Outcome State: {self.audit_state.value}",
+            f"Preflight Passed: {self.preflight_passed} (Assumed: {self.preflight_assumed}, Provenance: {self.preflight_provenance})",
             f"Manifest Path: {self.manifest_path} (Preserved: {'YES' if self.manifest_preserved else 'NO'})",
             f"HTTP Requests: {self.http_requests_total}/{self.http_requests_ceiling} (Cleanup Reserve Used: {self.cleanup_reserve_used}/{CLEANUP_RESERVE_REQUESTS})",
             f"Synthetic Rows Peak: {self.synthetic_rows_written_peak} | Mutating SQL Operations: {self.total_mutating_operations}",
@@ -973,6 +977,9 @@ class StagingSessionRunner:
         self.halt_before_cleanup = False
         self.audit_state = AuditOutcomeState.UNKNOWN
         self.session_status = SessionStatus.FAILED
+        self._preflight_passed = False
+        self._preflight_assumed = False
+        self._preflight_provenance = "NOT_RUN"
 
     @property
     def budget_transport(self) -> Optional[BudgetTrackingTransport]:
@@ -1027,8 +1034,21 @@ class StagingSessionRunner:
         )
         self.manifest_path = self.manifest.save_atomic(self.manifest_dir)
 
-    def run(self) -> StagingRunnerReport:
-        """Execute full hermetic dry-run session across stages LIVE-01 through LIVE-08."""
+    def run(self, *, skip_live_01: bool = False) -> StagingRunnerReport:
+        """Execute hermetic controlled staging session across LIVE stages.
+
+        If skip_live_01 is False (default), executes full hermetic session LIVE-01 through LIVE-08.
+        If skip_live_01 is True, executes controlled write stages LIVE-02 through LIVE-08,
+        under an explicit offline-only mock assumption that LIVE-01 preflight was previously executed.
+
+        SAFETY NOTICE:
+        - Skipping LIVE-01 is strictly an offline mock-only simulation and provenance assumption.
+        - It does NOT verify remote preflight, schema state, or baseline collisions.
+        - Real LIVE-02..08 execution against cloud staging requires verified remote preflight,
+          authenticated same-session/same-run-ID and exact manifest-identity handoff, and
+          separate Product Owner authorization.
+        - Ahead-of-time manifest registration is always performed before any write mutation.
+        """
         # Reject previously initialized client before dispatching SQL or mutating state
         if getattr(self.client, "_client", None) is not None:
             raise PermissionError(
@@ -1044,9 +1064,14 @@ class StagingSessionRunner:
         manifest_unlinked = False
 
         try:
-            # Phase 1: Pre-Execution Safety Gate (LIVE-01)
+            # Phase 1: Pre-Execution Safety Gate
             self._create_and_persist_manifest()
-            self._run_live_01()
+            if not skip_live_01:
+                self._run_live_01()
+            else:
+                self._preflight_passed = False
+                self._preflight_assumed = True
+                self._preflight_provenance = "ASSUMED_OFFLINE_MOCK_ONLY"
 
             # Phase 2: Controlled Live Execution (LIVE-02 through LIVE-07)
             self._run_live_02()
@@ -1100,6 +1125,9 @@ class StagingSessionRunner:
             stages=self.stages,
             errors=self.errors,
             warnings=self.warnings,
+            preflight_passed=self._preflight_passed,
+            preflight_assumed=self._preflight_assumed,
+            preflight_provenance=self._preflight_provenance,
         )
 
     # -------------------------------------------------------------------------
@@ -1149,6 +1177,9 @@ class StagingSessionRunner:
             duration_seconds=duration,
             details={"schema_version": report.schema_version, "tables_checked": report.tables_checked},
         ))
+        self._preflight_passed = True
+        self._preflight_assumed = False
+        self._preflight_provenance = "VERIFIED_IN_SESSION"
 
     def _run_live_02(self) -> None:
         """LIVE-02: Hrana v2 Multi-Statement Transaction Atomicity & Baton Read-Back (4 calls)."""
@@ -1667,6 +1698,79 @@ def uuid_hex(length: int = 12) -> str:
     return uuid.uuid4().hex[:length]
 
 
+def execute_controlled_staging(
+    *,
+    destination_url: str = EXACT_STAGING_DESTINATION,
+    manifest_dir: Optional[Path] = None,
+    mock_transport: Optional[httpx.BaseTransport] = None,
+    auth_token: str = "mock-hermetic-staging-token",
+    skip_live_01: bool = False,
+    simulate_ownership_mismatch: bool = False,
+    simulate_rollback_persisted: bool = False,
+    simulate_audit_failure: bool = False,
+    simulate_ambiguous_contradictory: bool = False,
+    simulate_ambiguous_inspection_failure: bool = False,
+) -> StagingRunnerReport:
+    """Execute transport-injected controlled-staging session across LIVE stages using mock transport only.
+
+    Strictly offline engineering verification:
+    - Default-deny real network IO: raises PermissionError if a real network transport is supplied.
+    - Validates destination URL against exact staging allowlist.
+    - Initializes an isolated Schema v6 in-memory SQLite fixture when mock_transport is None.
+    - Enforces BudgetTrackingTransport with single hard ceiling (<100 requests) and cleanup reserve (20 requests).
+    - Supports skip_live_01=True to execute controlled write stages LIVE-02 through LIVE-08 directly
+      (for post-LIVE-01 write-unblock window execution).
+    - Preserves durable ownership manifest on disk on ambiguous COMMIT, UNKNOWN, or cleanup halt.
+    - Strict $0.00 / 0 TRY spending ceiling.
+    """
+    valid_dest = validate_staging_destination(destination_url)
+
+    # Reject real network transports immediately
+    if mock_transport is not None and isinstance(mock_transport, (httpx.HTTPTransport, httpx.AsyncHTTPTransport)):
+        raise PermissionError(
+            "Hermetic security boundary violation: real network transports are strictly prohibited. "
+            "Controlled staging runner supports mock transport only."
+        )
+
+    if mock_transport is None:
+        conn = sqlite3.connect(":memory:")
+        for stmt in get_all_init_statements():
+            conn.execute(stmt)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at, description) "
+            "VALUES (6, '2026-10-25T15:00:00Z', 'Schema v6')"
+        )
+        conn.commit()
+        raw_transport = HermeticStagingTransport(conn)
+        budget_transport = BudgetTrackingTransport(raw_transport)
+    elif isinstance(mock_transport, BudgetTrackingTransport):
+        budget_transport = mock_transport
+    elif isinstance(mock_transport, HermeticStagingTransport):
+        budget_transport = BudgetTrackingTransport(mock_transport)
+    else:
+        budget_transport = BudgetTrackingTransport(mock_transport)
+
+    client = TursoHTTPClient(
+        database_url=valid_dest,
+        auth_token=auth_token,
+        transport=budget_transport,
+        timeout_seconds=PER_OPERATION_TIMEOUT_SECONDS,
+    )
+
+    runner = StagingSessionRunner(
+        client=client,
+        destination_url=valid_dest,
+        manifest_dir=manifest_dir,
+        simulate_ownership_mismatch=simulate_ownership_mismatch,
+        simulate_rollback_persisted=simulate_rollback_persisted,
+        simulate_audit_failure=simulate_audit_failure,
+        simulate_ambiguous_contradictory=simulate_ambiguous_contradictory,
+        simulate_ambiguous_inspection_failure=simulate_ambiguous_inspection_failure,
+    )
+
+    return runner.run(skip_live_01=skip_live_01)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m efso_radar.staging.runner",
@@ -1684,6 +1788,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help="Offline validation and simulated audit of a persisted manifest file.",
+    )
+    parser.add_argument(
+        "--skip-live-01",
+        action="store_true",
+        default=False,
+        help="Execute controlled write stages LIVE-02 through LIVE-08 directly (post-LIVE-01 unblock window simulation).",
     )
     return parser
 
@@ -1719,33 +1829,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             sys.stderr.write(f"Manifest recovery validation failed: {type(exc).__name__}: {exc}\n")
             return 1
 
-    # Mode 2: Hermetic Dry-Run Simulation
+    # Mode 2: Hermetic Simulation (Full or Controlled LIVE-02..08 Slice)
     try:
-        # Create an isolated temporary SQLite database initialized with Schema v6
-        conn = sqlite3.connect(":memory:")
-        for stmt in get_all_init_statements():
-            conn.execute(stmt)
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (version, applied_at, description) "
-            "VALUES (6, '2026-10-25T15:00:00Z', 'Schema v6')"
-        )
-        conn.commit()
-
-        raw_transport = HermeticStagingTransport(conn)
-        budget_transport = BudgetTrackingTransport(raw_transport)
-        client = TursoHTTPClient(
-            database_url=EXACT_STAGING_DESTINATION,
-            auth_token="mock-hermetic-staging-token",
-            transport=budget_transport,
-            timeout_seconds=PER_OPERATION_TIMEOUT_SECONDS,
-        )
-
-        runner = StagingSessionRunner(
-            client=client,
+        report = execute_controlled_staging(
             destination_url=EXACT_STAGING_DESTINATION,
+            skip_live_01=args.skip_live_01,
         )
-
-        report = runner.run()
         sys.stdout.write(f"{report.summary()}\n")
         return 0 if report.status == SessionStatus.PASSED else 1
 
