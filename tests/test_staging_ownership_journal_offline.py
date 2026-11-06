@@ -28,6 +28,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from efso_radar.repositories.schema import (
     CURRENT_SCHEMA_VERSION,
@@ -47,6 +48,7 @@ from efso_radar.staging.journal import (
     InvalidRunIdError,
     JournalError,
     JournalExecutionPattern,
+    JournalHaltedError,
     JournalStatus,
     ManifestTamperedError,
     OperatorReconciliationProposal,
@@ -59,6 +61,7 @@ from efso_radar.staging.journal import (
     UnauthorizedTakeoverError,
     apply_candidate_schema_v7,
     canonical_inventory_json,
+    compute_authenticated_manifest_seal,
     validate_status_transition,
 )
 from efso_radar.staging.runner import (
@@ -79,14 +82,7 @@ def _make_run_id(suffix: str = "01") -> str:
 
 def _create_authenticated_seal(run_id: str, entities: list[RegisteredEntity]) -> str:
     """Compute the authentic SHA-256 digest of the canonical PerRunOwnershipManifest."""
-    manifest = PerRunOwnershipManifest(
-        run_id=run_id,
-        created_at="2026-11-06T20:00:00Z",
-        version=1,
-        registered_entities=entities,
-    )
-    content = manifest.model_dump_json(indent=2).encode("utf-8")
-    return hashlib.sha256(content).hexdigest()
+    return compute_authenticated_manifest_seal(run_id, entities)
 
 
 class TestCandidateSchemaV7Isolation(unittest.TestCase):
@@ -144,16 +140,14 @@ class TestCandidateSchemaV7Isolation(unittest.TestCase):
 
     def test_apply_candidate_schema_v7_runtime_guard_rejects_non_temp_file(self):
         """Runtime guard on apply_candidate_schema_v7 rejects connection outside temp directory."""
-        with tempfile.TemporaryDirectory() as external_fake_dir:
-            fake_operational_db = Path(external_fake_dir) / "sub" / "radar.db"
-            fake_operational_db.parent.mkdir(parents=True, exist_ok=True)
-            # Temporarily point to a path outside system tempdir by patching resolve
-            conn = sqlite3.connect(str(fake_operational_db))
-            # Test that if file path is not within tempfile.gettempdir(), PermissionError is raised
-            # To test this reliably, pass a custom path or monkeypatch relative_to
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_db = Path(temp_dir) / "test_fake_external.db"
+            conn = sqlite3.connect(str(fake_db))
             try:
-                # If fake_operational_db is already inside tempdir on Windows, verify tempdir pass
-                apply_candidate_schema_v7(conn)
+                with patch("tempfile.gettempdir", return_value="C:\\nonexistent_other_temp_root"):
+                    with self.assertRaises(PermissionError) as ctx:
+                        apply_candidate_schema_v7(conn)
+                    self.assertIn("Security violation: apply_candidate_schema_v7 is restricted strictly", str(ctx.exception))
             finally:
                 conn.close()
 
@@ -327,9 +321,135 @@ class TestStagingOwnershipJournalHermeticSuite(unittest.TestCase):
             )
         self.assertIn("does not match expected", str(ctx.exception))
 
+    def test_p1_1_sql_expression_in_values_bypassing_pk_is_rejected(self):
+        """Negative regression: Expression in VALUES clause like (? || '_foreign') is rejected fail-closed."""
+        self.journal.register_intent(
+            run_id=self.run_id,
+            owner_id=self.owner_id,
+            manifest_seal_hex=self.manifest_seal_hex,
+            target_inventory=self.entities,
+        )
+
+        article = self.entities[0]
+        # SQL with SQLite string concatenation expression in VALUES clause
+        expression_mutation = (
+            "INSERT INTO processed_articles (article_id, title, source, published_at, processed_at) VALUES (? || '_foreign', ?, ?, ?, ?)",
+            (article.pk_value, article.expected_attributes["title"], article.expected_attributes["source"], "2026-11-06T20:00:00Z", "2026-11-06T20:00:00Z"),
+        )
+
+        with self.assertRaises(TargetInventoryViolationError) as ctx:
+            self.journal.execute_atomic_stage_mutation(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                expected_fencing_token=1,
+                stage="LIVE_02",
+                mutation_statements=[expression_mutation],
+                manifest_seal_hex=self.manifest_seal_hex,
+            )
+        self.assertIn("only literal '?' parameter placeholders are permitted", str(ctx.exception))
+
+        # Verify zero rows inserted
+        cur = self.conn.execute("SELECT COUNT(*) FROM processed_articles")
+        self.assertEqual(cur.fetchone()[0], 0)
+
+    def test_p1_1_structured_mutation_command_pk_value_mismatch_rejected(self):
+        """Negative regression: StageMutationCommand where values PK differs from pk_value fails closed."""
+        self.journal.register_intent(
+            run_id=self.run_id,
+            owner_id=self.owner_id,
+            manifest_seal_hex=self.manifest_seal_hex,
+            target_inventory=self.entities,
+        )
+
+        article = self.entities[0]
+        # pk_value says registered PK, but values has 'foreign_article_id'
+        mismatched_cmd = StageMutationCommand(
+            table="processed_articles",
+            pk_column="article_id",
+            pk_value=article.pk_value,
+            columns=["article_id", "title", "source", "published_at", "processed_at"],
+            values=["foreign_article_id", article.expected_attributes["title"], article.expected_attributes["source"], "2026-11-06T20:00:00Z", "2026-11-06T20:00:00Z"],
+        )
+        with self.assertRaises(TargetInventoryViolationError) as ctx:
+            self.journal.execute_atomic_stage_mutation(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                expected_fencing_token=1,
+                stage="LIVE_02",
+                mutation_statements=[mismatched_cmd],
+                manifest_seal_hex=self.manifest_seal_hex,
+            )
+        self.assertIn("does not match declared pk_value", str(ctx.exception))
+
+        # Verify zero rows inserted
+        cur = self.conn.execute("SELECT COUNT(*) FROM processed_articles")
+        self.assertEqual(cur.fetchone()[0], 0)
+
+    def test_p1_1_structured_mutation_command_omitted_mandatory_attribute_rejected(self):
+        """Negative regression: StageMutationCommand omitting an expected attribute fails closed."""
+        self.journal.register_intent(
+            run_id=self.run_id,
+            owner_id=self.owner_id,
+            manifest_seal_hex=self.manifest_seal_hex,
+            target_inventory=self.entities,
+        )
+
+        article = self.entities[0]
+        # Columns omit mandatory attribute 'source'
+        omitted_attr_cmd = StageMutationCommand(
+            table="processed_articles",
+            pk_column="article_id",
+            pk_value=article.pk_value,
+            columns=["article_id", "title", "published_at", "processed_at"],
+            values=[article.pk_value, article.expected_attributes["title"], "2026-11-06T20:00:00Z", "2026-11-06T20:00:00Z"],
+        )
+        with self.assertRaises(TargetInventoryViolationError) as ctx:
+            self.journal.execute_atomic_stage_mutation(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                expected_fencing_token=1,
+                stage="LIVE_02",
+                mutation_statements=[omitted_attr_cmd],
+                manifest_seal_hex=self.manifest_seal_hex,
+            )
+        self.assertIn("Mandatory expected attribute 'source' is missing", str(ctx.exception))
+
+        cur = self.conn.execute("SELECT COUNT(*) FROM processed_articles")
+        self.assertEqual(cur.fetchone()[0], 0)
+
     # -------------------------------------------------------------------------
-    # P1-2: Atomic Cleanup & Foreign Row Safety
+    # P1-2: Atomic Cleanup, Manifest Authentication & Foreign Row Safety
     # -------------------------------------------------------------------------
+    def test_p1_2_foreign_existing_row_declared_as_inventory_rejected_at_registration(self):
+        """Negative regression: Caller declaring unowned foreign row in target_inventory is rejected at registration."""
+        foreign_entities = list(self.entities)
+        foreign_entities[0] = RegisteredEntity(
+            table="processed_articles",
+            pk_column="article_id",
+            pk_value="foreign_unowned_article_123",
+            cleanup_dependency_order=2,
+            expected_attributes={"source": "unowned", "title": "unowned"},
+        )
+        with self.assertRaises(TargetInventoryViolationError) as ctx:
+            self.journal.register_intent(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                manifest_seal_hex=self.manifest_seal_hex,
+                target_inventory=foreign_entities,
+            )
+        self.assertIn("fails canonical manifest validation", str(ctx.exception))
+
+    def test_p1_2_syntactically_valid_unrelated_seal_rejected_at_registration(self):
+        """Negative regression: Caller-computed valid SHA-256 unrelated to canonical manifest is rejected."""
+        unrelated_seal = hashlib.sha256(b"arbitrary_attacker_payload_not_canonical").hexdigest()
+        with self.assertRaises(ManifestTamperedError) as ctx:
+            self.journal.register_intent(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                manifest_seal_hex=unrelated_seal,
+                target_inventory=self.entities,
+            )
+        self.assertIn("Caller-supplied digest is not trusted as authentication proof", str(ctx.exception))
     def test_p1_2_atomic_cleanup_rolls_back_entirely_on_audit_failure_preventing_partial_deletions(self):
         """Negative regression: If audit detects residual entities, entire cleanup rolls back with ZERO partial deletions."""
         self.journal.register_intent(
@@ -583,12 +703,40 @@ class TestStagingOwnershipJournalHermeticSuite(unittest.TestCase):
                 simulate_ambiguous_commit=AmbiguousCommitOutcome.COMMITTED_BUT_ACK_LOST,
             )
         self.assertIn("transaction committed on provider, but network ACK was lost", str(ctx.exception))
+        self.assertTrue(self.journal.is_halted(self.run_id))
 
         # Forensic verification: entity committed on provider, status committed
         cur = self.conn.execute("SELECT COUNT(*) FROM processed_articles WHERE article_id = ?", (article.pk_value,))
         self.assertEqual(cur.fetchone()[0], 1)
         entry = self.journal.inspect_run(self.run_id)
         self.assertEqual(entry.status, JournalStatus.EFFECT_COMMITTED)
+
+        # Subsequent automated mutations, retries, cleanup, or abort MUST fail closed with JournalHaltedError
+        with self.assertRaises(JournalHaltedError):
+            self.journal.execute_atomic_stage_mutation(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                expected_fencing_token=2,
+                stage="LIVE_02",
+                mutation_statements=[cmd],
+                manifest_seal_hex=self.manifest_seal_hex,
+            )
+
+        with self.assertRaises(JournalHaltedError):
+            self.journal.execute_conditional_cleanup(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                expected_fencing_token=2,
+                manifest_seal_hex=self.manifest_seal_hex,
+            )
+
+        with self.assertRaises(JournalHaltedError):
+            self.journal.abort_run(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                expected_fencing_token=2,
+                reason="Halt abort test",
+            )
 
     def test_p1_5_ambiguous_commit_outcome_rolled_back_and_ack_lost(self):
         """Simulated ambiguity: transaction rolled back on provider, and network ACK dropped."""
@@ -619,12 +767,113 @@ class TestStagingOwnershipJournalHermeticSuite(unittest.TestCase):
                 simulate_ambiguous_commit=AmbiguousCommitOutcome.ROLLED_BACK_AND_ACK_LOST,
             )
         self.assertIn("transaction rolled back on provider, and network ACK was lost", str(ctx.exception))
+        self.assertTrue(self.journal.is_halted(self.run_id))
 
         # Forensic verification: zero rows committed on provider, status rolled back to ACKED
         cur = self.conn.execute("SELECT COUNT(*) FROM processed_articles WHERE article_id = ?", (article.pk_value,))
         self.assertEqual(cur.fetchone()[0], 0)
         entry = self.journal.inspect_run(self.run_id)
         self.assertEqual(entry.status, JournalStatus.ACKED)
+
+        # Subsequent automated mutations, retries, cleanup, or abort MUST fail closed with JournalHaltedError
+        with self.assertRaises(JournalHaltedError):
+            self.journal.execute_atomic_stage_mutation(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                expected_fencing_token=1,
+                stage="LIVE_02",
+                mutation_statements=[cmd],
+                manifest_seal_hex=self.manifest_seal_hex,
+            )
+
+        with self.assertRaises(JournalHaltedError):
+            self.journal.execute_conditional_cleanup(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                expected_fencing_token=1,
+                manifest_seal_hex=self.manifest_seal_hex,
+            )
+
+        with self.assertRaises(JournalHaltedError):
+            self.journal.abort_run(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                expected_fencing_token=1,
+                reason="Halt abort test",
+            )
+
+    def test_p1_5_ambiguous_intent_registration_committed_then_retry_rejected_as_halted(self):
+        """Ambiguous intent registration (COMMITTED_BUT_ACK_LOST): row committed, client halted, retries fail."""
+        with self.assertRaises(AmbiguousCommitError) as ctx:
+            self.journal.register_intent(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                manifest_seal_hex=self.manifest_seal_hex,
+                target_inventory=self.entities,
+                simulate_ambiguous_commit=AmbiguousCommitOutcome.COMMITTED_BUT_ACK_LOST,
+            )
+        self.assertIn("COMMITTED_BUT_ACK_LOST", str(ctx.exception))
+        self.assertTrue(self.journal.is_halted(self.run_id))
+
+        # Forensic verification: row exists on provider with status ACKED
+        entry = self.journal.inspect_run(self.run_id)
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.status, JournalStatus.ACKED)
+
+        # Subsequent automated registration, mutation, cleanup, or abort MUST fail closed with JournalHaltedError
+        with self.assertRaises(JournalHaltedError):
+            self.journal.register_intent(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                manifest_seal_hex=self.manifest_seal_hex,
+                target_inventory=self.entities,
+            )
+
+        with self.assertRaises(JournalHaltedError):
+            self.journal.execute_atomic_stage_mutation(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                expected_fencing_token=1,
+                stage="LIVE_02",
+                mutation_statements=[],
+                manifest_seal_hex=self.manifest_seal_hex,
+            )
+
+    def test_p1_5_ambiguous_intent_registration_rolled_back_then_retry_rejected_as_halted(self):
+        """Ambiguous intent registration (ROLLED_BACK_AND_ACK_LOST): row absent, client halted, retries fail."""
+        with self.assertRaises(AmbiguousCommitError) as ctx:
+            self.journal.register_intent(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                manifest_seal_hex=self.manifest_seal_hex,
+                target_inventory=self.entities,
+                simulate_ambiguous_commit=AmbiguousCommitOutcome.ROLLED_BACK_AND_ACK_LOST,
+            )
+        self.assertIn("ROLLED_BACK_AND_ACK_LOST", str(ctx.exception))
+        self.assertTrue(self.journal.is_halted(self.run_id))
+
+        # Forensic verification: row does NOT exist on provider
+        entry = self.journal.inspect_run(self.run_id)
+        self.assertIsNone(entry)
+
+        # Subsequent automated calls fail closed with JournalHaltedError
+        with self.assertRaises(JournalHaltedError):
+            self.journal.register_intent(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                manifest_seal_hex=self.manifest_seal_hex,
+                target_inventory=self.entities,
+            )
+
+        with self.assertRaises(JournalHaltedError):
+            self.journal.execute_atomic_stage_mutation(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                expected_fencing_token=1,
+                stage="LIVE_02",
+                mutation_statements=[],
+                manifest_seal_hex=self.manifest_seal_hex,
+            )
 
     # -------------------------------------------------------------------------
     # P1-6: Safe ABORT Semantics

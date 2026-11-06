@@ -24,8 +24,11 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field
 
 from efso_radar.staging.runner import (
+    ALLOWED_TABLE_PK_MAP,
     RUN_ID_REGEX,
+    PerRunOwnershipManifest,
     RegisteredEntity,
+    create_default_manifest_entities,
 )
 
 
@@ -223,6 +226,42 @@ class UnauthorizedTakeoverError(JournalError, PermissionError):
     """Automated takeover attempted; caller cannot self-certify PO authorization."""
 
 
+class JournalHaltedError(JournalError, RuntimeError):
+    """Operation attempted on a locally halted run in LOCAL_OUTCOME_UNKNOWN."""
+
+
+def compute_authenticated_manifest_seal(
+    run_id: str,
+    entities: Optional[list[RegisteredEntity] | list[dict[str, Any]]] = None,
+    created_at: str = "2026-11-06T20:00:00Z",
+) -> str:
+    """Compute the authentic SHA-256 seal for the canonical PerRunOwnershipManifest.
+
+    Binds the run_id, canonical timestamp, version 1, and the exact canonical
+    five synthetic entities to form the authentic cryptographic digest.
+    """
+    if entities is None:
+        canonical_entities = create_default_manifest_entities(run_id)
+    else:
+        canonical_entities = []
+        for e in entities:
+            if isinstance(e, RegisteredEntity):
+                canonical_entities.append(e)
+            elif isinstance(e, dict):
+                canonical_entities.append(RegisteredEntity.model_validate(e))
+            else:
+                raise ValueError(f"Unsupported entity type: {type(e)}")
+
+    manifest = PerRunOwnershipManifest(
+        run_id=run_id,
+        created_at=created_at,
+        version=1,
+        registered_entities=canonical_entities,
+    )
+    content = manifest.model_dump_json(indent=2).encode("utf-8")
+    return hashlib.sha256(content).hexdigest()
+
+
 # =============================================================================
 # Models
 # =============================================================================
@@ -346,9 +385,49 @@ def validate_and_normalize_mutation(
 ) -> tuple[str, tuple[Any, ...]]:
     """Strictly validate that a mutation targets an exact registered entity.
 
-    Prevents arbitrary SQL injection, broad clauses (e.g. OR 1=1), and foreign row mutations.
+    Prevents arbitrary SQL injection, broad clauses (e.g. OR 1=1), foreign row mutations,
+    and expression bypasses in VALUES clauses.
     """
     if isinstance(stmt, StageMutationCommand):
+        # 1. Validate table identifier
+        if not re.match(r"\A[a-zA-Z0-9_]+\Z", stmt.table):
+            raise TargetInventoryViolationError(f"Invalid table identifier: '{stmt.table}'.")
+        if stmt.table not in ALLOWED_TABLE_PK_MAP:
+            raise TargetInventoryViolationError(
+                f"Unauthorized mutation table '{stmt.table}'. Allowed: {sorted(ALLOWED_TABLE_PK_MAP.keys())}."
+            )
+
+        # 2. Validate columns and values
+        if len(stmt.columns) != len(stmt.values) or not stmt.columns:
+            raise TargetInventoryViolationError(
+                f"Column and value length mismatch in StageMutationCommand: {len(stmt.columns)} cols vs {len(stmt.values)} vals."
+            )
+        for col in stmt.columns:
+            if not re.match(r"\A[a-zA-Z0-9_]+\Z", col):
+                raise TargetInventoryViolationError(f"Invalid column identifier: '{col}'.")
+
+        # 3. Check PK column matches table definition
+        expected_pk_col = ALLOWED_TABLE_PK_MAP[stmt.table]
+        if stmt.pk_column != expected_pk_col:
+            raise TargetInventoryViolationError(
+                f"PK column mismatch for table '{stmt.table}': expected '{expected_pk_col}', got '{stmt.pk_column}'."
+            )
+        if stmt.pk_column not in stmt.columns:
+            raise TargetInventoryViolationError(
+                f"Mutation columns for '{stmt.table}' do not include primary key column '{stmt.pk_column}'."
+            )
+
+        col_val_map = dict(zip(stmt.columns, stmt.values))
+
+        # 4. Enforce that bound value for PK column strictly equals declared pk_value
+        bound_pk_val = str(col_val_map[stmt.pk_column])
+        if bound_pk_val != str(stmt.pk_value):
+            raise TargetInventoryViolationError(
+                f"Bound value '{bound_pk_val}' for PK column '{stmt.pk_column}' does not match "
+                f"declared pk_value '{stmt.pk_value}' in StageMutationCommand."
+            )
+
+        # 5. Find matching registered entity
         matching = [
             e for e in registered_entities
             if e["table"] == stmt.table and str(e["pk_value"]) == str(stmt.pk_value)
@@ -358,29 +437,26 @@ def validate_and_normalize_mutation(
                 f"Mutation command targets unregistered entity: table '{stmt.table}', PK '{stmt.pk_value}'."
             )
         ent = matching[0]
-        if stmt.pk_column != ent["pk_column"]:
-            raise TargetInventoryViolationError(
-                f"PK column mismatch for table '{stmt.table}': expected '{ent['pk_column']}', got '{stmt.pk_column}'."
-            )
-        if stmt.pk_column not in stmt.columns:
-            raise TargetInventoryViolationError(
-                f"Mutation columns for '{stmt.table}' do not include primary key column '{stmt.pk_column}'."
-            )
-        # Check expected attributes match if present
-        col_val_map = dict(zip(stmt.columns, stmt.values))
-        for attr_k, attr_v in ent.get("expected_attributes", {}).items():
-            col_name = "worker_id" if (ent.get("table") == "run_locks" and attr_k == "worker_ids") else attr_k
-            if col_name in col_val_map:
-                actual_val = col_val_map[col_name]
-                if isinstance(attr_v, list):
-                    if actual_val not in attr_v:
-                        raise TargetInventoryViolationError(
-                            f"Attribute '{col_name}' value '{actual_val}' not in expected list {attr_v}."
-                        )
-                elif actual_val != attr_v:
+
+        # 6. Mandatory expected-attributes check: ALL must be present and match
+        expected_attrs = ent.get("expected_attributes", {})
+        for attr_k, exp_val in expected_attrs.items():
+            col_name = "worker_id" if (stmt.table == "run_locks" and attr_k == "worker_ids") else attr_k
+            if col_name not in col_val_map:
+                raise TargetInventoryViolationError(
+                    f"Mandatory expected attribute '{col_name}' is missing from mutation columns for entity '{stmt.table}:{stmt.pk_value}'."
+                )
+            actual_val = col_val_map[col_name]
+            if isinstance(exp_val, list):
+                if actual_val not in exp_val:
                     raise TargetInventoryViolationError(
-                        f"Attribute '{col_name}' value '{actual_val}' does not match expected '{attr_v}'."
+                        f"Attribute '{col_name}' value '{actual_val}' not in expected list {exp_val}."
                     )
+            elif actual_val != exp_val:
+                raise TargetInventoryViolationError(
+                    f"Attribute '{col_name}' value '{actual_val}' does not match expected '{exp_val}'."
+                )
+
         return stmt.build_parameterized_sql()
 
     elif isinstance(stmt, (tuple, list)) and len(stmt) == 2:
@@ -403,6 +479,11 @@ def validate_and_normalize_mutation(
             )
 
         tbl = match.group(1).strip()
+        if not re.match(r"\A[a-zA-Z0-9_]+\Z", tbl):
+            raise TargetInventoryViolationError(f"Invalid table identifier in SQL: '{tbl}'.")
+        if tbl not in ALLOWED_TABLE_PK_MAP:
+            raise TargetInventoryViolationError(f"Unauthorized mutation table '{tbl}'.")
+
         cols = [c.strip() for c in match.group(2).split(",")]
         placeholders = [p.strip() for p in match.group(3).split(",")]
 
@@ -411,38 +492,58 @@ def validate_and_normalize_mutation(
                 f"Column/placeholder/parameter length mismatch in SQL: '{sql}'."
             )
 
+        for col in cols:
+            if not re.match(r"\A[a-zA-Z0-9_]+\Z", col):
+                raise TargetInventoryViolationError(f"Invalid column identifier in SQL: '{col}'.")
+
+        # CRITICAL P1 FIX: Every single placeholder expression MUST literally be '?'
+        for p in placeholders:
+            if p != "?":
+                raise TargetInventoryViolationError(
+                    f"Disallowed SQL expression '{p}' in VALUES clause: only literal '?' parameter placeholders are permitted."
+                )
+
         col_val_map = dict(zip(cols, params))
-
-        # Find exact registered entity for this table where pk_column is present and pk_value matches
-        matched_ent = None
-        for ent in registered_entities:
-            if ent["table"].lower() == tbl.lower():
-                pk_col = ent["pk_column"]
-                if pk_col in col_val_map and str(col_val_map[pk_col]) == str(ent["pk_value"]):
-                    matched_ent = ent
-                    break
-
-        if not matched_ent:
+        expected_pk_col = ALLOWED_TABLE_PK_MAP[tbl]
+        if expected_pk_col not in col_val_map:
             raise TargetInventoryViolationError(
-                f"Mutation targets unregistered table '{tbl}' or unregistered PK value in params."
+                f"Mutation SQL for '{tbl}' does not include primary key column '{expected_pk_col}'."
             )
 
-        # Verify expected attributes match if present
-        for attr_k, attr_v in matched_ent.get("expected_attributes", {}).items():
-            col_name = "worker_id" if (tbl == "run_locks" and attr_k == "worker_ids") else attr_k
-            if col_name in col_val_map:
-                actual_val = col_val_map[col_name]
-                if isinstance(attr_v, list):
-                    if actual_val not in attr_v:
-                        raise TargetInventoryViolationError(
-                            f"Attribute '{col_name}' value '{actual_val}' not in expected list {attr_v}."
-                        )
-                elif actual_val != attr_v:
-                    raise TargetInventoryViolationError(
-                        f"Attribute '{col_name}' value '{actual_val}' does not match expected '{attr_v}'."
-                    )
+        bound_pk_val = str(col_val_map[expected_pk_col])
 
-        return sql, tuple(params)
+        # Find matching registered entity
+        matching = [
+            e for e in registered_entities
+            if e["table"] == tbl and str(e["pk_value"]) == bound_pk_val
+        ]
+        if not matching:
+            raise TargetInventoryViolationError(
+                f"Mutation targets unregistered table '{tbl}' or unregistered PK value '{bound_pk_val}'."
+            )
+        ent = matching[0]
+
+        # Mandatory expected-attributes check: ALL must be present and match
+        expected_attrs = ent.get("expected_attributes", {})
+        for attr_k, exp_val in expected_attrs.items():
+            col_name = "worker_id" if (tbl == "run_locks" and attr_k == "worker_ids") else attr_k
+            if col_name not in col_val_map:
+                raise TargetInventoryViolationError(
+                    f"Mandatory expected attribute '{col_name}' is missing from mutation columns for entity '{tbl}:{bound_pk_val}'."
+                )
+            actual_val = col_val_map[col_name]
+            if isinstance(exp_val, list):
+                if actual_val not in exp_val:
+                    raise TargetInventoryViolationError(
+                        f"Attribute '{col_name}' value '{actual_val}' not in expected list {exp_val}."
+                    )
+            elif actual_val != exp_val:
+                raise TargetInventoryViolationError(
+                    f"Attribute '{col_name}' value '{actual_val}' does not match expected '{exp_val}'."
+                )
+
+        canonical_sql = f"INSERT INTO {tbl} ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})"
+        return canonical_sql, tuple(params)
 
     else:
         raise TargetInventoryViolationError(f"Unsupported mutation statement type: {type(stmt)}")
@@ -467,7 +568,12 @@ class StagingOwnershipJournal:
     ) -> None:
         self._conn = conn
         self._allow_unverified_read = allow_unverified_read
+        self._halted_runs: set[str] = set()
         self._verify_table_exists()
+
+    def is_halted(self, run_id: str) -> bool:
+        """Check if run is in a local halted state (LOCAL_OUTCOME_UNKNOWN)."""
+        return run_id in self._halted_runs
 
     def _verify_table_exists(self) -> None:
         """Verify that candidate Schema v7 table exists in the test connection."""
@@ -499,20 +605,31 @@ class StagingOwnershipJournal:
         initial_fencing_token: int = 1,
         pattern: JournalExecutionPattern = JournalExecutionPattern.OPTION_B_SEPARATED,
         workload_key: str = "staging_controlled_run",
+        simulate_ambiguous_commit: Optional[AmbiguousCommitOutcome] = None,
         now: Optional[datetime] = None,
     ) -> StagingJournalEntry:
         """Register ahead-of-time staging run ownership and target inventory.
 
         Multi-Layered Invariants Enforced in a Single Atomic Transaction:
-        1. Validates canonical run_id format profile.
-        2. Validates 64-character SHA-256 manifest seal hex.
-        3. Mandatory workload_key cannot be bypassed or omitted.
-        4. Atomically acquires coarse-grained task lease in run_locks (fails if leased).
-        5. Atomically checks staging_run_journal for ANY unresolved runs (including UNKNOWN).
+        1. Checks that run_id is not locally halted in LOCAL_OUTCOME_UNKNOWN.
+        2. Validates canonical run_id format profile.
+        3. Validates canonical manifest payload against PerRunOwnershipManifest.
+        4. Authenticates manifest_seal_hex against canonical 5-entity manifest digest.
+        5. Mandatory workload_key cannot be bypassed or omitted.
+        6. Atomically acquires coarse-grained task lease in run_locks (fails if leased).
+        7. Atomically checks staging_run_journal for ANY unresolved runs (including UNKNOWN).
            If an unresolved run exists, new registration is blocked fail-closed.
-        6. Enforces PK(run_id) uniqueness.
-        7. Encloses registration and lease acquisition inside a single BEGIN IMMEDIATE transaction.
+        8. Enforces PK(run_id) uniqueness.
+        9. Encloses registration and lease acquisition inside a single BEGIN IMMEDIATE transaction.
+        10. Supports simulating ambiguous commits (COMMITTED_BUT_ACK_LOST / ROLLED_BACK_AND_ACK_LOST)
+            triggering local UNKNOWN/HALT without automated retries.
         """
+        if run_id in self._halted_runs:
+            raise JournalHaltedError(
+                f"Run '{run_id}' is permanently halted in LOCAL_OUTCOME_UNKNOWN. "
+                "Subsequent registration, automated mutations, retries, cleanups, or aborts are prohibited."
+            )
+
         if not isinstance(run_id, str) or not RUN_ID_REGEX.match(run_id):
             raise InvalidRunIdError(
                 f"Invalid run_id '{run_id}'. Must match canonical profile {RUN_ID_REGEX.pattern}."
@@ -525,6 +642,36 @@ class StagingOwnershipJournal:
 
         if not isinstance(workload_key, str) or not workload_key.strip():
             raise ValueError("workload_key is mandatory and cannot be empty.")
+
+        # P1-2: Canonical Manifest Validation & Authentication
+        raw_entities = []
+        for ent in target_inventory:
+            if hasattr(ent, "model_dump"):
+                raw_entities.append(ent.model_dump())
+            elif isinstance(ent, dict):
+                raw_entities.append(ent)
+            else:
+                raise TargetInventoryViolationError(f"Unsupported entity type in target_inventory: {type(ent)}")
+
+        manifest_payload = {
+            "run_id": run_id,
+            "created_at": "2026-11-06T20:00:00Z",
+            "version": 1,
+            "registered_entities": raw_entities,
+        }
+        try:
+            validated_manifest = PerRunOwnershipManifest.validate_payload(manifest_payload)
+        except Exception as exc:
+            raise TargetInventoryViolationError(
+                f"Target inventory fails canonical manifest validation for run '{run_id}': {exc}"
+            ) from exc
+
+        expected_seal = compute_authenticated_manifest_seal(run_id, validated_manifest.registered_entities)
+        if manifest_seal_hex != expected_seal:
+            raise ManifestTamperedError(
+                f"Manifest seal mismatch for run '{run_id}': expected authentic seal '{expected_seal}', "
+                f"received '{manifest_seal_hex}'. Caller-supplied digest is not trusted as authentication proof."
+            )
 
         inventory_json = canonical_inventory_json(target_inventory)
         now_dt = now or datetime.now(timezone.utc)
@@ -639,6 +786,24 @@ class StagingOwnershipJournal:
             else:
                 final_status = initial_status
 
+            # Handle simulated ambiguous commit during intent registration
+            if simulate_ambiguous_commit == AmbiguousCommitOutcome.COMMITTED_BUT_ACK_LOST:
+                self._conn.execute("COMMIT")
+                self._halted_runs.add(run_id)
+                raise AmbiguousCommitError(
+                    f"Simulated network drop during intent COMMIT for run '{run_id}'. "
+                    "Transaction committed on provider (COMMITTED_BUT_ACK_LOST), but client outcome is LOCAL_OUTCOME_UNKNOWN. "
+                    "Run is locally HALTED. Automated retries or mutations are prohibited."
+                )
+            elif simulate_ambiguous_commit == AmbiguousCommitOutcome.ROLLED_BACK_AND_ACK_LOST:
+                self._conn.execute("ROLLBACK")
+                self._halted_runs.add(run_id)
+                raise AmbiguousCommitError(
+                    f"Simulated network drop during intent COMMIT for run '{run_id}'. "
+                    "Transaction rolled back on provider (ROLLED_BACK_AND_ACK_LOST), client outcome is LOCAL_OUTCOME_UNKNOWN. "
+                    "Run is locally HALTED. Zero rows exist on provider. Automated retries or mutations are prohibited."
+                )
+
             self._conn.execute("COMMIT")
         except Exception:
             try:
@@ -683,6 +848,12 @@ class StagingOwnershipJournal:
 
         Returns the new incremented fencing token upon successful commit.
         """
+        if run_id in self._halted_runs:
+            raise JournalHaltedError(
+                f"Run '{run_id}' is permanently halted in LOCAL_OUTCOME_UNKNOWN. "
+                "Subsequent automated mutations, retries, cleanups, or aborts are prohibited."
+            )
+
         now_iso = self._now_iso(now)
 
         entry = self.inspect_run(run_id)
@@ -778,12 +949,14 @@ class StagingOwnershipJournal:
             # Step 4: Handle simulated ambiguous commit
             if simulate_ambiguous_commit == AmbiguousCommitOutcome.COMMITTED_BUT_ACK_LOST:
                 self._conn.execute("COMMIT")
+                self._halted_runs.add(run_id)
                 raise AmbiguousCommitError(
                     f"Ambiguous commit encountered for run '{run_id}': transaction committed on provider, "
                     "but network ACK was lost. Client outcome is LOCAL_OUTCOME_UNKNOWN / HALT."
                 )
             elif simulate_ambiguous_commit == AmbiguousCommitOutcome.ROLLED_BACK_AND_ACK_LOST:
                 self._conn.execute("ROLLBACK")
+                self._halted_runs.add(run_id)
                 raise AmbiguousCommitError(
                     f"Ambiguous commit encountered for run '{run_id}': transaction rolled back on provider, "
                     "and network ACK was lost. Client outcome is LOCAL_OUTCOME_UNKNOWN / HALT."
@@ -825,6 +998,12 @@ class StagingOwnershipJournal:
         4. If ANY deletion affects unexpected rows, or if residual entities remain:
            the transaction is immediately rolled back! No partial destructive deletions persist.
         """
+        if run_id in self._halted_runs:
+            raise JournalHaltedError(
+                f"Run '{run_id}' is permanently halted in LOCAL_OUTCOME_UNKNOWN. "
+                "Subsequent automated mutations, retries, cleanups, or aborts are prohibited."
+            )
+
         now_iso = self._now_iso(now)
 
         entry = self.inspect_run(run_id)
@@ -1055,6 +1234,12 @@ class StagingOwnershipJournal:
           abort is strictly prohibited to avoid stranding committed effects.
         - Verifies that zero registered entities exist in the database before aborting.
         """
+        if run_id in self._halted_runs:
+            raise JournalHaltedError(
+                f"Run '{run_id}' is permanently halted in LOCAL_OUTCOME_UNKNOWN. "
+                "Subsequent automated mutations, retries, cleanups, or aborts are prohibited."
+            )
+
         now_iso = self._now_iso(now)
         entry = self.inspect_run(run_id)
         if not entry:

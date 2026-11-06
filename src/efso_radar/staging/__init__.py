@@ -92,6 +92,8 @@ if TYPE_CHECKING:
         StageMutationCommand,
         OperatorReconciliationProposal,
         AmbiguousCommitOutcome,
+        JournalHaltedError,
+        compute_authenticated_manifest_seal,
     )
 
 __all__ = [
@@ -244,6 +246,8 @@ _JOURNAL_EXPORTS = frozenset({
     "StageMutationCommand",
     "OperatorReconciliationProposal",
     "AmbiguousCommitOutcome",
+    "JournalHaltedError",
+    "compute_authenticated_manifest_seal",
 })
 
 
