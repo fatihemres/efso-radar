@@ -191,14 +191,22 @@ OBSERVED_PROJECT_INPUT_TPM_LIMIT: int = 250_000
 OBSERVED_PROJECT_RPD_LIMIT: int = 500
 
 
-def is_pacific_daylight_saving_time(dt_utc: datetime) -> bool:
-    """Determine if a UTC datetime falls within US Pacific Daylight Time (PDT).
+def is_pacific_daylight_saving_time(dt: datetime) -> bool:
+    """Determine if a datetime falls within US Pacific Daylight Time (PDT).
+
+    Normalizes any timezone-aware datetime to UTC first.
+    Naïve datetimes without tzinfo are assumed to represent UTC.
 
     Follows US Energy Policy Act of 2005 rules:
     - Starts on the second Sunday in March at 02:00 local time (10:00 UTC).
     - Ends on the first Sunday in November at 02:00 local time (09:00 UTC).
     Pure standard library implementation that does not require external tzdata on Windows.
     """
+    if dt.tzinfo is None:
+        dt_utc = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt_utc = dt.astimezone(timezone.utc)
+
     year = dt_utc.year
     first_sun_march = 1 + (6 - calendar.weekday(year, 3, 1)) % 7
     second_sun_march = first_sun_march + 7
@@ -210,15 +218,23 @@ def is_pacific_daylight_saving_time(dt_utc: datetime) -> bool:
     return dst_start_utc <= dt_utc < dst_end_utc
 
 
-def get_pacific_calendar_date(dt_utc: Optional[datetime] = None) -> str:
+def get_pacific_calendar_date(dt: Optional[datetime] = None) -> str:
     """Return the current calendar date (YYYY-MM-DD) in US Pacific Time (PT).
 
     Google AI Studio / Gemini API Free Tier RPD resets daily at midnight Pacific Time.
+
+    Timezone Normalization Policy:
+    - None: Uses current datetime in UTC (datetime.now(timezone.utc)).
+    - Timezone-aware datetime: Normalized to UTC via .astimezone(timezone.utc)
+      before determining DST and calculating the Pacific offset.
+    - Naïve datetime: Assumed to represent UTC (.replace(tzinfo=timezone.utc)).
     """
-    if dt_utc is None:
+    if dt is None:
         dt_utc = datetime.now(timezone.utc)
-    elif dt_utc.tzinfo is None:
-        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+    elif dt.tzinfo is None:
+        dt_utc = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt_utc = dt.astimezone(timezone.utc)
 
     offset_hours = -7 if is_pacific_daylight_saving_time(dt_utc) else -8
     pacific_dt = dt_utc + timedelta(hours=offset_hours)
@@ -307,6 +323,8 @@ def validate_free_tier_project_proof(
     ref_now = now or datetime.now(timezone.utc)
     if ref_now.tzinfo is None:
         ref_now = ref_now.replace(tzinfo=timezone.utc)
+    else:
+        ref_now = ref_now.astimezone(timezone.utc)
 
     if isinstance(proof, dict):
         if "billing_enabled" not in proof:
@@ -1017,6 +1035,8 @@ def evaluate_g3_activation_preflight(
     ref_now = now or datetime.now(timezone.utc)
     if ref_now.tzinfo is None:
         ref_now = ref_now.replace(tzinfo=timezone.utc)
+    else:
+        ref_now = ref_now.astimezone(timezone.utc)
     pacific_date = get_pacific_calendar_date(ref_now)
 
     clean_name = model_name.strip().lower()

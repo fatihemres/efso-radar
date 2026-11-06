@@ -176,7 +176,7 @@ Tüm makine kapıları ve insan PO parametresi sağlansa dahi, bağımsız sağl
 * **Pasifik Gece Yarısı (PT Midnight) Sıfırlaması:** Google RPD kotası her gün ABD Pasifik Saatiyle (PT) 00:00:00'da sıfırlanır:
   - Standart Saat (PST, UTC-8): Türkiye saatiyle 11:00 (08:00 UTC).
   - Yaz Saati (PDT, UTC-7): Türkiye saatiyle 10:00 (07:00 UTC).
-  - Sistem, `calendar` tabanlı saf Python algoritmasıyla (`is_pacific_daylight_saving_time`) harici `tzdata` bağımlılığı olmadan Pasifik takvim gününü (`get_pacific_calendar_date`) hesaplar ve RPD takvim gününü izler.
+  - Sistem, `calendar` tabanlı saf Python algoritmasıyla (`is_pacific_daylight_saving_time`) harici `tzdata` bağımlılığı olmadan Pasifik takvim gününü (`get_pacific_calendar_date`) hesaplar ve RPD takvim gününü izler. Saat dilimi bilgisine sahip (timezone-aware) tüm girdiler DST ve Pasifik farkı hesabından önce otomatik olarak UTC'ye normalize edilir (`.astimezone(timezone.utc)`); naif (timezone-naïve) girdiler ise UTC kabul edilir (`.replace(tzinfo=timezone.utc)`).
 
 ### 4.5. Dış İstek Sınırları ve Güvenlik Parametreleri (Hedef Tasarım vs. Mevcut Durum)
 * **Model:** Yalnızca `gemini-3.5-flash-lite`.

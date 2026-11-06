@@ -28,7 +28,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -822,6 +822,47 @@ class TestG3ActivationContractAndPreflight(unittest.TestCase):
         # Exactly at 07:00:00 UTC it becomes midnight PDT (2026-07-15)
         dt_post_reset_summer = datetime(2026, 7, 15, 7, 0, 0, tzinfo=timezone.utc)
         self.assertEqual(get_pacific_calendar_date(dt_post_reset_summer), "2026-07-15")
+
+    def test_pacific_calendar_date_normalizes_timezone_aware_offsets_to_utc(self):
+        """Focused regression for P1/P2: Timezone-aware datetimes are normalized to UTC before Pacific date calculation.
+
+        Equivalent representations of the same moment (e.g. UTC and Europe/Istanbul +03:00)
+        yield identical Pacific calendar dates.
+        Instant: 2026-11-06T07:00:00Z == 2026-11-06T10:00:00+03:00.
+        In Pacific Standard Time (PST, UTC-8), this is 2026-11-05 23:00:00 PST -> Pacific date 2026-11-05.
+        """
+        dt_utc = datetime(2026, 11, 6, 7, 0, 0, tzinfo=timezone.utc)
+        dt_trt = datetime(2026, 11, 6, 10, 0, 0, tzinfo=timezone(timedelta(hours=3)))
+
+        # 1. Direct helper checks: both return 2026-11-05
+        self.assertEqual(get_pacific_calendar_date(dt_utc), "2026-11-05")
+        self.assertEqual(get_pacific_calendar_date(dt_trt), "2026-11-05")
+        self.assertEqual(get_pacific_calendar_date(dt_utc), get_pacific_calendar_date(dt_trt))
+
+        # 2. evaluate_g3_activation_preflight(now=...) consistency
+        decision_utc = evaluate_g3_activation_preflight(
+            model_name="gemini-3.5-flash-lite",
+            project_proof=self.valid_synthetic_proof,
+            quota_evidence=self.valid_synthetic_quota,
+            is_po_live_go_granted=True,
+            allow_synthetic_simulation=True,
+            now=dt_utc,
+        )
+        decision_trt = evaluate_g3_activation_preflight(
+            model_name="gemini-3.5-flash-lite",
+            project_proof=self.valid_synthetic_proof,
+            quota_evidence=self.valid_synthetic_quota,
+            is_po_live_go_granted=True,
+            allow_synthetic_simulation=True,
+            now=dt_trt,
+        )
+        self.assertEqual(decision_utc.pacific_reset_date, "2026-11-05")
+        self.assertEqual(decision_trt.pacific_reset_date, "2026-11-05")
+        self.assertEqual(decision_utc.pacific_reset_date, decision_trt.pacific_reset_date)
+
+        # 3. Naïve timestamp policy: assumed to represent UTC
+        dt_naive = datetime(2026, 11, 6, 7, 0, 0)
+        self.assertEqual(get_pacific_calendar_date(dt_naive), "2026-11-05")
 
     def test_input_tpm_missing_consumption_fails_closed(self):
         """When input_tpm_limit is specified, missing current_input_tpm fails closed."""
