@@ -1383,6 +1383,89 @@ class TestStagingOwnershipJournalHermeticSuite(unittest.TestCase):
         # Foreign file was NOT modified or deleted
         self.assertEqual(foreign_path.read_text(encoding="utf-8"), foreign_payload)
 
+        # Fresh journal instance treats foreign marker as unsafe -> fails closed (is_halted = True)
+        journal2 = StagingOwnershipJournal(self.conn, marker_dir=self.marker_dir)
+        self.assertTrue(journal2.is_halted(self.run_id))
+
+    def test_p1_5_foreign_valid_json_marker_causes_new_instance_to_halt_fail_closed(self):
+        """Any unexpected/foreign marker file (even containing valid JSON with another run_id) fails closed to HALT."""
+        foreign_path = _halt_marker_path(self.run_id, self.marker_dir)
+        foreign_payload = json.dumps({
+            "run_id": "different_run_9999",
+            "halted_at": "2026-11-06T20:00:00Z",
+            "reason": "Foreign worker halt",
+        })
+        foreign_path.write_text(foreign_payload, encoding="utf-8")
+
+        # New journal instance must treat ANY file at marker location as unsafe/halted -> True
+        journal2 = StagingOwnershipJournal(self.conn, marker_dir=self.marker_dir)
+        self.assertTrue(journal2.is_halted(self.run_id))
+
+        # Automated continuation on journal2 for self.run_id must be completely blocked
+        with self.assertRaises(JournalHaltedError) as ctx:
+            journal2.execute_atomic_stage_mutation(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                expected_fencing_token=1,
+                stage="LIVE_02",
+                mutation_statements=[],
+                manifest_seal_hex=self.manifest_seal_hex,
+            )
+        self.assertIn("halted in LOCAL_OUTCOME_UNKNOWN", str(ctx.exception))
+
+    def test_p1_5_fsync_failure_raises_halt_marker_persistence_error(self):
+        """os.fsync failure is NEVER swallowed; raises HaltMarkerPersistenceError fail-closed."""
+        self.journal.register_intent(
+            run_id=self.run_id,
+            owner_id=self.owner_id,
+            manifest_seal_hex=self.manifest_seal_hex,
+            target_inventory=self.entities,
+        )
+
+        article = self.entities[0]
+        cmd = StageMutationCommand(
+            table="processed_articles",
+            pk_column="article_id",
+            pk_value=article.pk_value,
+            columns=["article_id", "title", "source", "published_at", "processed_at"],
+            values=[article.pk_value, article.expected_attributes["title"], article.expected_attributes["source"], "2026-11-06T20:00:00Z", "2026-11-06T20:00:00Z"],
+        )
+
+        with patch("os.fsync", side_effect=OSError("Simulated fsync sync failure")):
+            with self.assertRaises(AmbiguousCommitError) as ctx:
+                self.journal.execute_atomic_stage_mutation(
+                    run_id=self.run_id,
+                    owner_id=self.owner_id,
+                    expected_fencing_token=1,
+                    stage="LIVE_02",
+                    mutation_statements=[cmd],
+                    manifest_seal_hex=self.manifest_seal_hex,
+                    simulate_ambiguous_commit=AmbiguousCommitOutcome.COMMITTED_BUT_ACK_LOST,
+                )
+            self.assertIsInstance(ctx.exception.__cause__, HaltMarkerPersistenceError)
+            self.assertIn("local halt marker persistence failed", str(ctx.exception))
+
+        # In-memory halt was still latched immediately
+        self.assertTrue(self.journal.is_halted(self.run_id))
+
+    def test_p1_5_marker_persistence_without_scoped_dir_fails_closed(self):
+        """Omitting marker_dir fails closed with HaltMarkerPersistenceError without touching global temp."""
+        journal_no_dir = StagingOwnershipJournal(self.conn, marker_dir=None)
+
+        with self.assertRaises(AmbiguousCommitError) as ctx:
+            journal_no_dir.register_intent(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                manifest_seal_hex=self.manifest_seal_hex,
+                target_inventory=self.entities,
+                simulate_ambiguous_commit=AmbiguousCommitOutcome.COMMITTED_BUT_ACK_LOST,
+            )
+        self.assertIsInstance(ctx.exception.__cause__, HaltMarkerPersistenceError)
+        self.assertIn("no scoped marker_dir configured", str(ctx.exception.__cause__))
+
+        # Journal is still halted in-memory
+        self.assertTrue(journal_no_dir.is_halted(self.run_id))
+
     def test_p1_5_crash_window_between_commit_and_marker_publication_documented(self):
         """Documents crash window: crash immediately after COMMIT before marker write leaves marker absent."""
         self.journal.register_intent(

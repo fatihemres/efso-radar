@@ -236,10 +236,14 @@ class HaltMarkerPersistenceError(JournalHaltedError):
 
 
 def _halt_marker_path(run_id: str, marker_dir: Optional[Path] = None) -> Path:
-    """Return the filesystem path for a halted run marker file within a scoped directory."""
+    """Return the filesystem path for a halted run marker file within an explicitly scoped directory."""
+    if marker_dir is None:
+        raise HaltMarkerPersistenceError(
+            f"Cannot resolve halt marker path for run '{run_id}': marker_dir is not configured. "
+            "Implicit global temp marker persistence is prohibited; an explicitly scoped, owned directory is required."
+        )
     safe_run_id = re.sub(r"[^a-zA-Z0-9_-]", "_", run_id)
-    root = marker_dir if marker_dir is not None else Path(tempfile.gettempdir())
-    return root / f"efso_radar_journal_halt_{safe_run_id}.lock"
+    return marker_dir / f"efso_radar_journal_halt_{safe_run_id}.lock"
 
 
 def compute_canonical_inventory_fingerprint(
@@ -619,10 +623,16 @@ class StagingOwnershipJournal:
 
         OVERWRITE PROTECTION & FAIL-CLOSED PERSISTENCE:
         - In-memory latch is set immediately so this instance fails closed on any subsequent call.
+        - Implicit global temp persistence is prohibited; an explicit marker_dir is required.
         - Pre-existing foreign files are NEVER overwritten and fail closed with HaltMarkerPersistenceError.
-        - Storage write failures (OSError) are NEVER silently swallowed; they fail closed with HaltMarkerPersistenceError.
+        - Storage write failures (OSError) and os.fsync() errors are NEVER silently swallowed; they fail closed with HaltMarkerPersistenceError.
         """
         self._halted_runs.add(run_id)
+        if self._marker_dir is None:
+            raise HaltMarkerPersistenceError(
+                f"Cannot persist halt marker for run '{run_id}': no scoped marker_dir configured. "
+                "Implicit global temp marker persistence is prohibited; run is halted in-memory only."
+            )
         marker = _halt_marker_path(run_id, self._marker_dir)
 
         payload = {
@@ -651,10 +661,7 @@ class StagingOwnershipJournal:
             with open(marker, "x", encoding="utf-8") as f:
                 f.write(content)
                 f.flush()
-                try:
-                    os.fsync(f.fileno())
-                except OSError:
-                    pass
+                os.fsync(f.fileno())
         except OSError as exc:
             raise HaltMarkerPersistenceError(
                 f"Failed to persist durable local halt marker for run '{run_id}' at '{marker}': {exc}. "
@@ -667,19 +674,22 @@ class StagingOwnershipJournal:
         """Check if run is in a local halted state (LOCAL_OUTCOME_UNKNOWN).
 
         Checks both instance-level set and persistent local halt marker file.
+        Fails closed: Any unexpected, malformed, or foreign existing marker file causes
+        is_halted() to return True, preventing unsafe automated continuation.
         """
         if run_id in self._halted_runs:
             return True
-        marker = _halt_marker_path(run_id, self._marker_dir)
+        if self._marker_dir is None:
+            return False
+        try:
+            marker = _halt_marker_path(run_id, self._marker_dir)
+        except HaltMarkerPersistenceError:
+            return False
         if marker.is_file():
-            try:
-                data = json.loads(marker.read_text(encoding="utf-8"))
-                if isinstance(data, dict) and data.get("run_id") == run_id:
-                    self._halted_runs.add(run_id)
-                    return True
-            except Exception:
-                self._halted_runs.add(run_id)
-                return True
+            # Any existing file at the marker location indicates an unsafe or halted state.
+            # Never return False if a file exists, even if valid JSON contains a different run ID or is malformed.
+            self._halted_runs.add(run_id)
+            return True
         return False
 
     def _verify_table_exists(self) -> None:
