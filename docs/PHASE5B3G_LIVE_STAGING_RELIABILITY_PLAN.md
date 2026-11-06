@@ -653,13 +653,214 @@ To prepare the controlled Turso staging runner for a future separately authorize
 
 #### 2. Architecture Boundary & ERD-017 Non-Proof Disclaimer
 - **Hermetic Logic Evidence vs. Live Reliability Guarantees:** Passing hermetic mock tests provides offline logic, invariant, and fault-injection evidence only. It does **NOT** prove process-crash survival, host reboot or power-loss durability, cross-process real preflight handoff, or remote Turso cloud reliability, nor does it prove or certify unattended cross-runner recovery on ephemeral GitHub Actions VMs where local disks and temporary directories vanish upon runner decommission.
-- **ERD-017 Architecture Choice Remains OPEN:** The architectural decision for cross-runner recovery remains unresolved and requires explicit Product Owner choice:
-  - **Option A:** Persistent-Host Staging Only (keep GitHub Actions offline-only).
-  - **Option B:** Dedicated Remote Ownership Journal Table (Schema v7 migration).
-  - **Option C:** Single-Transaction Atomic Batching (Hrana pipeline transaction coupling; potentially complementary with Option B).
+- **ERD-017 Architectural Direction Selected (PO Approved 2026-11-06; Issue #82 / Issue #84):** Following the Launch Readiness audit, the Product Owner explicitly selected **Option B (provider-persistent cross-runner ownership journal)** for target unattended GitHub Actions + Turso automation, complemented selectively by **Option C (single-transaction atomic batching)** where appropriate ([PO Decision Comment 6679425019](https://github.com/fatihemres/efso-radar/issues/82#issuecomment-6679425019)). Option A remains recognized for supervised single-machine staging sessions only. This selects architectural direction only; it is **NOT IMPLEMENTED / NOT LIVE**, and live writes remain permanently blocked. See §5.11 for the complete capability matrix, journal contract, and Schema v6 reuse assessment.
 - **Hard Runtime Gate:** Real Turso staging writes remain permanently blocked. CLI live execution flags (`--live`, `--execute`, `--enable-writes`, etc.) fail closed immediately.
 
 ---
+
+### 5.11. ERD-017 — Minimal Cross-Runner Journal Contract & Schema v6 Reuse Assessment (2026-11-06; Issue #84)
+
+**PO-Approved Architectural Direction (Option B + Selective C); Strictly Offline Design Only; NOT IMPLEMENTED / NOT LIVE.**
+
+#### 1. Context, Authority, and Architectural Direction
+- **PO Decision Evidence:** Product Owner architecture selection on Launch Readiness Issue #82 ([Comment 6679425019](https://github.com/fatihemres/efso-radar/issues/82#issuecomment-6679425019)), followed by Issue #84 assignment.
+- **Target Unattended System Architecture:** **Option B** (provider-persistent, cross-runner-discoverable ownership and recovery journal in Turso/libSQL) is selected for the intended GitHub Actions + Turso unattended scheduled pipeline.
+- **Selectively Complementary Transaction Coupling:** **Option C** (single-transaction atomic batching coupling journal intent + entity mutations inside one Hrana pipeline transaction) is selected as a complementary technique where atomic coupling is supported, but cannot stand alone without Option B for runner discovery or ambiguous wire COMMIT resolution.
+- **Supervised Staging Boundary:** **Option A** (local POSIX 0700 manifest with `os.fsync`) remains valid solely for supervised, single-machine controlled staging on an owner-managed persistent host, but is fundamentally incapable of solving cross-runner recovery across ephemeral Actions runner VMs.
+- **Recommended Candidate (Not Approved Implementation):** A dedicated journal table is the **recommended architectural candidate under Option B, requiring a separate engineering implementation and migration PO GO**. Schema v7 remains an unapproved candidate design; no schema version bump or migration has been authorized.
+- **Hard Safety & Budget Boundary:** This design selection does **NOT** authorize Schema v7 migration, table creation, journal code implementation, live staging connections (including reads), tokens, cron/production schedules, Gemini, Telegram, or cloud backup. Strict **$0.00 / 0 TRY** expenditure requires independent verification of provider Free Tier entitlement and billing disablement before any live execution, which remains a strict preflight gate rather than a runtime code guarantee.
+
+#### 2. Schema v6 Capability vs. Gap Matrix
+
+| Schema v6 Construct | Existing Capability (Integrated Contract) | Operational Gap for Unattended Cross-Runner Recovery | Reused vs. New State Decision |
+| :--- | :--- | :--- | :--- |
+| **`run_locks`** (Migration v1) | Mutually exclusive task-level concurrency lease (`lock_key`, `worker_id`, `acquired_at`, `expires_at`, `heartbeat_at`). Prevents overlapping processes on same task. | Leases are ephemeral; expires upon timeout. Does not record ahead-of-time entity inventories, mutation stages, cryptographic manifest digests, or post-crash reconciliation proofs for `UNKNOWN` outcomes. | **REUSED** for coarse-grained runner mutual exclusion. **INSUFFICIENT** for mutation-level ownership or cross-runner orphan discovery. |
+| **`scheduled_execution_history`** (Migration v6) | Historical run execution log (`run_id`, `run_type`, `worker_id`, `started_at`, `finished_at`, `status`, aggregate counters). | Written coarse-grained at start/finish. Lacks per-stage transition tracking, fencing tokens, entity primary keys, or rollback manifests. Cannot prove atomic coupling. | **REUSED** for operational metrics and history. **NOT A RECOVERY JOURNAL**. |
+| **`telegram_delivery_records`** (Migration v6) | Durable outbox with strict at-most-once delivery constraint (`uq_recipient_message UNIQUE (recipient_chat_id, message_key)`), attempt counter, and 5 delivery statuses (`PENDING`, `DISPATCHING`, `SENT`, `FAILED`, `DELIVERY_UNCERTAIN`; `domain.py::DeliveryStatus`). | Domain-specific to external Telegram HTTP dispatch. Does not track database mutations, synthetic staging keys, or cross-runner SQL cleanup. | **REUSED** exclusively for Telegram message dispatch deduplication and uncertainty reconciliation. |
+| **`ai_usage_ledger`** (Migration v5) | Persistent token consumption, candidate count, batch hash index (`idx_ai_usage_ledger_batch_hash`), model names, and estimated USD cost for Gemini API. | Domain-specific AI budget ledger and response cache. Completely orthogonal to staging database entity mutation ownership. | **REUSED** exclusively for AI cost tracking, duplicate candidate caching, and fail-closed budget checks. |
+| **`durable_recovery_state`** (Migration v6) | Generic pipeline checkpointing (`state_key`, `stage`, `worker_id`, `batch_id`, `last_processed_id`, `state_json`, timestamps). | **Critical lifecycle and namespace collision:** In LIVE-06 and LIVE-08, this table is itself the *synthetic test target entity* (`synth_stage_{run_id}::current`), registered in the ahead-of-time manifest and targeted for automated conditional cleanup. Using it simultaneously as the operational cross-runner recovery journal creates an immediate lifecycle hazard: automated cleanup would delete the recovery journal before verification is finalized. Also lacks fencing tokens, manifest seal digests, and structured target inventory columns. | **CANNOT SERVE AS OPERATIONAL JOURNAL.** Retained as synthetic test target for LIVE-06/08 and general batch checkpointing. Dedicated journal table recommended as candidate v7. |
+| **`staging/offline_recovery_evidence.py`** | Pure, inert in-memory verification models (`HermeticSnapshot`, `ManifestEvidence`, `ReviewDecision`) comparing snapshots against sealed manifests. | Operates purely on in-memory Pydantic data structures without persistence or network I/O; not a live storage backend. | **REUSED** as deterministic verification logic and decision rules for evaluating snapshot evidence. |
+
+##### Operational Mapping: Unattended Operations vs. Reused Controls
+- **Ordinary Editorial Operations (Collection / Evaluation / Delivery):**
+  - Concurrency & execution lease: Reuses `run_locks`.
+  - Batch evaluation cache & cost tracking: Reuses `ai_usage_ledger`.
+  - Telegram alert deduplication & outbox: Reuses `telegram_delivery_records`.
+  - Daily admin report delivery: Reuses `admin_operational_reports`.
+  - Execution history & monitoring: Reuses `scheduled_execution_history`.
+- **Staging Multi-Stage Mutations (LIVE-02..08) & Ephemeral Crash Recovery:**
+  - Requires dedicated provider-persistent journal state (Option B).
+  - **Lifecycle Isolation Principle:** Staging synthetic target lifecycles and ordinary production work MUST NOT share one table or namespace. The operational journal must survive the deletion of synthetic test entities during LIVE-08 cleanup.
+
+#### 3. Minimal Future Journal Contract (Design Only)
+
+##### A. Canonical Run ID & Fencing Tokens
+- **`run_id` Format:** Strict canonical regex profile: `\Arun_[0-9]{8}T[0-9]{6}Z_[a-f0-9]{12}\Z` (enforced across manifest and database).
+- **`owner_id` Identity:** Ephemeral runner identifier combining execution environment and worker UUID (e.g. `gha_<run_id>_<attempt>_<uuid>` or `host_<hostname>_<pid>`).
+- **`fencing_token` Semantics:** Monotonically increasing positive integer initialized at `1`.
+  - **Compare-And-Swap (CAS) on Journal:** Journal updates validate `WHERE fencing_token = :expected_token`, atomically setting `fencing_token = :expected_token + 1`.
+  - **Fencing the *Effect*, Not Just the Journal:** A CAS update on the journal alone is **not sufficient** to fence mutations. If entity mutations execute in separate SQL statements without an atomic fence check, a delayed/zombie runner could pass its journal check earlier or bypass it to issue mutations. Therefore, **every mutation and cleanup operation must be bound to an authoritative, server-enforced fence check** (either within the same atomic transaction or verified via row-count conditions), aborting immediately if the fence has advanced.
+
+##### B. Journal Identity vs. Sealed Manifest Target Inventory
+- **Ahead-of-Time Target Registration:** Before any entity mutation statement is dispatched, the runner records an intent containing:
+  - `manifest_seal_hex`: SHA-256 digest of the canonical manifest JSON.
+  - `target_inventory_json`: JSON-serialized canonical inventory of all registered entities (`table`, `pk_column`, `pk_value`, `expected_attributes`).
+- **Strict Target Boundary:** Mutations are forbidden from creating, modifying, or deleting any row not explicitly enumerated in `target_inventory_json`.
+
+##### C. Least-Privilege & Read Provenance
+- **Scoped Inspection:** Cross-runner recovery queries must query strictly by `run_id` or scan for unresolved statuses (`INTENT_PENDING`, `ACKED`, `UNKNOWN`). Broad table scans or multi-tenant reads are prohibited.
+- **Read Provenance & Replica Semantics:** Recovery tools must record read provenance (`UNVERIFIED_READ` vs `PRIMARY_CONSISTENT_READ`). Simply attaching a label like `REPLICATED_CONSISTENT_READ` does not confer consistency. On distributed backends like Turso/libSQL, edge read-replicas may lag primary writes; authoritative recovery inspection must execute against the primary instance with provider-confirmed linearizable or read-after-write consistency semantics under explicit PO GO.
+
+##### D. State Transitions & Execution Patterns: Option B vs. Option B+C
+
+The system design defines two distinct execution patterns with different recovery and crash-visibility characteristics:
+
+###### Pattern 1: Separated Two-Phase Intent & Effect (Option B Alone)
+1. **Phase 1 (Intent Insert):** Runner issues `INSERT INTO staging_run_journal ... status = 'INTENT_PENDING'`. Once provider acknowledges, status is `ACKED`.
+2. **Phase 2 (Entity Mutations):** Runner dispatches entity mutations across tables.
+3. **Phase 3 (Effect Confirmation):** Runner issues `UPDATE staging_run_journal SET status = 'EFFECT_COMMITTED'`.
+- **Crash Visibility (Option B):**
+  - If Runner A crashes *after* Phase 1 ACK but *before* Phase 2: An `ACKED` intent row **is durable and discoverable** by Runner B / operator. The operator inspects target tables, observes no targets, and transitions journal to `ABORTED`.
+- **Ambiguous COMMIT on Intent (Option B):**
+  - If the Phase 1 insert receives a network drop / timeout: The local runner enters **`LOCAL_OUTCOME_UNKNOWN` / `LOCAL_HALT`**. The remote provider state is **`UNVERIFIED / MAY NOT EXIST`**. The runner does **not** assume the remote row exists or has status `UNKNOWN`. Follow-up writes or retries to manufacture certainty are strictly prohibited.
+
+###### Pattern 2: Atomic Intent & Effect Batching (Option B + Option C)
+1. **Single Atomic Pipeline Transaction:** A single Hrana v2 pipeline couples journal intent, authoritative fence validation, entity mutations, and journal status confirmation within `BEGIN ... COMMIT`.
+- **Crash Visibility (Option B+C):**
+  - If Runner A crashes *before* `COMMIT`: The uncommitted transaction aborts completely in the database engine. **No intent row and no entity mutations exist on the provider.** There is **no orphaned pre-effect intent row to recover** on the provider.
+- **Ambiguous COMMIT on Atomic Block (Option B+C):**
+  - If `COMMIT` drops or times out: The client outcome is **`LOCAL_OUTCOME_UNKNOWN` / `LOCAL_HALT`**. Remote provider state is **`UNVERIFIED / ENTIRE_TX_UNCERTAIN`**. Either the entire atomic block committed (intent + mutations + committed status), or nothing committed. Discovering this requires operator-supervised read-only inspection of both the journal and target tables under separate PO GO.
+
+```mermaid
+flowchart TD
+    subgraph OptionB["Option B: Separated Intent & Effect"]
+        B_Start["Register Intent"] --> B_ACK{"Provider ACK?"}
+        B_ACK -- "Success" --> B_Acked["Journal: ACKED"]
+        B_ACK -- "Timeout/Drop" --> B_Unk["Local: LOCAL_OUTCOME_UNKNOWN / HALT<br/>Provider: UNVERIFIED / MAY NOT EXIST"]
+        B_Acked --> B_Mut["Dispatch Stage Mutations"]
+        B_Mut --> B_Conf["Journal: EFFECT_COMMITTED"]
+    end
+
+    subgraph OptionBC["Option B+C: Atomic Pipelined Batch"]
+        BC_Tx["BEGIN Transaction<br/>1. CAS Fence Update (check affected_rows=1)<br/>2. Entity Mutations<br/>3. Journal EFFECT_COMMITTED"]
+        BC_Tx --> BC_Commit{"COMMIT ACK?"}
+        BC_Commit -- "Success" --> BC_Done["All Committed Atomically"]
+        BC_Commit -- "Timeout/Drop" --> BC_Unk["Local: LOCAL_OUTCOME_UNKNOWN / HALT<br/>Provider: UNVERIFIED / ENTIRE_TX_UNCERTAIN"]
+    end
+```
+
+##### E. Authoritative Fencing of Effects & Conditional Cleanup
+- **Enforcing the Fence on Mutations:**
+  - In Option B+C atomic transactions, the fence update statement (`WHERE run_id = :run_id AND fencing_token = :expected_token`) executes within the same atomic transaction as the mutations. The application asserts that the fence update affected exactly 1 row; if 0 rows (because another runner bumped the token), the transaction is immediately rolled back.
+  - If mutations are executed outside a single transaction, each individual mutation statement must carry an authoritative ownership/fence predicate, or execution must HALT fail-closed as unsupported.
+- **Parameterized Conditional Cleanup (LIVE-08):**
+  - Cleanup requires matching primary key AND synthetic ownership attributes AND verified `affected_row_count == 1`.
+  - Cleanup is authorized IF AND ONLY IF the acting runner possesses the matching active `fencing_token`.
+- **Three-State Audit (LIVE-08):** Independent inspection of all 5 registered entities (`CLEAN`, `RESIDUAL`, `UNKNOWN`).
+- **Journal/Manifest Teardown:** Manifest unlinking and journal closure occurs IF AND ONLY IF the audit evaluation is strictly `CLEAN`. In all other cases (`RESIDUAL`, `UNKNOWN`, `OWNERSHIP_MISMATCH_HALT`), the journal row and manifest are permanently preserved for operator inspection.
+
+##### F. Retention & Operator-Only Recovery
+- **No Automated Takeover:** Ephemeral runners on unattended scheduled workflows must NEVER automatically take over an orphaned, in-flight, or `UNKNOWN` run.
+- **Operator-Driven Reconciliation:** Recovery of an unverified or orphaned run requires an authorized human operator executing offline/read-only audit tooling, inspecting provider state against the sealed manifest, and manually approving cleanup or retirement under separate PO GO.
+
+##### G. Duplicate Invocation & Split-Brain Mitigation
+- **Split-Brain Reality:** A primary key on `staging_run_journal.run_id` prevents duplicate runners from claiming the *identical* run ID. However, **`run_id` uniqueness alone does NOT prevent split-brain execution across multiple runners**: distinct runners triggered for the same schedule can generate distinct run IDs targeting the same logical workload, or runner leases may expire while a stalled runner continues executing.
+- **Multi-Layered Mitigation:**
+  1. **Coarse-Grained Task Lease (`run_locks`):** Active heartbeat lease must be held. If lease expires or is stolen, runner must self-fence.
+  2. **Run-Level Primary Key:** Prevents identical run ID collisions.
+  3. **Authoritative Monotonic Fencing Tokens:** Every mutating transaction verifies the current fencing token; if a takeover runner bumped the token, stale runner writes fail atomically.
+  4. **Ahead-of-Time Manifest Seal:** Bound to exact target inventory; unauthorized targets are denied by the boundary guard.
+
+#### 4. Schema Evaluation: Candidate Schema v7 Assessment (Design Only)
+
+##### A. Assessment of Schema v6 Reuse
+- **Direct Table Reuse Rejected:** Repurposing `durable_recovery_state` is fundamentally unsafe because:
+  1. It introduces a fatal lifecycle collision with LIVE-06 and LIVE-08 synthetic target testing and automated cleanup.
+  2. It lacks necessary columns for fencing tokens, manifest seals, and structured target inventories.
+  3. Modifying `durable_recovery_state` in-place would break existing stage recovery contracts and schema version stability.
+- **Conclusion:** A dedicated journal table is the **recommended architectural candidate under Option B, requiring a separate engineering implementation and migration PO GO**. Schema v7 remains an unapproved candidate design.
+
+##### B. Candidate Minimal Schema v7 Table Definition (Design Only — Not Executed)
+
+```sql
+CREATE TABLE IF NOT EXISTS staging_run_journal (
+    run_id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    fencing_token INTEGER NOT NULL DEFAULT 1,
+    stage TEXT NOT NULL,
+    status TEXT NOT NULL,
+    manifest_seal_hex TEXT NOT NULL,
+    target_inventory_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_staging_run_journal_status
+    ON staging_run_journal (status, updated_at);
+```
+
+##### C. Transaction Boundaries: Separated (Option B) vs. Atomic Batch (Option B+C)
+
+In candidate Option B+C, the transaction couples the authoritative fence check, entity mutations, and journal status inside one atomic block:
+
+```sql
+BEGIN;
+-- 1. Atomically validate authoritative fence and increment token
+UPDATE staging_run_journal
+    SET fencing_token = :expected_fencing_token + 1,
+        stage = 'LIVE_02',
+        status = 'MUTATING',
+        updated_at = :now
+    WHERE run_id = :run_id
+      AND fencing_token = :expected_fencing_token;
+-- Application verifies affected_row_count == 1; if 0, ROLLBACK and HALT immediately
+
+-- 2. Execute registered stage entity mutations (bound to same transaction)
+INSERT INTO processed_articles (article_id, title, source, published_at, processed_at)
+    VALUES (:synth_art_id, :title, :source, :pub_at, :now);
+
+-- 3. Confirm effect commitment within same transaction
+UPDATE staging_run_journal
+    SET status = 'EFFECT_COMMITTED',
+        updated_at = :now
+    WHERE run_id = :run_id
+      AND fencing_token = :expected_fencing_token + 1;
+COMMIT;
+```
+
+- **Why Option C Alone Is Insufficient:**
+  1. A network timeout during `COMMIT` leaves the client in `LOCAL_OUTCOME_UNKNOWN`, requiring external discovery.
+  2. If Runner A crashes abruptly mid-run, Runner B cannot inspect uncommitted local transaction buffers; Runner B requires committed provider state to discover what was intended and what was affected.
+  3. Therefore, Option B provides **durable discoverability across independent runners**, while Option C provides **atomic consistency during active execution**. They are complementary, not competing.
+
+##### D. Candidate Non-Destructive Application Rollback Design (Design Only)
+- **Non-Destructive Operational Rollback:**
+  - Operational rollback must be **strictly non-destructive**:
+    1. Revert application code / disable the journal feature switch.
+    2. Retain the `staging_run_journal` table and all records intact on the database.
+    3. Maintain backward-compatible read access to allow cross-runner discovery and forensic inspection of unresolved or `UNKNOWN` runs.
+  - Routine operational rollback must **NEVER** execute `DROP TABLE` or delete rows from `schema_migrations`. Dropping the table destroys the very evidence needed to reconcile state after runner crashes or ambiguous operations.
+- **Audited Data Retirement Procedure (Separately Authorized):**
+  - Physical table retirement or schema removal is an exceptional, separately authorized administrative procedure. It is permissible ONLY after:
+    1. Independent verification that zero unresolved, in-flight, or `UNKNOWN` runs exist;
+    2. Complete archival and export of operational recovery evidence and audit logs;
+    3. An explicit, separate Product Owner GO specifically authorizing destructive database modification.
+- **Strict Implementation Gate:** No migration script is executed, no migration code is added to `schema.py`, and the database schema remains at version 6.
+
+#### 5. Failure & Cost Matrix (Option B & Option B+C Invariants)
+
+| Failure Scenario | Primary Risk | System Action (Option B vs. B+C) | Retry / Cleanup Policy | Cost & Budget Policy ($0.00 / 0 TRY) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Ambiguous journal-intent COMMIT (Option B)** | Unknown whether intent was recorded on Turso provider. | Client marks local status `LOCAL_OUTCOME_UNKNOWN` / `LOCAL_HALT`. Remote provider journal state is `UNVERIFIED / MAY NOT EXIST`. | **NEVER** blind-retry intent insert. **NEVER** dispatch entity mutations. Preserve on-disk manifest. Do not assume remote journal shows `UNKNOWN`. | Unverified design estimate (<100 request ceiling). Provider Free Tier verification required prior to execution. |
+| **Ambiguous COMMIT on Atomic Block (Option B+C)** | Uncertainty whether entire atomic transaction (intent + mutations) committed. | Client marks local status `LOCAL_OUTCOME_UNKNOWN` / `LOCAL_HALT`. Remote provider state is `UNVERIFIED / ENTIRE_TX_UNCERTAIN`. | **NEVER** blind-retry batch. **NEVER** run automated cleanup. Retain local manifest. Requires authorized operator-supervised read-only inspection. | Unverified design estimate. $0.00 / 0 TRY hard ceiling preserved. |
+| **Process crash during active mutations** | Partial or orphaned state on provider. | **Option B:** Runner B / operator discovers `ACKED` intent row with expired lease; inspects targets. If targets absent, marks `ABORTED`.<br/>**Option B+C:** Uncommitted transaction rolled back by engine; no orphan intent row exists on provider. | **Option B:** Cleanup of intent row permitted ONLY after proven absence of targets.<br/>**Option B+C:** Zero provider cleanup needed (engine rolled back). | Zero network requests during offline crash. $0.00 / 0 TRY. |
+| **Foreign owner / fencing mismatch** | Delayed/zombie runner or concurrent process attempting mutations. | CAS update fails (`fencing_token != expected`, `affected_rows == 0`). Runner triggers immediate fail-closed `HALT`. | Prohibit all writes. Do **NOT** clean up. Log `OWNERSHIP_MISMATCH_HALT`. Preserves state for operator investigation. | Zero mutation requests executed. $0.00 / 0 TRY. |
+| **Missing or partial journal** | Inability to verify entity ownership or manifest authenticity. | Runner detects missing journal record or corrupt manifest seal. Immediate fail-closed `HALT`. | Treat all registered entities as `UNKNOWN`. Prohibit automated cleanup. Requires manual operator recovery. | Zero mutation requests. $0.00 / 0 TRY. |
+| **Runner B takeover attempt** | Premature takeover of Runner A's active run before lease expiry. | Takeover is strictly forbidden during unattended automated workflows. Allowed ONLY via explicit operator CLI command with incremented `fencing_token`. | Unattended runners must exit cleanly without attempting takeover. Operator intervention required. | Unverified design estimate (read query). $0.00 / 0 TRY. |
+| **Race / duplicate re-entry** | Two workflow runs triggered simultaneously for the same schedule. | Runner fails `run_locks` lease acquisition, or fails `PRIMARY KEY (run_id)` on journal insert. | Clean exit with status code 0. No mutations dispatched. | Unverified design estimate (lock probe). $0.00 / 0 TRY. |
+| **Unknown provider / billing / quota change** | Unexpected provider response or billing status change. | Any HTTP 402, 429, or unexpected status code triggers immediate fail-closed `HALT`. | Pipeline terminates permanently. No retries. No paid fallback. | HTTP errors do **not** prove zero charge; provider Free Tier entitlement and unlinked billing must be verified preflight. Strict $0.00 / 0 TRY. |
+
 
 ## 6. Separation of Software Cleanup vs. Manual Dashboard Operations
 
