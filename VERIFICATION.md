@@ -1,6 +1,22 @@
 # Efso Radar — Verification Ledger
 
-**Latest GitHub checkpoint:** 2026-11-05. This ledger separates direct GitHub CI evidence, implementation-agent local runs, historical pilot acceptance and missing validations. Earlier dated reviewer entries retain their original scope. Evidence is not a release certificate.
+**Latest GitHub checkpoint:** 2026-11-06. This ledger separates direct GitHub CI evidence, implementation-agent local runs, historical pilot acceptance and missing validations. Earlier dated reviewer entries retain their original scope. Evidence is not a release certificate.
+
+## 2026-11-07 — Launch G2 Offline Journal ↔ Mock Hrana Integration (Issue #92 / Parent Issue #82 G2)
+
+| Evidence / status | Verified result and scope boundary |
+| --- | --- |
+| Protected `main` baseline `94f777843c9387a76616f96af08af39d031c3c97` | Exact-main CI [#42291986457](https://github.com/fatihemres/efso-radar/actions/runs/42291986457) 4/4 PASS. Task worktree `feat/issue-92-g2-offline-journal-hrana-seam`. |
+| Offline engineering deliverable (`src/efso_radar/staging/journal_hrana_seam.py`, `runner.py`, `__init__.py`) | Implemented `StagingJournalHranaSeam` and `build_live02_synthetic_mutations` bridging staging ownership journal and mock Hrana transport. Strict transport isolation (`HermeticStagingTransport` required) and database isolation (`:memory:` or temporary files via `PRAGMA database_list`). Prototyped against candidate Schema v7 DDL; `CURRENT_SCHEMA_VERSION` in `schema.py` remains strictly 6; zero production migration or live database modification. |
+| Atomic Option B+C single-transaction batching over Hrana | Proved atomic transaction coupling inside Hrana interactive transaction batons: journal fence CAS increment, allowlisted entity mutations (`processed_articles`, `stories`), and effect status confirmation (`EFFECT_COMMITTED`) execute atomically. Client inspects statement row counts (`affected_row_count == 1`); stale token CAS or constraint violation triggers immediate `ROLLBACK`. |
+| Single-transaction conditional cleanup | Reverse-dependency conditional deletions (`processed_articles`, `stories`), fence CAS to `CLEANUP_PENDING`, `run_locks` lease deletion, and finalization to `CLEANED_UP` execute inside a single atomic Hrana transaction, rolling back completely on any deletion failure. |
+| Adversarial test coverage (8 PO-mandated scenarios) | Two independent runner sessions (Runner A & B) against shared temporary SQLite fixture with independent connections: (1) duplicate run ID and distinct run ID collisions; (2) stale-owner attempts and fencing races; (3) atomic rollback on failed mutation; (4) ambiguous intent & effect COMMIT (committed/ACK-lost and rolled-back/ACK-lost); (5) crash before and after COMMIT; (6) Runner B forensic reconstruction without local marker files; (7) no blind retry or takeover on `UNKNOWN`; (8) exact inventory conditional deletion, clean audit, and ownership mismatch halt. |
+| Dedicated test suite: `tests/test_staging_journal_hrana_integration_offline.py` | **21 passed in 4.16s** on Windows Python 3.12.10. |
+| Combined staging test suite | **115 passed, 18 subtests passed in 7.33s** on Windows (`test_staging_journal_hrana_integration_offline.py`, `test_staging_ownership_journal_offline.py`, `test_phase5b3g_c_controlled_staging_slice.py`, `test_phase5b3g_c_offline_recovery_evidence.py`). |
+| Hermetic repository test suite | **1422 passed, 18 skipped in 159.12s** on Windows Python 3.12.10. Zero regressions. |
+| Static safety: Ruff 0.13.3 (`E9,F63,F7,F82`) & `git diff --check` | **Clean 0 return code.** Zero trailing whitespace or syntax errors. |
+| Non-proof contract & durability disclosures | Offline hermetic tests prove application-level transaction semantics against mock Hrana transport only. Provider-persistent cross-runner durability across ephemeral CI runner VM teardowns and real Hrana transaction guarantees remain explicitly **UNPROVEN / BLOCKED**. |
+| Hard operational boundaries | Strictly **$0.00 / 0 TRY**. Zero live network calls, zero Turso connections (including reads), Block Writes on staging strictly ON, zero credentials created. STOP at Draft PR for independent review. |
 
 ## 2026-11-06 — Launch G2 / ERD-017 Offline Staging Ownership Journal Implementation (Issue #90 / Parent Issue #82 G2)
 

@@ -97,6 +97,10 @@ if TYPE_CHECKING:
         compute_authenticated_manifest_seal,
         compute_canonical_inventory_fingerprint,
     )
+    from efso_radar.staging.journal_hrana_seam import (
+        StagingJournalHranaSeam,
+        build_live02_synthetic_mutations,
+    )
 
 __all__ = [
     "CloudPreflightValidator",
@@ -171,6 +175,8 @@ __all__ = [
     "HaltMarkerPersistenceError",
     "compute_authenticated_manifest_seal",
     "compute_canonical_inventory_fingerprint",
+    "StagingJournalHranaSeam",
+    "build_live02_synthetic_mutations",
 ]
 
 _RUNNER_EXPORTS = frozenset({
@@ -258,6 +264,11 @@ _JOURNAL_EXPORTS = frozenset({
     "compute_canonical_inventory_fingerprint",
 })
 
+_JOURNAL_HRANA_EXPORTS = frozenset({
+    "StagingJournalHranaSeam",
+    "build_live02_synthetic_mutations",
+})
+
 
 def __getattr__(name: str) -> Any:
     if name in _CONNECTION_EXPORTS:
@@ -288,4 +299,7 @@ def __getattr__(name: str) -> Any:
     if name in _JOURNAL_EXPORTS:
         import efso_radar.staging.journal as journal_mod
         return getattr(journal_mod, name)
+    if name in _JOURNAL_HRANA_EXPORTS:
+        import efso_radar.staging.journal_hrana_seam as seam_mod
+        return getattr(seam_mod, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -607,6 +607,8 @@ class HermeticStagingTransport(httpx.BaseTransport):
         fail_on_commit_timeout: bool = False,
         fail_on_commit_network: bool = False,
         fail_on_commit_status: Optional[int] = None,
+        fail_after_commit_timeout: bool = False,
+        fail_after_commit_network: bool = False,
         fail_on_stmt_idx: Optional[int] = None,
         fail_stmt_code: str = "SQLITE_CONSTRAINT",
         custom_response_hook: Optional[Callable[[httpx.Request], Optional[httpx.Response]]] = None,
@@ -615,6 +617,8 @@ class HermeticStagingTransport(httpx.BaseTransport):
         self.fail_on_commit_timeout = fail_on_commit_timeout
         self.fail_on_commit_network = fail_on_commit_network
         self.fail_on_commit_status = fail_on_commit_status
+        self.fail_after_commit_timeout = fail_after_commit_timeout
+        self.fail_after_commit_network = fail_after_commit_network
         self.fail_on_stmt_idx = fail_on_stmt_idx
         self.fail_stmt_code = fail_stmt_code
         self.custom_response_hook = custom_response_hook
@@ -687,6 +691,10 @@ class HermeticStagingTransport(httpx.BaseTransport):
                         self.conn.commit()
                         if in_baton in self.in_transaction:
                             self.in_transaction[in_baton] = False
+                        if self.fail_after_commit_timeout:
+                            raise httpx.TimeoutException("Simulated connection timeout after COMMIT was persisted on server")
+                        if self.fail_after_commit_network:
+                            raise httpx.ConnectError("Simulated network drop after COMMIT was persisted on server")
                         results.append({"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}})
                     except sqlite3.Error as exc:
                         results.append({"type": "error", "error": {"code": "SQLITE_ERROR", "message": str(exc)}})
