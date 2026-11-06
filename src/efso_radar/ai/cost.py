@@ -54,7 +54,8 @@ import json
 import logging
 import sqlite3
 from contextlib import closing
-from datetime import datetime, timezone
+import calendar
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NamedTuple, Optional, Sequence
 
@@ -178,6 +179,49 @@ FREE_TIER_DEFAULT_RPM_CAP: int = DOC_EXAMPLE_RPM_CAP
 FREE_TIER_DEFAULT_RPD_CAP: int = DOC_EXAMPLE_RPD_CAP
 FREE_TIER_DEFAULT_TPM_CAP: int = DOC_EXAMPLE_TPM_CAP
 
+# Observed project limits for Efso Radar in Google AI Studio / Gemini API (gemini-3.5-flash-lite).
+# CRITICAL: These are project-level baselines, NOT universal constants or permanent entitlements!
+# Google may adjust project-specific limits at any time, and these quotas are shared across
+# all API keys and runners within the same Google Cloud / AI Studio project.
+# Dynamic reservation and quota checks must fail closed if limits are unobserved or exceeded.
+OBSERVED_PROJECT_RPM_LIMIT: int = 15
+OBSERVED_PROJECT_INPUT_TPM_LIMIT: int = 250_000
+OBSERVED_PROJECT_RPD_LIMIT: int = 500
+
+
+def is_pacific_daylight_saving_time(dt_utc: datetime) -> bool:
+    """Determine if a UTC datetime falls within US Pacific Daylight Time (PDT).
+
+    Follows US Energy Policy Act of 2005 rules:
+    - Starts on the second Sunday in March at 02:00 local time (10:00 UTC).
+    - Ends on the first Sunday in November at 02:00 local time (09:00 UTC).
+    Pure standard library implementation that does not require external tzdata on Windows.
+    """
+    year = dt_utc.year
+    first_sun_march = 1 + (6 - calendar.weekday(year, 3, 1)) % 7
+    second_sun_march = first_sun_march + 7
+    dst_start_utc = datetime(year, 3, second_sun_march, 10, 0, 0, tzinfo=timezone.utc)
+
+    first_sun_nov = 1 + (6 - calendar.weekday(year, 11, 1)) % 7
+    dst_end_utc = datetime(year, 11, first_sun_nov, 9, 0, 0, tzinfo=timezone.utc)
+
+    return dst_start_utc <= dt_utc < dst_end_utc
+
+
+def get_pacific_calendar_date(dt_utc: Optional[datetime] = None) -> str:
+    """Return the current calendar date (YYYY-MM-DD) in US Pacific Time (PT).
+
+    Google AI Studio / Gemini API Free Tier RPD resets daily at midnight Pacific Time.
+    """
+    if dt_utc is None:
+        dt_utc = datetime.now(timezone.utc)
+    elif dt_utc.tzinfo is None:
+        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+
+    offset_hours = -7 if is_pacific_daylight_saving_time(dt_utc) else -8
+    pacific_dt = dt_utc + timedelta(hours=offset_hours)
+    return pacific_dt.strftime("%Y-%m-%d")
+
 # Provenance states for account-level billing status
 BILLING_TIER_UNKNOWN: str = "UNKNOWN_UNVERIFIED"
 BILLING_TIER_DISALLOWED_PAID: str = "DISALLOWED_PAID"
@@ -222,6 +266,7 @@ class FreeTierProjectProof(NamedTuple):
 def validate_free_tier_project_proof(
     proof: Optional[dict[str, Any] | FreeTierProjectProof],
     now: Optional[datetime] = None,
+    allow_synthetic_simulation: bool = False,
 ) -> tuple[bool, str, str]:
     """Evaluate candidate provider billing status attestation.
 
@@ -353,6 +398,13 @@ def validate_free_tier_project_proof(
 
     # CRITICAL P1: Caller-provided record is NOT an authenticated provider attestation.
     # It cannot certify actual provider $0 billing.
+    if allow_synthetic_simulation:
+        return (
+            True,
+            "SIMULATED_FREE_TIER",
+            "Valid proof structure (synthetic simulation only - non-authorizing)",
+        )
+
     return (
         False,
         BILLING_TIER_UNKNOWN,
@@ -707,6 +759,9 @@ def check_free_tier_safety_guard(
     tpm_limit: Optional[int] = None,
     current_tpm: Optional[int] = None,
     estimated_batch_tokens: Optional[int] = None,
+    input_tpm_limit: Optional[int] = None,
+    current_input_tpm: Optional[int] = None,
+    estimated_input_tokens: Optional[int] = None,
     rpd_limit: Optional[int] = None,
     current_rpd: Optional[int] = None,
     # Backward compatibility aliases for existing caller signatures:
@@ -813,27 +868,50 @@ def check_free_tier_safety_guard(
             f"Requests per minute ({effective_current_rpm}) reaches or exceeds verified RPM limit ({effective_rpm_limit}).",
         )
 
-    # 7. TPM quota: limit, consumption, AND estimated batch tokens must be explicitly observed
-    if tpm_limit is None:
+    # 7. TPM / Input TPM quota: limit, consumption, AND estimated batch tokens must be explicitly observed
+    if tpm_limit is None and input_tpm_limit is None:
         return (
             False,
             "Missing verified TPM (Tokens Per Minute) provider quota limit: status is UNKNOWN. "
             "Universal constant cannot be assumed as an account entitlement. Fail closed.",
         )
-    if current_tpm is None:
+    if tpm_limit is not None:
+        if current_tpm is None:
+            return (
+                False,
+                "Missing current TPM consumption observation: status is UNKNOWN. Fail closed.",
+            )
+        if estimated_batch_tokens is None or estimated_batch_tokens <= 0:
+            return (
+                False,
+                "Missing estimated batch token count for TPM quota verification: status is UNKNOWN. Fail closed.",
+            )
+        if (current_tpm + estimated_batch_tokens) > tpm_limit:
+            return (
+                False,
+                f"Projected tokens per minute ({current_tpm + estimated_batch_tokens}) exceeds verified TPM limit ({tpm_limit}).",
+            )
+
+    if input_tpm_limit is not None:
+        if current_input_tpm is None:
+            return (
+                False,
+                "Missing current input TPM consumption observation: status is UNKNOWN. Fail closed.",
+            )
+        if estimated_input_tokens is None or estimated_input_tokens <= 0:
+            return (
+                False,
+                "Missing estimated input batch tokens for input TPM quota verification: status is UNKNOWN. Fail closed.",
+            )
+        if (current_input_tpm + estimated_input_tokens) > input_tpm_limit:
+            return (
+                False,
+                f"Projected input tokens per minute ({current_input_tpm + estimated_input_tokens}) exceeds verified input TPM limit ({input_tpm_limit}).",
+            )
+    elif current_input_tpm is not None:
         return (
             False,
-            "Missing current TPM consumption observation: status is UNKNOWN. Fail closed.",
-        )
-    if estimated_batch_tokens is None or estimated_batch_tokens <= 0:
-        return (
-            False,
-            "Missing estimated batch token count for TPM quota verification: status is UNKNOWN. Fail closed.",
-        )
-    if (current_tpm + estimated_batch_tokens) > tpm_limit:
-        return (
-            False,
-            f"Projected tokens per minute ({current_tpm + estimated_batch_tokens}) exceeds verified TPM limit ({tpm_limit}).",
+            "Missing verified input TPM provider quota limit: status is UNKNOWN. Fail closed.",
         )
 
     # Resolve RPD parameter aliases
@@ -871,6 +949,222 @@ def check_free_tier_safety_guard(
         )
 
     return True, "OK (synthetic simulation only - non-authorizing)"
+
+
+class G3PreDispatchDecision(NamedTuple):
+    """Immutable preflight evaluation outcome for G3 Gemini activation safety."""
+    allowed: bool
+    status_code: str
+    reason: str
+    model_name: str
+    billing_tier: str
+    pacific_reset_date: str
+    requires_erd017_fencing: bool
+    provenance_summary: dict[str, Any]
+
+
+def evaluate_g3_activation_preflight(
+    model_name: str = "gemini-3.5-flash-lite",
+    enable_search_grounding: bool = False,
+    max_run_cost_usd: float = 0.0,
+    max_monthly_cost_usd: float = 0.0,
+    project_proof: Optional[dict[str, Any] | FreeTierProjectProof] = None,
+    quota_evidence: Optional[dict[str, Any]] = None,
+    is_po_live_go_granted: bool = False,
+    is_multi_runner_environment: bool = False,
+    allow_synthetic_simulation: bool = False,
+    now: Optional[datetime] = None,
+) -> G3PreDispatchDecision:
+    """Evaluate G3 Gemini activation preflight gates strictly offline.
+
+    SEPARATION OF MACHINE GATES FROM HUMAN PO LIVE GO:
+    Passing machine gates (model assessment, search grounding off, zero monetary
+    budget, verified billing proof, within quota limits) is a strictly mandatory
+    prerequisite, but CANNOT self-authorize live dispatch.
+    An authenticated human Product Owner Live GO token (is_po_live_go_granted=True)
+    is independently required. Without it, preflight returns DENY_NO_PO_GO.
+
+    UNCONDITIONAL OFFLINE BARRIER:
+    In this offline engineering slice, live API dispatch remains blocked by
+    require_verified_free_tier() at the client boundary, regardless of preflight decision.
+    """
+    ref_now = now or datetime.now(timezone.utc)
+    if ref_now.tzinfo is None:
+        ref_now = ref_now.replace(tzinfo=timezone.utc)
+    pacific_date = get_pacific_calendar_date(ref_now)
+
+    clean_name = model_name.strip().lower()
+
+    # 1. Model Assessment Gate
+    if not is_model_assessed_for_launch(clean_name):
+        return G3PreDispatchDecision(
+            allowed=False,
+            status_code="DENY_UNASSESSED_MODEL",
+            reason=(
+                f"Model '{clean_name}' is unassessed for launch. Sole evaluated "
+                f"launch candidate is 'gemini-3.5-flash-lite'. Fail closed."
+            ),
+            model_name=clean_name,
+            billing_tier=BILLING_TIER_UNKNOWN,
+            pacific_reset_date=pacific_date,
+            requires_erd017_fencing=is_multi_runner_environment,
+            provenance_summary={"model": clean_name, "gate": "model_assessment"},
+        )
+
+    # 2. Search Grounding Gate
+    if enable_search_grounding:
+        return G3PreDispatchDecision(
+            allowed=False,
+            status_code="DENY_SEARCH_GROUNDING",
+            reason=(
+                "Search grounding is enabled. Search grounding is not free under Free Tier. "
+                "Strict $0.00 / 0 TRY policy requires search grounding disabled. Fail closed."
+            ),
+            model_name=clean_name,
+            billing_tier=BILLING_TIER_UNKNOWN,
+            pacific_reset_date=pacific_date,
+            requires_erd017_fencing=is_multi_runner_environment,
+            provenance_summary={"search_grounding": True, "gate": "search_grounding"},
+        )
+
+    # 3. Monetary Budget Gate (must be strictly $0.00)
+    if max_run_cost_usd > 0.0 or max_monthly_cost_usd > 0.0:
+        return G3PreDispatchDecision(
+            allowed=False,
+            status_code="DENY_POSITIVE_BUDGET",
+            reason=(
+                f"Positive monetary budget override detected (${max_run_cost_usd:.4f} / "
+                f"${max_monthly_cost_usd:.4f}). Strict Free Tier launch policy requires "
+                "$0.00 / 0 TRY monetary ceilings. Fail closed."
+            ),
+            model_name=clean_name,
+            billing_tier=BILLING_TIER_UNKNOWN,
+            pacific_reset_date=pacific_date,
+            requires_erd017_fencing=is_multi_runner_environment,
+            provenance_summary={
+                "max_run_cost_usd": max_run_cost_usd,
+                "max_monthly_cost_usd": max_monthly_cost_usd,
+                "gate": "zero_budget",
+            },
+        )
+
+    # 4. Project Billing Proof Gate
+    proof_ok, billing_tier, proof_reason = validate_free_tier_project_proof(
+        project_proof, now=ref_now, allow_synthetic_simulation=allow_synthetic_simulation
+    )
+    if billing_tier == BILLING_TIER_DISALLOWED_PAID:
+        return G3PreDispatchDecision(
+            allowed=False,
+            status_code="DENY_PAID_PROJECT",
+            reason=proof_reason,
+            model_name=clean_name,
+            billing_tier=BILLING_TIER_DISALLOWED_PAID,
+            pacific_reset_date=pacific_date,
+            requires_erd017_fencing=is_multi_runner_environment,
+            provenance_summary={"billing_tier": BILLING_TIER_DISALLOWED_PAID, "gate": "billing_proof"},
+        )
+    if not proof_ok:
+        return G3PreDispatchDecision(
+            allowed=False,
+            status_code="DENY_UNVERIFIED_BILLING",
+            reason=proof_reason,
+            model_name=clean_name,
+            billing_tier=billing_tier,
+            pacific_reset_date=pacific_date,
+            requires_erd017_fencing=is_multi_runner_environment,
+            provenance_summary={"billing_tier": billing_tier, "gate": "billing_proof"},
+        )
+
+    # 5. Quota Evidence Gate
+    if quota_evidence is None:
+        return G3PreDispatchDecision(
+            allowed=False,
+            status_code="DENY_QUOTA_UNVERIFIED",
+            reason="Missing quota evidence. Dynamic provider quota state cannot be assumed. Fail closed.",
+            model_name=clean_name,
+            billing_tier=billing_tier,
+            pacific_reset_date=pacific_date,
+            requires_erd017_fencing=is_multi_runner_environment,
+            provenance_summary={"quota_evidence": None, "gate": "quota_guard"},
+        )
+
+    quota_ok, quota_reason = check_free_tier_safety_guard(
+        model_name=clean_name,
+        current_monthly_calls=quota_evidence.get("current_monthly_calls"),
+        max_monthly_calls=quota_evidence.get("max_monthly_calls", 300),
+        enable_search_grounding=enable_search_grounding,
+        max_run_cost_usd=max_run_cost_usd,
+        max_monthly_cost_usd=max_monthly_cost_usd,
+        rpm_limit=quota_evidence.get("rpm_limit"),
+        current_rpm=quota_evidence.get("current_rpm"),
+        tpm_limit=quota_evidence.get("tpm_limit"),
+        current_tpm=quota_evidence.get("current_tpm"),
+        estimated_batch_tokens=quota_evidence.get("estimated_batch_tokens"),
+        input_tpm_limit=quota_evidence.get("input_tpm_limit"),
+        current_input_tpm=quota_evidence.get("current_input_tpm"),
+        estimated_input_tokens=quota_evidence.get("estimated_input_tokens"),
+        rpd_limit=quota_evidence.get("rpd_limit"),
+        current_rpd=quota_evidence.get("current_rpd"),
+        dynamic_quota_unknown=quota_evidence.get("dynamic_quota_unknown"),
+        allow_synthetic_simulation=allow_synthetic_simulation,
+    )
+    if not quota_ok:
+        code = (
+            "DENY_QUOTA_EXHAUSTED"
+            if ("exceeds" in quota_reason or "reaches" in quota_reason)
+            else "DENY_QUOTA_UNVERIFIED"
+        )
+        return G3PreDispatchDecision(
+            allowed=False,
+            status_code=code,
+            reason=quota_reason,
+            model_name=clean_name,
+            billing_tier=billing_tier,
+            pacific_reset_date=pacific_date,
+            requires_erd017_fencing=is_multi_runner_environment,
+            provenance_summary={"quota_error": quota_reason, "gate": "quota_guard"},
+        )
+
+    # 6. Human Product Owner Live GO Gate
+    if not is_po_live_go_granted:
+        return G3PreDispatchDecision(
+            allowed=False,
+            status_code="DENY_NO_PO_GO",
+            reason=(
+                "Machine preflight checks passed, but human Product Owner (PO) live "
+                "execution authorization (PO Live GO) has not been granted. Machine gates "
+                "cannot self-authorize live dispatch."
+            ),
+            model_name=clean_name,
+            billing_tier=billing_tier,
+            pacific_reset_date=pacific_date,
+            requires_erd017_fencing=is_multi_runner_environment,
+            provenance_summary={
+                "is_po_live_go_granted": False,
+                "preflight_machine_gates": "PASS",
+                "gate": "human_po_go",
+            },
+        )
+
+    # 7. Preflight Ready (offline simulation or supervised preflight)
+    return G3PreDispatchDecision(
+        allowed=True,
+        status_code="ALLOW_PREFLIGHT_READY",
+        reason=(
+            "Preflight safety gates and PO Live GO satisfied for offline readiness evaluation. "
+            "(Note: require_verified_free_tier() remains in place at API dispatch boundary)."
+        ),
+        model_name=clean_name,
+        billing_tier=billing_tier,
+        pacific_reset_date=pacific_date,
+        requires_erd017_fencing=is_multi_runner_environment,
+        provenance_summary={
+            "is_po_live_go_granted": True,
+            "preflight_machine_gates": "PASS",
+            "allow_synthetic_simulation": allow_synthetic_simulation,
+            "gate": "preflight_complete",
+        },
+    )
 
 
 class ExperimentBudgetGuard:

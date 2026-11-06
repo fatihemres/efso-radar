@@ -53,6 +53,13 @@ from efso_radar.ai.cost import (
     require_verified_free_tier,
     resolve_model_pricing,
     validate_free_tier_project_proof,
+    OBSERVED_PROJECT_RPM_LIMIT,
+    OBSERVED_PROJECT_INPUT_TPM_LIMIT,
+    OBSERVED_PROJECT_RPD_LIMIT,
+    is_pacific_daylight_saving_time,
+    get_pacific_calendar_date,
+    G3PreDispatchDecision,
+    evaluate_g3_activation_preflight,
 )
 from efso_radar.config import Settings
 from efso_radar.domain import Article
@@ -758,6 +765,254 @@ class TestDispatchSafetyAndLedgerContract(unittest.TestCase):
         for col_name, col_type in expected_cols.items():
             self.assertIn(col_name, cols)
             self.assertEqual(cols[col_name].upper(), col_type)
+
+
+class TestG3ActivationContractAndPreflight(unittest.TestCase):
+    """Hermetic test suite for Issue #88: G3 Gemini activation safety contract and preflight gates."""
+
+    def setUp(self):
+        self.now_utc = datetime(2026, 11, 6, 12, 0, 0, tzinfo=timezone.utc)
+        self.valid_synthetic_proof = {
+            "project_id": "test-gemini-project",
+            "billing_enabled": False,
+            "free_tier_eligible": True,
+            "attestation_source": "synthetic-offline-test",
+            "verified_at": "2026-11-06T11:00:00Z",
+            "expires_at": "2026-11-07T11:00:00Z",
+        }
+        self.valid_synthetic_quota = {
+            "current_monthly_calls": 5,
+            "max_monthly_calls": 300,
+            "rpm_limit": 15,
+            "current_rpm": 2,
+            "tpm_limit": 1_000_000,
+            "current_tpm": 10_000,
+            "estimated_batch_tokens": 1_500,
+            "input_tpm_limit": 250_000,
+            "current_input_tpm": 5_000,
+            "estimated_input_tokens": 1_200,
+            "rpd_limit": 500,
+            "current_rpd": 20,
+        }
+
+    def test_observed_project_limits_constants(self):
+        """Observed project limits are defined as project-level baselines (not universal entitlements)."""
+        self.assertEqual(OBSERVED_PROJECT_RPM_LIMIT, 15)
+        self.assertEqual(OBSERVED_PROJECT_INPUT_TPM_LIMIT, 250_000)
+        self.assertEqual(OBSERVED_PROJECT_RPD_LIMIT, 500)
+
+    def test_pacific_calendar_date_and_midnight_reset(self):
+        """RPD calendar date resets at midnight US Pacific Time (PT), correctly accounting for PST and PDT."""
+        # 1. Winter (PST, UTC-8): 2026-11-06 07:59:59 UTC is 2026-11-05 23:59:59 PST
+        dt_pre_reset_winter = datetime(2026, 11, 6, 7, 59, 59, tzinfo=timezone.utc)
+        self.assertFalse(is_pacific_daylight_saving_time(dt_pre_reset_winter))
+        self.assertEqual(get_pacific_calendar_date(dt_pre_reset_winter), "2026-11-05")
+
+        # Exactly at 08:00:00 UTC it becomes midnight PST (2026-11-06)
+        dt_post_reset_winter = datetime(2026, 11, 6, 8, 0, 0, tzinfo=timezone.utc)
+        self.assertEqual(get_pacific_calendar_date(dt_post_reset_winter), "2026-11-06")
+
+        # 2. Summer (PDT, UTC-7): 2026-07-15 06:59:59 UTC is 2026-07-14 23:59:59 PDT
+        dt_pre_reset_summer = datetime(2026, 7, 15, 6, 59, 59, tzinfo=timezone.utc)
+        self.assertTrue(is_pacific_daylight_saving_time(dt_pre_reset_summer))
+        self.assertEqual(get_pacific_calendar_date(dt_pre_reset_summer), "2026-07-14")
+
+        # Exactly at 07:00:00 UTC it becomes midnight PDT (2026-07-15)
+        dt_post_reset_summer = datetime(2026, 7, 15, 7, 0, 0, tzinfo=timezone.utc)
+        self.assertEqual(get_pacific_calendar_date(dt_post_reset_summer), "2026-07-15")
+
+    def test_input_tpm_missing_consumption_fails_closed(self):
+        """When input_tpm_limit is specified, missing current_input_tpm fails closed."""
+        is_ok, reason = check_free_tier_safety_guard(
+            model_name="gemini-3.5-flash-lite",
+            current_monthly_calls=1,
+            rpm_limit=15,
+            current_rpm=1,
+            input_tpm_limit=250_000,
+            current_input_tpm=None,  # Missing!
+            estimated_input_tokens=500,
+            rpd_limit=500,
+            current_rpd=1,
+            allow_synthetic_simulation=True,
+        )
+        self.assertFalse(is_ok)
+        self.assertIn("Missing current input TPM consumption", reason)
+
+    def test_input_tpm_exhaustion_fails_closed(self):
+        """When projected input tokens exceed input_tpm_limit, check fails closed."""
+        is_ok, reason = check_free_tier_safety_guard(
+            model_name="gemini-3.5-flash-lite",
+            current_monthly_calls=1,
+            rpm_limit=15,
+            current_rpm=1,
+            input_tpm_limit=250_000,
+            current_input_tpm=245_000,
+            estimated_input_tokens=6_000,  # 245k + 6k = 251k > 250k!
+            rpd_limit=500,
+            current_rpd=1,
+            allow_synthetic_simulation=True,
+        )
+        self.assertFalse(is_ok)
+        self.assertIn("exceeds verified input TPM limit", reason)
+
+    def test_g3_preflight_denies_without_human_po_go(self):
+        """Preflight gates pass all machine checks, but DENY when PO Live GO is not granted."""
+        decision = evaluate_g3_activation_preflight(
+            model_name="gemini-3.5-flash-lite",
+            enable_search_grounding=False,
+            max_run_cost_usd=0.0,
+            max_monthly_cost_usd=0.0,
+            project_proof=self.valid_synthetic_proof,
+            quota_evidence=self.valid_synthetic_quota,
+            is_po_live_go_granted=False,  # PO GO NOT GRANTED!
+            allow_synthetic_simulation=True,
+            now=self.now_utc,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.status_code, "DENY_NO_PO_GO")
+        self.assertIn("PO Live GO", decision.reason)
+        self.assertIn("Machine gates cannot self-authorize", decision.reason)
+
+    def test_g3_preflight_denies_unassessed_model(self):
+        """Preflight rejects models that are not the sole assessed launch candidate."""
+        decision = evaluate_g3_activation_preflight(
+            model_name="gemini-3.8-flash",
+            is_po_live_go_granted=True,
+            allow_synthetic_simulation=True,
+            now=self.now_utc,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.status_code, "DENY_UNASSESSED_MODEL")
+        self.assertIn("unassessed for launch", decision.reason)
+
+    def test_g3_preflight_denies_search_grounding(self):
+        """Preflight rejects search grounding under strict $0.00 Free Tier policy."""
+        decision = evaluate_g3_activation_preflight(
+            model_name="gemini-3.5-flash-lite",
+            enable_search_grounding=True,
+            is_po_live_go_granted=True,
+            allow_synthetic_simulation=True,
+            now=self.now_utc,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.status_code, "DENY_SEARCH_GROUNDING")
+        self.assertIn("Search grounding is enabled", decision.reason)
+
+    def test_g3_preflight_denies_positive_budget_ceiling(self):
+        """Preflight rejects positive monetary ceilings."""
+        decision = evaluate_g3_activation_preflight(
+            model_name="gemini-3.5-flash-lite",
+            max_run_cost_usd=0.05,
+            is_po_live_go_granted=True,
+            allow_synthetic_simulation=True,
+            now=self.now_utc,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.status_code, "DENY_POSITIVE_BUDGET")
+
+    def test_g3_preflight_denies_paid_project(self):
+        """Preflight rejects projects marked billing_enabled=True as DISALLOWED_PAID."""
+        paid_proof = dict(self.valid_synthetic_proof)
+        paid_proof["billing_enabled"] = True
+        decision = evaluate_g3_activation_preflight(
+            model_name="gemini-3.5-flash-lite",
+            project_proof=paid_proof,
+            is_po_live_go_granted=True,
+            allow_synthetic_simulation=True,
+            now=self.now_utc,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.status_code, "DENY_PAID_PROJECT")
+        self.assertEqual(decision.billing_tier, BILLING_TIER_DISALLOWED_PAID)
+
+    def test_g3_preflight_denies_unverified_billing_by_default(self):
+        """Preflight denies unauthenticated caller proofs when allow_synthetic_simulation is False."""
+        decision = evaluate_g3_activation_preflight(
+            model_name="gemini-3.5-flash-lite",
+            project_proof=self.valid_synthetic_proof,
+            quota_evidence=self.valid_synthetic_quota,
+            is_po_live_go_granted=True,
+            allow_synthetic_simulation=False,  # Default production / live evaluation mode
+            now=self.now_utc,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.status_code, "DENY_UNVERIFIED_BILLING")
+        self.assertEqual(decision.billing_tier, BILLING_TIER_UNKNOWN)
+
+    def test_g3_preflight_denies_missing_or_exhausted_quota(self):
+        """Preflight denies when quota evidence is missing or exceeded."""
+        # 1. Missing quota evidence
+        decision_missing = evaluate_g3_activation_preflight(
+            model_name="gemini-3.5-flash-lite",
+            project_proof=self.valid_synthetic_proof,
+            quota_evidence=None,
+            is_po_live_go_granted=True,
+            allow_synthetic_simulation=True,
+            now=self.now_utc,
+        )
+        self.assertFalse(decision_missing.allowed)
+        self.assertEqual(decision_missing.status_code, "DENY_QUOTA_UNVERIFIED")
+
+        # 2. Exhausted quota (RPD exceeded)
+        exhausted_quota = dict(self.valid_synthetic_quota)
+        exhausted_quota["current_rpd"] = 500  # 500 + 1 = 501 > 500
+        decision_exhausted = evaluate_g3_activation_preflight(
+            model_name="gemini-3.5-flash-lite",
+            project_proof=self.valid_synthetic_proof,
+            quota_evidence=exhausted_quota,
+            is_po_live_go_granted=True,
+            allow_synthetic_simulation=True,
+            now=self.now_utc,
+        )
+        self.assertFalse(decision_exhausted.allowed)
+        self.assertEqual(decision_exhausted.status_code, "DENY_QUOTA_EXHAUSTED")
+
+    def test_g3_preflight_tracks_erd017_fencing_requirement(self):
+        """Preflight decision accurately notes ERD-017 cross-runner fencing for multi-runner mode."""
+        decision = evaluate_g3_activation_preflight(
+            model_name="gemini-3.5-flash-lite",
+            project_proof=self.valid_synthetic_proof,
+            quota_evidence=self.valid_synthetic_quota,
+            is_po_live_go_granted=True,
+            is_multi_runner_environment=True,
+            allow_synthetic_simulation=True,
+            now=self.now_utc,
+        )
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.status_code, "ALLOW_PREFLIGHT_READY")
+        self.assertTrue(decision.requires_erd017_fencing)
+
+    def test_evaluate_still_unconditionally_denied_even_if_g3_preflight_ready(self):
+        """GeminiEditorialEngine.evaluate() still unconditionally blocks API dispatch
+        via require_verified_free_tier() even when preflight decision returns ALLOW_PREFLIGHT_READY."""
+        preflight = evaluate_g3_activation_preflight(
+            model_name="gemini-3.5-flash-lite",
+            project_proof=self.valid_synthetic_proof,
+            quota_evidence=self.valid_synthetic_quota,
+            is_po_live_go_granted=True,
+            allow_synthetic_simulation=True,
+            now=self.now_utc,
+        )
+        self.assertTrue(preflight.allowed)
+        self.assertEqual(preflight.status_code, "ALLOW_PREFLIGHT_READY")
+
+        # Now test that evaluate() cannot be bypassed
+        settings = Settings(
+            gemini_api_key="synthetic-key",
+            gemini_model="gemini-3.5-flash-lite",
+            max_estimated_run_cost_usd=0.0,
+            max_monthly_ai_cost_usd=0.0,
+            max_monthly_ai_calls=10,
+        )
+        engine = GeminiEditorialEngine(settings)
+        engine.client = MagicMock()
+
+        article = Article.create("Test", "https://example.com/test", "Source", self.now_utc)
+
+        with self.assertRaises(AIEvaluationError) as ctx:
+            engine.evaluate([article], [], self.now_utc)
+        self.assertIn("free-tier/no-billing", str(ctx.exception))
+        engine.client.models.generate_content.assert_not_called()
 
 
 if __name__ == "__main__":
