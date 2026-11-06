@@ -497,6 +497,9 @@ class StagingRunnerReport(BaseModel):
     stages: list[StageResult] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    preflight_passed: bool = False
+    preflight_assumed: bool = False
+    preflight_provenance: str = "NOT_RUN"
 
     def summary(self) -> str:
         lines = [
@@ -504,6 +507,7 @@ class StagingRunnerReport(BaseModel):
             f"Run ID: {self.run_id}",
             f"Destination: {mask_turso_url(self.destination_url)}",
             f"Audit Outcome State: {self.audit_state.value}",
+            f"Preflight Passed: {self.preflight_passed} (Assumed: {self.preflight_assumed}, Provenance: {self.preflight_provenance})",
             f"Manifest Path: {self.manifest_path} (Preserved: {'YES' if self.manifest_preserved else 'NO'})",
             f"HTTP Requests: {self.http_requests_total}/{self.http_requests_ceiling} (Cleanup Reserve Used: {self.cleanup_reserve_used}/{CLEANUP_RESERVE_REQUESTS})",
             f"Synthetic Rows Peak: {self.synthetic_rows_written_peak} | Mutating SQL Operations: {self.total_mutating_operations}",
@@ -973,6 +977,9 @@ class StagingSessionRunner:
         self.halt_before_cleanup = False
         self.audit_state = AuditOutcomeState.UNKNOWN
         self.session_status = SessionStatus.FAILED
+        self._preflight_passed = False
+        self._preflight_assumed = False
+        self._preflight_provenance = "NOT_RUN"
 
     @property
     def budget_transport(self) -> Optional[BudgetTrackingTransport]:
@@ -1032,8 +1039,15 @@ class StagingSessionRunner:
 
         If skip_live_01 is False (default), executes full hermetic session LIVE-01 through LIVE-08.
         If skip_live_01 is True, executes controlled write stages LIVE-02 through LIVE-08,
-        assuming LIVE-01 preflight was separately verified read-only under Block Writes ON.
-        Ahead-of-time manifest registration is always performed before any write mutation.
+        under an explicit offline-only mock assumption that LIVE-01 preflight was previously executed.
+
+        SAFETY NOTICE:
+        - Skipping LIVE-01 is strictly an offline mock-only simulation and provenance assumption.
+        - It does NOT verify remote preflight, schema state, or baseline collisions.
+        - Real LIVE-02..08 execution against cloud staging requires verified remote preflight,
+          authenticated same-session/same-run-ID and exact manifest-identity handoff, and
+          separate Product Owner authorization.
+        - Ahead-of-time manifest registration is always performed before any write mutation.
         """
         # Reject previously initialized client before dispatching SQL or mutating state
         if getattr(self.client, "_client", None) is not None:
@@ -1054,6 +1068,10 @@ class StagingSessionRunner:
             self._create_and_persist_manifest()
             if not skip_live_01:
                 self._run_live_01()
+            else:
+                self._preflight_passed = False
+                self._preflight_assumed = True
+                self._preflight_provenance = "ASSUMED_OFFLINE_MOCK_ONLY"
 
             # Phase 2: Controlled Live Execution (LIVE-02 through LIVE-07)
             self._run_live_02()
@@ -1107,6 +1125,9 @@ class StagingSessionRunner:
             stages=self.stages,
             errors=self.errors,
             warnings=self.warnings,
+            preflight_passed=self._preflight_passed,
+            preflight_assumed=self._preflight_assumed,
+            preflight_provenance=self._preflight_provenance,
         )
 
     # -------------------------------------------------------------------------
@@ -1156,6 +1177,9 @@ class StagingSessionRunner:
             duration_seconds=duration,
             details={"schema_version": report.schema_version, "tables_checked": report.tables_checked},
         ))
+        self._preflight_passed = True
+        self._preflight_assumed = False
+        self._preflight_provenance = "VERIFIED_IN_SESSION"
 
     def _run_live_02(self) -> None:
         """LIVE-02: Hrana v2 Multi-Statement Transaction Atomicity & Baton Read-Back (4 calls)."""

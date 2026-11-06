@@ -95,6 +95,8 @@ class LiveReadyOperatorReport(BaseModel):
     status: LiveReadyOperatorStatus
     audit_state: AuditOutcomeState
     preflight_passed: bool
+    preflight_assumed: bool = False
+    preflight_provenance: str = "NONE"
     human_window_confirmed: bool
     destination_url: str
     manifest_path: str
@@ -116,6 +118,8 @@ class LiveReadyOperatorReport(BaseModel):
             f"Run ID: {self.run_id}",
             f"Destination: {mask_turso_url(self.destination_url)}",
             f"Preflight Passed: {self.preflight_passed}",
+            f"Preflight Assumed (Offline Mock Only): {self.preflight_assumed}",
+            f"Preflight Provenance: {self.preflight_provenance}",
             f"Human Window Confirmed: {self.human_window_confirmed}",
             f"Live Execution Refused (Default-Deny): {self.live_execution_refused}",
             f"Security Boundary Active: {self.security_boundary_active}",
@@ -211,6 +215,8 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
         self.cleanup_reserve = cleanup_reserve
         self.session_deadline_seconds = session_deadline_seconds
         self.human_window_confirmed = False
+        self._preflight_assumed_offline = False
+        self._preflight_provenance = "NONE"
         self._gate: Optional[OfflineSessionGate] = None
         self.lockdown_recorded = False
         self.live_execution_refused = True
@@ -286,10 +292,11 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
                 simulated_block_writes_on=True,
                 request_count=req_used,
             )
+        self._preflight_provenance = "VERIFIED_IN_SESSION"
 
     def confirm_human_window(self, marker: str = "MOCK_ONLY") -> None:
         """Explicit human approval window gate; required before any write mutation."""
-        if not self._preflight_accepted or self.halt_before_cleanup:
+        if not (self._preflight_accepted or self._preflight_assumed_offline) or self.halt_before_cleanup:
             self._deny("PREFLIGHT_REQUIRED")
         if self.human_window_confirmed:
             self._deny("HUMAN_WINDOW_ALREADY_CONFIRMED")
@@ -303,7 +310,7 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
         self.human_window_confirmed = True
 
     def _guard_mutation(self, sql: str, params: list[Any] | None) -> None:
-        if not self._preflight_accepted or self._seal is None:
+        if not (self._preflight_accepted or self._preflight_assumed_offline) or self._seal is None:
             self._deny("PREFLIGHT_REQUIRED")
         if not self.human_window_confirmed:
             self._deny("HUMAN_WINDOW_REQUIRED")
@@ -382,7 +389,7 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
 
     def _run_live_02(self) -> None:
         self._check_budget_and_deadline(cleanup=False)
-        if not self._preflight_accepted:
+        if not (self._preflight_accepted or self._preflight_assumed_offline):
             self._deny("PREFLIGHT_REQUIRED")
         if not self.human_window_confirmed:
             self._deny("HUMAN_WINDOW_REQUIRED")
@@ -710,13 +717,18 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             if not skip_live_01:
                 self._run_live_01()
             else:
-                self._preflight_accepted = True
-                if self.security_boundary is not None:
-                    self.security_boundary._stage_sequence_index = 1
-                    self.security_boundary._preflight_passed = True
-                if self._gate is not None:
-                    self._gate._phase = MockPhase.PREFLIGHT
-                    self._gate._requests = 46
+                self._preflight_assumed_offline = True
+                self._preflight_provenance = "ASSUMED_OFFLINE_MOCK_ONLY"
+                if self.security_boundary is not None and self._seal is not None:
+                    self.security_boundary.record_simulated_preflight_assumption(
+                        manifest_sha256=self._seal.sha256,
+                        marker="OFFLINE_SIMULATED_PREFLIGHT_ASSUMPTION",
+                    )
+                if self._gate is not None and self._seal is not None:
+                    self._gate.record_simulated_preflight_assumption(
+                        manifest_sha256=self._seal.sha256,
+                        marker="OFFLINE_SIMULATED_PREFLIGHT_ASSUMPTION",
+                    )
 
             # 3. Human Approval Window Gate
             if auto_human_window:
@@ -752,7 +764,7 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
 
                 if (
                     self.human_window_confirmed
-                    and self._preflight_accepted
+                    and (self._preflight_accepted or self._preflight_assumed_offline)
                     and all_stages_succeeded
                     and self.lockdown_recorded
                     and self.audit_state == AuditOutcomeState.CLEAN
@@ -848,6 +860,8 @@ class LiveReadyStagingOperator(SealedHermeticStagingRunner):
             status=session_status,
             audit_state=self.audit_state,
             preflight_passed=self._preflight_accepted,
+            preflight_assumed=self._preflight_assumed_offline,
+            preflight_provenance=self._preflight_provenance,
             human_window_confirmed=self.human_window_confirmed,
             destination_url=self.destination_url,
             manifest_path=str(self.manifest_path or ""),

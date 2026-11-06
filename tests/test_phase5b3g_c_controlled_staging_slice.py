@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -39,10 +40,14 @@ from efso_radar.staging import (
     execute_controlled_staging,
     validate_staging_destination,
 )
+from efso_radar.staging.manifest_seal import OfflineManifestSeal
+from efso_radar.staging.hrana_outbound_guard import HranaOutboundSecurityBoundary
 from efso_radar.staging.runner import (
     BudgetTrackingTransport,
     HermeticStagingTransport,
+    PerRunOwnershipManifest,
     build_parser,
+    create_default_manifest_entities,
     main,
 )
 
@@ -259,9 +264,11 @@ class TestFaultInjectionControlledSlice(unittest.TestCase):
         """Simulated persisted rollback article is conditionally deleted and tracked in LIVE-08."""
         conn = _create_isolated_v6_db()
         self.addCleanup(conn.close)
+        raw_transport = HermeticStagingTransport(conn)
 
         report = execute_controlled_staging(
             manifest_dir=self.manifest_dir,
+            mock_transport=raw_transport,
             skip_live_01=True,
             simulate_rollback_persisted=True,
         )
@@ -274,16 +281,43 @@ class TestFaultInjectionControlledSlice(unittest.TestCase):
         live08_details = report.stages[-1].details
         self.assertEqual(live08_details.get("entities_deleted"), 5)
 
-        # Database is completely clean
+        # Database is completely clean: rollback entity and other registered synthetic rows are absent
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM processed_articles;")
         self.assertEqual(cur.fetchone()[0], 0)
 
+        cur.execute(
+            "SELECT COUNT(*) FROM processed_articles WHERE article_id = ?",
+            (f"synth_art_{report.run_id}_02_rollback",),
+        )
+        self.assertEqual(cur.fetchone()[0], 0)
+
+        cur.execute(
+            "SELECT COUNT(*) FROM processed_articles WHERE article_id = ?",
+            (f"synth_art_{report.run_id}_01",),
+        )
+        self.assertEqual(cur.fetchone()[0], 0)
+
+        cur.execute(
+            "SELECT COUNT(*) FROM stories WHERE story_id = ?",
+            (f"synth_story_{report.run_id}_01",),
+        )
+        self.assertEqual(cur.fetchone()[0], 0)
+
+        cur.execute(
+            "SELECT COUNT(*) FROM run_locks WHERE lock_key = ?",
+            (f"synth_lock_{report.run_id}",),
+        )
+        self.assertEqual(cur.fetchone()[0], 0)
+
+        cur.execute(
+            "SELECT COUNT(*) FROM durable_recovery_state WHERE state_key = ?",
+            (f"synth_stage_{report.run_id}::current",),
+        )
+        self.assertEqual(cur.fetchone()[0], 0)
+
     def test_live07_ambiguous_contradictory_halts_before_cleanup(self):
         """Contradictory state in LIVE-07 flags PARTIAL_CORRUPTION_DETECTED and halts before cleanup."""
-        conn = _create_isolated_v6_db()
-        self.addCleanup(conn.close)
-
         report = execute_controlled_staging(
             manifest_dir=self.manifest_dir,
             skip_live_01=True,
@@ -297,9 +331,6 @@ class TestFaultInjectionControlledSlice(unittest.TestCase):
 
     def test_live07_ambiguous_inspection_failure_halts_fail_closed(self):
         """Reconciliation transport failure in LIVE-07 preserves UNKNOWN and manifest."""
-        conn = _create_isolated_v6_db()
-        self.addCleanup(conn.close)
-
         report = execute_controlled_staging(
             manifest_dir=self.manifest_dir,
             skip_live_01=True,
@@ -313,9 +344,6 @@ class TestFaultInjectionControlledSlice(unittest.TestCase):
 
     def test_live08_ownership_mismatch_halts_immediately(self):
         """Ownership attribute mismatch in LIVE-08a halts with OWNERSHIP_MISMATCH_HALT and skips delete."""
-        conn = _create_isolated_v6_db()
-        self.addCleanup(conn.close)
-
         report = execute_controlled_staging(
             manifest_dir=self.manifest_dir,
             skip_live_01=True,
@@ -329,9 +357,6 @@ class TestFaultInjectionControlledSlice(unittest.TestCase):
 
     def test_live08_audit_failure_marks_unknown_and_preserves_manifest(self):
         """Transport error during 3-state audit query in LIVE-08c marks UNKNOWN and preserves manifest."""
-        conn = _create_isolated_v6_db()
-        self.addCleanup(conn.close)
-
         report = execute_controlled_staging(
             manifest_dir=self.manifest_dir,
             skip_live_01=True,
@@ -409,7 +434,9 @@ class TestLiveReadyOperatorCoherence(unittest.TestCase):
         self.assertFalse(report.manifest_preserved)
         self.assertTrue(report.lockdown_recorded)
         self.assertTrue(report.human_window_confirmed)
-        self.assertTrue(report.preflight_passed)
+        self.assertFalse(report.preflight_passed)
+        self.assertTrue(report.preflight_assumed)
+        self.assertEqual(report.preflight_provenance, "ASSUMED_OFFLINE_MOCK_ONLY")
 
         # 7 stages executed (LIVE-02 through LIVE-08)
         self.assertEqual(len(report.stages), 7)
@@ -438,3 +465,213 @@ class TestNonProofContractAndArchitectureDistinction(unittest.TestCase):
             report.destination_url.startswith("https://efso-radar-staging-fatihemres"),
             "Destination must be allowlisted staging host",
         )
+
+
+class TestPreflightIntegrityAndNegativeRegressions(unittest.TestCase):
+    """Negative regression tests proving skipped preflight cannot be reported as verified remote preflight."""
+
+    def setUp(self):
+        self.manifest_dir = Path(tempfile.mkdtemp(prefix="efso_staging_preflight_neg_test_"))
+
+    def tearDown(self):
+        if self.manifest_dir.exists():
+            shutil.rmtree(self.manifest_dir, ignore_errors=True)
+
+    def test_skip_live01_reports_false_preflight_and_explicit_mock_provenance(self):
+        """Simulated skip_live_01=True reports preflight_passed=False and ASSUMED_OFFLINE_MOCK_ONLY provenance."""
+        report = execute_controlled_staging(
+            manifest_dir=self.manifest_dir,
+            skip_live_01=True,
+        )
+        self.assertEqual(report.status, SessionStatus.PASSED)
+        self.assertFalse(report.preflight_passed)
+        self.assertTrue(report.preflight_assumed)
+        self.assertEqual(report.preflight_provenance, "ASSUMED_OFFLINE_MOCK_ONLY")
+
+    def test_nominal_full_session_reports_verified_in_session_provenance(self):
+        """Nominal session with executed LIVE-01 reports preflight_passed=True and VERIFIED_IN_SESSION provenance."""
+        report = execute_controlled_staging(
+            manifest_dir=self.manifest_dir,
+            skip_live_01=False,
+        )
+        self.assertEqual(report.status, SessionStatus.PASSED)
+        self.assertTrue(report.preflight_passed)
+        self.assertFalse(report.preflight_assumed)
+        self.assertEqual(report.preflight_provenance, "VERIFIED_IN_SESSION")
+
+    def test_wire_boundary_denies_preflight_completed_without_evidence(self):
+        """Security boundary record_preflight_completed fails closed if wire queries are absent."""
+        entities = create_default_manifest_entities("run_20261025T150000Z_aaaaaaaaaaaa")
+        manifest = PerRunOwnershipManifest(
+            run_id="run_20261025T150000Z_aaaaaaaaaaaa",
+            created_at="2026-10-25T15:00:00Z",
+            registered_entities=entities,
+        )
+        manifest_path = manifest.save_atomic(self.manifest_dir)
+        seal = OfflineManifestSeal.from_persisted(manifest_path, expected_run_id="run_20261025T150000Z_aaaaaaaaaaaa")
+        conn = _create_isolated_v6_db()
+        self.addCleanup(conn.close)
+        raw = HermeticStagingTransport(conn)
+        boundary = HranaOutboundSecurityBoundary(
+            inner=raw,
+            seal=seal,
+            dynamic_validation=True,
+            session_mode=True,
+        )
+        with self.assertRaises(PermissionError) as ctx:
+            boundary.record_preflight_completed(seal.sha256)
+        self.assertIn("PREFLIGHT_EVIDENCE_MISSING", str(ctx.exception))
+
+    def test_wire_boundary_simulated_preflight_assumption_gate_checks(self):
+        """Security boundary record_simulated_preflight_assumption enforces SHA, marker, and sequence."""
+        entities = create_default_manifest_entities("run_20261025T150000Z_bbbbbbbbbbbb")
+        manifest = PerRunOwnershipManifest(
+            run_id="run_20261025T150000Z_bbbbbbbbbbbb",
+            created_at="2026-10-25T15:00:00Z",
+            registered_entities=entities,
+        )
+        manifest_path = manifest.save_atomic(self.manifest_dir)
+        seal = OfflineManifestSeal.from_persisted(manifest_path, expected_run_id="run_20261025T150000Z_bbbbbbbbbbbb")
+        conn = _create_isolated_v6_db()
+        self.addCleanup(conn.close)
+        raw = HermeticStagingTransport(conn)
+        boundary = HranaOutboundSecurityBoundary(
+            inner=raw,
+            seal=seal,
+            dynamic_validation=True,
+            session_mode=True,
+        )
+
+        # 1. Reject invalid manifest SHA
+        with self.assertRaises(PermissionError) as ctx:
+            boundary.record_simulated_preflight_assumption(
+                manifest_sha256="0" * 64,
+                marker="OFFLINE_SIMULATED_PREFLIGHT_ASSUMPTION",
+            )
+        self.assertIn("MANIFEST_MISMATCH", str(ctx.exception))
+
+        # Re-create fresh boundary
+        boundary = HranaOutboundSecurityBoundary(
+            inner=raw,
+            seal=seal,
+            dynamic_validation=True,
+            session_mode=True,
+        )
+
+        # 2. Reject invalid marker
+        with self.assertRaises(PermissionError) as ctx:
+            boundary.record_simulated_preflight_assumption(
+                manifest_sha256=seal.sha256,
+                marker="REMOTE_VERIFIED_AUTHENTICATED",
+            )
+        self.assertIn("INVALID_PREFLIGHT_ASSUMPTION_MARKER", str(ctx.exception))
+
+        # Re-create fresh boundary
+        boundary = HranaOutboundSecurityBoundary(
+            inner=raw,
+            seal=seal,
+            dynamic_validation=True,
+            session_mode=True,
+        )
+
+        # 3. Successful transition
+        boundary.record_simulated_preflight_assumption(
+            manifest_sha256=seal.sha256,
+            marker="OFFLINE_SIMULATED_PREFLIGHT_ASSUMPTION",
+        )
+        self.assertFalse(boundary._preflight_passed)
+        self.assertTrue(boundary._preflight_assumed_offline)
+        self.assertEqual(boundary._stage_sequence_index, 1)
+
+        # 4. Reject re-recording (sequence index != 0)
+        with self.assertRaises(PermissionError) as ctx:
+            boundary.record_simulated_preflight_assumption(
+                manifest_sha256=seal.sha256,
+                marker="OFFLINE_SIMULATED_PREFLIGHT_ASSUMPTION",
+            )
+        self.assertIn("OUT_OF_ORDER_STAGE", str(ctx.exception))
+
+    def test_offline_session_gate_simulated_preflight_assumption_checks(self):
+        """OfflineSessionGate record_simulated_preflight_assumption validates SHA, marker, and phase."""
+        from efso_radar.staging.offline_session_gate import MockGateDenied, OfflineSessionGate
+        digest = "a" * 64
+        gate = OfflineSessionGate(expected_manifest_sha256=digest)
+
+        # 1. Reject wrong digest
+        with self.assertRaises(MockGateDenied) as ctx:
+            gate.record_simulated_preflight_assumption(
+                manifest_sha256="b" * 64,
+                marker="OFFLINE_SIMULATED_PREFLIGHT_ASSUMPTION",
+            )
+        self.assertIn("MANIFEST_MISMATCH", str(ctx.exception))
+
+        # Re-create fresh gate
+        gate = OfflineSessionGate(expected_manifest_sha256=digest)
+
+        # 2. Reject invalid marker
+        with self.assertRaises(MockGateDenied) as ctx:
+            gate.record_simulated_preflight_assumption(
+                manifest_sha256=digest,
+                marker="INVALID_MARKER",
+            )
+        self.assertIn("INVALID_PREFLIGHT_ASSUMPTION_MARKER", str(ctx.exception))
+
+        # Re-create fresh gate
+        gate = OfflineSessionGate(expected_manifest_sha256=digest)
+
+        # 3. Successful assumption
+        gate.record_simulated_preflight_assumption(
+            manifest_sha256=digest,
+            marker="OFFLINE_SIMULATED_PREFLIGHT_ASSUMPTION",
+        )
+        snap = gate.snapshot()
+        self.assertEqual(snap.phase.value, "PREFLIGHT")
+        self.assertEqual(snap.requests, 0)  # No phantom requests
+        self.assertTrue(snap.preflight_assumed)
+    def test_wire_boundary_rejects_mutation_without_preflight_or_assumption(self):
+        """Wire boundary rejects any mutating SQL if preflight is neither verified nor assumed."""
+        entities = create_default_manifest_entities("run_20261025T150000Z_cccccccccccc")
+        manifest = PerRunOwnershipManifest(
+            run_id="run_20261025T150000Z_cccccccccccc",
+            created_at="2026-10-25T15:00:00Z",
+            registered_entities=entities,
+        )
+        manifest_path = manifest.save_atomic(self.manifest_dir)
+        seal = OfflineManifestSeal.from_persisted(manifest_path, expected_run_id="run_20261025T150000Z_cccccccccccc")
+        conn = _create_isolated_v6_db()
+        self.addCleanup(conn.close)
+        raw = HermeticStagingTransport(conn)
+        boundary = HranaOutboundSecurityBoundary(
+            inner=raw,
+            seal=seal,
+            dynamic_validation=True,
+            session_mode=True,
+        )
+
+        request = httpx.Request(
+            "POST",
+            "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/v2/pipeline",
+            json={
+                "requests": [
+                    {
+                        "type": "execute",
+                        "stmt": {
+                            "sql": "INSERT INTO processed_articles (article_id, canonical_url, title, source, published_at, processed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                            "args": [
+                                {"type": "text", "value": "synth_art_run_20261025T150000Z_cccccccccccc_01"},
+                                {"type": "text", "value": "https://example.com/synth/01"},
+                                {"type": "text", "value": "SYNTH_ARTICLE_run_20261025T150000Z_cccccccccccc_01"},
+                                {"type": "text", "value": "staging_synth_test"},
+                                {"type": "text", "value": "2026-10-25T15:00:00Z"},
+                                {"type": "text", "value": "2026-10-25T15:00:00Z"},
+                            ],
+                        },
+                    },
+                    {"type": "close"},
+                ]
+            },
+        )
+
+        with self.assertRaises(PermissionError) as ctx:
+            boundary.handle_request(request)
+        self.assertIn("PREFLIGHT_REQUIRED", str(ctx.exception))
