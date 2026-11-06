@@ -849,6 +849,17 @@ COMMIT;
     3. An explicit, separate Product Owner GO specifically authorizing destructive database modification.
 - **Strict Implementation Gate:** No migration script is executed, no migration code is added to `schema.py`, and the database schema remains at version 6.
 
+##### E. Issue #90 Offline Implementation & Independent Review Remediation (2026-11-06)
+- **Scope & Runtime Boundaries:** Implemented in `src/efso_radar/staging/journal.py` strictly for offline hermetic testing against in-memory or temporary SQLite connections. No live Turso connections (including reads), no cloud endpoints, and no production schema migration (`CURRENT_SCHEMA_VERSION` remains 6).
+- **Independent Security & Engineering Remediations (PR #91):**
+  1. *Target Inventory Containment:* Callers cannot supply arbitrary SQL or WHERE clauses. Mutations are restricted to structured `StageMutationCommand` targeting only allowlisted tables and registered primary keys with matching expected attributes. Conditional cleanup queries are constructed directly by the journal manager from `target_inventory_json`, preventing SQL injection and unconfined deletions.
+  2. *Single-Transaction Atomic Cleanup:* Fencing CAS update to `CLEANUP_PENDING`, exact conditional deletions, 3-state audit (`CLEAN` / `RESIDUAL`), and status finalization to `CLEANED_UP` execute inside a single atomic `BEGIN IMMEDIATE` transaction. Any error or residual entity triggers complete transaction rollback, ensuring zero partial deletions.
+  3. *Removal of Caller-Controlled Authorization:* Removed write-capable `operator_reconcile_run` and caller boolean `is_po_approved=True`. Replaced with read-only `propose_operator_reconciliation`, which emits non-authorizing `OperatorReconciliationProposal` (`PROPOSAL_ONLY_NON_AUTHORIZING`) for manual offline review.
+  4. *Unresolved Run / UNKNOWN Re-entry Prevention:* `register_intent` verifies inside an atomic `BEGIN IMMEDIATE` transaction that no unresolved runs (including `UNKNOWN`) exist before admitting fresh registration or updating `run_locks`.
+  5. *Genuine Ambiguous Commit Outcomes:* Client models distributed commit ambiguity (`AmbiguousCommitOutcome.COMMITTED_BUT_ACK_LOST` vs `AmbiguousCommitOutcome.ROLLED_BACK_AND_ACK_LOST`) without conflating client local halt with provider remote state.
+  6. *Safe Abort Semantics:* Aborting is prohibited once mutating writes have begun (`MUTATING`, `EFFECT_COMMITTED`, `CLEANUP_PENDING`). In pre-mutation states, abort verifies zero residual entities exist before marking `ABORTED`.
+  7. *Offline Fixture Isolation:* `apply_candidate_schema_v7` enforces a runtime guard restricting DDL execution strictly to `:memory:` or OS temporary directories. Read operations default to `ReadProvenance.OFFLINE_LOCAL_FIXTURE_READ`.
+
 #### 5. Failure & Cost Matrix (Option B & Option B+C Invariants)
 
 | Failure Scenario | Primary Risk | System Action (Option B vs. B+C) | Retry / Cleanup Policy | Cost & Budget Policy ($0.00 / 0 TRY) |

@@ -89,6 +89,9 @@ if TYPE_CHECKING:
         UnauthorizedTakeoverError,
         validate_status_transition,
         canonical_inventory_json,
+        StageMutationCommand,
+        OperatorReconciliationProposal,
+        AmbiguousCommitOutcome,
     )
 
 __all__ = [
@@ -157,6 +160,9 @@ __all__ = [
     "UnauthorizedTakeoverError",
     "validate_status_transition",
     "canonical_inventory_json",
+    "StageMutationCommand",
+    "OperatorReconciliationProposal",
+    "AmbiguousCommitOutcome",
 ]
 
 _RUNNER_EXPORTS = frozenset({
@@ -235,6 +241,9 @@ _JOURNAL_EXPORTS = frozenset({
     "UnauthorizedTakeoverError",
     "validate_status_transition",
     "canonical_inventory_json",
+    "StageMutationCommand",
+    "OperatorReconciliationProposal",
+    "AmbiguousCommitOutcome",
 })
 
 
