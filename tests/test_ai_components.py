@@ -86,8 +86,8 @@ class TestAIComponents(unittest.TestCase):
             settings = Settings(
                 gemini_api_key="mock-test-key",
                 gemini_model="gemini-3.5-flash-lite",
-                max_estimated_run_cost_usd=0.05,
-                max_monthly_ai_cost_usd=1.20,
+                max_estimated_run_cost_usd=0.0,
+                max_monthly_ai_cost_usd=0.0,
                 max_monthly_ai_calls=10,
             )
             engine = GeminiEditorialEngine(settings, repository=repo)
@@ -96,7 +96,7 @@ class TestAIComponents(unittest.TestCase):
             art = Article.create("Test Haberi", "https://example.com/1", "Kaynak", self.now)
 
             # The old monetary ledger behavior is retained as a MOCK-ONLY fixture.
-            with patch("efso_radar.ai.client.require_verified_free_tier"):
+            with patch("efso_radar.ai.client.require_verified_free_tier"), patch("efso_radar.ai.client.check_free_tier_safety_guard", return_value=(True, "OK")):
                 with self.assertRaises(AIEvaluationError):
                     engine.evaluate([art], [], self.now)
 
@@ -288,7 +288,7 @@ class TestAIComponents(unittest.TestCase):
         art2 = Article.create("Haber 2", "https://url.com/2", "Kaynak", self.now)
         art3 = Article.create("Haber 3", "https://url.com/3", "Kaynak", self.now)
 
-        settings = Settings(gemini_api_key="mock-key", max_output_tokens=4096, max_estimated_run_cost_usd=0.05)
+        settings = Settings(gemini_api_key="mock-key", max_output_tokens=4096, max_estimated_run_cost_usd=0.0)
         engine = GeminiEditorialEngine(settings)
         engine.client = MagicMock()
 
@@ -297,7 +297,7 @@ class TestAIComponents(unittest.TestCase):
         mock_resp.text = '{"picks": []}'
         engine.client.models.generate_content.return_value = mock_resp
 
-        with patch("efso_radar.ai.client.require_verified_free_tier"):
+        with patch("efso_radar.ai.client.require_verified_free_tier"), patch("efso_radar.ai.client.check_free_tier_safety_guard", return_value=(True, "OK")):
             engine.evaluate([art1, art2, art3], [], self.now)
 
         # Inspect the config passed to client.models.generate_content

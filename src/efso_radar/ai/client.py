@@ -16,12 +16,13 @@ from typing import Any, Optional
 from pydantic import ValidationError
 
 from efso_radar.ai.cost import (
-    check_monthly_budget_guard,
+    check_free_tier_safety_guard,
     compute_candidate_batch_hash,
     compute_enforceable_batch_output_tokens,
     estimate_call_cost,
     estimate_tokens_from_text,
     extract_provider_token_usage,
+    is_model_free_tier_eligible,
     require_verified_free_tier,
 )
 from efso_radar.ai.prompts import build_diagnostic_editorial_prompt, build_editorial_prompt
@@ -426,28 +427,46 @@ class GeminiEditorialEngine(AIEditorialEngine):
             used_search_grounding=self.settings.enable_search_grounding,
         )
         logger.info(
-            "Estimated AI call: ~%d input tokens, est cost: $%.4f USD",
+            "Estimated AI call: ~%d input tokens, paid-equivalent reference cost: $%.4f USD",
             est_input_tokens,
             est_cost,
         )
 
+        monthly_calls = 0
+        monthly_cost = 0.0
         if self.repository is not None:
             monthly_usage = self.repository.get_monthly_ai_usage(now=now)
-            allowed, reason = check_monthly_budget_guard(
-                est_run_cost_usd=est_cost,
-                current_monthly_cost_usd=float(monthly_usage["total_cost_usd"]),
-                current_monthly_calls=int(monthly_usage["call_count"]),
-                max_run_cost_usd=self.settings.max_estimated_run_cost_usd,
-                max_monthly_cost_usd=self.settings.max_monthly_ai_cost_usd,
-                max_monthly_calls=self.settings.max_monthly_ai_calls,
+            monthly_calls = int(monthly_usage["call_count"])
+            monthly_cost = float(monthly_usage["total_cost_usd"])
+
+        # Reject positive operational monetary ceilings unconditionally (strict $0.00 / 0 TRY policy).
+        # Positive budget overrides cannot bypass Free Tier enforcement or authorize dispatch.
+        if (
+            self.settings.max_estimated_run_cost_usd > 0.0
+            or self.settings.max_monthly_ai_cost_usd > 0.0
+        ):
+            msg = (
+                f"Positive operational monetary budget override rejected "
+                f"(max_estimated_run_cost_usd={self.settings.max_estimated_run_cost_usd}, "
+                f"max_monthly_ai_cost_usd={self.settings.max_monthly_ai_cost_usd}). "
+                "Strict $0.00 / 0 TRY launch policy requires all monetary ceilings to remain $0.00. "
+                "Positive allowances cannot bypass Free Tier enforcement."
             )
-            if not allowed:
-                logger.error("AI Budget Circuit-Breaker triggered: %s", reason)
-                raise AIEvaluationError(reason)
-        elif est_cost > self.settings.max_estimated_run_cost_usd:
-            msg = f"Estimated AI cost (${est_cost:.4f}) exceeds configured per-run budget (${self.settings.max_estimated_run_cost_usd:.4f})."
             logger.error(msg)
             raise AIEvaluationError(msg)
+
+        # Enforce Free Tier safety guard under strict $0.00 launch defaults
+        allowed, reason = check_free_tier_safety_guard(
+            model_name=self.settings.gemini_model,
+            current_monthly_calls=monthly_calls,
+            max_monthly_calls=self.settings.max_monthly_ai_calls,
+            enable_search_grounding=self.settings.enable_search_grounding,
+            max_run_cost_usd=self.settings.max_estimated_run_cost_usd,
+            max_monthly_cost_usd=self.settings.max_monthly_ai_cost_usd,
+        )
+        if not allowed:
+            logger.error("Free Tier Safety Guard triggered: %s", reason)
+            raise AIEvaluationError(reason)
 
         import uuid
         usage_id = f"AI-{now.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
