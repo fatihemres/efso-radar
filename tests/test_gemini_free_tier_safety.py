@@ -97,6 +97,30 @@ class TestBillingProvenanceAndAccounting(unittest.TestCase):
         self.assertIn("Actual billed USD: UNKNOWN", accounting.reconciliation_notes)
         self.assertIn("Nominal Free Tier rate assumption", accounting.reconciliation_notes)
 
+    def test_nominal_free_tier_rate_is_none_for_unassessed_model_or_search_grounding(self):
+        """Theoretical Free Tier nominal rate is None (NOT_APPLICABLE) for unassessed models
+        or when search grounding is enabled, avoiding false $0.00 assumptions."""
+        # Unassessed model
+        accounting_unassessed = compute_gemini_cost_accounting(
+            model_name="gemini-3.8-flash",
+            input_tokens=1000,
+            output_tokens=500,
+            now=self.now,
+        )
+        self.assertIsNone(accounting_unassessed.nominal_free_tier_rate_usd)
+        self.assertIn("NOT_APPLICABLE", accounting_unassessed.reconciliation_notes)
+
+        # Search grounding enabled
+        accounting_grounded = compute_gemini_cost_accounting(
+            model_name="gemini-3.5-flash-lite",
+            input_tokens=1000,
+            output_tokens=500,
+            used_search_grounding=True,
+            now=self.now,
+        )
+        self.assertIsNone(accounting_grounded.nominal_free_tier_rate_usd)
+        self.assertIn("NOT_APPLICABLE", accounting_grounded.reconciliation_notes)
+
     def test_adversarial_caller_constructed_proof_cannot_certify_zero_dollar_billing(self):
         """Adversarial caller-constructed proof asserting billing_enabled=False cannot
         trick the system into reporting actual billed USD = 0 or VERIFIED_FREE_TIER."""
@@ -348,6 +372,7 @@ class TestQuotaAndCircuitBreakers(unittest.TestCase):
             rpm_limit=15,
             current_rpm=2,
             tpm_limit=1_000_000,
+            current_tpm=5000,
             estimated_batch_tokens=None,  # Missing!
             rpd_limit=1500,
             current_rpd=10,
@@ -379,6 +404,7 @@ class TestQuotaAndCircuitBreakers(unittest.TestCase):
             rpm_limit=15,
             current_rpm=2,
             tpm_limit=1_000_000,
+            current_tpm=5000,
             estimated_batch_tokens=1000,
             rpd_limit=None,  # Missing!
             current_rpd=10,
@@ -394,6 +420,7 @@ class TestQuotaAndCircuitBreakers(unittest.TestCase):
             rpm_limit=15,
             current_rpm=2,
             tpm_limit=1_000_000,
+            current_tpm=5000,
             estimated_batch_tokens=1000,
             rpd_limit=1500,
             current_rpd=None,  # Missing!
@@ -409,6 +436,7 @@ class TestQuotaAndCircuitBreakers(unittest.TestCase):
             rpm_limit=15,
             current_rpm=2,
             tpm_limit=1_000_000,
+            current_tpm=5000,
             estimated_batch_tokens=1000,
             rpd_limit=1500,
             current_rpd=1500,  # 1500 + 1 > 1500 -> DENY
@@ -447,8 +475,40 @@ class TestQuotaAndCircuitBreakers(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertIn("exceeds Free Tier monthly call cap", reason)
 
-    def test_all_quota_dimensions_verified_allows(self):
-        """When all required quota limits and consumption observations are verified and within bounds, ALLOW."""
+    def test_missing_current_tpm_consumption_fails_closed(self):
+        """Missing current TPM consumption observation fails closed."""
+        allowed, reason = check_free_tier_safety_guard(
+            model_name="gemini-3.5-flash-lite",
+            current_monthly_calls=10,
+            rpm_limit=15,
+            current_rpm=2,
+            tpm_limit=1_000_000,
+            current_tpm=None,  # Missing!
+            estimated_batch_tokens=1000,
+            rpd_limit=1500,
+            current_rpd=10,
+            allow_synthetic_simulation=True,
+        )
+        self.assertFalse(allowed)
+        self.assertIn("Missing current TPM consumption observation", reason)
+
+        # Also fails closed under default (non-synthetic) caller mode
+        allowed_default, reason_default = check_free_tier_safety_guard(
+            model_name="gemini-3.5-flash-lite",
+            current_monthly_calls=10,
+            rpm_limit=15,
+            current_rpm=2,
+            tpm_limit=1_000_000,
+            current_tpm=None,
+            estimated_batch_tokens=1000,
+            rpd_limit=1500,
+            current_rpd=10,
+        )
+        self.assertFalse(allowed_default)
+        self.assertIn("Missing current TPM consumption observation", reason_default)
+
+    def test_caller_supplied_numerical_quotas_fail_closed_without_synthetic_flag(self):
+        """Caller-supplied numerical quota values cannot certify provider quotas for real dispatch."""
         allowed, reason = check_free_tier_safety_guard(
             model_name="gemini-3.5-flash-lite",
             current_monthly_calls=10,
@@ -460,9 +520,29 @@ class TestQuotaAndCircuitBreakers(unittest.TestCase):
             estimated_batch_tokens=1500,
             rpd_limit=1500,
             current_rpd=50,
+            # allow_synthetic_simulation defaults to False
+        )
+        self.assertFalse(allowed)
+        self.assertIn("Caller-supplied numerical quota values cannot certify provider quotas", reason)
+
+    def test_synthetic_mathematical_quota_calculation_within_limits_returns_synthetic_ok(self):
+        """When explicitly marked as synthetic simulation for pure mathematical unit-testing,
+        numbers within bounds return synthetic OK."""
+        allowed, reason = check_free_tier_safety_guard(
+            model_name="gemini-3.5-flash-lite",
+            current_monthly_calls=10,
+            max_monthly_calls=300,
+            rpm_limit=15,
+            current_rpm=2,
+            tpm_limit=1_000_000,
+            current_tpm=5000,
+            estimated_batch_tokens=1500,
+            rpd_limit=1500,
+            current_rpd=50,
+            allow_synthetic_simulation=True,
         )
         self.assertTrue(allowed)
-        self.assertEqual(reason, "OK")
+        self.assertEqual(reason, "OK (synthetic simulation only - non-authorizing)")
 
     def test_default_production_caller_receives_deny_due_to_unobserved_quotas(self):
         """Production callers without dynamic quota observations receive DENY by default."""
@@ -511,6 +591,26 @@ class TestPositiveBudgetOverrideRejection(unittest.TestCase):
         )
         self.assertFalse(allowed)
         self.assertIn("Positive monetary budget override detected", reason)
+
+    def test_evaluate_rejects_positive_operational_budget_ceiling_even_if_hard_barrier_mocked(self):
+        """Even if require_verified_free_tier is mocked, evaluate() directly rejects positive
+        operational monetary ceilings under strict $0.00 / 0 TRY policy."""
+        settings = Settings(
+            gemini_api_key="synthetic-key",
+            gemini_model="gemini-3.5-flash-lite",
+            max_estimated_run_cost_usd=0.05,
+            max_monthly_ai_cost_usd=1.20,
+        )
+        engine = GeminiEditorialEngine(settings)
+        engine.client = MagicMock()
+        article = Article.create("Test", "https://example.com/test", "Source", datetime.now(timezone.utc))
+
+        with patch("efso_radar.ai.client.require_verified_free_tier"):
+            with self.assertRaises(AIEvaluationError) as ctx:
+                engine.evaluate([article], [], datetime.now(timezone.utc))
+            self.assertIn("Positive operational monetary budget override rejected", str(ctx.exception))
+
+        engine.client.models.generate_content.assert_not_called()
 
 
 class TestDispatchSafetyAndLedgerContract(unittest.TestCase):
@@ -615,16 +715,17 @@ class TestDispatchSafetyAndLedgerContract(unittest.TestCase):
         settings = Settings(
             gemini_api_key="synthetic-key",
             gemini_model="gemini-3.5-flash-lite",
-            max_estimated_run_cost_usd=0.05,
-            max_monthly_ai_cost_usd=1.20,
+            max_estimated_run_cost_usd=0.0,
+            max_monthly_ai_cost_usd=0.0,
             max_monthly_ai_calls=10,
         )
         engine = GeminiEditorialEngine(settings, repository=self.repo)
         engine.client = MagicMock()
         engine.client.models.generate_content.side_effect = RuntimeError("504 Gateway Timeout")
 
-        # Mock the live dispatch barrier to test the API error handling path
-        with patch("efso_radar.ai.client.require_verified_free_tier"):
+        # Mock the live dispatch barrier and quota guard to test the API error handling path
+        with patch("efso_radar.ai.client.require_verified_free_tier"), \
+             patch("efso_radar.ai.client.check_free_tier_safety_guard", return_value=(True, "OK")):
             with self.assertRaises(AIEvaluationError):
                 engine.evaluate([self.article], [], self.now)
 

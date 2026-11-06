@@ -162,7 +162,7 @@ ASSESSED_LAUNCH_MODELS: frozenset[str] = frozenset({
     "gemini-3.5-flash-lite",
 })
 
-# Backward compatibility alias
+# Backward compatibility alias for internal launch assessment (not Google Free Tier catalog eligibility)
 FREE_TIER_ELIGIBLE_MODELS: frozenset[str] = ASSESSED_LAUNCH_MODELS
 
 # Inert documentation examples from Google AI Studio public tier tables.
@@ -194,10 +194,14 @@ def is_model_assessed_for_launch(model_name: str) -> bool:
 
 
 def is_model_free_tier_eligible(model_name: str) -> bool:
-    """Backward compatibility alias checking if model is assessed for launch.
+    """Backward compatibility alias checking internal launch assessment for Efso Radar.
 
-    Only assessed launch models (gemini-3.5-flash-lite) are approved for launch.
-    Unassessed, shut-down, or unrecognized models return False.
+    IMPORTANT DISTINCTION:
+    This function checks internal launch assessment under Efso Radar's strict $0.00 launch policy,
+    NOT Google Free Tier catalog eligibility. While Google documents Standard Free Tier for
+    several models (such as gemini-3.8-flash), Efso Radar restricts operational launch readiness
+    strictly to gemini-3.5-flash-lite (ASSESSED_LAUNCH_MODELS). Unassessed, shut-down, or
+    unrecognized models return False.
     """
     clean_name = model_name.strip().lower()
     if clean_name in SHUTDOWN_MODELS:
@@ -368,7 +372,9 @@ class GeminiCostAccounting(NamedTuple):
         paid_equivalent_estimate_usd: Published Standard paid-tier reference price Google would charge
             ($0.30 input / $2.50 output per 1M tokens for gemini-3.5-flash-lite).
             Preserved in ai_usage_ledger.estimated_cost_usd for economic opportunity cost audit.
-        nominal_free_tier_rate_usd: Published theoretical rate for Free Tier ($0.00).
+        nominal_free_tier_rate_usd: Published theoretical rate for Free Tier ($0.00) when applicable
+            to the assessed launch model without search grounding; None (NOT_APPLICABLE) for unassessed
+            models or when search grounding is enabled.
             This is a reference rate assumption, NOT an observed invoice or billing attestation.
         actual_billed_usd: Actual billable charge on invoice. ALWAYS None (UNKNOWN) in offline operation
             until independently authenticated provider billing evidence exists.
@@ -382,7 +388,7 @@ class GeminiCostAccounting(NamedTuple):
     input_tokens: int
     output_tokens: int
     paid_equivalent_estimate_usd: float
-    nominal_free_tier_rate_usd: float
+    nominal_free_tier_rate_usd: Optional[float]
     actual_billed_usd: Optional[float]
     billing_tier: str
     is_assessed_launch_model: bool
@@ -391,7 +397,7 @@ class GeminiCostAccounting(NamedTuple):
 
     @property
     def is_free_tier_eligible(self) -> bool:
-        """Backward compatibility alias for is_assessed_launch_model."""
+        """Backward compatibility alias for is_assessed_launch_model (internal launch assessment)."""
         return self.is_assessed_launch_model
 
 
@@ -426,16 +432,22 @@ def compute_gemini_cost_accounting(
 
     # In this offline slice, actual billed USD is ALWAYS None (UNKNOWN) because
     # real provider billing observation is not implemented or authorized.
-    # nominal_free_tier_rate_usd is 0.0 (theoretical Free Tier price),
-    # strictly separated from actual billed invoice charge.
-    nominal_rate = 0.0 if (is_assessed and not used_search_grounding) else 0.0
+    # nominal_free_tier_rate_usd is 0.0 (theoretical Free Tier price) only when
+    # model is assessed for launch and search grounding is disabled; None (NOT_APPLICABLE) otherwise.
+    # Strictly separated from actual billed invoice charge.
+    nominal_rate: Optional[float] = 0.0 if (is_assessed and not used_search_grounding) else None
 
     _, proof_tier, reason = validate_free_tier_project_proof(project_proof, now=now)
 
+    nominal_rate_str = (
+        f"${nominal_rate:.6f} USD"
+        if nominal_rate is not None
+        else "NOT_APPLICABLE (unassessed model or search grounding enabled)"
+    )
     reconciliation = (
         f"Paid-tier equivalent reference: ${paid_est:.6f} USD. "
         f"Actual billed USD: UNKNOWN (offline slice; no provider billing verification). "
-        f"Nominal Free Tier rate assumption: ${nominal_rate:.6f} USD. "
+        f"Nominal Free Tier rate assumption: {nominal_rate_str}. "
         f"Proof assessment: {reason}"
     )
 
@@ -703,6 +715,7 @@ def check_free_tier_safety_guard(
     requests_per_minute: Optional[int] = None,
     rpm_cap: Optional[int] = None,
     dynamic_quota_unknown: Optional[bool] = None,
+    allow_synthetic_simulation: bool = False,
 ) -> tuple[bool, str]:
     """Free Tier safety and quota circuit breaker.
 
@@ -711,6 +724,10 @@ def check_free_tier_safety_guard(
     Universal constants (e.g. 15 RPM, 1500 RPD, 1M TPM) are NOT account entitlements.
     Exact project/model-scoped, fresh, and trusted quota evidence is required for any ALLOW.
 
+    In this offline slice, caller-supplied numerical quota values cannot certify provider quotas.
+    Real dispatch authorization fails closed unless explicitly marked as a synthetic mathematical
+    simulation (allow_synthetic_simulation=True) for unit test validation.
+
     Enforces:
     1. Assessed launch model candidate (is_model_assessed_for_launch).
     2. Search grounding strictly disabled (search grounding is not free under Free Tier).
@@ -718,8 +735,9 @@ def check_free_tier_safety_guard(
     4. Explicit dynamic quota unknown flag check.
     5. Monthly call cap (current_monthly_calls must be observed and + 1 <= max_monthly_calls).
     6. Verified RPM quota limit AND consumption observed; current_rpm < rpm_limit.
-    7. Verified TPM quota limit AND consumption + batch reservation observed; current_tpm + tokens <= tpm_limit.
+    7. Verified TPM quota limit, consumption observed, AND batch reservation; current_tpm + tokens <= tpm_limit.
     8. Verified RPD quota limit AND consumption observed; current_rpd + 1 <= rpd_limit.
+    9. Provider quota provenance: caller-supplied numbers cannot authorize live dispatch (fail closed).
     """
     clean_name = model_name.strip().lower()
 
@@ -795,23 +813,27 @@ def check_free_tier_safety_guard(
             f"Requests per minute ({effective_current_rpm}) reaches or exceeds verified RPM limit ({effective_rpm_limit}).",
         )
 
-    # 7. TPM quota: limit AND estimated batch tokens must be explicitly observed
+    # 7. TPM quota: limit, consumption, AND estimated batch tokens must be explicitly observed
     if tpm_limit is None:
         return (
             False,
             "Missing verified TPM (Tokens Per Minute) provider quota limit: status is UNKNOWN. "
             "Universal constant cannot be assumed as an account entitlement. Fail closed.",
         )
+    if current_tpm is None:
+        return (
+            False,
+            "Missing current TPM consumption observation: status is UNKNOWN. Fail closed.",
+        )
     if estimated_batch_tokens is None or estimated_batch_tokens <= 0:
         return (
             False,
             "Missing estimated batch token count for TPM quota verification: status is UNKNOWN. Fail closed.",
         )
-    tpm_consumed = current_tpm if current_tpm is not None else 0
-    if (tpm_consumed + estimated_batch_tokens) > tpm_limit:
+    if (current_tpm + estimated_batch_tokens) > tpm_limit:
         return (
             False,
-            f"Projected tokens per minute ({tpm_consumed + estimated_batch_tokens}) exceeds verified TPM limit ({tpm_limit}).",
+            f"Projected tokens per minute ({current_tpm + estimated_batch_tokens}) exceeds verified TPM limit ({tpm_limit}).",
         )
 
     # Resolve RPD parameter aliases
@@ -836,7 +858,19 @@ def check_free_tier_safety_guard(
             f"Daily requests count ({effective_current_rpd + 1}) exceeds verified RPD limit ({effective_rpd_limit}).",
         )
 
-    return True, "OK"
+    # 9. Provider quota provenance: caller-supplied numerical values cannot certify provider quotas.
+    # Authenticated project/model/tier-specific quota evidence is unavailable in this offline slice.
+    # Fail closed for real dispatch authorization. Pure mathematical tests must explicitly pass
+    # allow_synthetic_simulation=True as non-authorizing tests.
+    if not allow_synthetic_simulation:
+        return (
+            False,
+            "Caller-supplied numerical quota values cannot certify provider quotas. "
+            "Authenticated project/model/tier-specific quota evidence and atomic reservation "
+            "counters are unavailable in this offline slice. Live dispatch authorization denied (fail closed).",
+        )
+
+    return True, "OK (synthetic simulation only - non-authorizing)"
 
 
 class ExperimentBudgetGuard:
