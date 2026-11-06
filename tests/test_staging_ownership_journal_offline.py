@@ -27,8 +27,10 @@ import json
 from pathlib import Path
 import sqlite3
 import tempfile
+from typing import Any, Optional
 import unittest
 from unittest.mock import patch
+import uuid
 
 from efso_radar.repositories.schema import (
     CURRENT_SCHEMA_VERSION,
@@ -47,6 +49,7 @@ from efso_radar.staging.journal import (
     InvalidJournalTransitionError,
     InvalidRunIdError,
     JournalError,
+    HaltMarkerPersistenceError,
     JournalExecutionPattern,
     JournalHaltedError,
     JournalStatus,
@@ -74,8 +77,10 @@ from efso_radar.staging.runner import (
 )
 
 
-def _make_run_id(suffix: str = "01") -> str:
+def _make_run_id(suffix: Optional[str] = None) -> str:
     """Helper to create a canonical run_id matching RUN_ID_REGEX."""
+    if suffix is None:
+        suffix = uuid.uuid4().hex[:12]
     hex_digest = hashlib.sha256(suffix.encode("utf-8")).hexdigest()[:12]
     run_id = f"run_20261106T200000Z_{hex_digest}"
     assert RUN_ID_REGEX.match(run_id)
@@ -142,7 +147,7 @@ class TestCandidateSchemaV7Isolation(unittest.TestCase):
 
     def test_apply_candidate_schema_v7_runtime_guard_rejects_non_temp_file(self):
         """Runtime guard on apply_candidate_schema_v7 rejects connection outside temp directory."""
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             fake_db = Path(temp_dir) / "test_fake_external.db"
             conn = sqlite3.connect(str(fake_db))
             try:
@@ -229,20 +234,17 @@ class TestStagingOwnershipJournalHermeticSuite(unittest.TestCase):
         for stmt in get_all_init_statements():
             self.conn.executescript(stmt)
         apply_candidate_schema_v7(self.conn)
-        self.journal = StagingOwnershipJournal(self.conn)
-        self.run_id = _make_run_id("test_01")
+        self.marker_temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.marker_dir = Path(self.marker_temp_dir.name)
+        self.journal = StagingOwnershipJournal(self.conn, marker_dir=self.marker_dir)
+        self.run_id = _make_run_id()
         self.owner_id = "gha_run_1234_attempt_1_uuid"
         self.entities = create_default_manifest_entities(self.run_id)
         self.manifest_seal_hex = _create_authenticated_seal(self.run_id, self.entities)
 
     def tearDown(self):
         self.conn.close()
-        marker = _halt_marker_path(self.run_id)
-        if marker.is_file():
-            try:
-                marker.unlink()
-            except OSError:
-                pass
+        self.marker_temp_dir.cleanup()
 
     # -------------------------------------------------------------------------
     # P1-1: Target Inventory Containment & Strict SQL Validation
@@ -775,7 +777,7 @@ class TestStagingOwnershipJournalHermeticSuite(unittest.TestCase):
 
     def test_p1_4_concurrent_multi_connection_registration_barrier_on_temp_db(self):
         """Multi-connection test: Two SQLite connections to a file DB cannot race to register distinct runs."""
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             db_path = Path(temp_dir) / "staging_test_barrier.db"
             conn_init = sqlite3.connect(str(db_path))
             for stmt in get_all_init_statements():
@@ -1021,19 +1023,21 @@ class TestStagingOwnershipJournalHermeticSuite(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_p1_5_reconstructed_journal_instance_mutation_committed_ack_lost_blocked(self):
         """Ambiguous mutation COMMIT (COMMITTED_BUT_ACK_LOST): a fresh journal object on a new connection remains halted."""
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             db_path = Path(temp_dir) / "staging_restart_mutation_committed.db"
+            marker_dir = Path(temp_dir) / "markers"
+            marker_dir.mkdir(parents=True, exist_ok=True)
             conn1 = sqlite3.connect(str(db_path))
             for stmt in get_all_init_statements():
                 conn1.executescript(stmt)
             apply_candidate_schema_v7(conn1)
 
-            run_id = _make_run_id("restart_mut_comm")
+            run_id = _make_run_id()
             entities = create_default_manifest_entities(run_id)
             seal = compute_canonical_inventory_fingerprint(run_id, entities)
             owner = "runner_restart_1"
 
-            journal1 = StagingOwnershipJournal(conn1)
+            journal1 = StagingOwnershipJournal(conn1, marker_dir=marker_dir)
             journal1.register_intent(
                 run_id=run_id,
                 owner_id=owner,
@@ -1062,77 +1066,75 @@ class TestStagingOwnershipJournalHermeticSuite(unittest.TestCase):
                 )
             conn1.close()
 
-            # Verify local halt marker was persisted
-            marker = _halt_marker_path(run_id)
+            # Verify local halt marker was persisted in the test-owned directory
+            marker = _halt_marker_path(run_id, marker_dir)
             self.assertTrue(marker.is_file())
 
-            try:
-                # Reopen connection with a brand new journal instance
-                conn2 = sqlite3.connect(str(db_path))
-                journal2 = StagingOwnershipJournal(conn2)
+            # Reopen connection with a brand new journal instance
+            conn2 = sqlite3.connect(str(db_path))
+            journal2 = StagingOwnershipJournal(conn2, marker_dir=marker_dir)
 
-                # Reconstructed journal MUST recognize halted state
-                self.assertTrue(journal2.is_halted(run_id))
+            # Reconstructed journal MUST recognize halted state
+            self.assertTrue(journal2.is_halted(run_id))
 
-                # Automated mutations fail closed
-                with self.assertRaises(JournalHaltedError) as ctx:
-                    journal2.execute_atomic_stage_mutation(
-                        run_id=run_id,
-                        owner_id=owner,
-                        expected_fencing_token=2,
-                        stage="LIVE_02",
-                        mutation_statements=[cmd],
-                        manifest_seal_hex=seal,
-                    )
-                self.assertIn("permanently halted in LOCAL_OUTCOME_UNKNOWN", str(ctx.exception))
+            # Automated mutations fail closed
+            with self.assertRaises(JournalHaltedError) as ctx:
+                journal2.execute_atomic_stage_mutation(
+                    run_id=run_id,
+                    owner_id=owner,
+                    expected_fencing_token=2,
+                    stage="LIVE_02",
+                    mutation_statements=[cmd],
+                    manifest_seal_hex=seal,
+                )
+            self.assertIn("permanently halted in LOCAL_OUTCOME_UNKNOWN", str(ctx.exception))
 
-                # Automated conditional cleanup fails closed
-                with self.assertRaises(JournalHaltedError):
-                    journal2.execute_conditional_cleanup(
-                        run_id=run_id,
-                        owner_id=owner,
-                        expected_fencing_token=2,
-                        manifest_seal_hex=seal,
-                    )
+            # Automated conditional cleanup fails closed
+            with self.assertRaises(JournalHaltedError):
+                journal2.execute_conditional_cleanup(
+                    run_id=run_id,
+                    owner_id=owner,
+                    expected_fencing_token=2,
+                    manifest_seal_hex=seal,
+                )
 
-                # Automated abort fails closed
-                with self.assertRaises(JournalHaltedError):
-                    journal2.abort_run(
-                        run_id=run_id,
-                        owner_id=owner,
-                        expected_fencing_token=2,
-                        reason="Restart abort test",
-                    )
+            # Automated abort fails closed
+            with self.assertRaises(JournalHaltedError):
+                journal2.abort_run(
+                    run_id=run_id,
+                    owner_id=owner,
+                    expected_fencing_token=2,
+                    reason="Restart abort test",
+                )
 
-                # Re-registration fails closed
-                with self.assertRaises(JournalHaltedError):
-                    journal2.register_intent(
-                        run_id=run_id,
-                        owner_id=owner,
-                        manifest_seal_hex=seal,
-                        target_inventory=entities,
-                    )
+            # Re-registration fails closed
+            with self.assertRaises(JournalHaltedError):
+                journal2.register_intent(
+                    run_id=run_id,
+                    owner_id=owner,
+                    manifest_seal_hex=seal,
+                    target_inventory=entities,
+                )
 
-                conn2.close()
-            finally:
-                if marker.is_file():
-                    marker.unlink()
+            conn2.close()
 
     def test_p1_5_reconstructed_journal_instance_mutation_rolled_back_ack_lost_blocked(self):
         """Ambiguous mutation COMMIT (ROLLED_BACK_AND_ACK_LOST): a fresh journal object on a new connection remains halted."""
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             db_path = Path(temp_dir) / "staging_restart_mutation_rollback.db"
+            marker_dir = Path(temp_dir) / "markers"
+            marker_dir.mkdir(parents=True, exist_ok=True)
             conn1 = sqlite3.connect(str(db_path))
             for stmt in get_all_init_statements():
                 conn1.executescript(stmt)
             apply_candidate_schema_v7(conn1)
 
-            run_id = _make_run_id("restart_mut_roll")
+            run_id = _make_run_id()
             entities = create_default_manifest_entities(run_id)
             seal = compute_canonical_inventory_fingerprint(run_id, entities)
             owner = "runner_restart_2"
 
-            journal1 = StagingOwnershipJournal(conn1)
+            journal1 = StagingOwnershipJournal(conn1, marker_dir=marker_dir)
             journal1.register_intent(
                 run_id=run_id,
                 owner_id=owner,
@@ -1161,61 +1163,59 @@ class TestStagingOwnershipJournalHermeticSuite(unittest.TestCase):
                 )
             conn1.close()
 
-            marker = _halt_marker_path(run_id)
+            marker = _halt_marker_path(run_id, marker_dir)
             self.assertTrue(marker.is_file())
 
-            try:
-                conn2 = sqlite3.connect(str(db_path))
-                journal2 = StagingOwnershipJournal(conn2)
+            conn2 = sqlite3.connect(str(db_path))
+            journal2 = StagingOwnershipJournal(conn2, marker_dir=marker_dir)
 
-                self.assertTrue(journal2.is_halted(run_id))
+            self.assertTrue(journal2.is_halted(run_id))
 
-                with self.assertRaises(JournalHaltedError):
-                    journal2.execute_atomic_stage_mutation(
-                        run_id=run_id,
-                        owner_id=owner,
-                        expected_fencing_token=1,
-                        stage="LIVE_02",
-                        mutation_statements=[cmd],
-                        manifest_seal_hex=seal,
-                    )
+            with self.assertRaises(JournalHaltedError):
+                journal2.execute_atomic_stage_mutation(
+                    run_id=run_id,
+                    owner_id=owner,
+                    expected_fencing_token=1,
+                    stage="LIVE_02",
+                    mutation_statements=[cmd],
+                    manifest_seal_hex=seal,
+                )
 
-                with self.assertRaises(JournalHaltedError):
-                    journal2.execute_conditional_cleanup(
-                        run_id=run_id,
-                        owner_id=owner,
-                        expected_fencing_token=1,
-                        manifest_seal_hex=seal,
-                    )
+            with self.assertRaises(JournalHaltedError):
+                journal2.execute_conditional_cleanup(
+                    run_id=run_id,
+                    owner_id=owner,
+                    expected_fencing_token=1,
+                    manifest_seal_hex=seal,
+                )
 
-                with self.assertRaises(JournalHaltedError):
-                    journal2.abort_run(
-                        run_id=run_id,
-                        owner_id=owner,
-                        expected_fencing_token=1,
-                        reason="Restart abort test",
-                    )
+            with self.assertRaises(JournalHaltedError):
+                journal2.abort_run(
+                    run_id=run_id,
+                    owner_id=owner,
+                    expected_fencing_token=1,
+                    reason="Restart abort test",
+                )
 
-                conn2.close()
-            finally:
-                if marker.is_file():
-                    marker.unlink()
+            conn2.close()
 
     def test_p1_5_reconstructed_journal_instance_intent_committed_ack_lost_blocked(self):
         """Ambiguous intent COMMIT (COMMITTED_BUT_ACK_LOST): fresh journal instance fails closed on retry."""
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             db_path = Path(temp_dir) / "staging_restart_intent_committed.db"
+            marker_dir = Path(temp_dir) / "markers"
+            marker_dir.mkdir(parents=True, exist_ok=True)
             conn1 = sqlite3.connect(str(db_path))
             for stmt in get_all_init_statements():
                 conn1.executescript(stmt)
             apply_candidate_schema_v7(conn1)
 
-            run_id = _make_run_id("restart_intent_comm")
+            run_id = _make_run_id()
             entities = create_default_manifest_entities(run_id)
             seal = compute_canonical_inventory_fingerprint(run_id, entities)
             owner = "runner_restart_3"
 
-            journal1 = StagingOwnershipJournal(conn1)
+            journal1 = StagingOwnershipJournal(conn1, marker_dir=marker_dir)
             with self.assertRaises(AmbiguousCommitError):
                 journal1.register_intent(
                     run_id=run_id,
@@ -1226,53 +1226,51 @@ class TestStagingOwnershipJournalHermeticSuite(unittest.TestCase):
                 )
             conn1.close()
 
-            marker = _halt_marker_path(run_id)
+            marker = _halt_marker_path(run_id, marker_dir)
             self.assertTrue(marker.is_file())
 
-            try:
-                conn2 = sqlite3.connect(str(db_path))
-                journal2 = StagingOwnershipJournal(conn2)
+            conn2 = sqlite3.connect(str(db_path))
+            journal2 = StagingOwnershipJournal(conn2, marker_dir=marker_dir)
 
-                self.assertTrue(journal2.is_halted(run_id))
+            self.assertTrue(journal2.is_halted(run_id))
 
-                with self.assertRaises(JournalHaltedError):
-                    journal2.register_intent(
-                        run_id=run_id,
-                        owner_id=owner,
-                        manifest_seal_hex=seal,
-                        target_inventory=entities,
-                    )
+            with self.assertRaises(JournalHaltedError):
+                journal2.register_intent(
+                    run_id=run_id,
+                    owner_id=owner,
+                    manifest_seal_hex=seal,
+                    target_inventory=entities,
+                )
 
-                with self.assertRaises(JournalHaltedError):
-                    journal2.execute_atomic_stage_mutation(
-                        run_id=run_id,
-                        owner_id=owner,
-                        expected_fencing_token=1,
-                        stage="LIVE_02",
-                        mutation_statements=[],
-                        manifest_seal_hex=seal,
-                    )
+            with self.assertRaises(JournalHaltedError):
+                journal2.execute_atomic_stage_mutation(
+                    run_id=run_id,
+                    owner_id=owner,
+                    expected_fencing_token=1,
+                    stage="LIVE_02",
+                    mutation_statements=[],
+                    manifest_seal_hex=seal,
+                )
 
-                conn2.close()
-            finally:
-                if marker.is_file():
-                    marker.unlink()
+            conn2.close()
 
     def test_p1_5_reconstructed_journal_instance_intent_rolled_back_ack_lost_blocked(self):
         """Ambiguous intent COMMIT (ROLLED_BACK_AND_ACK_LOST): fresh journal instance fails closed on retry."""
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             db_path = Path(temp_dir) / "staging_restart_intent_rollback.db"
+            marker_dir = Path(temp_dir) / "markers"
+            marker_dir.mkdir(parents=True, exist_ok=True)
             conn1 = sqlite3.connect(str(db_path))
             for stmt in get_all_init_statements():
                 conn1.executescript(stmt)
             apply_candidate_schema_v7(conn1)
 
-            run_id = _make_run_id("restart_intent_roll")
+            run_id = _make_run_id()
             entities = create_default_manifest_entities(run_id)
             seal = compute_canonical_inventory_fingerprint(run_id, entities)
             owner = "runner_restart_4"
 
-            journal1 = StagingOwnershipJournal(conn1)
+            journal1 = StagingOwnershipJournal(conn1, marker_dir=marker_dir)
             with self.assertRaises(AmbiguousCommitError):
                 journal1.register_intent(
                     run_id=run_id,
@@ -1283,37 +1281,155 @@ class TestStagingOwnershipJournalHermeticSuite(unittest.TestCase):
                 )
             conn1.close()
 
-            marker = _halt_marker_path(run_id)
+            marker = _halt_marker_path(run_id, marker_dir)
             self.assertTrue(marker.is_file())
 
-            try:
-                conn2 = sqlite3.connect(str(db_path))
-                journal2 = StagingOwnershipJournal(conn2)
+            conn2 = sqlite3.connect(str(db_path))
+            journal2 = StagingOwnershipJournal(conn2, marker_dir=marker_dir)
 
-                self.assertTrue(journal2.is_halted(run_id))
+            self.assertTrue(journal2.is_halted(run_id))
 
-                with self.assertRaises(JournalHaltedError):
-                    journal2.register_intent(
-                        run_id=run_id,
-                        owner_id=owner,
-                        manifest_seal_hex=seal,
-                        target_inventory=entities,
-                    )
+            with self.assertRaises(JournalHaltedError):
+                journal2.register_intent(
+                    run_id=run_id,
+                    owner_id=owner,
+                    manifest_seal_hex=seal,
+                    target_inventory=entities,
+                )
 
-                with self.assertRaises(JournalHaltedError):
-                    journal2.execute_atomic_stage_mutation(
-                        run_id=run_id,
-                        owner_id=owner,
-                        expected_fencing_token=1,
-                        stage="LIVE_02",
-                        mutation_statements=[],
-                        manifest_seal_hex=seal,
-                    )
+            with self.assertRaises(JournalHaltedError):
+                journal2.execute_atomic_stage_mutation(
+                    run_id=run_id,
+                    owner_id=owner,
+                    expected_fencing_token=1,
+                    stage="LIVE_02",
+                    mutation_statements=[],
+                    manifest_seal_hex=seal,
+                )
 
-                conn2.close()
-            finally:
-                if marker.is_file():
-                    marker.unlink()
+            conn2.close()
+
+    def test_p1_5_marker_write_failure_raises_halt_marker_persistence_error_and_halts_in_memory(self):
+        """Marker write failure (e.g. disk full) is NEVER silently swallowed; fails closed and halts in-memory."""
+        self.journal.register_intent(
+            run_id=self.run_id,
+            owner_id=self.owner_id,
+            manifest_seal_hex=self.manifest_seal_hex,
+            target_inventory=self.entities,
+        )
+
+        article = self.entities[0]
+        cmd = StageMutationCommand(
+            table="processed_articles",
+            pk_column="article_id",
+            pk_value=article.pk_value,
+            columns=["article_id", "title", "source", "published_at", "processed_at"],
+            values=[article.pk_value, article.expected_attributes["title"], article.expected_attributes["source"], "2026-11-06T20:00:00Z", "2026-11-06T20:00:00Z"],
+        )
+
+        original_open = open
+
+        def failing_open(path, mode="r", *args, **kwargs):
+            if "efso_radar_journal_halt_" in str(path) and "x" in mode:
+                raise OSError("Simulated disk full / permission denied")
+            return original_open(path, mode, *args, **kwargs)
+
+        with patch("builtins.open", side_effect=failing_open):
+            with self.assertRaises(AmbiguousCommitError) as ctx:
+                self.journal.execute_atomic_stage_mutation(
+                    run_id=self.run_id,
+                    owner_id=self.owner_id,
+                    expected_fencing_token=1,
+                    stage="LIVE_02",
+                    mutation_statements=[cmd],
+                    manifest_seal_hex=self.manifest_seal_hex,
+                    simulate_ambiguous_commit=AmbiguousCommitOutcome.COMMITTED_BUT_ACK_LOST,
+                )
+            # Verify the failure was NOT swallowed: cause is HaltMarkerPersistenceError
+            self.assertIsInstance(ctx.exception.__cause__, HaltMarkerPersistenceError)
+            self.assertIn("local halt marker persistence failed", str(ctx.exception))
+
+        # Current journal instance is STILL halted in memory
+        self.assertTrue(self.journal.is_halted(self.run_id))
+        with self.assertRaises(JournalHaltedError):
+            self.journal.execute_atomic_stage_mutation(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                expected_fencing_token=2,
+                stage="LIVE_02",
+                mutation_statements=[cmd],
+                manifest_seal_hex=self.manifest_seal_hex,
+            )
+
+        # Verify marker was NOT created on disk
+        marker = _halt_marker_path(self.run_id, self.marker_dir)
+        self.assertFalse(marker.exists())
+
+        # A fresh journal instance without the marker does NOT see the run as halted,
+        # demonstrating that restart safety was not achieved when the marker write failed
+        journal2 = StagingOwnershipJournal(self.conn, marker_dir=self.marker_dir)
+        self.assertFalse(journal2.is_halted(self.run_id))
+
+    def test_p1_5_foreign_pre_existing_marker_file_is_preserved_and_never_overwritten(self):
+        """Pre-existing foreign marker files are never overwritten; halts fail closed and preserve evidence."""
+        foreign_path = _halt_marker_path(self.run_id, self.marker_dir)
+        foreign_payload = '{"foreign_owner": "attacker", "token": "preserve_this_evidence"}'
+        foreign_path.write_text(foreign_payload, encoding="utf-8")
+
+        with self.assertRaises(HaltMarkerPersistenceError) as ctx:
+            self.journal._latch_local_halt(self.run_id, "Attempted halt latch")
+        self.assertIn("cannot be overwritten without proven file ownership", str(ctx.exception))
+
+        # Foreign file was NOT modified or deleted
+        self.assertEqual(foreign_path.read_text(encoding="utf-8"), foreign_payload)
+
+    def test_p1_5_crash_window_between_commit_and_marker_publication_documented(self):
+        """Documents crash window: crash immediately after COMMIT before marker write leaves marker absent."""
+        self.journal.register_intent(
+            run_id=self.run_id,
+            owner_id=self.owner_id,
+            manifest_seal_hex=self.manifest_seal_hex,
+            target_inventory=self.entities,
+        )
+
+        article = self.entities[0]
+        cmd = StageMutationCommand(
+            table="processed_articles",
+            pk_column="article_id",
+            pk_value=article.pk_value,
+            columns=["article_id", "title", "source", "published_at", "processed_at"],
+            values=[article.pk_value, article.expected_attributes["title"], article.expected_attributes["source"], "2026-11-06T20:00:00Z", "2026-11-06T20:00:00Z"],
+        )
+
+        # Execute normal mutation (simulating provider commit)
+        token = self.journal.execute_atomic_stage_mutation(
+            run_id=self.run_id,
+            owner_id=self.owner_id,
+            expected_fencing_token=1,
+            stage="LIVE_02",
+            mutation_statements=[cmd],
+            manifest_seal_hex=self.manifest_seal_hex,
+        )
+        self.assertEqual(token, 2)
+
+        # Simulate process death before marker could be written: marker does NOT exist
+        marker = _halt_marker_path(self.run_id, self.marker_dir)
+        self.assertFalse(marker.exists())
+
+        # New journal instance does not know a local ambiguous commit occurred
+        journal2 = StagingOwnershipJournal(self.conn, marker_dir=self.marker_dir)
+        self.assertFalse(journal2.is_halted(self.run_id))
+
+        # However, database workload barrier still prevents fresh run registration
+        other_run = _make_run_id()
+        with self.assertRaises(ActiveWorkloadCollisionError) as ctx:
+            journal2.register_intent(
+                run_id=other_run,
+                owner_id="other_runner",
+                manifest_seal_hex=_create_authenticated_seal(other_run, create_default_manifest_entities(other_run)),
+                target_inventory=create_default_manifest_entities(other_run),
+            )
+        self.assertIn("unresolved staging run", str(ctx.exception))
 
     # -------------------------------------------------------------------------
     # P1-6: Safe ABORT Semantics

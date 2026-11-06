@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -230,10 +231,15 @@ class JournalHaltedError(JournalError, RuntimeError):
     """Operation attempted on a locally halted run in LOCAL_OUTCOME_UNKNOWN."""
 
 
-def _halt_marker_path(run_id: str) -> Path:
-    """Return the deterministic local filesystem path for a halted run marker file."""
+class HaltMarkerPersistenceError(JournalHaltedError):
+    """Raised when the durable local halt marker could not be persisted or pre-existing foreign file is found."""
+
+
+def _halt_marker_path(run_id: str, marker_dir: Optional[Path] = None) -> Path:
+    """Return the filesystem path for a halted run marker file within a scoped directory."""
     safe_run_id = re.sub(r"[^a-zA-Z0-9_-]", "_", run_id)
-    return Path(tempfile.gettempdir()) / f"efso_radar_journal_halt_{safe_run_id}.lock"
+    root = marker_dir if marker_dir is not None else Path(tempfile.gettempdir())
+    return root / f"efso_radar_journal_halt_{safe_run_id}.lock"
 
 
 def compute_canonical_inventory_fingerprint(
@@ -593,25 +599,69 @@ class StagingOwnershipJournal:
         conn: sqlite3.Connection,
         *,
         allow_unverified_read: bool = False,
+        marker_dir: Optional[Path] = None,
     ) -> None:
         self._conn = conn
         self._allow_unverified_read = allow_unverified_read
+        self._marker_dir = marker_dir
         self._halted_runs: set[str] = set()
         self._verify_table_exists()
 
-    def _latch_local_halt(self, run_id: str, reason: str) -> None:
-        """Latch run into LOCAL_OUTCOME_UNKNOWN / HALT state in-memory and on local disk."""
+    def _latch_local_halt(self, run_id: str, reason: str) -> Path:
+        """Latch run into LOCAL_OUTCOME_UNKNOWN / HALT state in-memory and on local disk.
+
+        CRASH WINDOW LIMITATION:
+        Simulated or actual provider COMMIT occurs before local marker publication. If the process
+        terminates abruptly (e.g. SIGKILL, power loss) between COMMIT and marker publication,
+        the local marker will not exist on disk. A subsequent process on the same machine cannot
+        distinguish this state from a normal completion. Therefore, crash-proof restart recovery
+        across sudden process death is explicitly BLOCKED and unproven in this offline slice.
+
+        OVERWRITE PROTECTION & FAIL-CLOSED PERSISTENCE:
+        - In-memory latch is set immediately so this instance fails closed on any subsequent call.
+        - Pre-existing foreign files are NEVER overwritten and fail closed with HaltMarkerPersistenceError.
+        - Storage write failures (OSError) are NEVER silently swallowed; they fail closed with HaltMarkerPersistenceError.
+        """
         self._halted_runs.add(run_id)
-        marker = _halt_marker_path(run_id)
+        marker = _halt_marker_path(run_id, self._marker_dir)
+
+        payload = {
+            "run_id": run_id,
+            "halted_at": self._now_iso(),
+            "reason": reason,
+        }
+        content = json.dumps(payload, indent=2)
+
+        if marker.exists():
+            # If a marker already exists, check if it was created for this exact run_id
+            try:
+                existing = json.loads(marker.read_text(encoding="utf-8"))
+                if isinstance(existing, dict) and existing.get("run_id") == run_id:
+                    # Valid existing marker for this exact run; preserve it
+                    return marker
+            except Exception:
+                pass
+            # Foreign or unowned file: fail closed to preserve foreign evidence
+            raise HaltMarkerPersistenceError(
+                f"Cannot persist halt marker for run '{run_id}': pre-existing file at '{marker}' "
+                "cannot be overwritten without proven file ownership."
+            )
+
         try:
-            payload = {
-                "run_id": run_id,
-                "halted_at": self._now_iso(),
-                "reason": reason,
-            }
-            marker.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        except OSError:
-            pass
+            with open(marker, "x", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+        except OSError as exc:
+            raise HaltMarkerPersistenceError(
+                f"Failed to persist durable local halt marker for run '{run_id}' at '{marker}': {exc}. "
+                "Local persistence failed; automated continuation cannot be safely prevented."
+            ) from exc
+
+        return marker
 
     def is_halted(self, run_id: str) -> bool:
         """Check if run is in a local halted state (LOCAL_OUTCOME_UNKNOWN).
@@ -620,10 +670,16 @@ class StagingOwnershipJournal:
         """
         if run_id in self._halted_runs:
             return True
-        marker = _halt_marker_path(run_id)
+        marker = _halt_marker_path(run_id, self._marker_dir)
         if marker.is_file():
-            self._halted_runs.add(run_id)
-            return True
+            try:
+                data = json.loads(marker.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and data.get("run_id") == run_id:
+                    self._halted_runs.add(run_id)
+                    return True
+            except Exception:
+                self._halted_runs.add(run_id)
+                return True
         return False
 
     def _verify_table_exists(self) -> None:
@@ -840,7 +896,14 @@ class StagingOwnershipJournal:
             # Handle simulated ambiguous commit during intent registration
             if simulate_ambiguous_commit == AmbiguousCommitOutcome.COMMITTED_BUT_ACK_LOST:
                 self._conn.execute("COMMIT")
-                self._latch_local_halt(run_id, "Ambiguous intent COMMIT (COMMITTED_BUT_ACK_LOST)")
+                try:
+                    self._latch_local_halt(run_id, "Ambiguous intent COMMIT (COMMITTED_BUT_ACK_LOST)")
+                except HaltMarkerPersistenceError as marker_exc:
+                    raise AmbiguousCommitError(
+                        f"Simulated network drop during intent COMMIT for run '{run_id}'. "
+                        f"Transaction committed on provider (COMMITTED_BUT_ACK_LOST), but local halt marker persistence failed: {marker_exc}. "
+                        "Client outcome is LOCAL_OUTCOME_UNKNOWN. Run is in-memory HALTED, but disk marker was not established."
+                    ) from marker_exc
                 raise AmbiguousCommitError(
                     f"Simulated network drop during intent COMMIT for run '{run_id}'. "
                     "Transaction committed on provider (COMMITTED_BUT_ACK_LOST), but client outcome is LOCAL_OUTCOME_UNKNOWN. "
@@ -848,7 +911,14 @@ class StagingOwnershipJournal:
                 )
             elif simulate_ambiguous_commit == AmbiguousCommitOutcome.ROLLED_BACK_AND_ACK_LOST:
                 self._conn.execute("ROLLBACK")
-                self._latch_local_halt(run_id, "Ambiguous intent COMMIT (ROLLED_BACK_AND_ACK_LOST)")
+                try:
+                    self._latch_local_halt(run_id, "Ambiguous intent COMMIT (ROLLED_BACK_AND_ACK_LOST)")
+                except HaltMarkerPersistenceError as marker_exc:
+                    raise AmbiguousCommitError(
+                        f"Simulated network drop during intent COMMIT for run '{run_id}'. "
+                        f"Transaction rolled back on provider (ROLLED_BACK_AND_ACK_LOST), but local halt marker persistence failed: {marker_exc}. "
+                        "Client outcome is LOCAL_OUTCOME_UNKNOWN. Zero rows exist on provider. Run is in-memory HALTED, but disk marker was not established."
+                    ) from marker_exc
                 raise AmbiguousCommitError(
                     f"Simulated network drop during intent COMMIT for run '{run_id}'. "
                     "Transaction rolled back on provider (ROLLED_BACK_AND_ACK_LOST), client outcome is LOCAL_OUTCOME_UNKNOWN. "
@@ -1000,14 +1070,28 @@ class StagingOwnershipJournal:
             # Step 4: Handle simulated ambiguous commit
             if simulate_ambiguous_commit == AmbiguousCommitOutcome.COMMITTED_BUT_ACK_LOST:
                 self._conn.execute("COMMIT")
-                self._latch_local_halt(run_id, "Ambiguous mutation COMMIT (COMMITTED_BUT_ACK_LOST)")
+                try:
+                    self._latch_local_halt(run_id, "Ambiguous mutation COMMIT (COMMITTED_BUT_ACK_LOST)")
+                except HaltMarkerPersistenceError as marker_exc:
+                    raise AmbiguousCommitError(
+                        f"Ambiguous commit encountered for run '{run_id}': transaction committed on provider, "
+                        f"but local halt marker persistence failed: {marker_exc}. "
+                        "Client outcome is LOCAL_OUTCOME_UNKNOWN / HALT. Run is in-memory HALTED, but disk marker was not established."
+                    ) from marker_exc
                 raise AmbiguousCommitError(
                     f"Ambiguous commit encountered for run '{run_id}': transaction committed on provider, "
                     "but network ACK was lost. Client outcome is LOCAL_OUTCOME_UNKNOWN / HALT."
                 )
             elif simulate_ambiguous_commit == AmbiguousCommitOutcome.ROLLED_BACK_AND_ACK_LOST:
                 self._conn.execute("ROLLBACK")
-                self._latch_local_halt(run_id, "Ambiguous mutation COMMIT (ROLLED_BACK_AND_ACK_LOST)")
+                try:
+                    self._latch_local_halt(run_id, "Ambiguous mutation COMMIT (ROLLED_BACK_AND_ACK_LOST)")
+                except HaltMarkerPersistenceError as marker_exc:
+                    raise AmbiguousCommitError(
+                        f"Ambiguous commit encountered for run '{run_id}': transaction rolled back on provider, "
+                        f"but local halt marker persistence failed: {marker_exc}. "
+                        "Client outcome is LOCAL_OUTCOME_UNKNOWN / HALT. Run is in-memory HALTED, but disk marker was not established."
+                    ) from marker_exc
                 raise AmbiguousCommitError(
                     f"Ambiguous commit encountered for run '{run_id}': transaction rolled back on provider, "
                     "and network ACK was lost. Client outcome is LOCAL_OUTCOME_UNKNOWN / HALT."

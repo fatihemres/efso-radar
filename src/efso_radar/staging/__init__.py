@@ -93,6 +93,7 @@ if TYPE_CHECKING:
         OperatorReconciliationProposal,
         AmbiguousCommitOutcome,
         JournalHaltedError,
+        HaltMarkerPersistenceError,
         compute_authenticated_manifest_seal,
         compute_canonical_inventory_fingerprint,
     )
@@ -167,6 +168,7 @@ __all__ = [
     "OperatorReconciliationProposal",
     "AmbiguousCommitOutcome",
     "JournalHaltedError",
+    "HaltMarkerPersistenceError",
     "compute_authenticated_manifest_seal",
     "compute_canonical_inventory_fingerprint",
 ]
@@ -251,6 +253,7 @@ _JOURNAL_EXPORTS = frozenset({
     "OperatorReconciliationProposal",
     "AmbiguousCommitOutcome",
     "JournalHaltedError",
+    "HaltMarkerPersistenceError",
     "compute_authenticated_manifest_seal",
     "compute_canonical_inventory_fingerprint",
 })
