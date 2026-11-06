@@ -135,67 +135,71 @@ Beş ayrı kavram veritabanında ayrı tablolarda ve modellerde saklanır:
 
 ---
 
-## 4. Launch G3: Minimal Strict-$0 Gemini Activation Safety Contract & Integration Plan (Offline Readiness)
+## 4. Launch G3: Minimal Strict-$0 Gemini Activation Safety Contract & Integration Plan (Offline Engineering Proposal)
 
-Bu bölüm, GitHub Issue [#88](https://github.com/fatihemres/efso-radar/issues/88) ve Üst Görev [#82](https://github.com/fatihemres/efso-radar/issues/82) (G1/G3/G6) kapsamında PO onaylı mimari yönü belgeler. Tamamen **ÇEVRİMDIŞI (OFFLINE-ONLY)** hazırlıktır; canlı Gemini çağrılarını, bulut staging bağlantılarını veya abonelik yükseltmelerini yetkilendirmez.
+Bu bölüm, GitHub Issue [#88](https://github.com/fatihemres/efso-radar/issues/88) ve Üst Görev [#82](https://github.com/fatihemres/efso-radar/issues/82) (G1/G3/G6) kapsamında hazırlanan **mühendislik önerisidir (engineering proposal)**. Bağımsız inceleme altındadır; Product Owner henüz nihai kabulü veya aktivasyonu onaylamamıştır. Tamamen **ÇEVRİMDIŞI (OFFLINE-ONLY)** sözleşme hazırlığıdır; canlı Gemini çağrılarını, bulut staging bağlantılarını veya abonelik yükseltmelerini kesinlikle yetkilendirmez.
 
 ### 4.1. Temel Güvenlik Değişmezleri ve Kesin $0.00 / 0 TRY İlkesi
 * **Sıfır Harcama:** Aylık ve koşu başı işletme harcaması kesin olarak **$0.00 / 0 TRY**'dir. Ücretli planlara otomatik yükseltme, fatura bağlantısı (`billing_enabled=True`) veya ücretli yedek sağlayıcı (paid fallback) kesinlikle yasaktır.
-* **Koşulsuz Canlı İstek Bariyeri:** `require_verified_free_tier()` fonksiyonu, gerçek Gemini API uç noktasına gidecek tüm canlı çağrıları çalışma zamanında koşulsuz olarak bloke eder (`RuntimeError`). Bu koruma hiçbir ortam değişkeni, `.env` bayrağı veya API anahtarı ile devre dışı bırakılamaz.
+* **Koşulsuz Canlı İstek Bariyeri:** `require_verified_free_tier()` fonksiyonu, gerçek Gemini API uç noktasına gidecek tüm canlı çağrıları çalışma zamanında `GeminiEditorialEngine.evaluate()` içinde koşulsuz olarak bloke eder (`RuntimeError`). Bu koruma hiçbir ortam değişkeni, `.env` bayrağı veya API anahtarı ile devre dışı bırakılamaz.
 * **Sahte Yetkilendirme Yasağı:** Çağrıcı tarafından sağlanan sözlükler, JSON kayıtları, ekran görüntüleri veya istemci içi sayaçlar bağımsız sağlayıcı kanıtı sayılamaz. Sağlayıcı tarafı doğrulanmış fatura kanıtı bulunmadıkça gerçek faturalandırılan tutar (`actual_billed_usd`) daima `None` (UNKNOWN) kalır.
+* **Aktivasyon Engelleyicileri (Blockers):** Güvenilir sağlayıcı fatura kanıtı (G1), sağlayıcı-kalıcı kota günlüğü (G2 / ERD-017), taze kota gözlemi, proje/model bağlama kanıtı ve bağımsız PO oturum yetkilendirmesi mevcut olmadığından canlı izin (`allowed=True`) hiçbir koşulda verilemez.
 
-### 4.2. Ön Dağıtım Karar Tablosu ve Durum Makinesi (Pre-Dispatch State Machine)
-Gemini çağrısı öncesinde her istek `evaluate_g3_activation_preflight()` fonksiyonu ile denetlenir. Tüm makine kontrolleri ve insan PO onayı sağlanmadıkça istek reddedilir (`allowed=False`).
+### 4.2. Ön Dağıtım Karar Durum Makinesi (Pre-Dispatch State Machine - Aday Sözleşme)
+`evaluate_g3_activation_preflight()` fonksiyonu, aday bir ön dağıtım denetleyicisidir. **Önemli Ayrım:** Bu fonksiyon henüz `GeminiEditorialEngine.evaluate()` çalışma zamanı dağıtım zincirine bağlanmamıştır (çalışma zamanında `require_verified_free_tier()` sert engeli bulunmaktadır).
+
+Tüm makine kapıları ve insan PO parametresi sağlansa dahi, bağımsız sağlayıcı kanıtı bulunmadığından fonksiyon **ASLA `allowed=True` veya `ALLOW_PREFLIGHT_READY` döndürmez**. Başarılı sentetik simülasyonlar `allowed=False` ve `SIMULATION_PASS_NON_AUTHORIZING` tanılama kodu ile sonlanır.
 
 | Kapı (Gate) | Denetlenen Koşul | Geçersizlik Durum Kodu | Reddin Gerekçesi (Fail-Closed) |
 | :--- | :--- | :--- | :--- |
 | **1. Model Adayı** | Model `gemini-3.5-flash-lite` mi? | `DENY_UNASSESSED_MODEL` | Yalnızca `gemini-3.5-flash-lite` değerlendirilmiştir (`ASSESSED_LAUNCH_MODELS`). `gemini-3.8-flash` ve diğer modeller fırlatma için değerlendirilmemiştir. |
-| **2. Arama Genişletme** | `enable_search_grounding == False` mu? | `DENY_SEARCH_GROUNDING` | Google Search Grounding Free Tier kapsamında ücretsiz değildir ($35 / 1.000 sorgu). Kesin $0 kuralı gereği kapalı olmalıdır. |
+| **2. Arama Genişletme** | `enable_search_grounding == False` mu? | `DENY_SEARCH_GROUNDING` | Resmî Google AI Studio fiyatlandırmasına göre Search Grounding **Free Tier kapsamında desteklenmemektedir / kullanılamaz**. Kesin $0 kuralı gereği kapalı olmalıdır. |
 | **3. Sıfır Bütçe** | `max_run_cost_usd == 0.0` ve `max_monthly_cost_usd == 0.0` mı? | `DENY_POSITIVE_BUDGET` | Pozitif dolar tavanı Free Tier ile çelişir; operasyonel tavanlar kesin $0.00 olmalıdır. |
 | **4. Fatura Kanıtı** | `billing_enabled == False` ve sağlayıcı kanıtı geçerli mi? | `DENY_PAID_PROJECT` veya `DENY_UNVERIFIED_BILLING` | `billing_enabled=True` doğrudan `DISALLOWED_PAID` verir. İstemci beyanları doğrulanamaz ise durum `UNKNOWN` sayılır. |
-| **5. Kota Kanıtı** | RPM, TPM, Input TPM, RPD ve Aylık Çağrı gözlemlendi mi? | `DENY_QUOTA_UNVERIFIED` veya `DENY_QUOTA_EXHAUSTED` | Kota gözlemi eksikse veya limit (`OBSERVED_PROJECT_*`) aşılmışsa derhal durulur. |
-| **6. İnsan PO Onayı** | İlgili oturum için `is_po_live_go_granted == True` mu? | `DENY_NO_PO_GO` | Makine kapılarının geçmesi zorunlu bir ön koşuldur ancak ASLA kendi başına canlı çağrıyı yetkilendirmez. |
-| **7. Çevrimdışı Sınır** | `require_verified_free_tier()` canlı çağrıyı bloke eder | `ALLOW_PREFLIGHT_READY` (Yalnızca Sentetik Test) | Sentetik ön hazırlık tamamlansa dahi kod tabanındaki sert bariyer canlı ağ erişimini engeller. |
+| **5. Kota Kanıtı** | RPM, TPM, Input TPM, RPD ve Aylık Çağrı gözlemlendi mi? | `DENY_QUOTA_UNVERIFIED`, `DENY_MISSING_INPUT_TPM_EVIDENCE` veya `DENY_QUOTA_EXHAUSTED` | Kota gözlemi eksikse, girdi TPM limiti belirtilmemişse veya limit (`OBSERVED_PROJECT_*`) aşılmışsa derhal durulur. İstemci aylık tavanı 300'ün üzerine çıkaramaz. |
+| **6. Çoklu Runner Fencing** | Çoklu runner ortamı mı (`is_multi_runner_environment`)? | `DENY_MISSING_CROSS_RUNNER_RESERVATION` | Çoklu runner ortamında ERD-017 sağlayıcı-kalıcı sahiplik günlüğü ve atomik kota rezervasyonu bulunmadığından aktivasyon engellenir (fail closed). |
+| **7. İnsan PO Onayı** | İlgili oturum için `is_po_live_go_granted == True` mu? | `DENY_NO_PO_GO` | Makine kapılarının geçmesi zorunlu bir ön koşuldur ancak ASLA kendi başına canlı çağrıyı yetkilendirmez. |
+| **8. Sentetik Sonuç** | Tüm sentetik koşullar sağlandı mı? | `SIMULATION_PASS_NON_AUTHORIZING` (`allowed=False`) | Tanılama amaçlı simülasyon geçerlidir; ancak canlı yetkilendirme altyapısı bulunmadığından `allowed=False` kalır; ASLA `ALLOW_PREFLIGHT_READY` dönmez. |
 
-### 4.3. Makine Kapıları ile İnsan Ürün Sahibi (PO) Onayının Kesin Ayrımı
-* **Makine Geçişi ≠ Canlı Yetki:** Güvenlik kapılarının tümünden "PASS" almak dağıtım için **gerekli ama yetersizdir**. Hiçbir yazılım bileşeni kendi kendine canlı API izni üretemez.
-* **Oturuma Özgü İnsan Onayı:** Canlı çağrı yapılabilmesi için Product Owner tarafından ilgili çalıştırma oturumuna özel, açık ve bağımsız bir "PO Live GO" yetkisi (`is_po_live_go_granted=True`) verilmiş olmalıdır.
-* **Bypass Edilemezlik:** Hiçbir `.env` değeri, CLI parametresi veya test konfigürasyonu insan PO onayını simüle edemez veya atlayamaz.
+### 4.3. Makine Kapıları ile İnsan Ürün Sahibi (PO) Onayının Ayrımı
+* **Makine Geçişi ≠ Canlı Yetki:** Güvenlik kapılarının tümünden geçmek dağıtım için gerekli ama yetersizdir. Hiçbir yazılım bileşeni kendi kendine canlı API izni üretemez.
+* **Mevcut Kod Gerçeği vs. Gelecek Tasarım:** Mevcut preflight prototipindeki `is_po_live_go_granted` parametresi, bir çağrıcı boolean bayrağıdır; henüz oturum bazlı kriptografik token veya bağımsız kimlik doğrulama altyapısı uygulanmamıştır (bu PR kapsamında yeni kimlik çerçevesi inşa edilmemiştir).
+* **Gelecek Tasarım Kuralı:** Olası bir canlı aktivasyonda, her oturum için Product Owner'ın bağımsız, kayıtlı ve doğrulanabilir canlı çalıştırma yetkilendirmesi zorunlu olacaktır.
 
-### 4.4. Kota Yönetimi ve Günlük Pasifik Gece Yarısı Sıfırlaması
-Google AI Studio / Gemini API kotaları proje bazlıdır (API anahtarına veya çalıştırıcıya özel değildir):
-* **Gözlemlenen Proje Temel Limitleri:**
+### 4.4. Kota Gözlemleri ve Günlük Pasifik Gece Yarısı Sıfırlaması
+* **Statik Gözlem Envanteri (2026-11-06):**
   - **RPM:** 15 İstek / Dakika (`OBSERVED_PROJECT_RPM_LIMIT`)
   - **Input TPM:** 250.000 Girdi Tokenı / Dakika (`OBSERVED_PROJECT_INPUT_TPM_LIMIT`)
   - **RPD:** 500 İstek / Gün (`OBSERVED_PROJECT_RPD_LIMIT`)
   - **Dahili Aylık Tavan:** 300 Çağrı / Ay (`MAX_MONTHLY_AI_CALLS`)
-* **Kalıcı Hak Değildir:** Bu değerler Efso Radar projesinin AI Studio konsolunda gözlemlenen mevcut kota sınırlarıdır; kalıcı hesap hakkı veya evrensel sabit değildir. Google tarafından değiştirilebilir.
+* **Kalıcı Hak Değildir:** Bu rakamlar 6 Kasım 2026 tarihinde AI Studio konsolunda gözlemlenmiş anlık proje tavanlarıdır; kalıcı hesap hakkı, sözleşme garantisi veya evrensel sabit değildir. Canlı tüketim verisi yerine geçemez veya kullanımı kendi kendine yetkilendiremez. Google tarafından her an değiştirilebilir.
 * **Pasifik Gece Yarısı (PT Midnight) Sıfırlaması:** Google RPD kotası her gün ABD Pasifik Saatiyle (PT) 00:00:00'da sıfırlanır:
   - Standart Saat (PST, UTC-8): Türkiye saatiyle 11:00 (08:00 UTC).
   - Yaz Saati (PDT, UTC-7): Türkiye saatiyle 10:00 (07:00 UTC).
-  - Sistem, `calendar` tabanlı saf Python algoritmasıyla (`is_pacific_daylight_saving_time`) harici `tzdata` bağımlılığı olmadan Pasifik takvim gününü (`get_pacific_calendar_date`) hesaplar ve RPD kotasını bu takvime göre izler.
+  - Sistem, `calendar` tabanlı saf Python algoritmasıyla (`is_pacific_daylight_saving_time`) harici `tzdata` bağımlılığı olmadan Pasifik takvim gününü (`get_pacific_calendar_date`) hesaplar ve RPD takvim gününü izler.
 
-### 4.5. Dış İstek Sınırları ve Yük Sanitizasyonu
-Canlı dağıtım düşünüldüğünde uygulanacak istek profili:
+### 4.5. Dış İstek Sınırları ve Güvenlik Parametreleri (Hedef Tasarım vs. Mevcut Durum)
 * **Model:** Yalnızca `gemini-3.5-flash-lite`.
 * **Araçlar ve Akıl Yürütme:** `enable_search_grounding=False`, fonksiyon çağırma kapalı, akıl yürütme seviyesi `minimal` (`thinking_level='minimal'`).
-* **Zaman Aşımı ve Deneme:** Tek deneme (`attempts=1`), sıfır kör yeniden deneme (blind-retry), 30 saniye katı zaman aşımı.
-* **Veri Koruma:** İstek gövdesinde yalnızca doğrulanmış kamuya açık RSS haber metinleri yer alır; kullanıcı kimlik bilgisi, şifre, API anahtarı veya PII (Kişisel Veri) promptlara kesinlikle dahil edilmez.
-* **Acil Durdurma (Kill-Switch):** `AI_EVALUATION_ENABLED=false` yapıldığında veya bütçe tavanı sıfırın üzerine çıktığında sistem derhal değerlendirmeyi durdurur.
+* **Zaman Aşımı:** Mevcut kod tabanında varsayılan `Settings.http_timeout_seconds` **18 saniyedir** ve GenAI SDK `HttpOptions` içinde ayrı bir zaman aşımı zorlanmamaktadır. Gelecekteki canlı çağrılar için hedeflenen katı sınır 30 saniyedir; bu bir kod garantisi değil, hedef tasarım kuralıdır.
+* **Tek Deneme:** `attempts=1`, sıfır kör yeniden deneme (blind-retry).
+* **Veri Koruma & PII:** İstek gövdesinde yalnızca onaylanmış kamuya açık RSS metinlerinin kullanılması bir **prompt tasarım kuralıdır**; kod tabanında otomatik bir çalışma zamanı PII/gizlilik tarayıcısı bulunmamaktadır.
+* **Acil Durdurma (Kill-Switch):** `AI_EVALUATION_ENABLED=false` ayarı, pipeline seviyesinde AI değerlendirmesini güvenli şekilde devre dışı bırakır (AI adımı atlanır, haberler kural tabanlı işlenir).
 
-### 4.6. Schema v6 Kalıcılık Yeteneği vs. Boşluk Matrisi (G2 / ERD-017 Bağımlılığı)
+### 4.6. Schema v6 Kalıcılık Yeteneği vs. Boşluk Matrisi (Aktivasyon Engelleyicileri)
 Mevcut Schema v6 tablolarının G3 gereksinimlerini karşılama durumu:
 
 | Alt Sistem / İhtiyaç | Schema v6 Mevcut Yetenek | Kalan Boşluk / Risk | Çözüm Yolu |
 | :--- | :--- | :--- | :--- |
 | **Tekil Çalıştırıcı Sıralaması** | `run_locks` (15 dk lease + heartbeat) eşzamanlı çakışmaları engeller. | Yok (tekil denetimli çalıştırma için yeterli). | Schema v6 `run_locks` korunur. |
 | **Belirsiz Hata Takibi** | `ai_usage_ledger` `FAILED_AMBIGUOUS` ve `RESERVED_IN_FLIGHT` durumlarını saklar. | Ağ zaman aşımında sağlayıcı durumunun kesinliği bilinemez (UNKNOWN). | İkircikli durumlarda HALT; kör yeniden deneme yok. |
-| **Aylık Çağrı Sayacı** | `ai_usage_ledger` üzerinden aylık başarılı/belirsiz çağrılar toplanır. | Dağıtık runner'larda SQLite kilitlenme riski. | Tekil koşu izolasyonu. |
-| **Çoklu Runner Kota Rezervasyonu** | `ai_usage_ledger` `INSERT OR REPLACE` kullanır; atomik CAS veya rolling-window desteği yoktur. | GitHub Actions geçici (ephemeral) sanal makineleri arasında 1 dakikalık RPM/TPM pencereleri paylaşılamaz. Harici projelerin kota tüketimi yerel veritabanında görülemez. | **G2 / ERD-017 Bağımlılığı:** Otomasyona geçilmeden önce Seçenek B (sağlayıcı-kalıcı sahiplik günlüğü) entegre edilmelidir. Erken Schema v7 yapılmaz. |
+| **Aylık Çağrı Sayacı** | `ai_usage_ledger` üzerinden aylık başarılı/belirsiz çağrılar toplanır. | Dağıtık runner'larda SQLite kilitlenme riski. | Tekil koşu izolasyonu, tavan 300 ile sınırlandırılır. |
+| **Çoklu Runner Kota Rezervasyonu** | `ai_usage_ledger` `INSERT OR REPLACE` kullanır; atomik CAS veya rolling-window desteği yoktur. | GitHub Actions geçici sanal makineleri arasında 1 dakikalık RPM/TPM pencereleri paylaşılamaz. Harici projelerin kota tüketimi görülemez. | **G2 / ERD-017 Bağımlılığı (Aktivasyon Engelleyici):** Otomasyona geçilmeden önce Seçenek B (sağlayıcı-kalıcı sahiplik günlüğü) entegre edilmelidir. Erken Schema v7 yapılmaz. |
 
-### 4.7. Entegrasyon ve Aktivasyon Hazırlık Sırası
-Gelecekte olası bir canlı aktivasyon öncesinde tamamlanması gereken aşamalar:
-1. **G1 (Fatura Doğrulama):** Google Cloud / AI Studio tarafında projenin faturalandırmaya bağlı olmadığının (`billing_enabled=False`) bağımsız, kanıtlanabilir kriptografik veya API doğrulaması.
+### 4.7. Aktivasyon Ön Koşulları ve Engelleyiciler (Activation Blockers)
+Canlı aktivasyon düşünülmeden önce çözülmesi gereken beş zorunlu engelleyici:
+1. **G1 (Sağlayıcı Fatura Kanıtı):** Google Cloud Billing API üzerinden projenin faturalandırmaya bağlı olmadığının (`billing_enabled=False`) bağımsız, kanıtlanabilir kriptografik doğrulaması.
 2. **G2 (ERD-017 Kota Günlüğü):** Çoklu runner ortamında kota aşımını önleyecek atomik sahiplik ve kota rezervasyon günlüğü.
-3. **G3 (Sözleşme & Preflight):** Mevcut `evaluate_g3_activation_preflight()` ve karar durum makinesinin devreye alınması (tamamlandı).
-4. **G6 (Bağımsız PO GO):** Her canlı oturum için Product Owner'ın açık, yazılı ve kayıtlı canlı çalıştırma onayı.
+3. **Güvenilir Kota Tazeliği:** Sağlayıcı konsolundan taze, doğrulanabilir kota gözlemi ve zaman damgası.
+4. **Proje/Model Bağlama Kanıtı:** API anahtarının doğru proje ve onaylı modele bağlı olduğunun kanıtı.
+5. **G6 (Bağımsız PO GO):** Her canlı oturum için Product Owner'ın bağımsız, kayıtlı ve doğrulanabilir canlı yetkilendirmesi.

@@ -53,6 +53,8 @@ from efso_radar.ai.cost import (
     require_verified_free_tier,
     resolve_model_pricing,
     validate_free_tier_project_proof,
+    ACTIVATION_BLOCKERS,
+    BILLING_TIER_SIMULATED_UNAUTHENTICATED,
     OBSERVED_PROJECT_RPM_LIMIT,
     OBSERVED_PROJECT_INPUT_TPM_LIMIT,
     OBSERVED_PROJECT_RPD_LIMIT,
@@ -796,7 +798,7 @@ class TestG3ActivationContractAndPreflight(unittest.TestCase):
         }
 
     def test_observed_project_limits_constants(self):
-        """Observed project limits are defined as project-level baselines (not universal entitlements)."""
+        """Observed project limits are defined as static 2026-11-06 observation baselines (not permanent entitlements)."""
         self.assertEqual(OBSERVED_PROJECT_RPM_LIMIT, 15)
         self.assertEqual(OBSERVED_PROJECT_INPUT_TPM_LIMIT, 250_000)
         self.assertEqual(OBSERVED_PROJECT_RPD_LIMIT, 500)
@@ -854,6 +856,18 @@ class TestG3ActivationContractAndPreflight(unittest.TestCase):
         )
         self.assertFalse(is_ok)
         self.assertIn("exceeds verified input TPM limit", reason)
+
+    def test_validate_free_tier_project_proof_simulation_remains_is_valid_false(self):
+        """validate_free_tier_project_proof returns is_valid=False even under allow_synthetic_simulation=True."""
+        is_valid, tier, reason = validate_free_tier_project_proof(
+            self.valid_synthetic_proof,
+            now=self.now_utc,
+            allow_synthetic_simulation=True,
+        )
+        self.assertFalse(is_valid)  # CRITICAL P1: Must never return is_valid=True
+        self.assertEqual(tier, BILLING_TIER_SIMULATED_UNAUTHENTICATED)
+        self.assertIn("Valid proof structure", reason)
+        self.assertIn("non-authorizing", reason)
 
     def test_g3_preflight_denies_without_human_po_go(self):
         """Preflight gates pass all machine checks, but DENY when PO Live GO is not granted."""
@@ -967,8 +981,41 @@ class TestG3ActivationContractAndPreflight(unittest.TestCase):
         self.assertFalse(decision_exhausted.allowed)
         self.assertEqual(decision_exhausted.status_code, "DENY_QUOTA_EXHAUSTED")
 
-    def test_g3_preflight_tracks_erd017_fencing_requirement(self):
-        """Preflight decision accurately notes ERD-017 cross-runner fencing for multi-runner mode."""
+    def test_g3_preflight_denies_missing_input_tpm_evidence(self):
+        """Preflight specifically denies when input_tpm_limit is missing from evidence (gemini-3.5-flash-lite)."""
+        quota_without_input_tpm = dict(self.valid_synthetic_quota)
+        del quota_without_input_tpm["input_tpm_limit"]
+        decision = evaluate_g3_activation_preflight(
+            model_name="gemini-3.5-flash-lite",
+            project_proof=self.valid_synthetic_proof,
+            quota_evidence=quota_without_input_tpm,
+            is_po_live_go_granted=True,
+            allow_synthetic_simulation=True,
+            now=self.now_utc,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.status_code, "DENY_MISSING_INPUT_TPM_EVIDENCE")
+        self.assertIn("input TPM", decision.reason)
+
+    def test_g3_preflight_clamps_monthly_call_cap_and_prevents_caller_inflation(self):
+        """Preflight clamps max_monthly_calls to internal ceiling of 300, rejecting inflated caller numbers."""
+        inflated_quota = dict(self.valid_synthetic_quota)
+        inflated_quota["max_monthly_calls"] = 1000  # Caller attempts to set 1000!
+        inflated_quota["current_monthly_calls"] = 300  # 300 + 1 = 301 > 300 internal ceiling!
+        decision = evaluate_g3_activation_preflight(
+            model_name="gemini-3.5-flash-lite",
+            project_proof=self.valid_synthetic_proof,
+            quota_evidence=inflated_quota,
+            is_po_live_go_granted=True,
+            allow_synthetic_simulation=True,
+            now=self.now_utc,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.status_code, "DENY_QUOTA_EXHAUSTED")
+        self.assertIn("exceeds Free Tier monthly call cap (300)", decision.reason)
+
+    def test_g3_preflight_blocks_multi_runner_environment_as_missing_reservation(self):
+        """Preflight explicitly blocks multi-runner environment when ERD-017 fencing is missing."""
         decision = evaluate_g3_activation_preflight(
             model_name="gemini-3.5-flash-lite",
             project_proof=self.valid_synthetic_proof,
@@ -978,13 +1025,57 @@ class TestG3ActivationContractAndPreflight(unittest.TestCase):
             allow_synthetic_simulation=True,
             now=self.now_utc,
         )
-        self.assertTrue(decision.allowed)
-        self.assertEqual(decision.status_code, "ALLOW_PREFLIGHT_READY")
+        self.assertFalse(decision.allowed)  # P1/P2: Blocked, never allowed=True!
+        self.assertEqual(decision.status_code, "DENY_MISSING_CROSS_RUNNER_RESERVATION")
         self.assertTrue(decision.requires_erd017_fencing)
+        self.assertIn("Multi-runner environment requires ERD-017", decision.reason)
+        self.assertIn("Activation blocked", decision.reason)
 
-    def test_evaluate_still_unconditionally_denied_even_if_g3_preflight_ready(self):
+    def test_g3_preflight_simulation_pass_is_strictly_non_authorizing(self):
+        """P1 REMEDIATION: Preflight in synthetic simulation mode returns allowed=False and SIMULATION_PASS_NON_AUTHORIZING."""
+        decision = evaluate_g3_activation_preflight(
+            model_name="gemini-3.5-flash-lite",
+            project_proof=self.valid_synthetic_proof,
+            quota_evidence=self.valid_synthetic_quota,
+            is_po_live_go_granted=True,
+            is_multi_runner_environment=False,
+            allow_synthetic_simulation=True,
+            now=self.now_utc,
+        )
+        # CRITICAL P1 INVARIANT: allowed is NEVER True!
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.status_code, "SIMULATION_PASS_NON_AUTHORIZING")
+        self.assertIn("non_authorizing", decision.status_code.lower())
+        self.assertIn("Synthetic simulation diagnostic checks passed structurally", decision.reason)
+        self.assertIn("live dispatch authorization DENIED", decision.reason)
+        self.assertIn("activation_blockers", decision.provenance_summary)
+        for blocker in ACTIVATION_BLOCKERS:
+            self.assertIn(blocker, decision.provenance_summary["activation_blockers"])
+
+    def test_preflight_never_returns_allowed_true_under_any_caller_flags(self):
+        """CRITICAL NEGATIVE REGRESSION: evaluate_g3_activation_preflight NEVER returns allowed=True."""
+        # Test permutations of caller inputs
+        for sim in [True, False]:
+            for po_go in [True, False]:
+                for multi in [True, False]:
+                    decision = evaluate_g3_activation_preflight(
+                        model_name="gemini-3.5-flash-lite",
+                        project_proof=self.valid_synthetic_proof if sim else None,
+                        quota_evidence=self.valid_synthetic_quota if sim else None,
+                        is_po_live_go_granted=po_go,
+                        is_multi_runner_environment=multi,
+                        allow_synthetic_simulation=sim,
+                        now=self.now_utc,
+                    )
+                    self.assertFalse(
+                        decision.allowed,
+                        f"Violated fail-closed invariant: allowed was True for sim={sim}, po_go={po_go}, multi={multi}"
+                    )
+                    self.assertNotEqual(decision.status_code, "ALLOW_PREFLIGHT_READY")
+
+    def test_evaluate_still_unconditionally_denied_even_if_g3_preflight_simulation_passes(self):
         """GeminiEditorialEngine.evaluate() still unconditionally blocks API dispatch
-        via require_verified_free_tier() even when preflight decision returns ALLOW_PREFLIGHT_READY."""
+        via require_verified_free_tier() even when preflight simulation diagnostics pass."""
         preflight = evaluate_g3_activation_preflight(
             model_name="gemini-3.5-flash-lite",
             project_proof=self.valid_synthetic_proof,
@@ -993,8 +1084,8 @@ class TestG3ActivationContractAndPreflight(unittest.TestCase):
             allow_synthetic_simulation=True,
             now=self.now_utc,
         )
-        self.assertTrue(preflight.allowed)
-        self.assertEqual(preflight.status_code, "ALLOW_PREFLIGHT_READY")
+        self.assertFalse(preflight.allowed)
+        self.assertEqual(preflight.status_code, "SIMULATION_PASS_NON_AUTHORIZING")
 
         # Now test that evaluate() cannot be bypassed
         settings = Settings(

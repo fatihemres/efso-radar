@@ -179,11 +179,13 @@ FREE_TIER_DEFAULT_RPM_CAP: int = DOC_EXAMPLE_RPM_CAP
 FREE_TIER_DEFAULT_RPD_CAP: int = DOC_EXAMPLE_RPD_CAP
 FREE_TIER_DEFAULT_TPM_CAP: int = DOC_EXAMPLE_TPM_CAP
 
-# Observed project limits for Efso Radar in Google AI Studio / Gemini API (gemini-3.5-flash-lite).
-# CRITICAL: These are project-level baselines, NOT universal constants or permanent entitlements!
-# Google may adjust project-specific limits at any time, and these quotas are shared across
-# all API keys and runners within the same Google Cloud / AI Studio project.
-# Dynamic reservation and quota checks must fail closed if limits are unobserved or exceeded.
+# Owner-observed project quota snapshots for Efso Radar in Google AI Studio (gemini-3.5-flash-lite) on 2026-11-06.
+# CRITICAL SAFETY NOTICE:
+# - These are static historical observations recorded on 2026-11-06, NOT runtime-verifiable entitlements!
+# - They CANNOT authorize usage or serve as current live consumption.
+# - Google may adjust project-specific limits at any time without notification.
+# - These limits are shared across ALL API keys and runners within the same Google Cloud / AI Studio project.
+# - Dynamic reservation and quota checks must fail closed if fresh, trusted quota evidence is unobserved.
 OBSERVED_PROJECT_RPM_LIMIT: int = 15
 OBSERVED_PROJECT_INPUT_TPM_LIMIT: int = 250_000
 OBSERVED_PROJECT_RPD_LIMIT: int = 500
@@ -225,6 +227,16 @@ def get_pacific_calendar_date(dt_utc: Optional[datetime] = None) -> str:
 # Provenance states for account-level billing status
 BILLING_TIER_UNKNOWN: str = "UNKNOWN_UNVERIFIED"
 BILLING_TIER_DISALLOWED_PAID: str = "DISALLOWED_PAID"
+BILLING_TIER_SIMULATED_UNAUTHENTICATED: str = "SIMULATED_UNAUTHENTICATED"
+
+# Mandatory activation blockers preventing live Gemini dispatch authorization
+ACTIVATION_BLOCKERS: tuple[str, ...] = (
+    "G1_PROVIDER_BILLING_ATTESTATION_UNAVAILABLE",
+    "G2_ERD017_CROSS_RUNNER_QUOTA_RESERVATION_UNAVAILABLE",
+    "TRUSTED_PROVIDER_QUOTA_FRESHNESS_UNAVAILABLE",
+    "PROJECT_MODEL_BINDING_ATTESTATION_UNAVAILABLE",
+    "SESSION_SCOPED_PO_GRANT_VALIDATION_UNAVAILABLE",
+)
 
 
 def is_model_assessed_for_launch(model_name: str) -> bool:
@@ -398,11 +410,13 @@ def validate_free_tier_project_proof(
 
     # CRITICAL P1: Caller-provided record is NOT an authenticated provider attestation.
     # It cannot certify actual provider $0 billing.
+    # In offline testing, synthetic simulations may pass allow_synthetic_simulation=True
+    # to evaluate structural proof validity, but is_valid remains False (non-authorizing).
     if allow_synthetic_simulation:
         return (
-            True,
-            "SIMULATED_FREE_TIER",
-            "Valid proof structure (synthetic simulation only - non-authorizing)",
+            False,
+            BILLING_TIER_SIMULATED_UNAUTHENTICATED,
+            "Valid proof structure (synthetic simulation only - non-authorizing; provider billing remains UNVERIFIED).",
         )
 
     return (
@@ -840,10 +854,12 @@ def check_free_tier_safety_guard(
             False,
             "Missing monthly call count observation: status is UNKNOWN. Fail closed.",
         )
-    if (current_monthly_calls + 1) > max_monthly_calls:
+    # Strictly clamp caller-provided monthly cap to internal ceiling of 300
+    effective_max_monthly_calls = min(int(max_monthly_calls), 300)
+    if (current_monthly_calls + 1) > effective_max_monthly_calls:
         return (
             False,
-            f"Monthly AI call count ({current_monthly_calls + 1}) exceeds Free Tier monthly call cap ({max_monthly_calls}).",
+            f"Monthly AI call count ({current_monthly_calls + 1}) exceeds Free Tier monthly call cap ({effective_max_monthly_calls}).",
         )
 
     # Resolve RPM parameter aliases
@@ -977,16 +993,26 @@ def evaluate_g3_activation_preflight(
 ) -> G3PreDispatchDecision:
     """Evaluate G3 Gemini activation preflight gates strictly offline.
 
-    SEPARATION OF MACHINE GATES FROM HUMAN PO LIVE GO:
-    Passing machine gates (model assessment, search grounding off, zero monetary
-    budget, verified billing proof, within quota limits) is a strictly mandatory
-    prerequisite, but CANNOT self-authorize live dispatch.
-    An authenticated human Product Owner Live GO token (is_po_live_go_granted=True)
-    is independently required. Without it, preflight returns DENY_NO_PO_GO.
+    FAIL-CLOSED SAFETY INVARIANT (P1 REMEDIATION):
+    This function NEVER returns allowed=True under any circumstance in this offline implementation!
+    Caller-controlled billing proof, quota dictionaries, allow_synthetic_simulation=True,
+    and is_po_live_go_granted=True are untrusted caller inputs and CANNOT authorize live dispatch.
+
+    Live activation remains permanently blocked by five mandatory activation blockers:
+    1. G1: Independent provider billing attestation (Google Cloud Billing API).
+    2. G2 / ERD-017: Provider-persistent cross-runner quota reservation and ownership journal.
+    3. Trusted provider quota freshness and observation timestamp.
+    4. Project/model binding attestation.
+    5. Authenticated, session-scoped human PO Live GO grant validation.
+
+    When all diagnostic checks pass in synthetic simulation mode (allow_synthetic_simulation=True),
+    preflight returns:
+        allowed=False
+        status_code="SIMULATION_PASS_NON_AUTHORIZING"
 
     UNCONDITIONAL OFFLINE BARRIER:
-    In this offline engineering slice, live API dispatch remains blocked by
-    require_verified_free_tier() at the client boundary, regardless of preflight decision.
+    In this offline engineering slice, live API dispatch remains unconditionally blocked by
+    require_verified_free_tier() at the client boundary, regardless of any preflight evaluation.
     """
     ref_now = now or datetime.now(timezone.utc)
     if ref_now.tzinfo is None:
@@ -1008,7 +1034,11 @@ def evaluate_g3_activation_preflight(
             billing_tier=BILLING_TIER_UNKNOWN,
             pacific_reset_date=pacific_date,
             requires_erd017_fencing=is_multi_runner_environment,
-            provenance_summary={"model": clean_name, "gate": "model_assessment"},
+            provenance_summary={
+                "model": clean_name,
+                "gate": "model_assessment",
+                "activation_blockers": list(ACTIVATION_BLOCKERS),
+            },
         )
 
     # 2. Search Grounding Gate
@@ -1017,14 +1047,18 @@ def evaluate_g3_activation_preflight(
             allowed=False,
             status_code="DENY_SEARCH_GROUNDING",
             reason=(
-                "Search grounding is enabled. Search grounding is not free under Free Tier. "
-                "Strict $0.00 / 0 TRY policy requires search grounding disabled. Fail closed."
+                "Search grounding is enabled. Search grounding is not available on Gemini Free Tier "
+                "and incurs charges. Strict $0.00 / 0 TRY policy requires search grounding disabled. Fail closed."
             ),
             model_name=clean_name,
             billing_tier=BILLING_TIER_UNKNOWN,
             pacific_reset_date=pacific_date,
             requires_erd017_fencing=is_multi_runner_environment,
-            provenance_summary={"search_grounding": True, "gate": "search_grounding"},
+            provenance_summary={
+                "search_grounding": True,
+                "gate": "search_grounding",
+                "activation_blockers": list(ACTIVATION_BLOCKERS),
+            },
         )
 
     # 3. Monetary Budget Gate (must be strictly $0.00)
@@ -1045,6 +1079,7 @@ def evaluate_g3_activation_preflight(
                 "max_run_cost_usd": max_run_cost_usd,
                 "max_monthly_cost_usd": max_monthly_cost_usd,
                 "gate": "zero_budget",
+                "activation_blockers": list(ACTIVATION_BLOCKERS),
             },
         )
 
@@ -1061,9 +1096,15 @@ def evaluate_g3_activation_preflight(
             billing_tier=BILLING_TIER_DISALLOWED_PAID,
             pacific_reset_date=pacific_date,
             requires_erd017_fencing=is_multi_runner_environment,
-            provenance_summary={"billing_tier": BILLING_TIER_DISALLOWED_PAID, "gate": "billing_proof"},
+            provenance_summary={
+                "billing_tier": BILLING_TIER_DISALLOWED_PAID,
+                "gate": "billing_proof",
+                "activation_blockers": list(ACTIVATION_BLOCKERS),
+            },
         )
-    if not proof_ok:
+
+    # Default production callers without synthetic flag fail closed
+    if not allow_synthetic_simulation:
         return G3PreDispatchDecision(
             allowed=False,
             status_code="DENY_UNVERIFIED_BILLING",
@@ -1072,7 +1113,28 @@ def evaluate_g3_activation_preflight(
             billing_tier=billing_tier,
             pacific_reset_date=pacific_date,
             requires_erd017_fencing=is_multi_runner_environment,
-            provenance_summary={"billing_tier": billing_tier, "gate": "billing_proof"},
+            provenance_summary={
+                "billing_tier": billing_tier,
+                "gate": "billing_proof",
+                "activation_blockers": list(ACTIVATION_BLOCKERS),
+            },
+        )
+
+    # In synthetic simulation: structural validation must pass
+    if billing_tier != BILLING_TIER_SIMULATED_UNAUTHENTICATED:
+        return G3PreDispatchDecision(
+            allowed=False,
+            status_code="DENY_UNVERIFIED_BILLING",
+            reason=proof_reason,
+            model_name=clean_name,
+            billing_tier=billing_tier,
+            pacific_reset_date=pacific_date,
+            requires_erd017_fencing=is_multi_runner_environment,
+            provenance_summary={
+                "billing_tier": billing_tier,
+                "gate": "billing_proof",
+                "activation_blockers": list(ACTIVATION_BLOCKERS),
+            },
         )
 
     # 5. Quota Evidence Gate
@@ -1085,13 +1147,42 @@ def evaluate_g3_activation_preflight(
             billing_tier=billing_tier,
             pacific_reset_date=pacific_date,
             requires_erd017_fencing=is_multi_runner_environment,
-            provenance_summary={"quota_evidence": None, "gate": "quota_guard"},
+            provenance_summary={
+                "quota_evidence": None,
+                "gate": "quota_guard",
+                "activation_blockers": list(ACTIVATION_BLOCKERS),
+            },
         )
+
+    # Specific Input TPM check for gemini-3.5-flash-lite (observed baseline: 250,000 input TPM)
+    if "input_tpm_limit" not in quota_evidence or quota_evidence.get("input_tpm_limit") is None:
+        return G3PreDispatchDecision(
+            allowed=False,
+            status_code="DENY_MISSING_INPUT_TPM_EVIDENCE",
+            reason=(
+                "Missing verified input TPM (Tokens Per Minute) limit in evidence. Assessed model "
+                "(gemini-3.5-flash-lite) specifically requires input TPM quota tracking "
+                f"(observed project baseline: {OBSERVED_PROJECT_INPUT_TPM_LIMIT:,} input TPM). Fail closed."
+            ),
+            model_name=clean_name,
+            billing_tier=billing_tier,
+            pacific_reset_date=pacific_date,
+            requires_erd017_fencing=is_multi_runner_environment,
+            provenance_summary={
+                "gate": "input_tpm_evidence",
+                "error": "missing_input_tpm_limit",
+                "activation_blockers": list(ACTIVATION_BLOCKERS),
+            },
+        )
+
+    # Strictly clamp caller-provided monthly cap to internal ceiling of 300
+    caller_monthly_cap = quota_evidence.get("max_monthly_calls", 300)
+    effective_monthly_cap = min(int(caller_monthly_cap), 300)
 
     quota_ok, quota_reason = check_free_tier_safety_guard(
         model_name=clean_name,
         current_monthly_calls=quota_evidence.get("current_monthly_calls"),
-        max_monthly_calls=quota_evidence.get("max_monthly_calls", 300),
+        max_monthly_calls=effective_monthly_cap,
         enable_search_grounding=enable_search_grounding,
         max_run_cost_usd=max_run_cost_usd,
         max_monthly_cost_usd=max_monthly_cost_usd,
@@ -1122,10 +1213,36 @@ def evaluate_g3_activation_preflight(
             billing_tier=billing_tier,
             pacific_reset_date=pacific_date,
             requires_erd017_fencing=is_multi_runner_environment,
-            provenance_summary={"quota_error": quota_reason, "gate": "quota_guard"},
+            provenance_summary={
+                "quota_error": quota_reason,
+                "gate": "quota_guard",
+                "activation_blockers": list(ACTIVATION_BLOCKERS),
+            },
         )
 
-    # 6. Human Product Owner Live GO Gate
+    # 6. Multi-Runner / Cross-Runner Fencing Gate (ERD-017 Blocker)
+    if is_multi_runner_environment:
+        return G3PreDispatchDecision(
+            allowed=False,
+            status_code="DENY_MISSING_CROSS_RUNNER_RESERVATION",
+            reason=(
+                "Multi-runner environment requires ERD-017 provider-persistent ownership journal "
+                "and atomic reservation fencing. Cross-runner reservation infrastructure is currently "
+                "unimplemented / unverified. Activation blocked (fail closed)."
+            ),
+            model_name=clean_name,
+            billing_tier=billing_tier,
+            pacific_reset_date=pacific_date,
+            requires_erd017_fencing=True,
+            provenance_summary={
+                "gate": "erd017_cross_runner_fencing",
+                "error": "missing_cross_runner_reservation",
+                "is_multi_runner_environment": True,
+                "activation_blockers": list(ACTIVATION_BLOCKERS),
+            },
+        )
+
+    # 7. Human Product Owner Live GO Gate
     if not is_po_live_go_granted:
         return G3PreDispatchDecision(
             allowed=False,
@@ -1143,16 +1260,20 @@ def evaluate_g3_activation_preflight(
                 "is_po_live_go_granted": False,
                 "preflight_machine_gates": "PASS",
                 "gate": "human_po_go",
+                "activation_blockers": list(ACTIVATION_BLOCKERS),
             },
         )
 
-    # 7. Preflight Ready (offline simulation or supervised preflight)
+    # 8. Synthetic Simulation Diagnostic Pass (NEVER allowed=True!)
+    # While trusted provider evidence, durable quota reservation, and independent
+    # PO grant validation are unavailable, allowed remains strictly False.
     return G3PreDispatchDecision(
-        allowed=True,
-        status_code="ALLOW_PREFLIGHT_READY",
+        allowed=False,
+        status_code="SIMULATION_PASS_NON_AUTHORIZING",
         reason=(
-            "Preflight safety gates and PO Live GO satisfied for offline readiness evaluation. "
-            "(Note: require_verified_free_tier() remains in place at API dispatch boundary)."
+            "Synthetic simulation diagnostic checks passed structurally; live dispatch authorization "
+            "DENIED (allowed=False) because trusted provider billing attestation, durable cross-runner "
+            "quota reservation, and independent PO grant validation are unavailable (activation blockers)."
         ),
         model_name=clean_name,
         billing_tier=billing_tier,
@@ -1161,8 +1282,9 @@ def evaluate_g3_activation_preflight(
         provenance_summary={
             "is_po_live_go_granted": True,
             "preflight_machine_gates": "PASS",
-            "allow_synthetic_simulation": allow_synthetic_simulation,
-            "gate": "preflight_complete",
+            "allow_synthetic_simulation": True,
+            "gate": "simulation_diagnostic_complete",
+            "activation_blockers": list(ACTIVATION_BLOCKERS),
         },
     )
 
