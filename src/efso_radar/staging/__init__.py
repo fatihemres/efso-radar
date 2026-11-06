@@ -100,6 +100,8 @@ if TYPE_CHECKING:
     from efso_radar.staging.journal_hrana_seam import (
         StagingJournalHranaSeam,
         build_live02_synthetic_mutations,
+        CleanupVerificationError,
+        OwnershipMismatchError,
     )
 
 __all__ = [
@@ -177,6 +179,8 @@ __all__ = [
     "compute_canonical_inventory_fingerprint",
     "StagingJournalHranaSeam",
     "build_live02_synthetic_mutations",
+    "CleanupVerificationError",
+    "OwnershipMismatchError",
 ]
 
 _RUNNER_EXPORTS = frozenset({
@@ -267,6 +271,8 @@ _JOURNAL_EXPORTS = frozenset({
 _JOURNAL_HRANA_EXPORTS = frozenset({
     "StagingJournalHranaSeam",
     "build_live02_synthetic_mutations",
+    "CleanupVerificationError",
+    "OwnershipMismatchError",
 })
 
 

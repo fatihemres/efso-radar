@@ -22,6 +22,7 @@ import json
 from pathlib import Path
 import sqlite3
 import tempfile
+from typing import Optional
 import unittest
 
 import httpx
@@ -34,6 +35,7 @@ from efso_radar.staging.journal import (
     AmbiguousCommitOutcome,
     FencingConflictError,
     HaltMarkerPersistenceError,
+    InvalidJournalTransitionError,
     JournalError,
     JournalExecutionPattern,
     JournalHaltedError,
@@ -46,6 +48,7 @@ from efso_radar.staging.journal import (
     compute_canonical_inventory_fingerprint,
 )
 from efso_radar.staging.journal_hrana_seam import (
+    CleanupVerificationError,
     StagingJournalHranaSeam,
     build_live02_synthetic_mutations,
     _assert_fixture_isolation,
@@ -219,6 +222,57 @@ class TestScenario1WorkloadCollisions(_BaseTwoRunnerFixture):
         self.assertEqual(entry_b.run_id, RUN_ID_B)
         self.assertEqual(entry_b.status, JournalStatus.ACKED)
 
+    def test_same_owner_different_run_id_rejected_when_prior_run_unresolved_and_lease_expired(self):
+        """Even with same owner and expired lease, prior unresolved run prevents new run registration."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        # Manually expire the lease in run_locks
+        self.conn_a.execute(
+            "UPDATE run_locks SET expires_at = '2020-01-01T00:00:00Z'"
+        )
+        self.conn_a.commit()
+
+        # Runner A (same owner!) attempts to register a distinct run_id
+        with self.assertRaises(ActiveWorkloadCollisionError) as ctx:
+            self.seam_a.register_intent(
+                run_id=RUN_ID_B,
+                manifest_seal_hex=self.seal_b,
+                target_inventory=self.entities_b,
+            )
+        self.assertIn("unresolved staging run", str(ctx.exception))
+
+        # Verify RUN_ID_B was not admitted in staging_run_journal
+        cur = self.conn_b.cursor()
+        cur.execute("SELECT COUNT(*) FROM staging_run_journal WHERE run_id = ?", (RUN_ID_B,))
+        self.assertEqual(cur.fetchone()[0], 0)
+
+    def test_concurrent_registration_race_one_winner(self):
+        """Concurrent intent registrations for distinct runs against the same workload permit exactly one winner."""
+        # Seam A registers first
+        entry_a = self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        self.assertEqual(entry_a.status, JournalStatus.ACKED)
+
+        # Seam B attempts to register RUN_ID_B concurrently
+        with self.assertRaises(ActiveWorkloadCollisionError):
+            self.seam_b.register_intent(
+                run_id=RUN_ID_B,
+                manifest_seal_hex=self.seal_b,
+                target_inventory=self.entities_b,
+            )
+
+        # Shared DB has only RUN_ID_A
+        cur = self.conn_b.cursor()
+        cur.execute("SELECT run_id FROM staging_run_journal")
+        rows = [r[0] for r in cur.fetchall()]
+        self.assertEqual(rows, [RUN_ID_A])
+
 
 # =============================================================================
 # Scenario 2: Stale-owner attempts and fencing races
@@ -318,6 +372,60 @@ class TestScenario2StaleOwnerAndFencingRaces(_BaseTwoRunnerFixture):
             )
 
         # Assert no entity rows were committed
+        cur = self.conn_b.cursor()
+        cur.execute("SELECT COUNT(*) FROM processed_articles WHERE article_id = ?", (f"synth_art_{RUN_ID_A}_01",))
+        self.assertEqual(cur.fetchone()[0], 0)
+
+    def test_mutation_rejected_when_journal_status_tampered(self):
+        """CAS rejects mutation if journal status is unexpectedly modified."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+
+        # Tamper status directly on DB to CLEANED_UP
+        self.conn_b.execute(
+            "UPDATE staging_run_journal SET status = ? WHERE run_id = ?",
+            (JournalStatus.CLEANED_UP.value, RUN_ID_A),
+        )
+        self.conn_b.commit()
+
+        with self.assertRaises((InvalidJournalTransitionError, FencingConflictError)):
+            self.seam_a.execute_atomic_stage_mutation(
+                run_id=RUN_ID_A,
+                expected_fencing_token=1,
+                stage="LIVE-02",
+                mutation_statements=mutations,
+                manifest_seal_hex=self.seal_a,
+            )
+
+    def test_mutation_rejected_when_lease_expired(self):
+        """CAS rejects mutation if worker lock lease has expired in run_locks."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+
+        # Expire lock lease directly on DB
+        self.conn_b.execute(
+            "UPDATE run_locks SET expires_at = '2020-01-01T00:00:00Z'"
+        )
+        self.conn_b.commit()
+
+        with self.assertRaises(FencingConflictError):
+            self.seam_a.execute_atomic_stage_mutation(
+                run_id=RUN_ID_A,
+                expected_fencing_token=1,
+                stage="LIVE-02",
+                mutation_statements=mutations,
+                manifest_seal_hex=self.seal_a,
+            )
+
+        # Verify no mutations were written
         cur = self.conn_b.cursor()
         cur.execute("SELECT COUNT(*) FROM processed_articles WHERE article_id = ?", (f"synth_art_{RUN_ID_A}_01",))
         self.assertEqual(cur.fetchone()[0], 0)
@@ -751,6 +859,267 @@ class TestScenario8ConditionalCleanupAndAudits(_BaseTwoRunnerFixture):
 
         audit = self.seam_a.audit_workload(RUN_ID_A)
         self.assertEqual(audit, AuditOutcomeState.OWNERSHIP_MISMATCH_HALT)
+
+    def test_cleanup_fails_closed_when_foreign_attribute_row_remains(self):
+        """If an entity row has foreign attributes, cleanup DELETE leaves it, in-transaction audit catches it, and rolls back."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        token2 = self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        # Tamper the source attribute of the article in the database
+        self.conn_b.execute(
+            "UPDATE processed_articles SET source = 'foreign_tampered' WHERE article_id = ?",
+            (f"synth_art_{RUN_ID_A}_01",),
+        )
+        self.conn_b.commit()
+
+        # Cleanup should fail fail-closed
+        with self.assertRaises(CleanupVerificationError) as ctx:
+            self.seam_a.execute_conditional_cleanup(
+                run_id=RUN_ID_A,
+                expected_fencing_token=token2,
+                manifest_seal_hex=self.seal_a,
+            )
+        self.assertIn("In-transaction cleanup audit failed", str(ctx.exception))
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+
+        # Status must NOT be CLEANED_UP
+        entry = self.seam_a.inspect_run(RUN_ID_A)
+        self.assertNotEqual(entry.status, JournalStatus.CLEANED_UP)
+
+        # The foreign row is still preserved (transaction rolled back)
+        cur = self.conn_b.cursor()
+        cur.execute("SELECT COUNT(*) FROM processed_articles WHERE article_id = ?", (f"synth_art_{RUN_ID_A}_01",))
+        self.assertEqual(cur.fetchone()[0], 1)
+
+    def test_cleanup_rejects_partial_entities_subset(self):
+        """Partial entity subsets are rejected fail-closed before dispatch."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        token2 = self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        # Attempt partial cleanup subset (only article, not story)
+        with self.assertRaises(CleanupVerificationError) as ctx:
+            self.seam_a.execute_conditional_cleanup(
+                run_id=RUN_ID_A,
+                expected_fencing_token=token2,
+                manifest_seal_hex=self.seal_a,
+                target_entities_subset=[f"synth_art_{RUN_ID_A}_01"],
+            )
+        self.assertIn("Partial cleanup subset requested", str(ctx.exception))
+
+        # Status is still EFFECT_COMMITTED and entities exist
+        entry = self.seam_a.inspect_run(RUN_ID_A)
+        self.assertEqual(entry.status, JournalStatus.EFFECT_COMMITTED)
+        cur = self.conn_b.cursor()
+        cur.execute("SELECT COUNT(*) FROM processed_articles WHERE article_id = ?", (f"synth_art_{RUN_ID_A}_01",))
+        self.assertEqual(cur.fetchone()[0], 1)
+
+    def test_cleanup_in_transaction_audit_query_failure_rolls_back(self):
+        """If an audit query errors during in-transaction audit, cleanup rolls back and halts."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        token2 = self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        # Hook to fail SELECT audit query inside cleanup
+        def failing_audit_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+                for req in body.get("requests", []):
+                    sql = req.get("stmt", {}).get("sql", "")
+                    if "SELECT * FROM" in sql:
+                        # Return an error for the audit query
+                        return httpx.Response(
+                            200,
+                            json={
+                                "baton": body.get("baton"),
+                                "results": [{
+                                    "type": "error",
+                                    "error": {"code": "SQLITE_IOERR", "message": "Simulated audit disk I/O failure"},
+                                }],
+                            },
+                            request=request,
+                        )
+            except Exception:
+                pass
+            return None
+
+        self.transport_a.custom_response_hook = failing_audit_hook
+
+        with self.assertRaises(CleanupVerificationError) as ctx:
+            self.seam_a.execute_conditional_cleanup(
+                run_id=RUN_ID_A,
+                expected_fencing_token=token2,
+                manifest_seal_hex=self.seal_a,
+            )
+        self.assertIn("Simulated audit disk I/O failure", str(ctx.exception))
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+
+        # Status not CLEANED_UP
+        entry = self.seam_a.inspect_run(RUN_ID_A)
+        self.assertNotEqual(entry.status, JournalStatus.CLEANED_UP)
+
+
+# =============================================================================
+# Hermetic HTTP Boundary & Mock Hrana Lifecycle Regressions (Security Review)
+# =============================================================================
+
+class TestHermeticHTTPBoundarySecurity(_BaseTwoRunnerFixture):
+    """Cover hermetic HTTP client and transport boundary enforcement."""
+
+    def test_pre_initialized_cached_client_rejected_at_construction(self):
+        """TursoHTTPClient with pre-initialized internal _client is rejected fail-closed."""
+        client = TursoHTTPClient(
+            database_url=EXACT_STAGING_DESTINATION,
+            auth_token="hermetic-token",
+            transport=self.transport_a,
+        )
+        # Force initialization of internal httpx client
+        _ = client._get_client()
+        self.assertIsNotNone(client._client)
+
+        with self.assertRaises(PermissionError) as ctx:
+            StagingJournalHranaSeam(
+                client=client,
+                owner_id="test_worker",
+                marker_dir=self.marker_dir_a,
+            )
+        self.assertIn("_client is not None", str(ctx.exception))
+
+    def test_read_only_client_rejected_at_construction(self):
+        """TursoHTTPClient configured with read_only=True is rejected fail-closed."""
+        client = TursoHTTPClient(
+            database_url=EXACT_STAGING_DESTINATION,
+            auth_token="hermetic-token",
+            transport=self.transport_a,
+            read_only=True,
+        )
+        with self.assertRaises(PermissionError) as ctx:
+            StagingJournalHranaSeam(
+                client=client,
+                owner_id="test_worker",
+                marker_dir=self.marker_dir_a,
+            )
+        self.assertIn("read_only=True", str(ctx.exception))
+
+    def test_cached_transport_mismatch_rejected_before_dispatch(self):
+        """If client._client._transport is swapped after seam creation, dispatch rejects fail-closed."""
+        client = TursoHTTPClient(
+            database_url=EXACT_STAGING_DESTINATION,
+            auth_token="hermetic-token",
+            transport=self.transport_a,
+        )
+        seam = StagingJournalHranaSeam(
+            client=client,
+            owner_id="test_worker",
+            marker_dir=self.marker_dir_a,
+        )
+        # Initialize internal client
+        _ = client._get_client()
+
+        # Swap the transport underneath
+        dummy_transport = httpx.HTTPTransport()
+        client._client._transport = dummy_transport
+
+        with self.assertRaises(PermissionError) as ctx:
+            seam.register_intent(
+                run_id=RUN_ID_A,
+                manifest_seal_hex=self.seal_a,
+                target_inventory=self.entities_a,
+            )
+        self.assertIn("cached transport identity mismatch", str(ctx.exception))
+
+
+class TestMockHranaTransactionLifecycle(_BaseTwoRunnerFixture):
+    """Cover mock Hrana transaction lifecycle semantics and failure injections."""
+
+    def test_timeout_before_commit_does_not_commit_on_subsequent_read(self):
+        """A timeout before COMMIT rolls back provider state; subsequent read never commits writes."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+
+        # Inject pre-commit timeout into Runner A's transport
+        self.transport_a.fail_before_commit_timeout = True
+
+        with self.assertRaises((AmbiguousCommitError, JournalError, httpx.TimeoutException)):
+            self.seam_a.execute_atomic_stage_mutation(
+                run_id=RUN_ID_A,
+                expected_fencing_token=1,
+                stage="LIVE-02",
+                mutation_statements=mutations,
+                manifest_seal_hex=self.seal_a,
+            )
+
+        # Disable timeout injection and issue an unrelated read query on Runner A
+        self.transport_a.fail_before_commit_timeout = False
+        entry = self.seam_a.inspect_run(RUN_ID_A)
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.status, JournalStatus.ACKED)
+
+        # Independent database inspection via conn_b: zero mutation rows leaked!
+        cur = self.conn_b.cursor()
+        cur.execute("SELECT COUNT(*) FROM processed_articles WHERE article_id = ?", (f"synth_art_{RUN_ID_A}_01",))
+        self.assertEqual(cur.fetchone()[0], 0)
+        cur.execute("SELECT COUNT(*) FROM stories WHERE story_id = ?", (f"synth_story_{RUN_ID_A}_01",))
+        self.assertEqual(cur.fetchone()[0], 0)
+
+        # Journal status in DB was not committed to EFFECT_COMMITTED
+        cur.execute("SELECT status FROM staging_run_journal WHERE run_id = ?", (RUN_ID_A,))
+        self.assertEqual(cur.fetchone()[0], JournalStatus.ACKED.value)
+
+    def test_nested_begin_in_mock_transport_returns_error(self):
+        """Mock Hrana transport rejects nested BEGIN within an active transaction."""
+        # Dispatch two BEGIN statements in the same pipeline via seam_a
+        res = self.seam_a._post_pipeline([
+            {"type": "execute", "stmt": {"sql": "BEGIN"}},
+            {"type": "execute", "stmt": {"sql": "BEGIN"}},
+        ])
+        results = res.get("results", [])
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0].get("type"), "ok")
+        self.assertEqual(results[1].get("type"), "error")
+        err = results[1].get("error", {})
+        self.assertEqual(err.get("code"), "SQLITE_ERROR")
+        self.assertIn("cannot start a transaction within a transaction", err.get("message", ""))
+
+        # Clean up by rolling back the opened transaction
+        baton = res.get("baton")
+        if baton:
+            self.seam_a._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
 
 
 # =============================================================================
