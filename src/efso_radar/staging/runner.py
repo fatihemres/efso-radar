@@ -607,6 +607,9 @@ class HermeticStagingTransport(httpx.BaseTransport):
         fail_on_commit_timeout: bool = False,
         fail_on_commit_network: bool = False,
         fail_on_commit_status: Optional[int] = None,
+        fail_before_commit_timeout: bool = False,
+        fail_after_commit_timeout: bool = False,
+        fail_after_commit_network: bool = False,
         fail_on_stmt_idx: Optional[int] = None,
         fail_stmt_code: str = "SQLITE_CONSTRAINT",
         custom_response_hook: Optional[Callable[[httpx.Request], Optional[httpx.Response]]] = None,
@@ -615,6 +618,9 @@ class HermeticStagingTransport(httpx.BaseTransport):
         self.fail_on_commit_timeout = fail_on_commit_timeout
         self.fail_on_commit_network = fail_on_commit_network
         self.fail_on_commit_status = fail_on_commit_status
+        self.fail_before_commit_timeout = fail_before_commit_timeout
+        self.fail_after_commit_timeout = fail_after_commit_timeout
+        self.fail_after_commit_network = fail_after_commit_network
         self.fail_on_stmt_idx = fail_on_stmt_idx
         self.fail_stmt_code = fail_stmt_code
         self.custom_response_hook = custom_response_hook
@@ -649,12 +655,33 @@ class HermeticStagingTransport(httpx.BaseTransport):
             req.get("type") == "execute" and req.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT"
             for req in requests_list
         )
+        if self.fail_before_commit_timeout and not has_commit:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            if in_baton in self.active_batons:
+                self.active_batons.remove(in_baton)
+            if in_baton in self.in_transaction:
+                self.in_transaction[in_baton] = False
+            raise httpx.TimeoutException("Simulated connection timeout before COMMIT (server rolled back)")
+
         if has_commit:
-            if self.fail_on_commit_timeout:
-                raise httpx.TimeoutException("Simulated connection timeout during COMMIT")
-            if self.fail_on_commit_network:
-                raise httpx.ConnectError("Simulated connection reset during COMMIT")
-            if self.fail_on_commit_status is not None:
+            if self.fail_on_commit_timeout or self.fail_on_commit_network or self.fail_on_commit_status is not None:
+                # In simulated rolled-back-and-ACK-lost scenario, server rolls back transaction before persistence
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
+                if in_baton in self.active_batons:
+                    self.active_batons.remove(in_baton)
+                if in_baton in self.in_transaction:
+                    self.in_transaction[in_baton] = False
+
+                if self.fail_on_commit_timeout:
+                    raise httpx.TimeoutException("Simulated connection timeout during COMMIT (server rolled back)")
+                if self.fail_on_commit_network:
+                    raise httpx.ConnectError("Simulated connection reset during COMMIT (server rolled back)")
                 return httpx.Response(self.fail_on_commit_status, json={"message": "Gateway error"}, request=request)
 
         results: list[dict[str, Any]] = []
@@ -671,22 +698,51 @@ class HermeticStagingTransport(httpx.BaseTransport):
                 upper_sql = sql.upper()
 
                 if upper_sql == "BEGIN":
+                    if self.conn.in_transaction or (in_baton is not None and self.in_transaction.get(in_baton, False)):
+                        results.append({
+                            "type": "error",
+                            "error": {
+                                "code": "SQLITE_ERROR",
+                                "message": "cannot start a transaction within a transaction",
+                            },
+                        })
+                        continue
+                    try:
+                        self.conn.execute("BEGIN")
+                    except sqlite3.Error as exc:
+                        results.append({
+                            "type": "error",
+                            "error": {
+                                "code": "SQLITE_ERROR",
+                                "message": str(exc),
+                            },
+                        })
+                        continue
                     self.session_counter += 1
                     out_baton = f"mock-baton-{self.session_counter}"
                     self.active_batons.add(out_baton)
                     self.in_transaction[out_baton] = True
-                    try:
-                        self.conn.execute("BEGIN")
-                    except sqlite3.OperationalError:
-                        pass
                     results.append({"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}})
                     continue
 
                 elif upper_sql == "COMMIT":
+                    if not self.conn.in_transaction and not self.in_transaction.get(in_baton or "", False):
+                        results.append({
+                            "type": "error",
+                            "error": {
+                                "code": "SQLITE_ERROR",
+                                "message": "cannot commit - no transaction is active",
+                            },
+                        })
+                        continue
                     try:
                         self.conn.commit()
                         if in_baton in self.in_transaction:
                             self.in_transaction[in_baton] = False
+                        if self.fail_after_commit_timeout:
+                            raise httpx.TimeoutException("Simulated connection timeout after COMMIT was persisted on server")
+                        if self.fail_after_commit_network:
+                            raise httpx.ConnectError("Simulated network drop after COMMIT was persisted on server")
                         results.append({"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}})
                     except sqlite3.Error as exc:
                         results.append({"type": "error", "error": {"code": "SQLITE_ERROR", "message": str(exc)}})
@@ -727,7 +783,8 @@ class HermeticStagingTransport(httpx.BaseTransport):
                     last_id = cur.lastrowid if cur.lastrowid and cur.lastrowid > 0 else None
 
                     if not in_baton and not self.in_transaction.get(out_baton or "", False):
-                        self.conn.commit()
+                        if not any(self.in_transaction.values()) and not upper_sql.startswith(("SELECT", "PRAGMA")):
+                            self.conn.commit()
 
                     results.append({
                         "type": "ok",
