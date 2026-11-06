@@ -94,6 +94,7 @@ if TYPE_CHECKING:
         AmbiguousCommitOutcome,
         JournalHaltedError,
         compute_authenticated_manifest_seal,
+        compute_canonical_inventory_fingerprint,
     )
 
 __all__ = [
@@ -165,6 +166,9 @@ __all__ = [
     "StageMutationCommand",
     "OperatorReconciliationProposal",
     "AmbiguousCommitOutcome",
+    "JournalHaltedError",
+    "compute_authenticated_manifest_seal",
+    "compute_canonical_inventory_fingerprint",
 ]
 
 _RUNNER_EXPORTS = frozenset({
@@ -248,6 +252,7 @@ _JOURNAL_EXPORTS = frozenset({
     "AmbiguousCommitOutcome",
     "JournalHaltedError",
     "compute_authenticated_manifest_seal",
+    "compute_canonical_inventory_fingerprint",
 })
 
 

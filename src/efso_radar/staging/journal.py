@@ -230,15 +230,23 @@ class JournalHaltedError(JournalError, RuntimeError):
     """Operation attempted on a locally halted run in LOCAL_OUTCOME_UNKNOWN."""
 
 
-def compute_authenticated_manifest_seal(
+def _halt_marker_path(run_id: str) -> Path:
+    """Return the deterministic local filesystem path for a halted run marker file."""
+    safe_run_id = re.sub(r"[^a-zA-Z0-9_-]", "_", run_id)
+    return Path(tempfile.gettempdir()) / f"efso_radar_journal_halt_{safe_run_id}.lock"
+
+
+def compute_canonical_inventory_fingerprint(
     run_id: str,
     entities: Optional[list[RegisteredEntity] | list[dict[str, Any]]] = None,
     created_at: str = "2026-11-06T20:00:00Z",
 ) -> str:
-    """Compute the authentic SHA-256 seal for the canonical PerRunOwnershipManifest.
+    """Compute the SHA-256 fingerprint for the canonical 5-entity synthetic manifest.
 
-    Binds the run_id, canonical timestamp, version 1, and the exact canonical
-    five synthetic entities to form the authentic cryptographic digest.
+    Binds the run_id, canonical timestamp, version 1, and the allowlisted canonical
+    five synthetic entities to form a deterministic inventory fingerprint.
+    NOTE: This is a synthetic canonical-inventory fingerprint for test validation,
+    NOT cryptographic proof of an existing persisted manifest file on disk.
     """
     if entities is None:
         canonical_entities = create_default_manifest_entities(run_id)
@@ -260,6 +268,10 @@ def compute_authenticated_manifest_seal(
     )
     content = manifest.model_dump_json(indent=2).encode("utf-8")
     return hashlib.sha256(content).hexdigest()
+
+
+# Backward-compatible alias for existing tests and call sites
+compute_authenticated_manifest_seal = compute_canonical_inventory_fingerprint
 
 
 # =============================================================================
@@ -402,9 +414,17 @@ def validate_and_normalize_mutation(
             raise TargetInventoryViolationError(
                 f"Column and value length mismatch in StageMutationCommand: {len(stmt.columns)} cols vs {len(stmt.values)} vals."
             )
+        seen_cols: set[str] = set()
         for col in stmt.columns:
             if not re.match(r"\A[a-zA-Z0-9_]+\Z", col):
                 raise TargetInventoryViolationError(f"Invalid column identifier: '{col}'.")
+            norm_col = col.lower()
+            if norm_col in seen_cols:
+                raise TargetInventoryViolationError(
+                    f"Duplicate column identifier '{col}' (case-insensitive) detected in StageMutationCommand columns. "
+                    "Repeated column names are strictly prohibited to prevent parameter-binding ambiguity."
+                )
+            seen_cols.add(norm_col)
 
         # 3. Check PK column matches table definition
         expected_pk_col = ALLOWED_TABLE_PK_MAP[stmt.table]
@@ -492,9 +512,17 @@ def validate_and_normalize_mutation(
                 f"Column/placeholder/parameter length mismatch in SQL: '{sql}'."
             )
 
+        seen_cols: set[str] = set()
         for col in cols:
             if not re.match(r"\A[a-zA-Z0-9_]+\Z", col):
                 raise TargetInventoryViolationError(f"Invalid column identifier in SQL: '{col}'.")
+            norm_col = col.lower()
+            if norm_col in seen_cols:
+                raise TargetInventoryViolationError(
+                    f"Duplicate column identifier '{col}' (case-insensitive) detected in mutation SQL columns. "
+                    "Repeated column names are strictly prohibited to prevent parameter-binding ambiguity."
+                )
+            seen_cols.add(norm_col)
 
         # CRITICAL P1 FIX: Every single placeholder expression MUST literally be '?'
         for p in placeholders:
@@ -571,9 +599,32 @@ class StagingOwnershipJournal:
         self._halted_runs: set[str] = set()
         self._verify_table_exists()
 
+    def _latch_local_halt(self, run_id: str, reason: str) -> None:
+        """Latch run into LOCAL_OUTCOME_UNKNOWN / HALT state in-memory and on local disk."""
+        self._halted_runs.add(run_id)
+        marker = _halt_marker_path(run_id)
+        try:
+            payload = {
+                "run_id": run_id,
+                "halted_at": self._now_iso(),
+                "reason": reason,
+            }
+            marker.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
     def is_halted(self, run_id: str) -> bool:
-        """Check if run is in a local halted state (LOCAL_OUTCOME_UNKNOWN)."""
-        return run_id in self._halted_runs
+        """Check if run is in a local halted state (LOCAL_OUTCOME_UNKNOWN).
+
+        Checks both instance-level set and persistent local halt marker file.
+        """
+        if run_id in self._halted_runs:
+            return True
+        marker = _halt_marker_path(run_id)
+        if marker.is_file():
+            self._halted_runs.add(run_id)
+            return True
+        return False
 
     def _verify_table_exists(self) -> None:
         """Verify that candidate Schema v7 table exists in the test connection."""
@@ -624,7 +675,7 @@ class StagingOwnershipJournal:
         10. Supports simulating ambiguous commits (COMMITTED_BUT_ACK_LOST / ROLLED_BACK_AND_ACK_LOST)
             triggering local UNKNOWN/HALT without automated retries.
         """
-        if run_id in self._halted_runs:
+        if self.is_halted(run_id):
             raise JournalHaltedError(
                 f"Run '{run_id}' is permanently halted in LOCAL_OUTCOME_UNKNOWN. "
                 "Subsequent registration, automated mutations, retries, cleanups, or aborts are prohibited."
@@ -789,7 +840,7 @@ class StagingOwnershipJournal:
             # Handle simulated ambiguous commit during intent registration
             if simulate_ambiguous_commit == AmbiguousCommitOutcome.COMMITTED_BUT_ACK_LOST:
                 self._conn.execute("COMMIT")
-                self._halted_runs.add(run_id)
+                self._latch_local_halt(run_id, "Ambiguous intent COMMIT (COMMITTED_BUT_ACK_LOST)")
                 raise AmbiguousCommitError(
                     f"Simulated network drop during intent COMMIT for run '{run_id}'. "
                     "Transaction committed on provider (COMMITTED_BUT_ACK_LOST), but client outcome is LOCAL_OUTCOME_UNKNOWN. "
@@ -797,7 +848,7 @@ class StagingOwnershipJournal:
                 )
             elif simulate_ambiguous_commit == AmbiguousCommitOutcome.ROLLED_BACK_AND_ACK_LOST:
                 self._conn.execute("ROLLBACK")
-                self._halted_runs.add(run_id)
+                self._latch_local_halt(run_id, "Ambiguous intent COMMIT (ROLLED_BACK_AND_ACK_LOST)")
                 raise AmbiguousCommitError(
                     f"Simulated network drop during intent COMMIT for run '{run_id}'. "
                     "Transaction rolled back on provider (ROLLED_BACK_AND_ACK_LOST), client outcome is LOCAL_OUTCOME_UNKNOWN. "
@@ -848,7 +899,7 @@ class StagingOwnershipJournal:
 
         Returns the new incremented fencing token upon successful commit.
         """
-        if run_id in self._halted_runs:
+        if self.is_halted(run_id):
             raise JournalHaltedError(
                 f"Run '{run_id}' is permanently halted in LOCAL_OUTCOME_UNKNOWN. "
                 "Subsequent automated mutations, retries, cleanups, or aborts are prohibited."
@@ -949,14 +1000,14 @@ class StagingOwnershipJournal:
             # Step 4: Handle simulated ambiguous commit
             if simulate_ambiguous_commit == AmbiguousCommitOutcome.COMMITTED_BUT_ACK_LOST:
                 self._conn.execute("COMMIT")
-                self._halted_runs.add(run_id)
+                self._latch_local_halt(run_id, "Ambiguous mutation COMMIT (COMMITTED_BUT_ACK_LOST)")
                 raise AmbiguousCommitError(
                     f"Ambiguous commit encountered for run '{run_id}': transaction committed on provider, "
                     "but network ACK was lost. Client outcome is LOCAL_OUTCOME_UNKNOWN / HALT."
                 )
             elif simulate_ambiguous_commit == AmbiguousCommitOutcome.ROLLED_BACK_AND_ACK_LOST:
                 self._conn.execute("ROLLBACK")
-                self._halted_runs.add(run_id)
+                self._latch_local_halt(run_id, "Ambiguous mutation COMMIT (ROLLED_BACK_AND_ACK_LOST)")
                 raise AmbiguousCommitError(
                     f"Ambiguous commit encountered for run '{run_id}': transaction rolled back on provider, "
                     "and network ACK was lost. Client outcome is LOCAL_OUTCOME_UNKNOWN / HALT."
@@ -998,7 +1049,7 @@ class StagingOwnershipJournal:
         4. If ANY deletion affects unexpected rows, or if residual entities remain:
            the transaction is immediately rolled back! No partial destructive deletions persist.
         """
-        if run_id in self._halted_runs:
+        if self.is_halted(run_id):
             raise JournalHaltedError(
                 f"Run '{run_id}' is permanently halted in LOCAL_OUTCOME_UNKNOWN. "
                 "Subsequent automated mutations, retries, cleanups, or aborts are prohibited."
@@ -1234,7 +1285,7 @@ class StagingOwnershipJournal:
           abort is strictly prohibited to avoid stranding committed effects.
         - Verifies that zero registered entities exist in the database before aborting.
         """
-        if run_id in self._halted_runs:
+        if self.is_halted(run_id):
             raise JournalHaltedError(
                 f"Run '{run_id}' is permanently halted in LOCAL_OUTCOME_UNKNOWN. "
                 "Subsequent automated mutations, retries, cleanups, or aborts are prohibited."

@@ -62,7 +62,9 @@ from efso_radar.staging.journal import (
     apply_candidate_schema_v7,
     canonical_inventory_json,
     compute_authenticated_manifest_seal,
+    compute_canonical_inventory_fingerprint,
     validate_status_transition,
+    _halt_marker_path,
 )
 from efso_radar.staging.runner import (
     RUN_ID_REGEX,
@@ -235,6 +237,12 @@ class TestStagingOwnershipJournalHermeticSuite(unittest.TestCase):
 
     def tearDown(self):
         self.conn.close()
+        marker = _halt_marker_path(self.run_id)
+        if marker.is_file():
+            try:
+                marker.unlink()
+            except OSError:
+                pass
 
     # -------------------------------------------------------------------------
     # P1-1: Target Inventory Containment & Strict SQL Validation
@@ -413,6 +421,139 @@ class TestStagingOwnershipJournalHermeticSuite(unittest.TestCase):
                 manifest_seal_hex=self.manifest_seal_hex,
             )
         self.assertIn("Mandatory expected attribute 'source' is missing", str(ctx.exception))
+
+        cur = self.conn.execute("SELECT COUNT(*) FROM processed_articles")
+        self.assertEqual(cur.fetchone()[0], 0)
+
+    def test_p1_1_duplicate_column_names_in_structured_command_rejected(self):
+        """Negative regression: Repeated column names in StageMutationCommand (case-insensitive) fail closed."""
+        self.journal.register_intent(
+            run_id=self.run_id,
+            owner_id=self.owner_id,
+            manifest_seal_hex=self.manifest_seal_hex,
+            target_inventory=self.entities,
+        )
+
+        article = self.entities[0]
+
+        # Case 1: Exact duplicate column identifier ('article_id')
+        dup_cmd_exact = StageMutationCommand(
+            table="processed_articles",
+            pk_column="article_id",
+            pk_value=article.pk_value,
+            columns=["article_id", "title", "source", "article_id", "published_at"],
+            values=[article.pk_value, article.expected_attributes["title"], article.expected_attributes["source"], "foreign_pk", "2026-11-06T20:00:00Z"],
+        )
+        with self.assertRaises(TargetInventoryViolationError) as ctx:
+            self.journal.execute_atomic_stage_mutation(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                expected_fencing_token=1,
+                stage="LIVE_02",
+                mutation_statements=[dup_cmd_exact],
+                manifest_seal_hex=self.manifest_seal_hex,
+            )
+        self.assertIn("Duplicate column identifier", str(ctx.exception))
+
+        # Case 2: Mixed-case duplicate column identifier ('ARTICLE_ID')
+        dup_cmd_case = StageMutationCommand(
+            table="processed_articles",
+            pk_column="article_id",
+            pk_value=article.pk_value,
+            columns=["article_id", "title", "source", "ARTICLE_ID", "published_at"],
+            values=[article.pk_value, article.expected_attributes["title"], article.expected_attributes["source"], "foreign_pk", "2026-11-06T20:00:00Z"],
+        )
+        with self.assertRaises(TargetInventoryViolationError) as ctx:
+            self.journal.execute_atomic_stage_mutation(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                expected_fencing_token=1,
+                stage="LIVE_02",
+                mutation_statements=[dup_cmd_case],
+                manifest_seal_hex=self.manifest_seal_hex,
+            )
+        self.assertIn("Duplicate column identifier", str(ctx.exception))
+
+        # Case 3: Duplicate attribute column identifier ('source' / 'SOURCE')
+        dup_cmd_attr = StageMutationCommand(
+            table="processed_articles",
+            pk_column="article_id",
+            pk_value=article.pk_value,
+            columns=["article_id", "title", "source", "published_at", "SOURCE"],
+            values=[article.pk_value, article.expected_attributes["title"], article.expected_attributes["source"], "2026-11-06T20:00:00Z", "evil_source"],
+        )
+        with self.assertRaises(TargetInventoryViolationError) as ctx:
+            self.journal.execute_atomic_stage_mutation(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                expected_fencing_token=1,
+                stage="LIVE_02",
+                mutation_statements=[dup_cmd_attr],
+                manifest_seal_hex=self.manifest_seal_hex,
+            )
+        self.assertIn("Duplicate column identifier", str(ctx.exception))
+
+        cur = self.conn.execute("SELECT COUNT(*) FROM processed_articles")
+        self.assertEqual(cur.fetchone()[0], 0)
+
+    def test_p1_1_duplicate_column_names_in_tuple_sql_rejected(self):
+        """Negative regression: Repeated column names in tuple SQL (case-insensitive) fail closed."""
+        self.journal.register_intent(
+            run_id=self.run_id,
+            owner_id=self.owner_id,
+            manifest_seal_hex=self.manifest_seal_hex,
+            target_inventory=self.entities,
+        )
+
+        article = self.entities[0]
+
+        # Case 1: Exact duplicate PK in SQL
+        dup_sql_exact = (
+            "INSERT INTO processed_articles (article_id, title, source, article_id, published_at) VALUES (?, ?, ?, ?, ?)",
+            (article.pk_value, article.expected_attributes["title"], article.expected_attributes["source"], "foreign_pk", "2026-11-06T20:00:00Z"),
+        )
+        with self.assertRaises(TargetInventoryViolationError) as ctx:
+            self.journal.execute_atomic_stage_mutation(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                expected_fencing_token=1,
+                stage="LIVE_02",
+                mutation_statements=[dup_sql_exact],
+                manifest_seal_hex=self.manifest_seal_hex,
+            )
+        self.assertIn("Duplicate column identifier", str(ctx.exception))
+
+        # Case 2: Mixed-case duplicate PK in SQL
+        dup_sql_case = (
+            "INSERT INTO processed_articles (article_id, title, source, ARTICLE_ID, published_at) VALUES (?, ?, ?, ?, ?)",
+            (article.pk_value, article.expected_attributes["title"], article.expected_attributes["source"], "foreign_pk", "2026-11-06T20:00:00Z"),
+        )
+        with self.assertRaises(TargetInventoryViolationError) as ctx:
+            self.journal.execute_atomic_stage_mutation(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                expected_fencing_token=1,
+                stage="LIVE_02",
+                mutation_statements=[dup_sql_case],
+                manifest_seal_hex=self.manifest_seal_hex,
+            )
+        self.assertIn("Duplicate column identifier", str(ctx.exception))
+
+        # Case 3: Mixed-case duplicate attribute in SQL
+        dup_sql_attr = (
+            "INSERT INTO processed_articles (article_id, title, source, published_at, SOURCE) VALUES (?, ?, ?, ?, ?)",
+            (article.pk_value, article.expected_attributes["title"], article.expected_attributes["source"], "2026-11-06T20:00:00Z", "evil_source"),
+        )
+        with self.assertRaises(TargetInventoryViolationError) as ctx:
+            self.journal.execute_atomic_stage_mutation(
+                run_id=self.run_id,
+                owner_id=self.owner_id,
+                expected_fencing_token=1,
+                stage="LIVE_02",
+                mutation_statements=[dup_sql_attr],
+                manifest_seal_hex=self.manifest_seal_hex,
+            )
+        self.assertIn("Duplicate column identifier", str(ctx.exception))
 
         cur = self.conn.execute("SELECT COUNT(*) FROM processed_articles")
         self.assertEqual(cur.fetchone()[0], 0)
@@ -876,6 +1017,305 @@ class TestStagingOwnershipJournalHermeticSuite(unittest.TestCase):
             )
 
     # -------------------------------------------------------------------------
+    # P1-5 / P1-B: Multi-Instance / Restart Safety on File-Backed Temp SQLite DB
+    # -------------------------------------------------------------------------
+    def test_p1_5_reconstructed_journal_instance_mutation_committed_ack_lost_blocked(self):
+        """Ambiguous mutation COMMIT (COMMITTED_BUT_ACK_LOST): a fresh journal object on a new connection remains halted."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "staging_restart_mutation_committed.db"
+            conn1 = sqlite3.connect(str(db_path))
+            for stmt in get_all_init_statements():
+                conn1.executescript(stmt)
+            apply_candidate_schema_v7(conn1)
+
+            run_id = _make_run_id("restart_mut_comm")
+            entities = create_default_manifest_entities(run_id)
+            seal = compute_canonical_inventory_fingerprint(run_id, entities)
+            owner = "runner_restart_1"
+
+            journal1 = StagingOwnershipJournal(conn1)
+            journal1.register_intent(
+                run_id=run_id,
+                owner_id=owner,
+                manifest_seal_hex=seal,
+                target_inventory=entities,
+            )
+
+            article = entities[0]
+            cmd = StageMutationCommand(
+                table="processed_articles",
+                pk_column="article_id",
+                pk_value=article.pk_value,
+                columns=["article_id", "title", "source", "published_at", "processed_at"],
+                values=[article.pk_value, article.expected_attributes["title"], article.expected_attributes["source"], "2026-11-06T20:00:00Z", "2026-11-06T20:00:00Z"],
+            )
+
+            with self.assertRaises(AmbiguousCommitError):
+                journal1.execute_atomic_stage_mutation(
+                    run_id=run_id,
+                    owner_id=owner,
+                    expected_fencing_token=1,
+                    stage="LIVE_02",
+                    mutation_statements=[cmd],
+                    manifest_seal_hex=seal,
+                    simulate_ambiguous_commit=AmbiguousCommitOutcome.COMMITTED_BUT_ACK_LOST,
+                )
+            conn1.close()
+
+            # Verify local halt marker was persisted
+            marker = _halt_marker_path(run_id)
+            self.assertTrue(marker.is_file())
+
+            try:
+                # Reopen connection with a brand new journal instance
+                conn2 = sqlite3.connect(str(db_path))
+                journal2 = StagingOwnershipJournal(conn2)
+
+                # Reconstructed journal MUST recognize halted state
+                self.assertTrue(journal2.is_halted(run_id))
+
+                # Automated mutations fail closed
+                with self.assertRaises(JournalHaltedError) as ctx:
+                    journal2.execute_atomic_stage_mutation(
+                        run_id=run_id,
+                        owner_id=owner,
+                        expected_fencing_token=2,
+                        stage="LIVE_02",
+                        mutation_statements=[cmd],
+                        manifest_seal_hex=seal,
+                    )
+                self.assertIn("permanently halted in LOCAL_OUTCOME_UNKNOWN", str(ctx.exception))
+
+                # Automated conditional cleanup fails closed
+                with self.assertRaises(JournalHaltedError):
+                    journal2.execute_conditional_cleanup(
+                        run_id=run_id,
+                        owner_id=owner,
+                        expected_fencing_token=2,
+                        manifest_seal_hex=seal,
+                    )
+
+                # Automated abort fails closed
+                with self.assertRaises(JournalHaltedError):
+                    journal2.abort_run(
+                        run_id=run_id,
+                        owner_id=owner,
+                        expected_fencing_token=2,
+                        reason="Restart abort test",
+                    )
+
+                # Re-registration fails closed
+                with self.assertRaises(JournalHaltedError):
+                    journal2.register_intent(
+                        run_id=run_id,
+                        owner_id=owner,
+                        manifest_seal_hex=seal,
+                        target_inventory=entities,
+                    )
+
+                conn2.close()
+            finally:
+                if marker.is_file():
+                    marker.unlink()
+
+    def test_p1_5_reconstructed_journal_instance_mutation_rolled_back_ack_lost_blocked(self):
+        """Ambiguous mutation COMMIT (ROLLED_BACK_AND_ACK_LOST): a fresh journal object on a new connection remains halted."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "staging_restart_mutation_rollback.db"
+            conn1 = sqlite3.connect(str(db_path))
+            for stmt in get_all_init_statements():
+                conn1.executescript(stmt)
+            apply_candidate_schema_v7(conn1)
+
+            run_id = _make_run_id("restart_mut_roll")
+            entities = create_default_manifest_entities(run_id)
+            seal = compute_canonical_inventory_fingerprint(run_id, entities)
+            owner = "runner_restart_2"
+
+            journal1 = StagingOwnershipJournal(conn1)
+            journal1.register_intent(
+                run_id=run_id,
+                owner_id=owner,
+                manifest_seal_hex=seal,
+                target_inventory=entities,
+            )
+
+            article = entities[0]
+            cmd = StageMutationCommand(
+                table="processed_articles",
+                pk_column="article_id",
+                pk_value=article.pk_value,
+                columns=["article_id", "title", "source", "published_at", "processed_at"],
+                values=[article.pk_value, article.expected_attributes["title"], article.expected_attributes["source"], "2026-11-06T20:00:00Z", "2026-11-06T20:00:00Z"],
+            )
+
+            with self.assertRaises(AmbiguousCommitError):
+                journal1.execute_atomic_stage_mutation(
+                    run_id=run_id,
+                    owner_id=owner,
+                    expected_fencing_token=1,
+                    stage="LIVE_02",
+                    mutation_statements=[cmd],
+                    manifest_seal_hex=seal,
+                    simulate_ambiguous_commit=AmbiguousCommitOutcome.ROLLED_BACK_AND_ACK_LOST,
+                )
+            conn1.close()
+
+            marker = _halt_marker_path(run_id)
+            self.assertTrue(marker.is_file())
+
+            try:
+                conn2 = sqlite3.connect(str(db_path))
+                journal2 = StagingOwnershipJournal(conn2)
+
+                self.assertTrue(journal2.is_halted(run_id))
+
+                with self.assertRaises(JournalHaltedError):
+                    journal2.execute_atomic_stage_mutation(
+                        run_id=run_id,
+                        owner_id=owner,
+                        expected_fencing_token=1,
+                        stage="LIVE_02",
+                        mutation_statements=[cmd],
+                        manifest_seal_hex=seal,
+                    )
+
+                with self.assertRaises(JournalHaltedError):
+                    journal2.execute_conditional_cleanup(
+                        run_id=run_id,
+                        owner_id=owner,
+                        expected_fencing_token=1,
+                        manifest_seal_hex=seal,
+                    )
+
+                with self.assertRaises(JournalHaltedError):
+                    journal2.abort_run(
+                        run_id=run_id,
+                        owner_id=owner,
+                        expected_fencing_token=1,
+                        reason="Restart abort test",
+                    )
+
+                conn2.close()
+            finally:
+                if marker.is_file():
+                    marker.unlink()
+
+    def test_p1_5_reconstructed_journal_instance_intent_committed_ack_lost_blocked(self):
+        """Ambiguous intent COMMIT (COMMITTED_BUT_ACK_LOST): fresh journal instance fails closed on retry."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "staging_restart_intent_committed.db"
+            conn1 = sqlite3.connect(str(db_path))
+            for stmt in get_all_init_statements():
+                conn1.executescript(stmt)
+            apply_candidate_schema_v7(conn1)
+
+            run_id = _make_run_id("restart_intent_comm")
+            entities = create_default_manifest_entities(run_id)
+            seal = compute_canonical_inventory_fingerprint(run_id, entities)
+            owner = "runner_restart_3"
+
+            journal1 = StagingOwnershipJournal(conn1)
+            with self.assertRaises(AmbiguousCommitError):
+                journal1.register_intent(
+                    run_id=run_id,
+                    owner_id=owner,
+                    manifest_seal_hex=seal,
+                    target_inventory=entities,
+                    simulate_ambiguous_commit=AmbiguousCommitOutcome.COMMITTED_BUT_ACK_LOST,
+                )
+            conn1.close()
+
+            marker = _halt_marker_path(run_id)
+            self.assertTrue(marker.is_file())
+
+            try:
+                conn2 = sqlite3.connect(str(db_path))
+                journal2 = StagingOwnershipJournal(conn2)
+
+                self.assertTrue(journal2.is_halted(run_id))
+
+                with self.assertRaises(JournalHaltedError):
+                    journal2.register_intent(
+                        run_id=run_id,
+                        owner_id=owner,
+                        manifest_seal_hex=seal,
+                        target_inventory=entities,
+                    )
+
+                with self.assertRaises(JournalHaltedError):
+                    journal2.execute_atomic_stage_mutation(
+                        run_id=run_id,
+                        owner_id=owner,
+                        expected_fencing_token=1,
+                        stage="LIVE_02",
+                        mutation_statements=[],
+                        manifest_seal_hex=seal,
+                    )
+
+                conn2.close()
+            finally:
+                if marker.is_file():
+                    marker.unlink()
+
+    def test_p1_5_reconstructed_journal_instance_intent_rolled_back_ack_lost_blocked(self):
+        """Ambiguous intent COMMIT (ROLLED_BACK_AND_ACK_LOST): fresh journal instance fails closed on retry."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "staging_restart_intent_rollback.db"
+            conn1 = sqlite3.connect(str(db_path))
+            for stmt in get_all_init_statements():
+                conn1.executescript(stmt)
+            apply_candidate_schema_v7(conn1)
+
+            run_id = _make_run_id("restart_intent_roll")
+            entities = create_default_manifest_entities(run_id)
+            seal = compute_canonical_inventory_fingerprint(run_id, entities)
+            owner = "runner_restart_4"
+
+            journal1 = StagingOwnershipJournal(conn1)
+            with self.assertRaises(AmbiguousCommitError):
+                journal1.register_intent(
+                    run_id=run_id,
+                    owner_id=owner,
+                    manifest_seal_hex=seal,
+                    target_inventory=entities,
+                    simulate_ambiguous_commit=AmbiguousCommitOutcome.ROLLED_BACK_AND_ACK_LOST,
+                )
+            conn1.close()
+
+            marker = _halt_marker_path(run_id)
+            self.assertTrue(marker.is_file())
+
+            try:
+                conn2 = sqlite3.connect(str(db_path))
+                journal2 = StagingOwnershipJournal(conn2)
+
+                self.assertTrue(journal2.is_halted(run_id))
+
+                with self.assertRaises(JournalHaltedError):
+                    journal2.register_intent(
+                        run_id=run_id,
+                        owner_id=owner,
+                        manifest_seal_hex=seal,
+                        target_inventory=entities,
+                    )
+
+                with self.assertRaises(JournalHaltedError):
+                    journal2.execute_atomic_stage_mutation(
+                        run_id=run_id,
+                        owner_id=owner,
+                        expected_fencing_token=1,
+                        stage="LIVE_02",
+                        mutation_statements=[],
+                        manifest_seal_hex=seal,
+                    )
+
+                conn2.close()
+            finally:
+                if marker.is_file():
+                    marker.unlink()
+
+    # -------------------------------------------------------------------------
     # P1-6: Safe ABORT Semantics
     # -------------------------------------------------------------------------
     def test_p1_6_abort_rejected_if_mutations_dispatched(self):
@@ -954,6 +1394,18 @@ class TestStagingOwnershipJournalHermeticSuite(unittest.TestCase):
         )
         entry = self.journal.inspect_run(self.run_id)
         self.assertEqual(entry.read_provenance, ReadProvenance.OFFLINE_LOCAL_FIXTURE_READ)
+
+    def test_p2_canonical_inventory_fingerprint_binds_canonical_entities_and_alias_matches(self):
+        """compute_canonical_inventory_fingerprint binds run_id and 5 entities; alias remains backward compatible."""
+        fp1 = compute_canonical_inventory_fingerprint(self.run_id, self.entities)
+        self.assertEqual(len(fp1), 64)
+        # Matches backward-compatible alias
+        self.assertEqual(fp1, compute_authenticated_manifest_seal(self.run_id, self.entities))
+
+        # Distinct run_id produces distinct fingerprint
+        other_run = _make_run_id("other_fp")
+        fp2 = compute_canonical_inventory_fingerprint(other_run, create_default_manifest_entities(other_run))
+        self.assertNotEqual(fp1, fp2)
 
 
 class TestNonDestructiveRollback(unittest.TestCase):
