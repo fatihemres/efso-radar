@@ -1,16 +1,26 @@
 """Hermetic test suite for Issue #86: Gemini Free Tier Accounting & Safety Guards.
 
-Verifies:
-1. Separation of paid-tier equivalent opportunity cost estimates from actual billable cost ($0 Free Tier).
-2. Fail-closed rejection of unverified billing status, expired proofs, and paid billing projects.
-3. Model eligibility rejection for unsupported models (e.g., gemini-3.8-flash) and shut-down models.
-4. Quota exhaustion circuit breakers: monthly call cap, daily requests (RPD), RPM, and unknown dynamic quota.
-5. Strict $0.00 / 0 TRY policy enforcement: positive monetary budget overrides fail closed.
-6. Search grounding prohibition under Free Tier.
-7. Unconditional fail-closed barrier of require_verified_free_tier() (no env or config bypass).
-8. Offline batch caching returns results with zero network dispatch and 0 API tokens billed.
-9. Ambiguous failures (429/504) recorded as FAILED_AMBIGUOUS in ai_usage_ledger without cache pollution.
-10. Preservation of Schema v6 ai_usage_ledger semantics without Schema v7.
+Remediation suite addressing independent review findings (P1/P2):
+1. Untrusted caller-constructed billing proofs cannot certify actual $0 provider billing.
+   - actual_billed_usd is ALWAYS None (UNKNOWN) in offline operation.
+   - nominal_free_tier_rate_usd is explicitly labeled as a nominal reference rate ($0.00), NOT an invoice.
+   - Missing 'billing_enabled' is never assumed False; fails closed.
+   - Future-dated, expired, malformed, or unauthenticated proofs fail closed.
+   - Project IDs are never leaked in error/reconciliation messages.
+2. Complete quota fail-closed enforcement:
+   - Missing ANY quota dimension (RPM, TPM, RPD, monthly calls) returns DENY.
+   - Universal constants are NOT treated as provider entitlements.
+   - Missing consumption observations return DENY.
+   - Default production callers without quota evidence are safely denied.
+3. Accurate model classification:
+   - gemini-3.5-flash-lite is the sole assessed launch model candidate.
+   - gemini-3.8-flash and legacy models are rejected as UNASSESSED for launch, without asserting paid-only status.
+   - Shut-down models are rejected fail-closed.
+4. Hard live dispatch barrier integrity:
+   - require_verified_free_tier() unconditionally raises RuntimeError.
+   - Zero network dispatch; offline caching returns picks with 0 tokens and 0 API calls.
+   - Ambiguous 429/504 errors recorded in ai_usage_ledger without polluting cache.
+   - Schema v6 preserved without Schema v7.
 """
 from __future__ import annotations
 
@@ -24,12 +34,12 @@ from unittest.mock import MagicMock, patch
 
 from efso_radar.ai.client import AIEvaluationError, GeminiEditorialEngine
 from efso_radar.ai.cost import (
+    ASSESSED_LAUNCH_MODELS,
     BILLING_TIER_DISALLOWED_PAID,
     BILLING_TIER_UNKNOWN,
-    BILLING_TIER_VERIFIED_FREE,
-    FREE_TIER_DEFAULT_RPD_CAP,
-    FREE_TIER_DEFAULT_RPM_CAP,
-    FREE_TIER_ELIGIBLE_MODELS,
+    DOC_EXAMPLE_RPD_CAP,
+    DOC_EXAMPLE_RPM_CAP,
+    DOC_EXAMPLE_TPM_CAP,
     FreeTierProjectProof,
     GeminiCostAccounting,
     check_free_tier_safety_guard,
@@ -38,9 +48,11 @@ from efso_radar.ai.cost import (
     compute_gemini_cost_accounting,
     estimate_call_cost,
     estimate_paid_equivalent_cost,
+    is_model_assessed_for_launch,
     is_model_free_tier_eligible,
     require_verified_free_tier,
     resolve_model_pricing,
+    validate_free_tier_project_proof,
 )
 from efso_radar.config import Settings
 from efso_radar.domain import Article
@@ -48,18 +60,20 @@ from efso_radar.repositories.sqlite import SqliteStateRepository
 
 
 class TestBillingProvenanceAndAccounting(unittest.TestCase):
-    """Verifies separation of paid-tier reference cost, actual billed USD, and proof validation."""
+    """Verifies separation of paid-tier reference cost, nominal Free Tier rates,
+    unobserved provider billing, and adversarial proof rejection."""
 
     def setUp(self):
         self.now = datetime(2026, 11, 6, 12, 0, 0, tzinfo=timezone.utc)
 
-    def test_paid_equivalent_positive_while_verified_free_tier_is_zero(self):
-        """Paid-tier equivalent estimate (> $0) does NOT imply nonzero billed USD on verified Free Tier."""
+    def test_paid_equivalent_positive_while_actual_billed_is_unknown(self):
+        """Paid-equivalent estimate is positive for economic opportunity cost audit,
+        while actual_billed_usd is strictly None (UNKNOWN) and nominal rate is $0.00."""
         proof = FreeTierProjectProof(
-            project_id="efso-radar-free-prj",
+            project_id="test-prj",
             billing_enabled=False,
             free_tier_eligible=True,
-            attestation_source="gcloud-billing-api-audit",
+            attestation_source="mock-audit",
             verified_at="2026-11-06T10:00:00Z",
             expires_at="2026-11-07T10:00:00Z",
         )
@@ -73,14 +87,115 @@ class TestBillingProvenanceAndAccounting(unittest.TestCase):
         # Paid-tier rate: $0.30/1M input + $2.50/1M output -> 0.0006 + 0.0025 = 0.0031 USD
         self.assertGreater(accounting.paid_equivalent_estimate_usd, 0.0)
         self.assertAlmostEqual(accounting.paid_equivalent_estimate_usd, 0.0031, places=5)
-        # Actual billed USD must be exactly 0.0 on verified Free Tier
-        self.assertEqual(accounting.actual_billed_usd, 0.0)
-        self.assertEqual(accounting.billing_tier, BILLING_TIER_VERIFIED_FREE)
-        self.assertTrue(accounting.is_free_tier_eligible)
-        self.assertIn("Verified Free Tier ($0.00 billed)", accounting.reconciliation_notes)
+
+        # CRITICAL P1 invariant: actual_billed_usd must NEVER be 0.0 from caller records;
+        # it is ALWAYS None (UNKNOWN) in offline operation
+        self.assertIsNone(accounting.actual_billed_usd)
+        self.assertEqual(accounting.nominal_free_tier_rate_usd, 0.0)
+        self.assertEqual(accounting.billing_tier, BILLING_TIER_UNKNOWN)
+        self.assertTrue(accounting.is_assessed_launch_model)
+        self.assertIn("Actual billed USD: UNKNOWN", accounting.reconciliation_notes)
+        self.assertIn("Nominal Free Tier rate assumption", accounting.reconciliation_notes)
+
+    def test_adversarial_caller_constructed_proof_cannot_certify_zero_dollar_billing(self):
+        """Adversarial caller-constructed proof asserting billing_enabled=False cannot
+        trick the system into reporting actual billed USD = 0 or VERIFIED_FREE_TIER."""
+        adversarial_proof = {
+            "project_id": "forged-project",
+            "billing_enabled": False,
+            "free_tier_eligible": True,
+            "attestation_source": "forged-cloud-attestation",
+            "verified_at": "2026-11-06T11:00:00Z",
+            "expires_at": "2026-11-07T11:00:00Z",
+        }
+        is_valid, tier, reason = validate_free_tier_project_proof(adversarial_proof, now=self.now)
+        self.assertFalse(is_valid)
+        self.assertEqual(tier, BILLING_TIER_UNKNOWN)
+        self.assertIn("Caller-provided unauthenticated record cannot prove provider billing status", reason)
+
+        accounting = compute_gemini_cost_accounting(
+            model_name="gemini-3.5-flash-lite",
+            input_tokens=1000,
+            output_tokens=500,
+            project_proof=adversarial_proof,
+            now=self.now,
+        )
+        self.assertIsNone(accounting.actual_billed_usd)
+        self.assertEqual(accounting.billing_tier, BILLING_TIER_UNKNOWN)
+
+    def test_missing_billing_enabled_fails_closed_and_is_not_assumed_false(self):
+        """Adversarial proof omitting 'billing_enabled' must NOT silently default to False."""
+        proof_missing_billing = {
+            "project_id": "test-prj",
+            # "billing_enabled" omitted!
+            "free_tier_eligible": True,
+            "attestation_source": "audit",
+            "verified_at": "2026-11-06T10:00:00Z",
+        }
+        is_valid, tier, reason = validate_free_tier_project_proof(proof_missing_billing, now=self.now)
+        self.assertFalse(is_valid)
+        self.assertEqual(tier, BILLING_TIER_UNKNOWN)
+        self.assertIn("missing explicit 'billing_enabled'", reason.lower())
+        self.assertIn("cannot be assumed false", reason.lower())
+
+    def test_future_dated_verified_at_timestamp_fails_closed(self):
+        """Proof claiming verification in the future (future timestamp) fails closed."""
+        future_proof = {
+            "project_id": "test-prj",
+            "billing_enabled": False,
+            "free_tier_eligible": True,
+            "attestation_source": "audit",
+            "verified_at": "2099-01-01T00:00:00Z",  # In the future!
+        }
+        is_valid, tier, reason = validate_free_tier_project_proof(future_proof, now=self.now)
+        self.assertFalse(is_valid)
+        self.assertEqual(tier, BILLING_TIER_UNKNOWN)
+        self.assertIn("in the future", reason.lower())
+
+    def test_expired_project_proof_fails_closed(self):
+        """Expired project proof fails closed as UNKNOWN_UNVERIFIED."""
+        expired_proof = {
+            "project_id": "test-prj",
+            "billing_enabled": False,
+            "free_tier_eligible": True,
+            "attestation_source": "audit",
+            "verified_at": "2026-11-01T10:00:00Z",
+            "expires_at": "2026-11-05T10:00:00Z",  # Expired yesterday
+        }
+        is_valid, tier, reason = validate_free_tier_project_proof(expired_proof, now=self.now)
+        self.assertFalse(is_valid)
+        self.assertEqual(tier, BILLING_TIER_UNKNOWN)
+        self.assertIn("expired", reason.lower())
+
+    def test_billing_enabled_true_fails_closed_as_disallowed_paid(self):
+        """Proof indicating billing_enabled=True fails closed as DISALLOWED_PAID."""
+        paid_proof = {
+            "project_id": "paid-corp-project",
+            "billing_enabled": True,
+            "free_tier_eligible": True,
+            "attestation_source": "audit",
+            "verified_at": "2026-11-06T10:00:00Z",
+        }
+        is_valid, tier, reason = validate_free_tier_project_proof(paid_proof, now=self.now)
+        self.assertFalse(is_valid)
+        self.assertEqual(tier, BILLING_TIER_DISALLOWED_PAID)
+        self.assertIn("Paid projects are strictly forbidden", reason)
+
+    def test_project_id_not_leaked_in_proof_validation_messages(self):
+        """Sensitive or distinctive project IDs must never be echoed into reason or logs."""
+        sensitive_id = "super-secret-internal-gcp-project-12345"
+        proof = {
+            "project_id": sensitive_id,
+            "billing_enabled": True,
+            "free_tier_eligible": True,
+            "attestation_source": "audit",
+            "verified_at": "2026-11-06T10:00:00Z",
+        }
+        _, _, reason = validate_free_tier_project_proof(proof, now=self.now)
+        self.assertNotIn(sensitive_id, reason)
 
     def test_absent_project_proof_results_in_unknown_billing_tier(self):
-        """When project proof is absent (None), actual billed USD is UNKNOWN (None), never assumed $0."""
+        """When project proof is absent (None), actual billed USD is UNKNOWN (None)."""
         accounting = compute_gemini_cost_accounting(
             model_name="gemini-3.5-flash-lite",
             input_tokens=2000,
@@ -91,90 +206,6 @@ class TestBillingProvenanceAndAccounting(unittest.TestCase):
         self.assertGreater(accounting.paid_equivalent_estimate_usd, 0.0)
         self.assertIsNone(accounting.actual_billed_usd)
         self.assertEqual(accounting.billing_tier, BILLING_TIER_UNKNOWN)
-        self.assertIn("Project billing unverified", accounting.reconciliation_notes)
-
-    def test_contradictory_proof_with_billing_enabled_fails_closed(self):
-        """Proof indicating billing_enabled=True fails closed as DISALLOWED_PAID."""
-        proof = {
-            "project_id": "paid-corp-project",
-            "billing_enabled": True,  # Paid billing active!
-            "free_tier_eligible": True,
-            "attestation_source": "cloud-console",
-            "verified_at": "2026-11-06T10:00:00Z",
-        }
-        accounting = compute_gemini_cost_accounting(
-            model_name="gemini-3.5-flash-lite",
-            input_tokens=1500,
-            output_tokens=800,
-            project_proof=proof,
-            now=self.now,
-        )
-        self.assertIsNone(accounting.actual_billed_usd)
-        self.assertEqual(accounting.billing_tier, BILLING_TIER_DISALLOWED_PAID)
-        self.assertIn("Paid projects are strictly forbidden", accounting.reconciliation_notes)
-
-    def test_expired_project_proof_fails_closed(self):
-        """Expired project proof fails closed as UNKNOWN_UNVERIFIED."""
-        expired_proof = FreeTierProjectProof(
-            project_id="efso-radar-free-prj",
-            billing_enabled=False,
-            free_tier_eligible=True,
-            attestation_source="gcloud-billing-api-audit",
-            verified_at="2026-11-01T10:00:00Z",
-            expires_at="2026-11-05T10:00:00Z",  # Expired yesterday
-        )
-        accounting = compute_gemini_cost_accounting(
-            model_name="gemini-3.5-flash-lite",
-            input_tokens=1000,
-            output_tokens=500,
-            project_proof=expired_proof,
-            now=self.now,  # 2026-11-06
-        )
-        self.assertIsNone(accounting.actual_billed_usd)
-        self.assertEqual(accounting.billing_tier, BILLING_TIER_UNKNOWN)
-        self.assertIn("expired", accounting.reconciliation_notes)
-
-    def test_incomplete_project_proof_fails_closed(self):
-        """Proof missing required provenance fields fails closed."""
-        for missing_field in ("project_id", "attestation_source", "verified_at"):
-            data = {
-                "project_id": "test-prj",
-                "billing_enabled": False,
-                "free_tier_eligible": True,
-                "attestation_source": "audit",
-                "verified_at": "2026-11-06T00:00:00Z",
-            }
-            data[missing_field] = ""
-            accounting = compute_gemini_cost_accounting(
-                model_name="gemini-3.5-flash-lite",
-                input_tokens=1000,
-                output_tokens=500,
-                project_proof=data,
-                now=self.now,
-            )
-            self.assertIsNone(accounting.actual_billed_usd)
-            self.assertEqual(accounting.billing_tier, BILLING_TIER_UNKNOWN)
-
-    def test_search_grounding_invalidates_free_tier_zero_dollar_accounting(self):
-        """Even with valid project proof, requesting search grounding sets billed USD to UNKNOWN."""
-        proof = FreeTierProjectProof(
-            project_id="efso-radar-free-prj",
-            billing_enabled=False,
-            free_tier_eligible=True,
-            attestation_source="audit",
-            verified_at="2026-11-06T10:00:00Z",
-        )
-        accounting = compute_gemini_cost_accounting(
-            model_name="gemini-3.5-flash-lite",
-            input_tokens=1000,
-            output_tokens=500,
-            used_search_grounding=True,
-            project_proof=proof,
-            now=self.now,
-        )
-        self.assertIsNone(accounting.actual_billed_usd)
-        self.assertTrue(accounting.used_search_grounding)
-        self.assertIn("search grounding", accounting.reconciliation_notes.lower())
 
     def test_estimate_paid_equivalent_cost_alias_matches_estimate_call_cost(self):
         """estimate_paid_equivalent_cost is an explicit alias for estimate_call_cost."""
@@ -183,29 +214,36 @@ class TestBillingProvenanceAndAccounting(unittest.TestCase):
         self.assertEqual(c1, c2)
 
 
-class TestModelEligibilityAndShutdownRejection(unittest.TestCase):
-    """Verifies model eligibility for Free Tier and rejection of shut-down / unsupported models."""
+class TestModelClassificationAndTruth(unittest.TestCase):
+    """Verifies launch model assessment and removal of false paid-only claims."""
 
-    def test_official_free_tier_eligible_models_accepted(self):
-        """Standard Flash-Lite and Flash models are officially eligible for Free Tier."""
-        for m in ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.5-flash-lite"):
-            self.assertTrue(
-                is_model_free_tier_eligible(m),
-                f"Model '{m}' should be recognized as Free Tier eligible.",
-            )
+    def test_gemini_3_5_flash_lite_is_sole_assessed_launch_model(self):
+        """gemini-3.5-flash-lite is the sole evaluated and approved candidate for launch."""
+        self.assertTrue(is_model_assessed_for_launch("gemini-3.5-flash-lite"))
+        self.assertEqual(ASSESSED_LAUNCH_MODELS, frozenset({"gemini-3.5-flash-lite"}))
 
-    def test_paid_only_model_gemini_3_8_flash_rejected_for_free_tier(self):
-        """gemini-3.8-flash has paid pricing only; rejected under Free Tier accounting."""
-        self.assertFalse(is_model_free_tier_eligible("gemini-3.8-flash"))
+    def test_gemini_3_8_flash_rejected_as_unassessed_without_claiming_paid_only(self):
+        """gemini-3.8-flash has Free Tier in Google AI Studio per official docs.
+        It is rejected in Efso Radar because it is UNASSESSED for launch, NOT because it is paid-only."""
+        self.assertFalse(is_model_assessed_for_launch("gemini-3.8-flash"))
         allowed, reason = check_free_tier_safety_guard(
             model_name="gemini-3.8-flash",
             current_monthly_calls=0,
+            rpm_limit=15,
+            current_rpm=0,
+            tpm_limit=1_000_000,
+            estimated_batch_tokens=1000,
+            rpd_limit=1500,
+            current_rpd=0,
         )
         self.assertFalse(allowed)
-        self.assertIn("not eligible for Google AI Studio Free Tier", reason)
+        self.assertIn("not an assessed launch model", reason)
+        # Must NOT falsely claim gemini-3.8-flash is paid-only or shut down
+        self.assertNotIn("paid-only", reason.lower())
+        self.assertNotIn("shut down", reason.lower())
 
-    def test_shut_down_models_rejected_at_registry_and_eligibility(self):
-        """Shut-down models are rejected at both eligibility check and resolve_model_pricing."""
+    def test_shut_down_models_rejected_with_shutdown_date(self):
+        """Shut-down models are rejected with actionable shutdown date provenance."""
         shut_down = [
             "gemini-3.1-flash-lite-preview",
             "gemini-2.0-flash",
@@ -214,76 +252,227 @@ class TestModelEligibilityAndShutdownRejection(unittest.TestCase):
             "gemini-2.5-flash-lite-preview-09-2025",
         ]
         for m in shut_down:
-            self.assertFalse(is_model_free_tier_eligible(m))
+            self.assertFalse(is_model_assessed_for_launch(m))
             with self.assertRaises(ValueError) as ctx:
                 resolve_model_pricing(m)
             self.assertIn("shut down", str(ctx.exception).lower())
 
     def test_arbitrary_unrecognized_model_rejected(self):
         """Arbitrary unrecognized model strings fail closed."""
-        self.assertFalse(is_model_free_tier_eligible("gpt-4o-mini"))
-        self.assertFalse(is_model_free_tier_eligible("unknown-model-xyz"))
+        self.assertFalse(is_model_assessed_for_launch("gpt-4o-mini"))
+        self.assertFalse(is_model_assessed_for_launch("claude-3-haiku"))
         allowed, reason = check_free_tier_safety_guard(
             model_name="gpt-4o-mini",
             current_monthly_calls=0,
+            rpm_limit=15,
+            current_rpm=0,
+            tpm_limit=1_000_000,
+            estimated_batch_tokens=1000,
+            rpd_limit=1500,
+            current_rpd=0,
         )
         self.assertFalse(allowed)
-        self.assertIn("not eligible", reason)
+        self.assertIn("not an assessed launch model", reason)
 
 
 class TestQuotaAndCircuitBreakers(unittest.TestCase):
-    """Verifies circuit breakers for monthly, daily (RPD), RPM, and dynamic quota exhaustion."""
+    """Verifies fail-closed behavior when ANY quota dimension (RPM, TPM, RPD, monthly)
+    is unobserved, missing, or exceeded."""
 
-    def test_monthly_call_cap_exhaustion_fails_closed(self):
-        """Reaching or exceeding the configured monthly call cap blocks further calls."""
-        # Cap is 300; current calls is 300 -> 300 + 1 > 300 -> DENY
+    def test_missing_rpm_limit_fails_closed(self):
+        """Missing verified RPM limit fails closed (universal constants are not entitlements)."""
         allowed, reason = check_free_tier_safety_guard(
             model_name="gemini-3.5-flash-lite",
-            current_monthly_calls=300,
+            current_monthly_calls=10,
+            rpm_limit=None,  # Missing!
+            current_rpm=2,
+            tpm_limit=1_000_000,
+            estimated_batch_tokens=1000,
+            rpd_limit=1500,
+            current_rpd=10,
+        )
+        self.assertFalse(allowed)
+        self.assertIn("Missing verified RPM", reason)
+        self.assertIn("Universal constant cannot be assumed as an account entitlement", reason)
+
+    def test_missing_current_rpm_consumption_fails_closed(self):
+        """Missing RPM consumption observation fails closed."""
+        allowed, reason = check_free_tier_safety_guard(
+            model_name="gemini-3.5-flash-lite",
+            current_monthly_calls=10,
+            rpm_limit=15,
+            current_rpm=None,  # Missing!
+            tpm_limit=1_000_000,
+            estimated_batch_tokens=1000,
+            rpd_limit=1500,
+            current_rpd=10,
+        )
+        self.assertFalse(allowed)
+        self.assertIn("Missing current RPM consumption observation", reason)
+
+    def test_rpm_exhaustion_fails_closed(self):
+        """Reaching or exceeding the verified RPM limit blocks calls."""
+        allowed, reason = check_free_tier_safety_guard(
+            model_name="gemini-3.5-flash-lite",
+            current_monthly_calls=10,
+            rpm_limit=15,
+            current_rpm=15,  # Reached limit!
+            tpm_limit=1_000_000,
+            estimated_batch_tokens=1000,
+            rpd_limit=1500,
+            current_rpd=10,
+        )
+        self.assertFalse(allowed)
+        self.assertIn("reaches or exceeds verified RPM limit", reason)
+
+    def test_missing_tpm_limit_fails_closed(self):
+        """Missing verified TPM limit fails closed."""
+        allowed, reason = check_free_tier_safety_guard(
+            model_name="gemini-3.5-flash-lite",
+            current_monthly_calls=10,
+            rpm_limit=15,
+            current_rpm=2,
+            tpm_limit=None,  # Missing!
+            estimated_batch_tokens=1000,
+            rpd_limit=1500,
+            current_rpd=10,
+        )
+        self.assertFalse(allowed)
+        self.assertIn("Missing verified TPM", reason)
+
+    def test_missing_estimated_batch_tokens_for_tpm_fails_closed(self):
+        """Missing estimated batch tokens fails closed."""
+        allowed, reason = check_free_tier_safety_guard(
+            model_name="gemini-3.5-flash-lite",
+            current_monthly_calls=10,
+            rpm_limit=15,
+            current_rpm=2,
+            tpm_limit=1_000_000,
+            estimated_batch_tokens=None,  # Missing!
+            rpd_limit=1500,
+            current_rpd=10,
+        )
+        self.assertFalse(allowed)
+        self.assertIn("Missing estimated batch token count", reason)
+
+    def test_tpm_exhaustion_fails_closed(self):
+        """Projected batch tokens exceeding TPM limit fails closed."""
+        allowed, reason = check_free_tier_safety_guard(
+            model_name="gemini-3.5-flash-lite",
+            current_monthly_calls=10,
+            rpm_limit=15,
+            current_rpm=2,
+            tpm_limit=1_000_000,
+            current_tpm=999_000,
+            estimated_batch_tokens=2000,  # 999k + 2k = 1,001,000 > 1,000,000!
+            rpd_limit=1500,
+            current_rpd=10,
+        )
+        self.assertFalse(allowed)
+        self.assertIn("exceeds verified TPM limit", reason)
+
+    def test_missing_rpd_limit_fails_closed(self):
+        """Missing verified RPD limit fails closed."""
+        allowed, reason = check_free_tier_safety_guard(
+            model_name="gemini-3.5-flash-lite",
+            current_monthly_calls=10,
+            rpm_limit=15,
+            current_rpm=2,
+            tpm_limit=1_000_000,
+            estimated_batch_tokens=1000,
+            rpd_limit=None,  # Missing!
+            current_rpd=10,
+        )
+        self.assertFalse(allowed)
+        self.assertIn("Missing verified RPD", reason)
+
+    def test_missing_current_rpd_consumption_fails_closed(self):
+        """Missing current RPD consumption fails closed."""
+        allowed, reason = check_free_tier_safety_guard(
+            model_name="gemini-3.5-flash-lite",
+            current_monthly_calls=10,
+            rpm_limit=15,
+            current_rpm=2,
+            tpm_limit=1_000_000,
+            estimated_batch_tokens=1000,
+            rpd_limit=1500,
+            current_rpd=None,  # Missing!
+        )
+        self.assertFalse(allowed)
+        self.assertIn("Missing current RPD consumption observation", reason)
+
+    def test_rpd_exhaustion_fails_closed(self):
+        """Reaching the RPD cap blocks further calls."""
+        allowed, reason = check_free_tier_safety_guard(
+            model_name="gemini-3.5-flash-lite",
+            current_monthly_calls=10,
+            rpm_limit=15,
+            current_rpm=2,
+            tpm_limit=1_000_000,
+            estimated_batch_tokens=1000,
+            rpd_limit=1500,
+            current_rpd=1500,  # 1500 + 1 > 1500 -> DENY
+        )
+        self.assertFalse(allowed)
+        self.assertIn("exceeds verified RPD limit", reason)
+
+    def test_missing_monthly_call_count_fails_closed(self):
+        """Missing monthly call count observation fails closed."""
+        allowed, reason = check_free_tier_safety_guard(
+            model_name="gemini-3.5-flash-lite",
+            current_monthly_calls=None,  # Missing!
+            rpm_limit=15,
+            current_rpm=2,
+            tpm_limit=1_000_000,
+            estimated_batch_tokens=1000,
+            rpd_limit=1500,
+            current_rpd=10,
+        )
+        self.assertFalse(allowed)
+        self.assertIn("Missing monthly call count observation", reason)
+
+    def test_monthly_call_cap_exhaustion_fails_closed(self):
+        """Reaching the monthly call cap (300) blocks further calls."""
+        allowed, reason = check_free_tier_safety_guard(
+            model_name="gemini-3.5-flash-lite",
+            current_monthly_calls=300,  # 300 + 1 > 300
             max_monthly_calls=300,
+            rpm_limit=15,
+            current_rpm=2,
+            tpm_limit=1_000_000,
+            estimated_batch_tokens=1000,
+            rpd_limit=1500,
+            current_rpd=10,
         )
         self.assertFalse(allowed)
         self.assertIn("exceeds Free Tier monthly call cap", reason)
 
-        # 299 calls -> 299 + 1 = 300 <= 300 -> ALLOW
-        allowed_ok, _ = check_free_tier_safety_guard(
+    def test_all_quota_dimensions_verified_allows(self):
+        """When all required quota limits and consumption observations are verified and within bounds, ALLOW."""
+        allowed, reason = check_free_tier_safety_guard(
             model_name="gemini-3.5-flash-lite",
-            current_monthly_calls=299,
+            current_monthly_calls=10,
             max_monthly_calls=300,
+            rpm_limit=15,
+            current_rpm=2,
+            tpm_limit=1_000_000,
+            current_tpm=5000,
+            estimated_batch_tokens=1500,
+            rpd_limit=1500,
+            current_rpd=50,
         )
-        self.assertTrue(allowed_ok)
+        self.assertTrue(allowed)
+        self.assertEqual(reason, "OK")
 
-    def test_daily_requests_cap_rpd_exhaustion_fails_closed(self):
-        """Reaching the Free Tier daily request quota (1500 RPD) blocks further calls."""
+    def test_default_production_caller_receives_deny_due_to_unobserved_quotas(self):
+        """Production callers without dynamic quota observations receive DENY by default."""
         allowed, reason = check_free_tier_safety_guard(
             model_name="gemini-3.5-flash-lite",
             current_monthly_calls=10,
-            daily_requests_count=1500,
-            daily_requests_cap=1500,
+            # No RPM, TPM, or RPD limits/counts passed!
         )
         self.assertFalse(allowed)
-        self.assertIn("exceeds Free Tier daily cap", reason)
-
-    def test_rpm_cap_exhaustion_fails_closed(self):
-        """Reaching the Free Tier RPM cap (15 RPM) blocks further calls."""
-        allowed, reason = check_free_tier_safety_guard(
-            model_name="gemini-3.5-flash-lite",
-            current_monthly_calls=10,
-            requests_per_minute=15,
-            rpm_cap=15,
-        )
-        self.assertFalse(allowed)
-        self.assertIn("reaches or exceeds Free Tier RPM cap", reason)
-
-    def test_unknown_dynamic_quota_fails_closed(self):
-        """When dynamic provider quota state is marked unknown, safety guard fails closed."""
-        allowed, reason = check_free_tier_safety_guard(
-            model_name="gemini-3.5-flash-lite",
-            current_monthly_calls=10,
-            dynamic_quota_unknown=True,
-        )
-        self.assertFalse(allowed)
-        self.assertIn("Dynamic provider quota state is UNKNOWN", reason)
+        self.assertIn("Missing verified RPM", reason)
 
     def test_search_grounding_enabled_fails_closed(self):
         """Search grounding is not free under Free Tier and must fail closed."""
@@ -301,7 +490,7 @@ class TestPositiveBudgetOverrideRejection(unittest.TestCase):
     """Verifies that positive monetary budget overrides fail closed under strict Free Tier policy."""
 
     def test_positive_max_run_cost_override_fails_closed(self):
-        """Under Free Tier accounting, positive max_run_cost_usd indicates a paid allowance expectation and fails closed."""
+        """Positive max_run_cost_usd indicates a paid allowance expectation and fails closed."""
         allowed, reason = check_free_tier_safety_guard(
             model_name="gemini-3.5-flash-lite",
             current_monthly_calls=0,
@@ -313,7 +502,7 @@ class TestPositiveBudgetOverrideRejection(unittest.TestCase):
         self.assertIn("Strict Free Tier launch policy requires $0.00 / 0 TRY monetary ceilings", reason)
 
     def test_positive_max_monthly_cost_override_fails_closed(self):
-        """Under Free Tier accounting, positive max_monthly_cost_usd indicates a paid allowance expectation and fails closed."""
+        """Positive max_monthly_cost_usd indicates a paid allowance expectation and fails closed."""
         allowed, reason = check_free_tier_safety_guard(
             model_name="gemini-3.5-flash-lite",
             current_monthly_calls=0,
@@ -362,6 +551,25 @@ class TestDispatchSafetyAndLedgerContract(unittest.TestCase):
 
         engine.client.models.generate_content.assert_not_called()
 
+    def test_quota_guard_denies_evaluate_even_if_dispatch_barrier_patched_under_default_settings(self):
+        """Defense-in-depth: If require_verified_free_tier were bypassed under default $0.00 settings,
+        check_free_tier_safety_guard still halts evaluate() because dynamic quotas are unobserved."""
+        settings = Settings(
+            gemini_api_key="synthetic-key",
+            gemini_model="gemini-3.5-flash-lite",
+            max_estimated_run_cost_usd=0.0,
+            max_monthly_ai_cost_usd=0.0,
+        )
+        engine = GeminiEditorialEngine(settings, repository=self.repo)
+        engine.client = MagicMock()
+
+        with patch("efso_radar.ai.client.require_verified_free_tier"):
+            with self.assertRaises(AIEvaluationError) as ctx:
+                engine.evaluate([self.article], [], self.now)
+            self.assertIn("Missing verified RPM", str(ctx.exception))
+
+        engine.client.models.generate_content.assert_not_called()
+
     def test_offline_caching_returns_picks_with_zero_network_dispatch_and_zero_tokens(self):
         """When batch is cached in ai_usage_ledger, evaluate() returns cached picks with 0 API calls."""
         batch_hash = compute_candidate_batch_hash([self.article.id], "gemini-3.5-flash-lite")
@@ -407,8 +615,8 @@ class TestDispatchSafetyAndLedgerContract(unittest.TestCase):
         settings = Settings(
             gemini_api_key="synthetic-key",
             gemini_model="gemini-3.5-flash-lite",
-            max_estimated_run_cost_usd=0.0,
-            max_monthly_ai_cost_usd=0.0,
+            max_estimated_run_cost_usd=0.05,
+            max_monthly_ai_cost_usd=1.20,
             max_monthly_ai_calls=10,
         )
         engine = GeminiEditorialEngine(settings, repository=self.repo)

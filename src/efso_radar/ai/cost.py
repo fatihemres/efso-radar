@@ -37,10 +37,13 @@ Important Billing & Safeguard Rules:
     1. Paid-Tier Equivalent Reference Pricing (`paid_equivalent_estimate_usd`): Published standard
        pay-as-you-go rates retained in `ai_usage_ledger.estimated_cost_usd` for economic opportunity
        cost tracking and auditability without schema changes.
-    2. Actual Billable Cost (`actual_billed_usd`): Exactly $0.00 for verified Free Tier; None (UNKNOWN)
-       until authentic provider-side proof validates `billing_enabled=False`. Paid charges are disallowed ($0.00 / 0 TRY).
-    3. Free Tier Quota Accounting: Model eligibility (`is_model_free_tier_eligible`), search grounding disabled,
-       zero monetary ceilings, monthly call cap (300), daily request cap (1500 RPD), and RPM limits (15 RPM).
+    2. Nominal Free Tier Rate vs Actual Billed Cost: Nominal free tier generation is $0.00/token (`nominal_free_tier_rate_usd`).
+       Actual billed USD (`actual_billed_usd`) is ALWAYS None (UNKNOWN) in offline operation until an
+       independently authenticated provider billing verification mechanism exists.
+       Caller-provided records cannot certify provider-side billing status. Nonzero paid charges are strictly disallowed ($0.00 / 0 TRY).
+    3. Free Tier Quota Accounting: Assessed launch model candidate (`gemini-3.5-flash-lite`), search grounding disabled,
+       zero monetary ceilings, monthly call cap (300). Missing or unobserved dynamic quota evidence (RPM, TPM, RPD)
+       fails closed (DENY). Universal constants are not account entitlements.
 - Application-level cost tracking in `ai_usage_ledger` is an internal defensive circuit-breaker
   and estimation safeguard; it is NOT a hard provider-side billing guarantee.
 """
@@ -149,40 +152,61 @@ SHUTDOWN_MODELS: dict[str, str] = {
     "gemini-3-pro-preview": "March 9, 2026",
 }
 
-# Google AI Studio Standard Free Tier Model Eligibility & Rate Limits (Official 2026 docs):
-# - Free tier is model-specific and available only for standard Flash-Lite / Flash models.
-# - Free Tier does NOT cover search grounding without charges or paid previews (e.g. gemini-3.8-flash).
-FREE_TIER_ELIGIBLE_MODELS: frozenset[str] = frozenset({
+# Assessed launch model candidate for Efso Radar ($0.00 launch policy).
+# gemini-3.5-flash-lite is the sole evaluated and approved candidate.
+# Note: Google AI Studio documentation (https://ai.google.dev/gemini-api/docs/pricing) specifies
+# that Standard Free Tier is available for multiple models including gemini-3.5-flash-lite and gemini-3.8-flash.
+# However, Efso Radar strictly restricts operational launch readiness to gemini-3.5-flash-lite.
+# Other models are UNASSESSED for launch and fail closed (DENY), without asserting universal paid-only status.
+ASSESSED_LAUNCH_MODELS: frozenset[str] = frozenset({
     "gemini-3.5-flash-lite",
-    "gemini-3.1-flash-lite",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
 })
 
-FREE_TIER_DEFAULT_RPM_CAP: int = 15
-FREE_TIER_DEFAULT_RPD_CAP: int = 1500
-FREE_TIER_DEFAULT_TPM_CAP: int = 1_000_000
+# Backward compatibility alias
+FREE_TIER_ELIGIBLE_MODELS: frozenset[str] = ASSESSED_LAUNCH_MODELS
+
+# Inert documentation examples from Google AI Studio public tier tables.
+# CRITICAL: These are NOT verified provider entitlements for any specific project or account!
+# Account-specific rate limits vary by project and model, viewable in AI Studio.
+# Quota guards require fresh, project-attested evidence and must fail closed if limits are unobserved.
+DOC_EXAMPLE_RPM_CAP: int = 15
+DOC_EXAMPLE_RPD_CAP: int = 1500
+DOC_EXAMPLE_TPM_CAP: int = 1_000_000
+
+# Backward compatibility aliases
+FREE_TIER_DEFAULT_RPM_CAP: int = DOC_EXAMPLE_RPM_CAP
+FREE_TIER_DEFAULT_RPD_CAP: int = DOC_EXAMPLE_RPD_CAP
+FREE_TIER_DEFAULT_TPM_CAP: int = DOC_EXAMPLE_TPM_CAP
 
 # Provenance states for account-level billing status
 BILLING_TIER_UNKNOWN: str = "UNKNOWN_UNVERIFIED"
-BILLING_TIER_VERIFIED_FREE: str = "VERIFIED_FREE_TIER"
 BILLING_TIER_DISALLOWED_PAID: str = "DISALLOWED_PAID"
 
 
-def is_model_free_tier_eligible(model_name: str) -> bool:
-    """Check if a Gemini model is officially eligible for Google AI Studio Free Tier.
+def is_model_assessed_for_launch(model_name: str) -> bool:
+    """Check if model is the assessed launch model (gemini-3.5-flash-lite).
 
-    Rejects shut-down models, paid-only models (e.g. gemini-3.8-flash),
-    and unrecognized model names.
+    Other models are unassessed for launch and fail closed (DENY).
+    Does NOT assert that unassessed models are paid-only.
+    """
+    clean_name = model_name.strip().lower()
+    return clean_name in ASSESSED_LAUNCH_MODELS
+
+
+def is_model_free_tier_eligible(model_name: str) -> bool:
+    """Backward compatibility alias checking if model is assessed for launch.
+
+    Only assessed launch models (gemini-3.5-flash-lite) are approved for launch.
+    Unassessed, shut-down, or unrecognized models return False.
     """
     clean_name = model_name.strip().lower()
     if clean_name in SHUTDOWN_MODELS:
         return False
-    return clean_name in FREE_TIER_ELIGIBLE_MODELS
+    return is_model_assessed_for_launch(clean_name)
 
 
 class FreeTierProjectProof(NamedTuple):
-    """Authentic attestation of provider-side billing and free tier status for a project."""
+    """Candidate representation of provider-side billing status attestation."""
     project_id: str
     billing_enabled: bool
     free_tier_eligible: bool
@@ -195,17 +219,22 @@ def validate_free_tier_project_proof(
     proof: Optional[dict[str, Any] | FreeTierProjectProof],
     now: Optional[datetime] = None,
 ) -> tuple[bool, str, str]:
-    """Validate provider-side free tier / no-billing status proof.
+    """Evaluate candidate provider billing status attestation.
 
-    Returns:
-        (is_valid, billing_tier, reason)
+    IMPORTANT SAFETY INVARIANT:
+    In this offline-only engineering slice, caller-constructed dictionaries or records
+    are NOT authenticated Google billing attestations and CANNOT certify actual $0 provider billing.
+    Observed actual provider billing remains UNKNOWN (None).
 
-    Fail-closed semantics:
-    - Missing/None proof: UNKNOWN_UNVERIFIED, invalid.
-    - billing_enabled=True: DISALLOWED_PAID, invalid ($0.00 / 0 TRY policy).
-    - free_tier_eligible=False: UNKNOWN_UNVERIFIED, invalid.
-    - Expired proof: UNKNOWN_UNVERIFIED, invalid.
-    - Valid non-billing, free-tier eligible proof: VERIFIED_FREE_TIER, valid.
+    Fail-closed validation rules:
+    - Missing/None proof: returns (False, BILLING_TIER_UNKNOWN, "No provider project proof provided; billing status is UNKNOWN. Fail closed.")
+    - Missing explicit 'billing_enabled' key: NOT assumed False! Missing billing status is treated as unknown and fails closed.
+    - If billing_enabled is True: returns (False, BILLING_TIER_DISALLOWED_PAID, "Project has billing_enabled=True. Paid projects are strictly forbidden under Efso Radar $0.00 / 0 TRY policy.")
+    - If free_tier_eligible is not True: returns (False, BILLING_TIER_UNKNOWN, "Proof is not marked free_tier_eligible=True. Fail closed.")
+    - Missing 'project_id', 'attestation_source', or 'verified_at': returns (False, BILLING_TIER_UNKNOWN, "Missing required provenance fields in proof. Fail closed.")
+    - Future-dated 'verified_at' (> now): returns (False, BILLING_TIER_UNKNOWN, "Proof verified_at timestamp is in the future. Fail closed.")
+    - Expired 'expires_at' (<= now): returns (False, BILLING_TIER_UNKNOWN, "Proof expired. Fail closed.")
+    - Stale/unauthenticated record: In the absence of an independently verified cryptographic signature or direct Google Cloud Billing API attestation, returns (False, BILLING_TIER_UNKNOWN, "Caller-provided record is unauthenticated; actual provider billing status remains UNKNOWN. Fail closed.")
     """
     if proof is None:
         return (
@@ -214,56 +243,102 @@ def validate_free_tier_project_proof(
             "No provider project proof provided; billing status is UNKNOWN. Fail closed.",
         )
 
+    ref_now = now or datetime.now(timezone.utc)
+    if ref_now.tzinfo is None:
+        ref_now = ref_now.replace(tzinfo=timezone.utc)
+
     if isinstance(proof, dict):
+        if "billing_enabled" not in proof:
+            return (
+                False,
+                BILLING_TIER_UNKNOWN,
+                "Proof missing explicit 'billing_enabled' status. Missing billing status cannot be assumed False. Fail closed.",
+            )
+        raw_billing = proof["billing_enabled"]
+        if not isinstance(raw_billing, bool):
+            return (
+                False,
+                BILLING_TIER_UNKNOWN,
+                "Proof 'billing_enabled' status must be an explicit boolean. Fail closed.",
+            )
+        billing_enabled = raw_billing
+
+        raw_ft = proof.get("free_tier_eligible")
+        if not isinstance(raw_ft, bool) or not raw_ft:
+            return (
+                False,
+                BILLING_TIER_UNKNOWN,
+                "Proof 'free_tier_eligible' must be explicitly True. Fail closed.",
+            )
+
         project_id = str(proof.get("project_id", "")).strip()
-        billing_enabled = bool(proof.get("billing_enabled", False))
-        free_tier_eligible = bool(proof.get("free_tier_eligible", False))
         attestation_source = str(proof.get("attestation_source", "")).strip()
         verified_at_str = str(proof.get("verified_at", "")).strip()
         expires_at_str = proof.get("expires_at")
-    else:
-        project_id = str(proof.project_id).strip()
+    elif isinstance(proof, FreeTierProjectProof):
         billing_enabled = bool(proof.billing_enabled)
-        free_tier_eligible = bool(proof.free_tier_eligible)
+        if not proof.free_tier_eligible:
+            return (
+                False,
+                BILLING_TIER_UNKNOWN,
+                "Proof 'free_tier_eligible' must be True. Fail closed.",
+            )
+        project_id = str(proof.project_id).strip()
         attestation_source = str(proof.attestation_source).strip()
         verified_at_str = str(proof.verified_at).strip()
         expires_at_str = proof.expires_at
+    else:
+        return (
+            False,
+            BILLING_TIER_UNKNOWN,
+            f"Unsupported proof record type '{type(proof).__name__}'. Fail closed.",
+        )
 
-    if not project_id:
-        return (False, BILLING_TIER_UNKNOWN, "Missing project_id in proof. Fail closed.")
-    if not attestation_source:
-        return (False, BILLING_TIER_UNKNOWN, "Missing attestation_source in proof. Fail closed.")
-    if not verified_at_str:
-        return (False, BILLING_TIER_UNKNOWN, "Missing verified_at in proof. Fail closed.")
+    if not project_id or not attestation_source or not verified_at_str:
+        return (
+            False,
+            BILLING_TIER_UNKNOWN,
+            "Missing required provenance fields in proof record. Fail closed.",
+        )
 
+    # Check billing_enabled
     if billing_enabled:
         return (
             False,
             BILLING_TIER_DISALLOWED_PAID,
-            f"Project '{project_id}' has billing_enabled=True. Paid projects are strictly "
+            "Project has billing_enabled=True. Paid projects are strictly "
             "forbidden under Efso Radar $0.00 / 0 TRY policy.",
         )
 
-    if not free_tier_eligible:
+    # Validate verified_at timestamp (no future dates)
+    try:
+        ver_dt = datetime.fromisoformat(verified_at_str)
+        if ver_dt.tzinfo is None:
+            ver_dt = ver_dt.replace(tzinfo=timezone.utc)
+        if ver_dt > ref_now:
+            return (
+                False,
+                BILLING_TIER_UNKNOWN,
+                f"Proof verified_at timestamp ({verified_at_str}) is in the future. Fail closed.",
+            )
+    except (ValueError, TypeError) as exc:
         return (
             False,
             BILLING_TIER_UNKNOWN,
-            f"Project '{project_id}' is not marked free_tier_eligible=True. Fail closed.",
+            f"Invalid verified_at timestamp format '{verified_at_str}': {exc}. Fail closed.",
         )
 
+    # Validate expires_at if present
     if expires_at_str:
         try:
             exp_dt = datetime.fromisoformat(str(expires_at_str))
             if exp_dt.tzinfo is None:
                 exp_dt = exp_dt.replace(tzinfo=timezone.utc)
-            ref_now = now or datetime.now(timezone.utc)
-            if ref_now.tzinfo is None:
-                ref_now = ref_now.replace(tzinfo=timezone.utc)
-            if ref_now > exp_dt:
+            if ref_now >= exp_dt:
                 return (
                     False,
                     BILLING_TIER_UNKNOWN,
-                    f"Project '{project_id}' proof expired at {expires_at_str}. Fail closed.",
+                    f"Proof expired at {expires_at_str}. Fail closed.",
                 )
         except (ValueError, TypeError) as exc:
             return (
@@ -272,16 +347,19 @@ def validate_free_tier_project_proof(
                 f"Invalid expires_at format '{expires_at_str}': {exc}. Fail closed.",
             )
 
+    # CRITICAL P1: Caller-provided record is NOT an authenticated provider attestation.
+    # It cannot certify actual provider $0 billing.
     return (
-        True,
-        BILLING_TIER_VERIFIED_FREE,
-        f"Project '{project_id}' verified as billing_enabled=False and free_tier_eligible=True.",
+        False,
+        BILLING_TIER_UNKNOWN,
+        "Caller-provided unauthenticated record cannot prove provider billing status. "
+        "Actual provider billing status remains UNKNOWN.",
     )
 
 
 class GeminiCostAccounting(NamedTuple):
-    """Separates paid-tier equivalent opportunity cost estimates from actual billable cost
-    and free-tier quota accounting.
+    """Separates paid-tier equivalent opportunity cost estimates from nominal Free Tier rates,
+    unobserved provider billing, and quota accounting.
 
     Attributes:
         model_name: The Gemini model ID.
@@ -290,10 +368,13 @@ class GeminiCostAccounting(NamedTuple):
         paid_equivalent_estimate_usd: Published Standard paid-tier reference price Google would charge
             ($0.30 input / $2.50 output per 1M tokens for gemini-3.5-flash-lite).
             Preserved in ai_usage_ledger.estimated_cost_usd for economic opportunity cost audit.
-        actual_billed_usd: Actual billable charge on invoice. Exactly 0.0 when VERIFIED_FREE_TIER.
-            None (UNKNOWN) when unverified. Nonzero paid charges are strictly disallowed ($0.00 / 0 TRY policy).
-        billing_tier: Provenance classification (UNKNOWN_UNVERIFIED, VERIFIED_FREE_TIER, or DISALLOWED_PAID).
-        is_free_tier_eligible: Whether the model qualifies for Google AI Studio Free Tier.
+        nominal_free_tier_rate_usd: Published theoretical rate for Free Tier ($0.00).
+            This is a reference rate assumption, NOT an observed invoice or billing attestation.
+        actual_billed_usd: Actual billable charge on invoice. ALWAYS None (UNKNOWN) in offline operation
+            until independently authenticated provider billing evidence exists.
+            Nonzero paid charges are strictly disallowed ($0.00 / 0 TRY policy).
+        billing_tier: Provenance classification (defaults to UNKNOWN_UNVERIFIED).
+        is_assessed_launch_model: Whether the model is the assessed launch model (gemini-3.5-flash-lite).
         used_search_grounding: Whether Google Search Grounding was requested.
         reconciliation_notes: Audit explanation of billing status and rate reconciliation.
     """
@@ -301,11 +382,17 @@ class GeminiCostAccounting(NamedTuple):
     input_tokens: int
     output_tokens: int
     paid_equivalent_estimate_usd: float
+    nominal_free_tier_rate_usd: float
     actual_billed_usd: Optional[float]
     billing_tier: str
-    is_free_tier_eligible: bool
+    is_assessed_launch_model: bool
     used_search_grounding: bool
     reconciliation_notes: str
+
+    @property
+    def is_free_tier_eligible(self) -> bool:
+        """Backward compatibility alias for is_assessed_launch_model."""
+        return self.is_assessed_launch_model
 
 
 def compute_gemini_cost_accounting(
@@ -320,9 +407,10 @@ def compute_gemini_cost_accounting(
     now: Optional[datetime] = None,
 ) -> GeminiCostAccounting:
     """Compute comprehensive Gemini cost accounting separating paid-equivalent estimates,
-    actual billable cost, and free tier eligibility.
+    nominal Free Tier rate assumptions, and unobserved actual billing.
 
-    Never assumes $0 provider billing from an in-app flag. Requires authentic FreeTierProjectProof.
+    Actual billed USD is ALWAYS None (UNKNOWN) in offline operation; caller records cannot
+    certify $0 provider billing.
     """
     clean_name, _ = resolve_model_pricing(model_name)
     paid_est = estimate_call_cost(
@@ -334,53 +422,34 @@ def compute_gemini_cost_accounting(
         output_already_includes_thinking=output_already_includes_thinking,
         use_batch_tier=use_batch_tier,
     )
-    is_eligible = is_model_free_tier_eligible(clean_name)
+    is_assessed = is_model_assessed_for_launch(clean_name)
 
-    if not is_eligible:
-        return GeminiCostAccounting(
-            model_name=clean_name,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            paid_equivalent_estimate_usd=round(paid_est, 6),
-            actual_billed_usd=None,
-            billing_tier=BILLING_TIER_UNKNOWN,
-            is_free_tier_eligible=False,
-            used_search_grounding=used_search_grounding,
-            reconciliation_notes=(
-                f"Model '{clean_name}' is not eligible for Google AI Studio Free Tier. "
-                "Actual billed cost is UNKNOWN; fail closed before dispatch."
-            ),
-        )
+    # In this offline slice, actual billed USD is ALWAYS None (UNKNOWN) because
+    # real provider billing observation is not implemented or authorized.
+    # nominal_free_tier_rate_usd is 0.0 (theoretical Free Tier price),
+    # strictly separated from actual billed invoice charge.
+    nominal_rate = 0.0 if (is_assessed and not used_search_grounding) else 0.0
 
-    is_proof_valid, tier, reason = validate_free_tier_project_proof(project_proof, now=now)
-    if is_proof_valid and tier == BILLING_TIER_VERIFIED_FREE:
-        if used_search_grounding:
-            actual_billed = None
-            notes = (
-                "Free Tier project proof verified, but search grounding was requested. "
-                "Search grounding is not free under Free Tier and incurs charges. "
-                "Violates $0.00 / 0 TRY policy. Billed USD is UNKNOWN."
-            )
-        else:
-            actual_billed = 0.0
-            notes = (
-                f"Verified Free Tier ($0.00 billed). Paid-tier equivalent reference estimate "
-                f"(${paid_est:.6f}) preserved for economic audit."
-            )
-    else:
-        actual_billed = None
-        notes = f"Project billing unverified ({reason}). Paid-tier equivalent retained for audit."
+    _, proof_tier, reason = validate_free_tier_project_proof(project_proof, now=now)
+
+    reconciliation = (
+        f"Paid-tier equivalent reference: ${paid_est:.6f} USD. "
+        f"Actual billed USD: UNKNOWN (offline slice; no provider billing verification). "
+        f"Nominal Free Tier rate assumption: ${nominal_rate:.6f} USD. "
+        f"Proof assessment: {reason}"
+    )
 
     return GeminiCostAccounting(
         model_name=clean_name,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         paid_equivalent_estimate_usd=round(paid_est, 6),
-        actual_billed_usd=actual_billed,
-        billing_tier=tier,
-        is_free_tier_eligible=is_eligible,
+        nominal_free_tier_rate_usd=nominal_rate,
+        actual_billed_usd=None,  # Always None in offline slice
+        billing_tier=proof_tier,
+        is_assessed_launch_model=is_assessed,
         used_search_grounding=used_search_grounding,
-        reconciliation_notes=notes,
+        reconciliation_notes=reconciliation,
     )
 
 
@@ -616,33 +685,55 @@ def check_monthly_budget_guard(
 
 def check_free_tier_safety_guard(
     model_name: str,
-    current_monthly_calls: int,
+    current_monthly_calls: Optional[int] = None,
     max_monthly_calls: int = 300,
     enable_search_grounding: bool = False,
     max_run_cost_usd: float = 0.0,
     max_monthly_cost_usd: float = 0.0,
+    rpm_limit: Optional[int] = None,
+    current_rpm: Optional[int] = None,
+    tpm_limit: Optional[int] = None,
+    current_tpm: Optional[int] = None,
+    estimated_batch_tokens: Optional[int] = None,
+    rpd_limit: Optional[int] = None,
+    current_rpd: Optional[int] = None,
+    # Backward compatibility aliases for existing caller signatures:
     daily_requests_count: Optional[int] = None,
-    daily_requests_cap: Optional[int] = FREE_TIER_DEFAULT_RPD_CAP,
+    daily_requests_cap: Optional[int] = None,
     requests_per_minute: Optional[int] = None,
-    rpm_cap: Optional[int] = FREE_TIER_DEFAULT_RPM_CAP,
-    dynamic_quota_unknown: bool = False,
+    rpm_cap: Optional[int] = None,
+    dynamic_quota_unknown: Optional[bool] = None,
 ) -> tuple[bool, str]:
     """Free Tier safety and quota circuit breaker.
 
+    FAIL-CLOSED SAFETY INVARIANT:
+    Missing or unobserved quota evidence (RPM, TPM, RPD, or monthly calls) MUST return DENY.
+    Universal constants (e.g. 15 RPM, 1500 RPD, 1M TPM) are NOT account entitlements.
+    Exact project/model-scoped, fresh, and trusted quota evidence is required for any ALLOW.
+
     Enforces:
-    1. Free Tier model eligibility (is_model_free_tier_eligible).
+    1. Assessed launch model candidate (is_model_assessed_for_launch).
     2. Search grounding strictly disabled (search grounding is not free under Free Tier).
     3. Zero monetary ceilings (positive budget overrides fail closed).
-    4. Monthly call cap (current_monthly_calls + 1 <= max_monthly_calls).
-    5. Daily requests (RPD) quota (daily_requests_count + 1 <= daily_requests_cap).
-    6. Requests per minute (RPM) quota (requests_per_minute < rpm_cap).
-    7. Unknown dynamic quota fails closed when dynamic_quota_unknown=True.
+    4. Explicit dynamic quota unknown flag check.
+    5. Monthly call cap (current_monthly_calls must be observed and + 1 <= max_monthly_calls).
+    6. Verified RPM quota limit AND consumption observed; current_rpm < rpm_limit.
+    7. Verified TPM quota limit AND consumption + batch reservation observed; current_tpm + tokens <= tpm_limit.
+    8. Verified RPD quota limit AND consumption observed; current_rpd + 1 <= rpd_limit.
     """
-    # 1. Model eligibility
-    if not is_model_free_tier_eligible(model_name):
+    clean_name = model_name.strip().lower()
+
+    # 1. Model launch assessment
+    if not is_model_assessed_for_launch(clean_name):
+        if clean_name in SHUTDOWN_MODELS:
+            return (
+                False,
+                f"Model '{clean_name}' was shut down on {SHUTDOWN_MODELS[clean_name]} and cannot be used. Fail closed.",
+            )
         return (
             False,
-            f"Model '{model_name}' is not eligible for Google AI Studio Free Tier. Fail closed.",
+            f"Model '{clean_name}' is not an assessed launch model (assessed: {sorted(ASSESSED_LAUNCH_MODELS)}). "
+            "Unassessed models are denied under launch safety policy. Fail closed.",
         )
 
     # 2. Search grounding
@@ -663,35 +754,87 @@ def check_free_tier_safety_guard(
             "Free Tier enforcement.",
         )
 
-    # 4. Unknown dynamic quota
-    if dynamic_quota_unknown:
+    # 4. Explicit dynamic quota unknown flag
+    if dynamic_quota_unknown is True:
         return (
             False,
-            "Dynamic provider quota state is UNKNOWN. Fail closed under strict Free Tier policy.",
+            "Dynamic provider quota state is explicitly marked UNKNOWN. Fail closed under strict Free Tier policy.",
         )
 
-    # 5. Monthly call quota
+    # 5. Monthly call quota (must be observed)
+    if current_monthly_calls is None:
+        return (
+            False,
+            "Missing monthly call count observation: status is UNKNOWN. Fail closed.",
+        )
     if (current_monthly_calls + 1) > max_monthly_calls:
         return (
             False,
             f"Monthly AI call count ({current_monthly_calls + 1}) exceeds Free Tier monthly call cap ({max_monthly_calls}).",
         )
 
-    # 6. Daily requests quota (RPD)
-    if daily_requests_count is not None and daily_requests_cap is not None:
-        if (daily_requests_count + 1) > daily_requests_cap:
-            return (
-                False,
-                f"Daily requests count ({daily_requests_count + 1}) exceeds Free Tier daily cap ({daily_requests_cap}).",
-            )
+    # Resolve RPM parameter aliases
+    effective_rpm_limit = rpm_limit if rpm_limit is not None else rpm_cap
+    effective_current_rpm = current_rpm if current_rpm is not None else requests_per_minute
 
-    # 7. RPM quota
-    if requests_per_minute is not None and rpm_cap is not None:
-        if requests_per_minute >= rpm_cap:
-            return (
-                False,
-                f"Requests per minute ({requests_per_minute}) reaches or exceeds Free Tier RPM cap ({rpm_cap}).",
-            )
+    # 6. RPM quota: limit AND consumption must be explicitly observed
+    if effective_rpm_limit is None:
+        return (
+            False,
+            "Missing verified RPM (Requests Per Minute) provider quota limit: status is UNKNOWN. "
+            "Universal constant cannot be assumed as an account entitlement. Fail closed.",
+        )
+    if effective_current_rpm is None:
+        return (
+            False,
+            "Missing current RPM consumption observation: status is UNKNOWN. Fail closed.",
+        )
+    if effective_current_rpm >= effective_rpm_limit:
+        return (
+            False,
+            f"Requests per minute ({effective_current_rpm}) reaches or exceeds verified RPM limit ({effective_rpm_limit}).",
+        )
+
+    # 7. TPM quota: limit AND estimated batch tokens must be explicitly observed
+    if tpm_limit is None:
+        return (
+            False,
+            "Missing verified TPM (Tokens Per Minute) provider quota limit: status is UNKNOWN. "
+            "Universal constant cannot be assumed as an account entitlement. Fail closed.",
+        )
+    if estimated_batch_tokens is None or estimated_batch_tokens <= 0:
+        return (
+            False,
+            "Missing estimated batch token count for TPM quota verification: status is UNKNOWN. Fail closed.",
+        )
+    tpm_consumed = current_tpm if current_tpm is not None else 0
+    if (tpm_consumed + estimated_batch_tokens) > tpm_limit:
+        return (
+            False,
+            f"Projected tokens per minute ({tpm_consumed + estimated_batch_tokens}) exceeds verified TPM limit ({tpm_limit}).",
+        )
+
+    # Resolve RPD parameter aliases
+    effective_rpd_limit = rpd_limit if rpd_limit is not None else daily_requests_cap
+    effective_current_rpd = current_rpd if current_rpd is not None else daily_requests_count
+
+    # 8. RPD quota: limit AND consumption must be explicitly observed
+    if effective_rpd_limit is None:
+        return (
+            False,
+            "Missing verified RPD (Requests Per Day) provider quota limit: status is UNKNOWN. "
+            "Universal constant cannot be assumed as an account entitlement. Fail closed.",
+        )
+    if effective_current_rpd is None:
+        return (
+            False,
+            "Missing current RPD consumption observation: status is UNKNOWN. Fail closed.",
+        )
+    if (effective_current_rpd + 1) > effective_rpd_limit:
+        return (
+            False,
+            f"Daily requests count ({effective_current_rpd + 1}) exceeds verified RPD limit ({effective_rpd_limit}).",
+        )
 
     return True, "OK"
 
