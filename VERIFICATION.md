@@ -2,6 +2,19 @@
 
 **Latest GitHub checkpoint:** 2026-11-05. This ledger separates direct GitHub CI evidence, implementation-agent local runs, historical pilot acceptance and missing validations. Earlier dated reviewer entries retain their original scope. Evidence is not a release certificate.
 
+## 2026-11-06 — Gemini Free Tier Safety & Accounting Separation (Issue #86 / Parent Issue #82 G1/G3)
+
+| Evidence / status | Verified result and scope boundary |
+| --- | --- |
+| Protected `main` baseline `935c43157fa7efd95d54404cb530f7b2bdf39df0` | Exact-main CI [#42107231638](https://github.com/fatihemres/efso-radar/actions/runs/42107231638) 4/4 PASS. Task worktree `feat/issue-86-gemini-free-tier-safety`. |
+| Three-way accounting separation (`src/efso_radar/ai/cost.py`, `ai/client.py`, `config.py`) | Separated **paid-tier equivalent reference pricing** (`paid_equivalent_estimate_usd`), **actual billable cost** (`actual_billed_usd`, exactly $0.00 only for verified Free Tier; `None` UNKNOWN without authentic proof; paid projects fail closed), and **Free Tier quota circuit breakers** (`check_free_tier_safety_guard`). Preserved existing `ai_usage_ledger.estimated_cost_usd` schema semantics without introducing Schema v7. |
+| Fail-closed dispatch barrier | `require_verified_free_tier()` remains unconditional hard barrier blocking real Gemini API dispatch. Never bypassed by environment variables, config settings, or positive budget overrides. |
+| Dedicated test suite: `tests/test_gemini_free_tier_safety.py` | **23 passed in 13.53s** on Windows. Verified: (1) positive paid-rate estimate with $0.00 billed on verified Free Tier; (2) absent/expired/incomplete proof yields UNKNOWN billing tier; (3) contradictory `billing_enabled=True` fails closed as `DISALLOWED_PAID`; (4) paid-only `gemini-3.8-flash` and shut-down models rejected; (5) monthly call cap, daily RPD (1500), RPM (15), and unknown dynamic quota fail closed; (6) positive budget overrides fail closed under Free Tier; (7) search grounding prohibited; (8) ambiguous 429/504 failures recorded as `FAILED_AMBIGUOUS` in `ai_usage_ledger` without cache pollution; (9) offline caching returns picks with 0 tokens and 0 API calls without hitting network; (10) Schema v6 column compatibility preserved. |
+| Existing AI test suites (`test_ai_components.py`, `test_gemini_shadow_preflight.py`, `test_gemini_shadow_operator.py`) | **54 passed in 13.74s** on Windows. Zero regressions. |
+| Full hermetic test suite | **1313 passed, 18 skipped, 294 subtests passed in 180.39s** on Windows. |
+| Static safety: Python 3.12 py_compile & git diff --check | **Clean 0 return code.** Zero trailing whitespace or syntax errors. |
+| Hard operational boundaries | Strictly **$0.00 / 0 TRY**. Zero live network calls, zero Turso connections (including reads), zero credentials created, zero operational file access. STOP at Draft PR for independent review. |
+
 ## 2026-11-06 — Controlled Staging Runner Offline Slice (Issue #82 / Issue #13 First Engineering Slice)
 
 | Evidence / status | Verified result and scope boundary |

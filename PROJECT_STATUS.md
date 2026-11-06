@@ -4,7 +4,18 @@
 **Canonical repository:** [fatihemres/efso-radar](https://github.com/fatihemres/efso-radar)
 **Historical 2026-10-29 baseline:** `589cf85045f73463515d8912205d82e0194f1501` (PR #46 integrated); prior sections preserve their dated implementation-time assessments.
 
-## Current operational checkpoint — Controlled Staging Runner Offline Slice (Issue #82 / Issue #13 First Engineering Slice, 2026-11-06)
+## Current operational checkpoint — Gemini Free Tier Safety & Accounting Separation (Issue #86 / Parent Issue #82 G1/G3, 2026-11-06)
+
+- **Main baseline:** `935c43157fa7efd95d54404cb530f7b2bdf39df0` (exact-main CI 4/4 PASS). Task branch: `feat/issue-86-gemini-free-tier-safety`.
+- **Implementation deliverable:** Strict separation of three distinct accounting dimensions in `src/efso_radar/ai/cost.py`, `src/efso_radar/ai/client.py`, and `src/efso_radar/config.py`:
+  1. **Paid-Tier Equivalent Reference Pricing (`paid_equivalent_estimate_usd`):** Standard published pay-as-you-go reference cost ($0.30 input / $2.50 output per 1M tokens for `gemini-3.5-flash-lite`), preserved in `ai_usage_ledger.estimated_cost_usd` for economic auditability and historical backward compatibility without introducing Schema v7.
+  2. **Actual Billable Cost (`actual_billed_usd`):** Strictly $0.00 only for verified Free Tier projects (`validate_free_tier_project_proof`); `None` (UNKNOWN) when unverified or expired. Paid billing accounts (`billing_enabled=True`) fail closed as `DISALLOWED_PAID` ($0.00 / 0 TRY policy).
+  3. **Free Tier Quota Circuit Breakers (`check_free_tier_safety_guard`):** Model eligibility (`FREE_TIER_ELIGIBLE_MODELS`), search grounding prohibition under Free Tier, positive monetary budget overrides fail closed (strictly $0.00 ceilings), monthly call limit (default 300), daily request cap (1500 RPD), RPM limit (15 RPM), and unknown dynamic quota fail-closed.
+- **Fail-closed dispatch barrier preserved:** `require_verified_free_tier()` remains an unconditional, hard live dispatch barrier with zero environment variable, config, or user-controlled bypass.
+- **Dedicated test suite (`tests/test_gemini_free_tier_safety.py`):** 23 passed in 13.53s covering unknown billing status, unsupported models (`gemini-3.8-flash`), shut-down models, quota exhaustion, positive budget overrides, search grounding violations, ambiguous 429/504 failures (recorded as `FAILED_AMBIGUOUS` without cache pollution), zero network dispatch, and offline batch caching (0 tokens, 0 API calls).
+- **Hard runtime boundaries:** Absolutely $0.00 / 0 TRY; zero live Gemini calls, zero Turso connections (including reads), RSS, Telegram, cron, credentials, or billing modifications. STOP at Draft PR for independent review.
+
+## Prior operational checkpoint — Controlled Staging Runner Offline Slice (Issue #82 / Issue #13 First Engineering Slice, 2026-11-06)
 
 - **Main baseline:** `8caeefd624eb4f288fe622c9e981248c0017d5ea` (exact-main CI #42107231638 4/4 PASS). Task branch: `feat/issue-13-staging-runner-offline-slice`.
 - **Implementation deliverable:** Smallest practical transport-injected controlled-staging execution path for LIVE-02 through LIVE-08 via `execute_controlled_staging` in `src/efso_radar/staging/runner.py` and coherent `skip_live_01=True` support in `LiveReadyStagingOperator`. Uses mock transport only; rejects real-network transports fail-closed immediately.

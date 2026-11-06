@@ -33,6 +33,14 @@ Published Standard Paid-Tier Pricing (per 1,000,000 tokens in USD):
 
 Important Billing & Safeguard Rules:
 - Output tokens encompass ALL generated tokens, including reasoning / thinking tokens.
+- Three-Way Accounting Separation:
+    1. Paid-Tier Equivalent Reference Pricing (`paid_equivalent_estimate_usd`): Published standard
+       pay-as-you-go rates retained in `ai_usage_ledger.estimated_cost_usd` for economic opportunity
+       cost tracking and auditability without schema changes.
+    2. Actual Billable Cost (`actual_billed_usd`): Exactly $0.00 for verified Free Tier; None (UNKNOWN)
+       until authentic provider-side proof validates `billing_enabled=False`. Paid charges are disallowed ($0.00 / 0 TRY).
+    3. Free Tier Quota Accounting: Model eligibility (`is_model_free_tier_eligible`), search grounding disabled,
+       zero monetary ceilings, monthly call cap (300), daily request cap (1500 RPD), and RPM limits (15 RPM).
 - Application-level cost tracking in `ai_usage_ledger` is an internal defensive circuit-breaker
   and estimation safeguard; it is NOT a hard provider-side billing guarantee.
 """
@@ -140,6 +148,262 @@ SHUTDOWN_MODELS: dict[str, str] = {
     "gemini-2.5-flash-lite-preview-09-2025": "March 31, 2026",
     "gemini-3-pro-preview": "March 9, 2026",
 }
+
+# Google AI Studio Standard Free Tier Model Eligibility & Rate Limits (Official 2026 docs):
+# - Free tier is model-specific and available only for standard Flash-Lite / Flash models.
+# - Free Tier does NOT cover search grounding without charges or paid previews (e.g. gemini-3.8-flash).
+FREE_TIER_ELIGIBLE_MODELS: frozenset[str] = frozenset({
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+})
+
+FREE_TIER_DEFAULT_RPM_CAP: int = 15
+FREE_TIER_DEFAULT_RPD_CAP: int = 1500
+FREE_TIER_DEFAULT_TPM_CAP: int = 1_000_000
+
+# Provenance states for account-level billing status
+BILLING_TIER_UNKNOWN: str = "UNKNOWN_UNVERIFIED"
+BILLING_TIER_VERIFIED_FREE: str = "VERIFIED_FREE_TIER"
+BILLING_TIER_DISALLOWED_PAID: str = "DISALLOWED_PAID"
+
+
+def is_model_free_tier_eligible(model_name: str) -> bool:
+    """Check if a Gemini model is officially eligible for Google AI Studio Free Tier.
+
+    Rejects shut-down models, paid-only models (e.g. gemini-3.8-flash),
+    and unrecognized model names.
+    """
+    clean_name = model_name.strip().lower()
+    if clean_name in SHUTDOWN_MODELS:
+        return False
+    return clean_name in FREE_TIER_ELIGIBLE_MODELS
+
+
+class FreeTierProjectProof(NamedTuple):
+    """Authentic attestation of provider-side billing and free tier status for a project."""
+    project_id: str
+    billing_enabled: bool
+    free_tier_eligible: bool
+    attestation_source: str
+    verified_at: str
+    expires_at: Optional[str] = None
+
+
+def validate_free_tier_project_proof(
+    proof: Optional[dict[str, Any] | FreeTierProjectProof],
+    now: Optional[datetime] = None,
+) -> tuple[bool, str, str]:
+    """Validate provider-side free tier / no-billing status proof.
+
+    Returns:
+        (is_valid, billing_tier, reason)
+
+    Fail-closed semantics:
+    - Missing/None proof: UNKNOWN_UNVERIFIED, invalid.
+    - billing_enabled=True: DISALLOWED_PAID, invalid ($0.00 / 0 TRY policy).
+    - free_tier_eligible=False: UNKNOWN_UNVERIFIED, invalid.
+    - Expired proof: UNKNOWN_UNVERIFIED, invalid.
+    - Valid non-billing, free-tier eligible proof: VERIFIED_FREE_TIER, valid.
+    """
+    if proof is None:
+        return (
+            False,
+            BILLING_TIER_UNKNOWN,
+            "No provider project proof provided; billing status is UNKNOWN. Fail closed.",
+        )
+
+    if isinstance(proof, dict):
+        project_id = str(proof.get("project_id", "")).strip()
+        billing_enabled = bool(proof.get("billing_enabled", False))
+        free_tier_eligible = bool(proof.get("free_tier_eligible", False))
+        attestation_source = str(proof.get("attestation_source", "")).strip()
+        verified_at_str = str(proof.get("verified_at", "")).strip()
+        expires_at_str = proof.get("expires_at")
+    else:
+        project_id = str(proof.project_id).strip()
+        billing_enabled = bool(proof.billing_enabled)
+        free_tier_eligible = bool(proof.free_tier_eligible)
+        attestation_source = str(proof.attestation_source).strip()
+        verified_at_str = str(proof.verified_at).strip()
+        expires_at_str = proof.expires_at
+
+    if not project_id:
+        return (False, BILLING_TIER_UNKNOWN, "Missing project_id in proof. Fail closed.")
+    if not attestation_source:
+        return (False, BILLING_TIER_UNKNOWN, "Missing attestation_source in proof. Fail closed.")
+    if not verified_at_str:
+        return (False, BILLING_TIER_UNKNOWN, "Missing verified_at in proof. Fail closed.")
+
+    if billing_enabled:
+        return (
+            False,
+            BILLING_TIER_DISALLOWED_PAID,
+            f"Project '{project_id}' has billing_enabled=True. Paid projects are strictly "
+            "forbidden under Efso Radar $0.00 / 0 TRY policy.",
+        )
+
+    if not free_tier_eligible:
+        return (
+            False,
+            BILLING_TIER_UNKNOWN,
+            f"Project '{project_id}' is not marked free_tier_eligible=True. Fail closed.",
+        )
+
+    if expires_at_str:
+        try:
+            exp_dt = datetime.fromisoformat(str(expires_at_str))
+            if exp_dt.tzinfo is None:
+                exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+            ref_now = now or datetime.now(timezone.utc)
+            if ref_now.tzinfo is None:
+                ref_now = ref_now.replace(tzinfo=timezone.utc)
+            if ref_now > exp_dt:
+                return (
+                    False,
+                    BILLING_TIER_UNKNOWN,
+                    f"Project '{project_id}' proof expired at {expires_at_str}. Fail closed.",
+                )
+        except (ValueError, TypeError) as exc:
+            return (
+                False,
+                BILLING_TIER_UNKNOWN,
+                f"Invalid expires_at format '{expires_at_str}': {exc}. Fail closed.",
+            )
+
+    return (
+        True,
+        BILLING_TIER_VERIFIED_FREE,
+        f"Project '{project_id}' verified as billing_enabled=False and free_tier_eligible=True.",
+    )
+
+
+class GeminiCostAccounting(NamedTuple):
+    """Separates paid-tier equivalent opportunity cost estimates from actual billable cost
+    and free-tier quota accounting.
+
+    Attributes:
+        model_name: The Gemini model ID.
+        input_tokens: Prompt/input token count.
+        output_tokens: Generated output token count (including thinking tokens).
+        paid_equivalent_estimate_usd: Published Standard paid-tier reference price Google would charge
+            ($0.30 input / $2.50 output per 1M tokens for gemini-3.5-flash-lite).
+            Preserved in ai_usage_ledger.estimated_cost_usd for economic opportunity cost audit.
+        actual_billed_usd: Actual billable charge on invoice. Exactly 0.0 when VERIFIED_FREE_TIER.
+            None (UNKNOWN) when unverified. Nonzero paid charges are strictly disallowed ($0.00 / 0 TRY policy).
+        billing_tier: Provenance classification (UNKNOWN_UNVERIFIED, VERIFIED_FREE_TIER, or DISALLOWED_PAID).
+        is_free_tier_eligible: Whether the model qualifies for Google AI Studio Free Tier.
+        used_search_grounding: Whether Google Search Grounding was requested.
+        reconciliation_notes: Audit explanation of billing status and rate reconciliation.
+    """
+    model_name: str
+    input_tokens: int
+    output_tokens: int
+    paid_equivalent_estimate_usd: float
+    actual_billed_usd: Optional[float]
+    billing_tier: str
+    is_free_tier_eligible: bool
+    used_search_grounding: bool
+    reconciliation_notes: str
+
+
+def compute_gemini_cost_accounting(
+    model_name: str,
+    input_tokens: int,
+    output_tokens: int,
+    thinking_tokens: int = 0,
+    used_search_grounding: bool = False,
+    output_already_includes_thinking: bool = False,
+    use_batch_tier: bool = False,
+    project_proof: Optional[dict[str, Any] | FreeTierProjectProof] = None,
+    now: Optional[datetime] = None,
+) -> GeminiCostAccounting:
+    """Compute comprehensive Gemini cost accounting separating paid-equivalent estimates,
+    actual billable cost, and free tier eligibility.
+
+    Never assumes $0 provider billing from an in-app flag. Requires authentic FreeTierProjectProof.
+    """
+    clean_name, _ = resolve_model_pricing(model_name)
+    paid_est = estimate_call_cost(
+        model_name=clean_name,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        thinking_tokens=thinking_tokens,
+        used_search_grounding=used_search_grounding,
+        output_already_includes_thinking=output_already_includes_thinking,
+        use_batch_tier=use_batch_tier,
+    )
+    is_eligible = is_model_free_tier_eligible(clean_name)
+
+    if not is_eligible:
+        return GeminiCostAccounting(
+            model_name=clean_name,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            paid_equivalent_estimate_usd=round(paid_est, 6),
+            actual_billed_usd=None,
+            billing_tier=BILLING_TIER_UNKNOWN,
+            is_free_tier_eligible=False,
+            used_search_grounding=used_search_grounding,
+            reconciliation_notes=(
+                f"Model '{clean_name}' is not eligible for Google AI Studio Free Tier. "
+                "Actual billed cost is UNKNOWN; fail closed before dispatch."
+            ),
+        )
+
+    is_proof_valid, tier, reason = validate_free_tier_project_proof(project_proof, now=now)
+    if is_proof_valid and tier == BILLING_TIER_VERIFIED_FREE:
+        if used_search_grounding:
+            actual_billed = None
+            notes = (
+                "Free Tier project proof verified, but search grounding was requested. "
+                "Search grounding is not free under Free Tier and incurs charges. "
+                "Violates $0.00 / 0 TRY policy. Billed USD is UNKNOWN."
+            )
+        else:
+            actual_billed = 0.0
+            notes = (
+                f"Verified Free Tier ($0.00 billed). Paid-tier equivalent reference estimate "
+                f"(${paid_est:.6f}) preserved for economic audit."
+            )
+    else:
+        actual_billed = None
+        notes = f"Project billing unverified ({reason}). Paid-tier equivalent retained for audit."
+
+    return GeminiCostAccounting(
+        model_name=clean_name,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        paid_equivalent_estimate_usd=round(paid_est, 6),
+        actual_billed_usd=actual_billed,
+        billing_tier=tier,
+        is_free_tier_eligible=is_eligible,
+        used_search_grounding=used_search_grounding,
+        reconciliation_notes=notes,
+    )
+
+
+def estimate_paid_equivalent_cost(
+    model_name: str,
+    input_tokens: int,
+    output_tokens: int,
+    thinking_tokens: int = 0,
+    used_search_grounding: bool = False,
+    output_already_includes_thinking: bool = False,
+    use_batch_tier: bool = False,
+) -> float:
+    """Explicit alias for estimate_call_cost documenting that it returns the published
+    standard paid-tier equivalent opportunity cost (not actual billed USD on Free Tier)."""
+    return estimate_call_cost(
+        model_name=model_name,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        thinking_tokens=thinking_tokens,
+        used_search_grounding=used_search_grounding,
+        output_already_includes_thinking=output_already_includes_thinking,
+        use_batch_tier=use_batch_tier,
+    )
 
 DEFAULT_PRICING = ModelPricing(input_per_million=0.30, output_per_million=2.50)
 SEARCH_GROUNDING_COST_PER_QUERY = 0.035  # Conservative ceiling ($14-$35 per 1,000 queries when over free quota)
@@ -347,6 +611,88 @@ def check_monthly_budget_guard(
             False,
             f"Monthly AI call count ({current_monthly_calls + 1}) exceeds configured monthly call cap ({max_monthly_calls}).",
         )
+    return True, "OK"
+
+
+def check_free_tier_safety_guard(
+    model_name: str,
+    current_monthly_calls: int,
+    max_monthly_calls: int = 300,
+    enable_search_grounding: bool = False,
+    max_run_cost_usd: float = 0.0,
+    max_monthly_cost_usd: float = 0.0,
+    daily_requests_count: Optional[int] = None,
+    daily_requests_cap: Optional[int] = FREE_TIER_DEFAULT_RPD_CAP,
+    requests_per_minute: Optional[int] = None,
+    rpm_cap: Optional[int] = FREE_TIER_DEFAULT_RPM_CAP,
+    dynamic_quota_unknown: bool = False,
+) -> tuple[bool, str]:
+    """Free Tier safety and quota circuit breaker.
+
+    Enforces:
+    1. Free Tier model eligibility (is_model_free_tier_eligible).
+    2. Search grounding strictly disabled (search grounding is not free under Free Tier).
+    3. Zero monetary ceilings (positive budget overrides fail closed).
+    4. Monthly call cap (current_monthly_calls + 1 <= max_monthly_calls).
+    5. Daily requests (RPD) quota (daily_requests_count + 1 <= daily_requests_cap).
+    6. Requests per minute (RPM) quota (requests_per_minute < rpm_cap).
+    7. Unknown dynamic quota fails closed when dynamic_quota_unknown=True.
+    """
+    # 1. Model eligibility
+    if not is_model_free_tier_eligible(model_name):
+        return (
+            False,
+            f"Model '{model_name}' is not eligible for Google AI Studio Free Tier. Fail closed.",
+        )
+
+    # 2. Search grounding
+    if enable_search_grounding:
+        return (
+            False,
+            "Search grounding is enabled. Search grounding is not free under Free Tier "
+            "and incurs charges. Strict $0.00 / 0 TRY policy requires search grounding disabled.",
+        )
+
+    # 3. Positive budget overrides
+    if max_run_cost_usd > 0.0 or max_monthly_cost_usd > 0.0:
+        return (
+            False,
+            f"Positive monetary budget override detected (max_run_cost_usd={max_run_cost_usd}, "
+            f"max_monthly_cost_usd={max_monthly_cost_usd}). Strict Free Tier launch policy "
+            "requires $0.00 / 0 TRY monetary ceilings. A positive dollar allowance contradicts "
+            "Free Tier enforcement.",
+        )
+
+    # 4. Unknown dynamic quota
+    if dynamic_quota_unknown:
+        return (
+            False,
+            "Dynamic provider quota state is UNKNOWN. Fail closed under strict Free Tier policy.",
+        )
+
+    # 5. Monthly call quota
+    if (current_monthly_calls + 1) > max_monthly_calls:
+        return (
+            False,
+            f"Monthly AI call count ({current_monthly_calls + 1}) exceeds Free Tier monthly call cap ({max_monthly_calls}).",
+        )
+
+    # 6. Daily requests quota (RPD)
+    if daily_requests_count is not None and daily_requests_cap is not None:
+        if (daily_requests_count + 1) > daily_requests_cap:
+            return (
+                False,
+                f"Daily requests count ({daily_requests_count + 1}) exceeds Free Tier daily cap ({daily_requests_cap}).",
+            )
+
+    # 7. RPM quota
+    if requests_per_minute is not None and rpm_cap is not None:
+        if requests_per_minute >= rpm_cap:
+            return (
+                False,
+                f"Requests per minute ({requests_per_minute}) reaches or exceeds Free Tier RPM cap ({rpm_cap}).",
+            )
+
     return True, "OK"
 
 
