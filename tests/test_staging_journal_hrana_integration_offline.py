@@ -51,6 +51,7 @@ from efso_radar.staging.journal import (
     compute_canonical_inventory_fingerprint,
 )
 from efso_radar.staging.journal_hrana_seam import (
+    AmbiguousRollbackError,
     CleanupVerificationError,
     StagingJournalHranaSeam,
     build_live02_synthetic_mutations,
@@ -1825,6 +1826,252 @@ class TestMockHranaTransactionLifecycle(_BaseTwoRunnerFixture):
                 mutation_statements=mutations,
                 manifest_seal_hex=self.seal_a,
             )
+
+    def test_mutation_rowcount_mismatch_with_unconfirmed_rollback_latches_halt(self):
+        """Rowcount/fencing mismatch followed by ROLLBACK timeout latches HALT and denies retry."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+
+        def rollback_timeout_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+            except Exception:
+                body = {}
+            reqs = body.get("requests", [])
+            has_begin = any(
+                r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN"
+                for r in reqs
+            )
+            has_rollback = any(
+                r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK"
+                for r in reqs
+            )
+            if has_begin:
+                # Concurrent session bumps fence behind Runner A's back after inspect_run passes
+                self.conn_b.execute(
+                    "UPDATE staging_run_journal SET fencing_token = 99 WHERE run_id = ?",
+                    (RUN_ID_A,),
+                )
+                self.conn_b.commit()
+                return None
+            if has_rollback:
+                raise httpx.TimeoutException("Simulated network timeout during ROLLBACK dispatch")
+            return None
+
+        self.transport_a.custom_response_hook = rollback_timeout_hook
+
+        with self.assertRaises(AmbiguousRollbackError) as ctx:
+            self.seam_a.execute_atomic_stage_mutation(
+                run_id=RUN_ID_A,
+                expected_fencing_token=1,
+                stage="LIVE-02",
+                mutation_statements=mutations,
+                manifest_seal_hex=self.seal_a,
+            )
+        self.assertIn("ROLLBACK could not be confirmed", str(ctx.exception))
+        self.assertIn("Transaction outcome UNKNOWN; run locally HALTED", str(ctx.exception))
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+
+        # Reset hook: subsequent automated actions denied with JournalHaltedError
+        self.transport_a.custom_response_hook = None
+        with self.assertRaises(JournalHaltedError):
+            self.seam_a.execute_atomic_stage_mutation(
+                run_id=RUN_ID_A,
+                expected_fencing_token=1,
+                stage="LIVE-02",
+                mutation_statements=mutations,
+                manifest_seal_hex=self.seal_a,
+            )
+
+        # Evidence preserved: unwritten entity rows not committed, DB entry preserved
+        cur = self.conn_b.cursor()
+        cur.execute("SELECT COUNT(*) FROM processed_articles WHERE article_id = ?", (f"synth_art_{RUN_ID_A}_01",))
+        self.assertEqual(cur.fetchone()[0], 0)
+        cur.execute("SELECT fencing_token FROM staging_run_journal WHERE run_id = ?", (RUN_ID_A,))
+        self.assertEqual(cur.fetchone()[0], 99)
+
+    def test_mutation_rowcount_mismatch_with_503_rollback_latches_halt(self):
+        """Rowcount/fencing mismatch followed by ROLLBACK HTTP 503 latches HALT."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+
+        def rollback_503_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+            except Exception:
+                body = {}
+            reqs = body.get("requests", [])
+            has_begin = any(
+                r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN"
+                for r in reqs
+            )
+            has_rollback = any(
+                r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK"
+                for r in reqs
+            )
+            if has_begin:
+                self.conn_b.execute(
+                    "UPDATE staging_run_journal SET fencing_token = 99 WHERE run_id = ?",
+                    (RUN_ID_A,),
+                )
+                self.conn_b.commit()
+                return None
+            if has_rollback:
+                return httpx.Response(503, json={"error": {"message": "Service Unavailable"}}, request=request)
+            return None
+
+        self.transport_a.custom_response_hook = rollback_503_hook
+
+        with self.assertRaises(AmbiguousRollbackError) as ctx:
+            self.seam_a.execute_atomic_stage_mutation(
+                run_id=RUN_ID_A,
+                expected_fencing_token=1,
+                stage="LIVE-02",
+                mutation_statements=mutations,
+                manifest_seal_hex=self.seal_a,
+            )
+        self.assertIn("ROLLBACK could not be confirmed", str(ctx.exception))
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+        self.transport_a.custom_response_hook = None
+
+    def test_cleanup_cas_mismatch_with_unconfirmed_rollback_latches_halt(self):
+        """Cleanup CAS mismatch followed by ROLLBACK with statement error latches HALT."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        token2 = self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+        self.assertEqual(token2, 2)
+
+        def rollback_error_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+            except Exception:
+                body = {}
+            reqs = body.get("requests", [])
+            has_begin = any(
+                r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN"
+                for r in reqs
+            )
+            has_rollback = any(
+                r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK"
+                for r in reqs
+            )
+            if has_begin:
+                # Concurrent update bumps fence on DB during cleanup CAS pipeline
+                self.conn_b.execute(
+                    "UPDATE staging_run_journal SET fencing_token = 99 WHERE run_id = ?",
+                    (RUN_ID_A,),
+                )
+                self.conn_b.commit()
+                return None
+            if has_rollback:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": body.get("baton", "mock_baton"),
+                        "results": [{"type": "error", "error": {"message": "synthetic rollback statement failure"}}],
+                    },
+                    request=request,
+                )
+            return None
+
+        self.transport_a.custom_response_hook = rollback_error_hook
+
+        with self.assertRaises(AmbiguousRollbackError) as ctx:
+            self.seam_a.execute_conditional_cleanup(
+                run_id=RUN_ID_A,
+                expected_fencing_token=token2,
+                manifest_seal_hex=self.seal_a,
+            )
+        self.assertIn("ROLLBACK could not be confirmed", str(ctx.exception))
+        self.assertIn("synthetic rollback statement failure", str(ctx.exception))
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+
+        # Status not marked CLEANED_UP
+        cur = self.conn_b.cursor()
+        cur.execute("SELECT status FROM staging_run_journal WHERE run_id = ?", (RUN_ID_A,))
+        row = cur.fetchone()
+        self.assertIsNotNone(row)
+        self.assertNotEqual(row[0], JournalStatus.CLEANED_UP.value)
+
+        # Registered entities preserved (evidence preserved)
+        cur.execute("SELECT COUNT(*) FROM processed_articles WHERE article_id = ?", (f"synth_art_{RUN_ID_A}_01",))
+        self.assertEqual(cur.fetchone()[0], 1)
+
+        # Reset hook: automated cleanup denied with JournalHaltedError
+        self.transport_a.custom_response_hook = None
+        with self.assertRaises(JournalHaltedError):
+            self.seam_a.execute_conditional_cleanup(
+                run_id=RUN_ID_A,
+                expected_fencing_token=token2,
+                manifest_seal_hex=self.seal_a,
+            )
+
+    def test_cleanup_cas_mismatch_with_confirmed_rollback_raises_fencing_conflict_without_halt(self):
+        """Cleanup CAS mismatch with confirmed ROLLBACK raises FencingConflictError without HALT."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        token2 = self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+        self.assertEqual(token2, 2)
+
+        def cas_mismatch_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+            except Exception:
+                body = {}
+            reqs = body.get("requests", [])
+            has_begin = any(
+                r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN"
+                for r in reqs
+            )
+            if has_begin:
+                self.conn_b.execute(
+                    "UPDATE staging_run_journal SET fencing_token = 99 WHERE run_id = ?",
+                    (RUN_ID_A,),
+                )
+                self.conn_b.commit()
+            return None
+
+        self.transport_a.custom_response_hook = cas_mismatch_hook
+
+        # Hook only bumps fence on BEGIN; ROLLBACK is acknowledged normally by HermeticStagingTransport
+        with self.assertRaises(FencingConflictError) as ctx:
+            self.seam_a.execute_conditional_cleanup(
+                run_id=RUN_ID_A,
+                expected_fencing_token=token2,
+                manifest_seal_hex=self.seal_a,
+            )
+        self.assertIn("Fencing check failed; transaction rolled back fail-closed", str(ctx.exception))
+        # Crucially: local HALT is NOT latched because ROLLBACK was confirmed successful
+        self.assertFalse(self.seam_a.is_halted(RUN_ID_A))
+        self.transport_a.custom_response_hook = None
 
 
 # =============================================================================

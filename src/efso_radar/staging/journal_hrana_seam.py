@@ -93,6 +93,10 @@ class OwnershipMismatchError(JournalError, PermissionError):
     """Entity attributes do not match registered ownership markers."""
 
 
+class AmbiguousRollbackError(FencingConflictError):
+    """Raised when a fencing or CAS conflict triggers a ROLLBACK that cannot be confirmed."""
+
+
 def _assert_fixture_isolation(conn: sqlite3.Connection) -> None:
     """Enforce that the connection is strictly in-memory or points to an OS temp file."""
     cursor = conn.execute("PRAGMA database_list")
@@ -495,6 +499,57 @@ class StagingJournalHranaSeam:
             raise TursoClientError(f"Malformed JSON pipeline response: expected dict, got {type(data).__name__}")
         return data
 
+    def _dispatch_verified_rollback(
+        self,
+        baton: Optional[str],
+        run_id: str,
+        context: str,
+    ) -> tuple[bool, Optional[str]]:
+        """Attempt a confirmed ROLLBACK on an active session baton.
+
+        Returns (True, None) if and only if the Hrana backend explicitly
+        acknowledges the ROLLBACK with a valid dict containing exactly one
+        result with type == 'ok'.
+
+        Returns (False, error_reason) if the dispatch times out, encounters a
+        transport/client error, returns non-JSON/malformed structure, or
+        reports a statement error in the rollback result.
+        """
+        if not baton or not isinstance(baton, str) or not baton.strip():
+            return (False, "no active session baton")
+
+        try:
+            rb_res = self._post_pipeline(
+                [{"type": "execute", "stmt": {"sql": "ROLLBACK"}}],
+                baton=baton,
+            )
+        except PermissionError:
+            raise
+        except (TursoAmbiguousTransactionError, TursoClientError, httpx.HTTPError, Exception) as exc:
+            return (False, f"ROLLBACK transport/pipeline error: {exc}")
+
+        if not isinstance(rb_res, dict):
+            return (False, f"malformed ROLLBACK response: expected dict, got {type(rb_res).__name__}")
+
+        rb_results = rb_res.get("results")
+        if not isinstance(rb_results, list) or len(rb_results) != 1:
+            return (
+                False,
+                f"malformed ROLLBACK results list: expected 1 item, got {len(rb_results) if isinstance(rb_results, list) else type(rb_results)}",
+            )
+
+        first_res = rb_results[0]
+        if not isinstance(first_res, dict):
+            return (False, f"malformed ROLLBACK result element: expected dict, got {type(first_res).__name__}")
+
+        res_type = first_res.get("type")
+        if res_type != "ok":
+            err_obj = first_res.get("error") if isinstance(first_res.get("error"), dict) else {}
+            err_msg = err_obj.get("message", f"result type '{res_type}'")
+            return (False, f"ROLLBACK statement execution failed: {err_msg}")
+
+        return (True, None)
+
     def _execute_hrana_transaction(
         self,
         statements: list[tuple[str, list[Any]]],
@@ -535,10 +590,8 @@ class StagingJournalHranaSeam:
         # 2. Validate exact result cardinality
         expected_results_count = 1 + len(statements)
         if not isinstance(results, list) or len(results) != expected_results_count:
-            try:
-                self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
-            except Exception:
-                pass
+            if baton:
+                self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="batch results shape mismatch")
             self._latch_local_halt(
                 run_id,
                 f"Malformed or truncated Hrana results: expected {expected_results_count}, "
@@ -554,10 +607,8 @@ class StagingJournalHranaSeam:
         begin_res = results[0]
         if not isinstance(begin_res, dict) or begin_res.get("type") != "ok":
             err_msg = begin_res.get("error", {}).get("message", "BEGIN not ok") if isinstance(begin_res, dict) else "malformed begin result"
-            try:
-                self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
-            except Exception:
-                pass
+            if baton:
+                self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="BEGIN failed")
             self._latch_local_halt(run_id, f"Failed to start Hrana transaction: {err_msg}")
             raise TursoClientError(f"Failed to start Hrana transaction: {err_msg}")
 
@@ -568,10 +619,7 @@ class StagingJournalHranaSeam:
                 err_dict = s_res.get("error", {}) if isinstance(s_res, dict) and isinstance(s_res.get("error"), dict) else {}
                 err_msg = err_dict.get("message", f"Statement {idx} result type '{s_res.get('type') if isinstance(s_res, dict) else type(s_res)}'")
                 if baton:
-                    try:
-                        self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
-                    except Exception:
-                        pass
+                    self._dispatch_verified_rollback(baton=baton, run_id=run_id, context=f"statement {idx} failed")
                 self._latch_local_halt(run_id, f"Statement {idx} failed in Hrana transaction: {err_msg}")
                 raise TursoClientError(f"Statement {idx} failed in Hrana transaction: {err_msg}")
 
@@ -581,11 +629,22 @@ class StagingJournalHranaSeam:
             req_affected = required_affected_counts[idx]
 
             if req_affected is not None and (actual_affected is None or actual_affected != req_affected):
-                if baton:
-                    try:
-                        self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
-                    except Exception:
-                        pass
+                rb_ok, rb_err = self._dispatch_verified_rollback(
+                    baton=baton,
+                    run_id=run_id,
+                    context=f"statement {idx} rowcount mismatch",
+                )
+                if not rb_ok:
+                    self._latch_local_halt(
+                        run_id,
+                        f"Hrana statement {idx} affected {actual_affected} rows (expected {req_affected}), "
+                        f"and ROLLBACK could not be confirmed ({rb_err}). Local outcome UNKNOWN / HALTED.",
+                    )
+                    raise AmbiguousRollbackError(
+                        f"Hrana statement {idx} affected {actual_affected} rows (expected {req_affected}), "
+                        f"and ROLLBACK could not be confirmed ({rb_err}). "
+                        "Transaction outcome UNKNOWN; run locally HALTED."
+                    )
                 raise FencingConflictError(
                     f"Hrana statement {idx} affected {actual_affected} rows (expected {req_affected}). "
                     "Transaction rolled back fail-closed."
@@ -1155,10 +1214,7 @@ class StagingJournalHranaSeam:
 
         expected_results1_count = 2 + len(sorted_entities)
         if not isinstance(results1, list) or len(results1) != expected_results1_count:
-            try:
-                self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
-            except Exception:
-                pass
+            self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 1 truncated cleanup response")
             self._latch_local_halt(
                 run_id,
                 f"Truncated Phase 1 cleanup response: expected {expected_results1_count}, "
@@ -1171,41 +1227,58 @@ class StagingJournalHranaSeam:
 
         # Check BEGIN
         if not isinstance(results1[0], dict) or results1[0].get("type") != "ok":
-            try:
-                self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
-            except Exception:
-                pass
+            self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 1 BEGIN failed")
             self._latch_local_halt(run_id, "Failed to begin cleanup transaction")
             raise TursoClientError("Failed to begin cleanup transaction.")
 
         # Check CAS
         cas_res = results1[1]
         if not isinstance(cas_res, dict) or cas_res.get("type") != "ok":
-            try:
-                self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
-            except Exception:
-                pass
-            raise FencingConflictError(f"Cleanup CAS failed: {cas_res.get('error') if isinstance(cas_res, dict) else 'malformed CAS result'}")
+            cas_err = cas_res.get("error") if isinstance(cas_res, dict) else "malformed CAS result"
+            rb_ok, rb_err = self._dispatch_verified_rollback(
+                baton=baton,
+                run_id=run_id,
+                context="cleanup CAS statement error",
+            )
+            if not rb_ok:
+                self._latch_local_halt(
+                    run_id,
+                    f"Cleanup CAS failed ({cas_err}), and ROLLBACK could not be confirmed ({rb_err}). "
+                    "Local outcome UNKNOWN / HALTED.",
+                )
+                raise AmbiguousRollbackError(
+                    f"Cleanup CAS failed ({cas_err}), and ROLLBACK could not be confirmed ({rb_err}). "
+                    "Transaction outcome UNKNOWN; run locally HALTED."
+                )
+            raise FencingConflictError(f"Cleanup CAS failed: {cas_err}. Transaction rolled back fail-closed.")
 
         cas_resp_obj = cas_res.get("response") if isinstance(cas_res, dict) else None
         cas_res_dict = cas_resp_obj.get("result") if isinstance(cas_resp_obj, dict) else None
         affected_cas = cas_res_dict.get("affected_row_count", 0) if isinstance(cas_res_dict, dict) else 0
         if affected_cas != 1:
-            try:
-                self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
-            except Exception:
-                pass
+            rb_ok, rb_err = self._dispatch_verified_rollback(
+                baton=baton,
+                run_id=run_id,
+                context="cleanup CAS fencing check failed",
+            )
+            if not rb_ok:
+                self._latch_local_halt(
+                    run_id,
+                    f"Cleanup CAS affected {affected_cas} rows (expected 1), and ROLLBACK could not be confirmed ({rb_err}). "
+                    "Local outcome UNKNOWN / HALTED.",
+                )
+                raise AmbiguousRollbackError(
+                    f"Cleanup CAS affected {affected_cas} rows (expected 1), and ROLLBACK could not be confirmed ({rb_err}). "
+                    "Transaction outcome UNKNOWN; run locally HALTED."
+                )
             raise FencingConflictError(
-                f"Cleanup CAS affected {affected_cas} rows (expected 1). Fencing check failed; transaction rolled back."
+                f"Cleanup CAS affected {affected_cas} rows (expected 1). Fencing check failed; transaction rolled back fail-closed."
             )
 
         # Check all DELETE statement outcomes
         for del_idx, del_res in enumerate(results1[2:]):
             if not isinstance(del_res, dict) or del_res.get("type") != "ok":
-                try:
-                    self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
-                except Exception:
-                    pass
+                self._dispatch_verified_rollback(baton=baton, run_id=run_id, context=f"DELETE statement {del_idx} failed")
                 err_dict = del_res.get("error", {}) if isinstance(del_res, dict) and isinstance(del_res.get("error"), dict) else {}
                 err_msg = err_dict.get("message", f"DELETE statement {del_idx} failed")
                 self._latch_local_halt(run_id, f"Cleanup DELETE statement {del_idx} failed: {err_msg}")
@@ -1228,18 +1301,12 @@ class StagingJournalHranaSeam:
         except PermissionError:
             raise
         except (TursoAmbiguousTransactionError, TursoClientError, httpx.HTTPError, Exception) as exc:
-            try:
-                self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
-            except Exception:
-                pass
+            self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 2 audit dispatch failed")
             self._latch_local_halt(run_id, f"Phase 2 audit pipeline dispatch failed in cleanup: {exc}")
             raise CleanupVerificationError(f"Phase 2 audit pipeline dispatch failed in cleanup: {exc}. Run locally HALTED.") from exc
 
         if not isinstance(res2, dict):
-            try:
-                self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
-            except Exception:
-                pass
+            self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 2 malformed response")
             self._latch_local_halt(run_id, f"Malformed Phase 2 audit response: expected dict, got {type(res2).__name__}")
             raise CleanupVerificationError(f"Malformed Phase 2 audit response: expected dict, got {type(res2).__name__}. Run locally HALTED.")
 
@@ -1248,10 +1315,7 @@ class StagingJournalHranaSeam:
 
         expected_audit_count = len(sorted_entities)
         if not isinstance(results2, list) or len(results2) != expected_audit_count:
-            try:
-                self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
-            except Exception:
-                pass
+            self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 2 truncated response")
             self._latch_local_halt(
                 run_id,
                 f"Truncated in-transaction cleanup audit response: expected {expected_audit_count}, "
@@ -1296,10 +1360,7 @@ class StagingJournalHranaSeam:
                 break
 
         if residual_detected:
-            try:
-                self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
-            except Exception:
-                pass
+            self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 2 residual detected")
             self._latch_local_halt(run_id, f"In-transaction cleanup audit failed: {residual_detected}")
             raise CleanupVerificationError(
                 f"In-transaction cleanup audit failed: {residual_detected}. "
@@ -1340,18 +1401,12 @@ class StagingJournalHranaSeam:
         except PermissionError:
             raise
         except (TursoAmbiguousTransactionError, TursoClientError, httpx.HTTPError, Exception) as exc:
-            try:
-                self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
-            except Exception:
-                pass
+            self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 3 dispatch failed")
             self._latch_local_halt(run_id, f"Phase 3 finalization pipeline dispatch failed in cleanup: {exc}")
             raise CleanupVerificationError(f"Phase 3 finalization pipeline dispatch failed in cleanup: {exc}. Run locally HALTED.") from exc
 
         if not isinstance(res3, dict):
-            try:
-                self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
-            except Exception:
-                pass
+            self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 3 malformed response")
             self._latch_local_halt(run_id, f"Malformed Phase 3 finalization response: expected dict, got {type(res3).__name__}")
             raise CleanupVerificationError(f"Malformed Phase 3 finalization response: expected dict, got {type(res3).__name__}. Run locally HALTED.")
 
@@ -1360,10 +1415,7 @@ class StagingJournalHranaSeam:
 
         expected_prep_count = len(req3)
         if not isinstance(results3, list) or len(results3) != expected_prep_count:
-            try:
-                self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
-            except Exception:
-                pass
+            self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 3 truncated prep response")
             self._latch_local_halt(
                 run_id,
                 f"Truncated Phase 3 cleanup preparation response: expected {expected_prep_count}, "
@@ -1377,10 +1429,7 @@ class StagingJournalHranaSeam:
         for p_idx, p_res in enumerate(results3):
             if not isinstance(p_res, dict) or p_res.get("type") != "ok":
                 err = p_res.get("error") if isinstance(p_res, dict) else "malformed result"
-                try:
-                    self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
-                except Exception:
-                    pass
+                self._dispatch_verified_rollback(baton=baton, run_id=run_id, context=f"Phase 3 statement {p_idx} failed")
                 self._latch_local_halt(run_id, f"Phase 3 statement {p_idx} failed: {err}")
                 raise CleanupVerificationError(f"Cleanup finalization statement {p_idx} failed: {err}. Transaction rolled back.")
 
@@ -1390,10 +1439,7 @@ class StagingJournalHranaSeam:
         last_res_dict = last_resp_obj.get("result") if isinstance(last_resp_obj, dict) else None
         affected_journal = last_res_dict.get("affected_row_count", 0) if isinstance(last_res_dict, dict) else None
         if affected_journal != 1:
-            try:
-                self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
-            except Exception:
-                pass
+            self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 3 journal UPDATE != 1")
             self._latch_local_halt(
                 run_id,
                 f"Journal UPDATE to CLEANED_UP affected {affected_journal} rows (expected 1)",

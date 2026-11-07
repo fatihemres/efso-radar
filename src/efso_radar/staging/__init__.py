@@ -102,6 +102,7 @@ if TYPE_CHECKING:
         build_live02_synthetic_mutations,
         CleanupVerificationError,
         OwnershipMismatchError,
+        AmbiguousRollbackError,
     )
 
 __all__ = [
@@ -181,6 +182,7 @@ __all__ = [
     "build_live02_synthetic_mutations",
     "CleanupVerificationError",
     "OwnershipMismatchError",
+    "AmbiguousRollbackError",
 ]
 
 _RUNNER_EXPORTS = frozenset({
@@ -273,6 +275,7 @@ _JOURNAL_HRANA_EXPORTS = frozenset({
     "build_live02_synthetic_mutations",
     "CleanupVerificationError",
     "OwnershipMismatchError",
+    "AmbiguousRollbackError",
 })
 
 
