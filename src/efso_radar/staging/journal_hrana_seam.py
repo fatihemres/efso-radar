@@ -250,6 +250,8 @@ class StagingJournalHranaSeam:
             raise ValueError(f"marker_dir '{marker_dir}' is not an existing directory.")
 
         self._client = client
+        self._pinned_transport = transport
+        self._pinned_inner_transport = inner
         self._transport = inner
         self._conn = conn
         self._owner_id = owner_id.strip()
@@ -415,8 +417,8 @@ class StagingJournalHranaSeam:
             reason=reason,
         )
 
-    def _post_pipeline(self, requests_payload: list[dict[str, Any]], baton: Optional[str] = None) -> dict[str, Any]:
-        """Internal helper to dispatch Hrana /v2/pipeline requests enforcing strict transport identity."""
+    def _validate_hermetic_transport_identity(self) -> None:
+        """Enforce strict identity of pinned hermetic transport before any client initialization or dispatch."""
         if getattr(self._client, "read_only", False):
             raise PermissionError("Hermetic security boundary violation: mutating pipeline on read_only client.")
 
@@ -424,17 +426,58 @@ class StagingJournalHranaSeam:
         if current_transport is None:
             raise PermissionError("Hermetic security boundary violation: client transport is None.")
 
-        # Ensure cached _client transport matches client.transport
+        # 1. Outer transport must be the exact pinned object
+        if current_transport is not self._pinned_transport:
+            raise PermissionError(
+                "Hermetic security boundary violation: client transport identity mismatch. "
+                "client.transport was modified or swapped after StagingJournalHranaSeam initialization."
+            )
+
+        # 2. Inner transport must be the exact pinned HermeticStagingTransport
+        inner = current_transport
+        if type(inner) is BudgetTrackingTransport:
+            inner = inner.inner
+        if type(inner).__name__ == "HranaOutboundSecurityBoundary":
+            inner = getattr(inner, "_inner", None)
+        if inner is not self._pinned_inner_transport or type(inner) is not HermeticStagingTransport:
+            raise PermissionError(
+                "Hermetic security boundary violation: inner transport identity mismatch. "
+                "Expected pinned HermeticStagingTransport."
+            )
+
+        # 3. Connection isolation
+        conn = getattr(inner, "conn", None)
+        if not isinstance(conn, sqlite3.Connection):
+            raise PermissionError(
+                "Hermetic security boundary violation: HermeticStagingTransport must be backed by sqlite3.Connection."
+            )
+        _assert_fixture_isolation(conn)
+
+        # 4. If internal client was already initialized, cached transport must match pinned transport
         cached_client = getattr(self._client, "_client", None)
         if cached_client is not None:
             cached_transport = getattr(cached_client, "_transport", None)
-            if cached_transport is not None and cached_transport is not current_transport:
+            if cached_transport is not None and cached_transport is not self._pinned_transport:
                 raise PermissionError("Hermetic security boundary violation: cached transport identity mismatch.")
 
+    def _get_guarded_http_client(self) -> httpx.Client:
+        """Verify transport identity before initializing or using the internal httpx client."""
+        self._validate_hermetic_transport_identity()
         http_client = self._client._get_client()
         actual_transport = getattr(http_client, "_transport", None)
-        if actual_transport is not None and actual_transport is not current_transport:
+        if actual_transport is not None and actual_transport is not self._pinned_transport:
             raise PermissionError("Hermetic security boundary violation: underlying HTTP client transport mismatch.")
+        return http_client
+
+    def _execute_guarded_client_query(self, sql: str, params: Optional[list[Any]] = None) -> Any:
+        """Execute a single query via client while enforcing transport identity guards beforehand."""
+        self._validate_hermetic_transport_identity()
+        _ = self._get_guarded_http_client()
+        return self._client.execute(sql, params)
+
+    def _post_pipeline(self, requests_payload: list[dict[str, Any]], baton: Optional[str] = None) -> dict[str, Any]:
+        """Internal helper to dispatch Hrana /v2/pipeline requests enforcing strict transport identity."""
+        http_client = self._get_guarded_http_client()
 
         body: dict[str, Any] = {"requests": requests_payload}
         if baton is not None:
@@ -463,30 +506,54 @@ class StagingJournalHranaSeam:
 
         pipeline_res = self._post_pipeline(requests)
         baton = pipeline_res.get("baton")
-        results = pipeline_res.get("results", [])
+        results = pipeline_res.get("results")
 
-        if not results:
-            if baton:
+        # 1. Validate session baton
+        if not baton or not isinstance(baton, str) or not baton.strip():
+            self._latch_local_halt(run_id, "Hrana transaction response missing valid session baton")
+            raise TursoClientError("Hrana transaction response missing valid session baton.")
+
+        # 2. Validate exact result cardinality
+        expected_results_count = 1 + len(statements)
+        if not isinstance(results, list) or len(results) != expected_results_count:
+            try:
                 self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
-            raise TursoClientError("Empty results from Hrana pipeline transaction.")
+            except Exception:
+                pass
+            self._latch_local_halt(
+                run_id,
+                f"Malformed or truncated Hrana results: expected {expected_results_count}, "
+                f"got {len(results) if isinstance(results, list) else type(results)}",
+            )
+            raise TursoClientError(
+                f"Malformed or truncated Hrana transaction results: expected {expected_results_count}, "
+                f"got {len(results) if isinstance(results, list) else type(results)}. "
+                "Transaction rolled back; run locally HALTED."
+            )
 
-        # Check BEGIN
+        # 3. Check BEGIN outcome
         begin_res = results[0]
-        if begin_res.get("type") == "error":
-            err_msg = begin_res.get("error", {}).get("message", "BEGIN failed")
+        if not isinstance(begin_res, dict) or begin_res.get("type") != "ok":
+            err_msg = begin_res.get("error", {}).get("message", "BEGIN not ok") if isinstance(begin_res, dict) else "malformed begin result"
+            try:
+                self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
+            except Exception:
+                pass
+            self._latch_local_halt(run_id, f"Failed to start Hrana transaction: {err_msg}")
             raise TursoClientError(f"Failed to start Hrana transaction: {err_msg}")
 
+        # 4. Check each statement outcome and row count
         stmt_results = results[1:]
-        # Verify statement outcomes and affected rows
         for idx, s_res in enumerate(stmt_results):
-            if s_res.get("type") == "error":
-                err_dict = s_res.get("error", {})
-                err_msg = err_dict.get("message", "statement error")
+            if not isinstance(s_res, dict) or s_res.get("type") != "ok":
+                err_dict = s_res.get("error", {}) if isinstance(s_res, dict) else {}
+                err_msg = err_dict.get("message", f"Statement {idx} result type '{s_res.get('type') if isinstance(s_res, dict) else type(s_res)}'")
                 if baton:
                     try:
                         self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
                     except Exception:
                         pass
+                self._latch_local_halt(run_id, f"Statement {idx} failed in Hrana transaction: {err_msg}")
                 raise TursoClientError(f"Statement {idx} failed in Hrana transaction: {err_msg}")
 
             exec_res = s_res.get("response", {}).get("result", {})
@@ -504,23 +571,25 @@ class StagingJournalHranaSeam:
                     "Transaction rolled back fail-closed."
                 )
 
-        # Commit transaction
+        # 5. Commit transaction
         try:
             commit_res = self._post_pipeline(
                 [{"type": "execute", "stmt": {"sql": "COMMIT"}}],
                 baton=baton,
             )
-        except (TursoAmbiguousTransactionError, httpx.TimeoutException, httpx.ConnectError) as exc:
+        except (TursoAmbiguousTransactionError, TursoClientError, httpx.TimeoutException, httpx.ConnectError) as exc:
             self._latch_local_halt(run_id, f"Ambiguous COMMIT on Hrana transaction: {exc}")
             raise AmbiguousCommitError(
                 f"Ambiguous COMMIT on Hrana transaction for run '{run_id}': {exc}. "
                 "Local status latched to LOCAL_OUTCOME_UNKNOWN / HALT."
             ) from exc
 
-        c_results = commit_res.get("results", [])
-        if not c_results or c_results[0].get("type") == "error":
-            err_msg = c_results[0].get("error", {}).get("message", "COMMIT error") if c_results else "No COMMIT result"
-            raise TursoClientError(f"Hrana COMMIT failed: {err_msg}")
+        # 6. Validate COMMIT acknowledgment
+        c_results = commit_res.get("results")
+        if not isinstance(c_results, list) or len(c_results) != 1 or c_results[0].get("type") != "ok":
+            err_msg = c_results[0].get("error", {}).get("message", "COMMIT not ok") if (isinstance(c_results, list) and c_results and isinstance(c_results[0], dict)) else f"Malformed COMMIT acknowledgment: {commit_res}"
+            self._latch_local_halt(run_id, f"Hrana COMMIT outcome uncertain: {err_msg}")
+            raise AmbiguousCommitError(f"Hrana COMMIT failed or unverified: {err_msg}. Local status latched to LOCAL_OUTCOME_UNKNOWN / HALT.")
 
         return stmt_results
 
@@ -667,7 +736,7 @@ class StagingJournalHranaSeam:
                     required_affected_counts=required_counts,
                     run_id=run_id,
                 )
-            except (FencingConflictError, TursoClientError):
+            except FencingConflictError:
                 self._diagnose_registration_failure(run_id)
             try:
                 self._latch_local_halt(run_id, "Ambiguous intent COMMIT (COMMITTED_BUT_ACK_LOST)")
@@ -702,7 +771,7 @@ class StagingJournalHranaSeam:
                 required_affected_counts=required_counts,
                 run_id=run_id,
             )
-        except (FencingConflictError, TursoClientError):
+        except FencingConflictError:
             self._diagnose_registration_failure(run_id)
 
         return StagingJournalEntry(
@@ -1032,28 +1101,69 @@ class StagingJournalHranaSeam:
 
         res1 = self._post_pipeline(req1)
         baton = res1.get("baton")
-        results1 = res1.get("results", [])
+        results1 = res1.get("results")
 
-        if not results1 or results1[0].get("type") == "error":
-            if baton:
+        if not baton or not isinstance(baton, str) or not baton.strip():
+            self._latch_local_halt(run_id, "Missing session baton in cleanup Phase 1")
+            raise TursoClientError("Missing session baton in cleanup Phase 1.")
+
+        expected_results1_count = 2 + len(sorted_entities)
+        if not isinstance(results1, list) or len(results1) != expected_results1_count:
+            try:
                 self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
+            except Exception:
+                pass
+            self._latch_local_halt(
+                run_id,
+                f"Truncated Phase 1 cleanup response: expected {expected_results1_count}, "
+                f"got {len(results1) if isinstance(results1, list) else type(results1)}",
+            )
+            raise CleanupVerificationError(
+                f"Truncated Phase 1 cleanup response: expected {expected_results1_count}, "
+                f"got {len(results1) if isinstance(results1, list) else type(results1)}. Transaction rolled back."
+            )
+
+        # Check BEGIN
+        if not isinstance(results1[0], dict) or results1[0].get("type") != "ok":
+            try:
+                self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
+            except Exception:
+                pass
+            self._latch_local_halt(run_id, "Failed to begin cleanup transaction")
             raise TursoClientError("Failed to begin cleanup transaction.")
 
+        # Check CAS
         cas_res = results1[1]
-        if cas_res.get("type") == "error":
-            if baton:
+        if not isinstance(cas_res, dict) or cas_res.get("type") != "ok":
+            try:
                 self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
-            raise FencingConflictError(f"Cleanup CAS failed: {cas_res.get('error')}")
+            except Exception:
+                pass
+            raise FencingConflictError(f"Cleanup CAS failed: {cas_res.get('error') if isinstance(cas_res, dict) else 'malformed CAS result'}")
 
         affected_cas = cas_res.get("response", {}).get("result", {}).get("affected_row_count", 0)
         if affected_cas != 1:
-            if baton:
+            try:
                 self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
+            except Exception:
+                pass
             raise FencingConflictError(
                 f"Cleanup CAS affected {affected_cas} rows (expected 1). Fencing check failed; transaction rolled back."
             )
 
-        # Step 2: In-transaction audit of all registered PKs inside the active baton
+        # Check all DELETE statement outcomes
+        for del_idx, del_res in enumerate(results1[2:]):
+            if not isinstance(del_res, dict) or del_res.get("type") != "ok":
+                try:
+                    self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
+                except Exception:
+                    pass
+                err_dict = del_res.get("error", {}) if isinstance(del_res, dict) else {}
+                err_msg = err_dict.get("message", f"DELETE statement {del_idx} failed")
+                self._latch_local_halt(run_id, f"Cleanup DELETE statement {del_idx} failed: {err_msg}")
+                raise CleanupVerificationError(f"Cleanup DELETE statement {del_idx} failed: {err_msg}. Transaction rolled back.")
+
+        # Phase 2: In-transaction audit of all registered PKs inside the active baton
         req2: list[dict[str, Any]] = []
         for ent in sorted_entities:
             tbl = ent["table"]
@@ -1067,14 +1177,34 @@ class StagingJournalHranaSeam:
 
         res2 = self._post_pipeline(req2, baton=baton)
         baton = res2.get("baton", baton)
-        results2 = res2.get("results", [])
+        results2 = res2.get("results")
+
+        expected_audit_count = len(sorted_entities)
+        if not isinstance(results2, list) or len(results2) != expected_audit_count:
+            try:
+                self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
+            except Exception:
+                pass
+            self._latch_local_halt(
+                run_id,
+                f"Truncated in-transaction cleanup audit response: expected {expected_audit_count}, "
+                f"got {len(results2) if isinstance(results2, list) else type(results2)}",
+            )
+            raise CleanupVerificationError(
+                f"Truncated in-transaction cleanup audit response: expected {expected_audit_count}, "
+                f"got {len(results2) if isinstance(results2, list) else type(results2)}. Transaction rolled back."
+            )
 
         residual_detected: Optional[str] = None
         for idx, audit_res in enumerate(results2):
-            if audit_res.get("type") == "error":
-                residual_detected = f"Audit query failed for entity index {idx}: {audit_res.get('error')}"
+            if not isinstance(audit_res, dict) or audit_res.get("type") != "ok":
+                err = audit_res.get("error") if isinstance(audit_res, dict) else "malformed result"
+                residual_detected = f"Audit query failed for entity index {idx}: {err}"
                 break
             rows = audit_res.get("response", {}).get("result", {}).get("rows", [])
+            if not isinstance(rows, list):
+                residual_detected = f"Malformed rows structure for entity index {idx}"
+                break
             if len(rows) > 0:
                 ent = sorted_entities[idx]
                 residual_detected = (
@@ -1094,13 +1224,14 @@ class StagingJournalHranaSeam:
                 "Transaction rolled back; run remains unresolved and is locally HALTED."
             )
 
-        # Step 3: Release lease in run_locks + update status to CLEANED_UP + COMMIT
+        # Phase 3: Release lease in run_locks + update status to CLEANED_UP (WITHOUT COMMIT)
         req3: list[dict[str, Any]] = []
 
         cur_tbl = self._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='run_locks'"
         )
-        if cur_tbl.fetchone():
+        has_run_locks = bool(cur_tbl.fetchone())
+        if has_run_locks:
             req3.append({
                 "type": "execute",
                 "stmt": {
@@ -1121,26 +1252,78 @@ class StagingJournalHranaSeam:
                 ],
             },
         })
-        req3.append({"type": "execute", "stmt": {"sql": "COMMIT"}})
 
+        res3 = self._post_pipeline(req3, baton=baton)
+        baton = res3.get("baton", baton)
+        results3 = res3.get("results")
+
+        expected_prep_count = len(req3)
+        if not isinstance(results3, list) or len(results3) != expected_prep_count:
+            try:
+                self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
+            except Exception:
+                pass
+            self._latch_local_halt(
+                run_id,
+                f"Truncated Phase 3 cleanup preparation response: expected {expected_prep_count}, "
+                f"got {len(results3) if isinstance(results3, list) else type(results3)}",
+            )
+            raise CleanupVerificationError(
+                f"Truncated Phase 3 cleanup preparation response: expected {expected_prep_count}, "
+                f"got {len(results3) if isinstance(results3, list) else type(results3)}. Transaction rolled back."
+            )
+
+        for p_idx, p_res in enumerate(results3):
+            if not isinstance(p_res, dict) or p_res.get("type") != "ok":
+                err = p_res.get("error") if isinstance(p_res, dict) else "malformed result"
+                try:
+                    self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
+                except Exception:
+                    pass
+                self._latch_local_halt(run_id, f"Phase 3 statement {p_idx} failed: {err}")
+                raise CleanupVerificationError(f"Cleanup finalization statement {p_idx} failed: {err}. Transaction rolled back.")
+
+        # Crucial check: verify journal UPDATE affected exactly 1 row
+        journal_update_res = results3[-1].get("response", {}).get("result", {})
+        affected_journal = journal_update_res.get("affected_row_count", 0)
+        if affected_journal != 1:
+            try:
+                self._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
+            except Exception:
+                pass
+            self._latch_local_halt(
+                run_id,
+                f"Journal UPDATE to CLEANED_UP affected {affected_journal} rows (expected 1)",
+            )
+            raise CleanupVerificationError(
+                f"Failed to update journal status to CLEANED_UP: affected {affected_journal} rows (expected 1). "
+                "Transaction rolled back; run locally HALTED."
+            )
+
+        # Phase 4: Explicit COMMIT only after Phase 3 verification succeeded
         try:
-            res3 = self._post_pipeline(req3, baton=baton)
-        except (TursoAmbiguousTransactionError, httpx.TimeoutException, httpx.ConnectError) as exc:
+            commit_res = self._post_pipeline(
+                [{"type": "execute", "stmt": {"sql": "COMMIT"}}],
+                baton=baton,
+            )
+        except (TursoAmbiguousTransactionError, TursoClientError, httpx.TimeoutException, httpx.ConnectError) as exc:
             self._latch_local_halt(run_id, f"Ambiguous COMMIT on cleanup transaction: {exc}")
             raise AmbiguousCommitError(
                 f"Ambiguous COMMIT on cleanup transaction for run '{run_id}': {exc}. "
                 "Local status latched to LOCAL_OUTCOME_UNKNOWN / HALT."
             ) from exc
 
-        results3 = res3.get("results", [])
-        commit_res = results3[-1] if results3 else {}
-        if commit_res.get("type") == "error":
-            raise TursoClientError(f"Cleanup COMMIT failed: {commit_res.get('error')}")
+        c_results = commit_res.get("results")
+        if not isinstance(c_results, list) or len(c_results) != 1 or c_results[0].get("type") != "ok":
+            err_msg = c_results[0].get("error", {}).get("message", "COMMIT not ok") if (isinstance(c_results, list) and c_results and isinstance(c_results[0], dict)) else f"Malformed COMMIT acknowledgment: {commit_res}"
+            self._latch_local_halt(run_id, f"Cleanup COMMIT outcome uncertain: {err_msg}")
+            raise AmbiguousCommitError(f"Cleanup COMMIT failed or unverified: {err_msg}. Local status latched to LOCAL_OUTCOME_UNKNOWN / HALT.")
 
         return new_fencing_token
 
     def audit_workload(self, run_id: str) -> AuditOutcomeState:
         """Perform an independent 3-state audit on the registered entity inventory."""
+        self._validate_hermetic_transport_identity()
         entry = self.inspect_run(run_id)
         if not entry:
             return AuditOutcomeState.UNKNOWN
@@ -1154,11 +1337,13 @@ class StagingJournalHranaSeam:
             pk_val = ent["pk_value"]
 
             try:
-                res = self._client.execute(
+                res = self._execute_guarded_client_query(
                     f"SELECT * FROM {tbl} WHERE {pk_col} = ?",
                     [pk_val],
                 )
                 rows = res.fetchall()
+            except PermissionError:
+                raise
             except Exception:
                 return AuditOutcomeState.UNKNOWN
 
@@ -1185,6 +1370,7 @@ class StagingJournalHranaSeam:
         manifest_bytes: Optional[bytes] = None,
     ) -> CrossRunnerReview:
         """Inspect provider DB via Hrana and generate a typed CrossRunnerReview."""
+        self._validate_hermetic_transport_identity()
         entry = self.inspect_run(run_id)
 
         j_entry: Optional[CrossRunnerJournalEntry] = None
@@ -1221,7 +1407,7 @@ class StagingJournalHranaSeam:
                 pk_col = ent["pk_column"]
                 pk_val = ent["pk_value"]
                 try:
-                    res = self._client.execute(
+                    res = self._execute_guarded_client_query(
                         f"SELECT * FROM {tbl} WHERE {pk_col} = ?",
                         [pk_val],
                     )
@@ -1243,6 +1429,8 @@ class StagingJournalHranaSeam:
                             rows=tuple(safe_rows),
                         )
                     )
+                except PermissionError:
+                    raise
                 except Exception:
                     observations.append(
                         EntityObservation(

@@ -607,7 +607,6 @@ class HermeticStagingTransport(httpx.BaseTransport):
         fail_on_commit_timeout: bool = False,
         fail_on_commit_network: bool = False,
         fail_on_commit_status: Optional[int] = None,
-        fail_before_commit_timeout: bool = False,
         fail_after_commit_timeout: bool = False,
         fail_after_commit_network: bool = False,
         fail_on_stmt_idx: Optional[int] = None,
@@ -618,7 +617,6 @@ class HermeticStagingTransport(httpx.BaseTransport):
         self.fail_on_commit_timeout = fail_on_commit_timeout
         self.fail_on_commit_network = fail_on_commit_network
         self.fail_on_commit_status = fail_on_commit_status
-        self.fail_before_commit_timeout = fail_before_commit_timeout
         self.fail_after_commit_timeout = fail_after_commit_timeout
         self.fail_after_commit_network = fail_after_commit_network
         self.fail_on_stmt_idx = fail_on_stmt_idx
@@ -655,16 +653,6 @@ class HermeticStagingTransport(httpx.BaseTransport):
             req.get("type") == "execute" and req.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT"
             for req in requests_list
         )
-        if self.fail_before_commit_timeout and not has_commit:
-            try:
-                self.conn.rollback()
-            except Exception:
-                pass
-            if in_baton in self.active_batons:
-                self.active_batons.remove(in_baton)
-            if in_baton in self.in_transaction:
-                self.in_transaction[in_baton] = False
-            raise httpx.TimeoutException("Simulated connection timeout before COMMIT (server rolled back)")
 
         if has_commit:
             if self.fail_on_commit_timeout or self.fail_on_commit_network or self.fail_on_commit_status is not None:

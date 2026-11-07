@@ -28,7 +28,10 @@ import unittest
 import httpx
 
 from efso_radar.repositories.schema import get_all_init_statements
-from efso_radar.repositories.turso_client import TursoHTTPClient
+from efso_radar.repositories.turso_client import (
+    TursoClientError,
+    TursoHTTPClient,
+)
 from efso_radar.staging.journal import (
     ActiveWorkloadCollisionError,
     AmbiguousCommitError,
@@ -955,10 +958,11 @@ class TestScenario8ConditionalCleanupAndAudits(_BaseTwoRunnerFixture):
         def failing_audit_hook(request: httpx.Request) -> Optional[httpx.Response]:
             try:
                 body = json.loads(request.content.decode("utf-8"))
-                for req in body.get("requests", []):
+                reqs = body.get("requests", [])
+                for req in reqs:
                     sql = req.get("stmt", {}).get("sql", "")
                     if "SELECT * FROM" in sql:
-                        # Return an error for the audit query
+                        # Return an error for each audit query to preserve cardinality
                         return httpx.Response(
                             200,
                             json={
@@ -966,7 +970,7 @@ class TestScenario8ConditionalCleanupAndAudits(_BaseTwoRunnerFixture):
                                 "results": [{
                                     "type": "error",
                                     "error": {"code": "SQLITE_IOERR", "message": "Simulated audit disk I/O failure"},
-                                }],
+                                } for _ in reqs],
                             },
                             request=request,
                         )
@@ -988,6 +992,222 @@ class TestScenario8ConditionalCleanupAndAudits(_BaseTwoRunnerFixture):
         # Status not CLEANED_UP
         entry = self.seam_a.inspect_run(RUN_ID_A)
         self.assertNotEqual(entry.status, JournalStatus.CLEANED_UP)
+
+    def test_cleanup_fails_closed_when_delete_statement_returns_error(self):
+        """If a DELETE statement in cleanup Phase 1 fails, cleanup fails closed, rolls back, and latches HALT."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        token2 = self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        def failing_delete_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+                reqs = body.get("requests", [])
+                has_delete = any("DELETE FROM" in r.get("stmt", {}).get("sql", "").upper() for r in reqs)
+                if has_delete:
+                    results = [
+                        {"type": "ok", "response": {"result": {"affected_row_count": 0, "rows": []}}},  # BEGIN
+                        {"type": "ok", "response": {"result": {"affected_row_count": 1, "rows": []}}},  # CAS
+                    ]
+                    for _ in reqs[2:]:
+                        results.append({
+                            "type": "error",
+                            "error": {"code": "SQLITE_LOCKED", "message": "Simulated table lock timeout"},
+                        })
+                    return httpx.Response(
+                        200,
+                        json={"baton": body.get("baton", "b_phase1_del_fail"), "results": results},
+                        request=request,
+                    )
+            except Exception:
+                pass
+            return None
+
+        self.transport_a.custom_response_hook = failing_delete_hook
+
+        with self.assertRaises(CleanupVerificationError) as ctx:
+            self.seam_a.execute_conditional_cleanup(
+                run_id=RUN_ID_A,
+                expected_fencing_token=token2,
+                manifest_seal_hex=self.seal_a,
+            )
+        self.assertIn("Simulated table lock timeout", str(ctx.exception))
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+
+        # Check DB: journal status is NOT CLEANED_UP
+        entry = self.seam_a.inspect_run(RUN_ID_A)
+        self.assertNotEqual(entry.status, JournalStatus.CLEANED_UP)
+
+    def test_cleanup_fails_closed_on_truncated_audit_response(self):
+        """If in-transaction audit (Phase 2) returns truncated results, cleanup rolls back and latches HALT."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        token2 = self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        def truncated_audit_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+                reqs = body.get("requests", [])
+                is_audit = (
+                    len(reqs) > 1
+                    and all("SELECT *" in r.get("stmt", {}).get("sql", "").upper() for r in reqs)
+                )
+                if is_audit:
+                    return httpx.Response(
+                        200,
+                        json={
+                            "baton": body.get("baton", "b_audit_trunc"),
+                            "results": [
+                                {"type": "ok", "response": {"result": {"rows": []}}}
+                            ],
+                        },
+                        request=request,
+                    )
+            except Exception:
+                pass
+            return None
+
+        self.transport_a.custom_response_hook = truncated_audit_hook
+
+        with self.assertRaises(CleanupVerificationError) as ctx:
+            self.seam_a.execute_conditional_cleanup(
+                run_id=RUN_ID_A,
+                expected_fencing_token=token2,
+                manifest_seal_hex=self.seal_a,
+            )
+        self.assertIn("Truncated in-transaction cleanup audit response", str(ctx.exception))
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+
+        entry = self.seam_a.inspect_run(RUN_ID_A)
+        self.assertNotEqual(entry.status, JournalStatus.CLEANED_UP)
+
+    def test_cleanup_fails_closed_when_final_journal_update_fails(self):
+        """If final journal update in Phase 3 affects 0 rows or fails, COMMIT is never issued and run is HALTED."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        token2 = self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        commit_issued = []
+
+        def failing_phase3_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+                reqs = body.get("requests", [])
+                has_commit = any(
+                    r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT"
+                    for r in reqs
+                )
+                if has_commit:
+                    commit_issued.append(True)
+                has_cleaned_up_update = any(
+                    "UPDATE STAGING_RUN_JOURNAL SET STATUS" in r.get("stmt", {}).get("sql", "").upper()
+                    for r in reqs
+                )
+                if has_cleaned_up_update:
+                    results = []
+                    for _ in reqs:
+                        results.append({
+                            "type": "ok",
+                            "response": {"result": {"affected_row_count": 0, "rows": []}},
+                        })
+                    return httpx.Response(
+                        200,
+                        json={"baton": body.get("baton", "b_p3_fail"), "results": results},
+                        request=request,
+                    )
+            except Exception:
+                pass
+            return None
+
+        self.transport_a.custom_response_hook = failing_phase3_hook
+
+        with self.assertRaises(CleanupVerificationError) as ctx:
+            self.seam_a.execute_conditional_cleanup(
+                run_id=RUN_ID_A,
+                expected_fencing_token=token2,
+                manifest_seal_hex=self.seal_a,
+            )
+        self.assertIn("affected 0 rows (expected 1)", str(ctx.exception))
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+        self.assertEqual(len(commit_issued), 0, "COMMIT must never be dispatched if Phase 3 validation fails")
+
+        entry = self.seam_a.inspect_run(RUN_ID_A)
+        self.assertNotEqual(entry.status, JournalStatus.CLEANED_UP)
+
+    def test_cleanup_missing_commit_acknowledgment_latches_halt(self):
+        """If COMMIT acknowledgment in Phase 4 is malformed or error, AmbiguousCommitError is raised and run latches HALT."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        token2 = self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        def malformed_commit_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+                reqs = body.get("requests", [])
+                has_commit = any(
+                    r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT"
+                    for r in reqs
+                )
+                if has_commit:
+                    return httpx.Response(
+                        200,
+                        json={"baton": body.get("baton", "b_c"), "results": []},
+                        request=request,
+                    )
+            except Exception:
+                pass
+            return None
+
+        self.transport_a.custom_response_hook = malformed_commit_hook
+
+        with self.assertRaises(AmbiguousCommitError) as ctx:
+            self.seam_a.execute_conditional_cleanup(
+                run_id=RUN_ID_A,
+                expected_fencing_token=token2,
+                manifest_seal_hex=self.seal_a,
+            )
+        self.assertIn("Cleanup COMMIT failed or unverified", str(ctx.exception))
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
 
 
 # =============================================================================
@@ -1059,6 +1279,52 @@ class TestHermeticHTTPBoundarySecurity(_BaseTwoRunnerFixture):
             )
         self.assertIn("cached transport identity mismatch", str(ctx.exception))
 
+    def test_transport_swap_before_first_dispatch_rejected_without_network(self):
+        """Swapping client.transport on an uninitialized client is rejected before any dispatch without network."""
+        client = TursoHTTPClient(
+            database_url=EXACT_STAGING_DESTINATION,
+            auth_token="hermetic-token",
+            transport=self.transport_a,
+        )
+        self.assertIsNone(client._client, "Client must be fresh and uninitialized")
+
+        seam = StagingJournalHranaSeam(
+            client=client,
+            owner_id="test_worker",
+            marker_dir=self.marker_dir_a,
+        )
+
+        intercepted_requests = []
+
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            intercepted_requests.append(request)
+            return httpx.Response(200, json={})
+
+        swapped_transport = httpx.MockTransport(mock_handler)
+        client.transport = swapped_transport
+
+        # Mutating path: register_intent
+        with self.assertRaises(PermissionError) as ctx:
+            seam.register_intent(
+                run_id=RUN_ID_A,
+                manifest_seal_hex=self.seal_a,
+                target_inventory=self.entities_a,
+            )
+        self.assertIn("client transport identity mismatch", str(ctx.exception))
+
+        # Read path 1: audit_workload
+        with self.assertRaises(PermissionError) as ctx:
+            seam.audit_workload(RUN_ID_A)
+        self.assertIn("client transport identity mismatch", str(ctx.exception))
+
+        # Read path 2: review_recovery_evidence
+        with self.assertRaises(PermissionError) as ctx:
+            seam.review_recovery_evidence(run_id=RUN_ID_A)
+        self.assertIn("client transport identity mismatch", str(ctx.exception))
+
+        # Verify zero requests reached the swapped transport
+        self.assertEqual(len(intercepted_requests), 0, "No network/HTTP requests may be issued after transport mismatch")
+
 
 class TestMockHranaTransactionLifecycle(_BaseTwoRunnerFixture):
     """Cover mock Hrana transaction lifecycle semantics and failure injections."""
@@ -1072,8 +1338,8 @@ class TestMockHranaTransactionLifecycle(_BaseTwoRunnerFixture):
         )
         mutations = build_live02_synthetic_mutations(RUN_ID_A)
 
-        # Inject pre-commit timeout into Runner A's transport
-        self.transport_a.fail_before_commit_timeout = True
+        # Inject timeout right before COMMIT persistence on server
+        self.transport_a.fail_on_commit_timeout = True
 
         with self.assertRaises((AmbiguousCommitError, JournalError, httpx.TimeoutException)):
             self.seam_a.execute_atomic_stage_mutation(
@@ -1085,7 +1351,7 @@ class TestMockHranaTransactionLifecycle(_BaseTwoRunnerFixture):
             )
 
         # Disable timeout injection and issue an unrelated read query on Runner A
-        self.transport_a.fail_before_commit_timeout = False
+        self.transport_a.fail_on_commit_timeout = False
         entry = self.seam_a.inspect_run(RUN_ID_A)
         self.assertIsNotNone(entry)
         self.assertEqual(entry.status, JournalStatus.ACKED)
@@ -1120,6 +1386,161 @@ class TestMockHranaTransactionLifecycle(_BaseTwoRunnerFixture):
         baton = res.get("baton")
         if baton:
             self.seam_a._post_pipeline([{"type": "execute", "stmt": {"sql": "ROLLBACK"}}], baton=baton)
+
+    def test_missing_session_baton_in_transaction_latches_halt(self):
+        """Hrana transaction response without a session baton fails closed and latches HALT."""
+        def no_baton_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+                reqs = body.get("requests", [])
+                has_begin = any(
+                    r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN"
+                    for r in reqs
+                )
+                if has_begin:
+                    return httpx.Response(
+                        200,
+                        json={"results": [{"type": "ok"}] * len(reqs)},
+                        request=request,
+                    )
+            except Exception:
+                pass
+            return None
+
+        self.transport_a.custom_response_hook = no_baton_hook
+
+        with self.assertRaises(TursoClientError) as ctx:
+            self.seam_a.register_intent(
+                run_id=RUN_ID_A,
+                manifest_seal_hex=self.seal_a,
+                target_inventory=self.entities_a,
+            )
+        self.assertIn("missing valid session baton", str(ctx.exception))
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+
+        cur = self.conn_b.cursor()
+        cur.execute("SELECT COUNT(*) FROM staging_run_journal WHERE run_id = ?", (RUN_ID_A,))
+        self.assertEqual(cur.fetchone()[0], 0)
+
+    def test_truncated_hrana_results_rolls_back_and_latches_halt(self):
+        """Hrana transaction returning fewer results than statements rolls back and latches HALT."""
+        def truncated_results_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+                reqs = body.get("requests", [])
+                has_begin = any(
+                    r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN"
+                    for r in reqs
+                )
+                if has_begin:
+                    return httpx.Response(
+                        200,
+                        json={
+                            "baton": "b_trunc_test",
+                            "results": [{"type": "ok", "response": {"result": {"affected_row_count": 0, "rows": []}}}],
+                        },
+                        request=request,
+                    )
+            except Exception:
+                pass
+            return None
+
+        self.transport_a.custom_response_hook = truncated_results_hook
+
+        with self.assertRaises(TursoClientError) as ctx:
+            self.seam_a.register_intent(
+                run_id=RUN_ID_A,
+                manifest_seal_hex=self.seal_a,
+                target_inventory=self.entities_a,
+            )
+        self.assertIn("Malformed or truncated Hrana transaction results", str(ctx.exception))
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+
+        cur = self.conn_b.cursor()
+        cur.execute("SELECT COUNT(*) FROM staging_run_journal WHERE run_id = ?", (RUN_ID_A,))
+        self.assertEqual(cur.fetchone()[0], 0)
+
+    def test_statement_result_type_error_rolls_back_and_latches_halt(self):
+        """Statement returning non-ok type in Hrana transaction rolls back and latches HALT."""
+        def stmt_error_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+                reqs = body.get("requests", [])
+                has_begin = any(
+                    r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN"
+                    for r in reqs
+                )
+                if has_begin:
+                    results = [{"type": "ok", "response": {"result": {"affected_row_count": 0, "rows": []}}}]
+                    results.append({
+                        "type": "error",
+                        "error": {"code": "SQLITE_IOERR", "message": "Simulated disk corruption"},
+                    })
+                    for _ in reqs[2:]:
+                        results.append({"type": "ok", "response": {"result": {"affected_row_count": 0, "rows": []}}})
+                    return httpx.Response(
+                        200,
+                        json={"baton": "b_err_test", "results": results},
+                        request=request,
+                    )
+            except Exception:
+                pass
+            return None
+
+        self.transport_a.custom_response_hook = stmt_error_hook
+
+        with self.assertRaises(TursoClientError) as ctx:
+            self.seam_a.register_intent(
+                run_id=RUN_ID_A,
+                manifest_seal_hex=self.seal_a,
+                target_inventory=self.entities_a,
+            )
+        self.assertIn("Statement 0 failed in Hrana transaction: Simulated disk corruption", str(ctx.exception))
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+
+        cur = self.conn_b.cursor()
+        cur.execute("SELECT COUNT(*) FROM staging_run_journal WHERE run_id = ?", (RUN_ID_A,))
+        self.assertEqual(cur.fetchone()[0], 0)
+
+    def test_missing_or_malformed_commit_acknowledgment_latches_halt(self):
+        """Malformed or error COMMIT acknowledgment raises AmbiguousCommitError and latches HALT."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+
+        def malformed_commit_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+                reqs = body.get("requests", [])
+                has_commit = any(
+                    r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT"
+                    for r in reqs
+                )
+                if has_commit:
+                    return httpx.Response(
+                        200,
+                        json={"baton": "b_c", "results": [{"type": "error", "error": {"message": "Simulated commit write conflict"}}]},
+                        request=request,
+                    )
+            except Exception:
+                pass
+            return None
+
+        self.transport_a.custom_response_hook = malformed_commit_hook
+
+        with self.assertRaises(AmbiguousCommitError) as ctx:
+            self.seam_a.execute_atomic_stage_mutation(
+                run_id=RUN_ID_A,
+                expected_fencing_token=1,
+                stage="LIVE-02",
+                mutation_statements=mutations,
+                manifest_seal_hex=self.seal_a,
+            )
+        self.assertIn("Hrana COMMIT failed or unverified", str(ctx.exception))
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
 
 
 # =============================================================================
