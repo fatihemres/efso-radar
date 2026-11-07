@@ -1101,6 +1101,84 @@ class TestScenario8ConditionalCleanupAndAudits(_BaseTwoRunnerFixture):
         entry = self.seam_a.inspect_run(RUN_ID_A)
         self.assertNotEqual(entry.status, JournalStatus.CLEANED_UP)
 
+    def test_cleanup_fails_closed_when_audit_response_omits_rows_field(self):
+        """If Phase 2 audit response has correct count and type: 'ok' but omits 'rows', cleanup fails closed, rolls back, preserves foreign rows, and latches HALT."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        token2 = self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        # Insert a real foreign row in SQLite fixture
+        self.conn_b.execute(
+            "INSERT INTO processed_articles (article_id, canonical_url, title, source, published_at, processed_at) "
+            "VALUES (?, 'https://example.com/foreign', 'Foreign Article', 'FOREIGN_SRC', '2026-10-25T15:00:00Z', '2026-10-25T15:00:00Z')",
+            ("synth_art_foreign_01",),
+        )
+        self.conn_b.commit()
+
+        commit_dispatched = []
+
+        def missing_rows_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+                reqs = body.get("requests", [])
+                has_commit = any(
+                    r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT"
+                    for r in reqs
+                )
+                if has_commit:
+                    commit_dispatched.append(True)
+                is_audit = (
+                    len(reqs) > 1
+                    and all("SELECT *" in r.get("stmt", {}).get("sql", "").upper() for r in reqs)
+                )
+                if is_audit:
+                    # Return exact matching count of results with type: 'ok', but result dictionary OMITS 'rows' field
+                    return httpx.Response(
+                        200,
+                        json={
+                            "baton": body.get("baton", "b_audit_no_rows"),
+                            "results": [
+                                {"type": "ok", "response": {"result": {}}}
+                                for _ in reqs
+                            ],
+                        },
+                        request=request,
+                    )
+            except Exception:
+                pass
+            return None
+
+        self.transport_a.custom_response_hook = missing_rows_hook
+
+        with self.assertRaises(CleanupVerificationError) as ctx:
+            self.seam_a.execute_conditional_cleanup(
+                run_id=RUN_ID_A,
+                expected_fencing_token=token2,
+                manifest_seal_hex=self.seal_a,
+            )
+        self.assertIn("missing explicit 'rows' array", str(ctx.exception))
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+        self.assertEqual(len(commit_dispatched), 0, "Phase 4 COMMIT must NEVER be dispatched when audit evidence is malformed")
+
+        # Status not CLEANED_UP
+        entry = self.seam_a.inspect_run(RUN_ID_A)
+        self.assertNotEqual(entry.status, JournalStatus.CLEANED_UP)
+
+        # Foreign row strictly preserved in database fixture
+        cur = self.conn_b.cursor()
+        cur.execute("SELECT COUNT(*) FROM processed_articles WHERE article_id = ?", ("synth_art_foreign_01",))
+        self.assertEqual(cur.fetchone()[0], 1)
+
     def test_cleanup_fails_closed_when_final_journal_update_fails(self):
         """If final journal update in Phase 3 affects 0 rows or fails, COMMIT is never issued and run is HALTED."""
         self.seam_a.register_intent(
@@ -1541,6 +1619,212 @@ class TestMockHranaTransactionLifecycle(_BaseTwoRunnerFixture):
             )
         self.assertIn("Hrana COMMIT failed or unverified", str(ctx.exception))
         self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+
+    def test_initial_pipeline_timeout_latches_halt_and_prohibits_retry(self):
+        """Transport timeout during initial BEGIN+statements pipeline latches HALT and prohibits retry."""
+        def initial_timeout_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+            except Exception:
+                body = {}
+            reqs = body.get("requests", [])
+            has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+            has_commit = any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in reqs)
+            if has_begin and not has_commit:
+                raise httpx.TimeoutException("Simulated network timeout during BEGIN+statements pipeline")
+            return None
+
+        self.transport_a.custom_response_hook = initial_timeout_hook
+
+        with self.assertRaises(TursoClientError) as ctx:
+            self.seam_a.register_intent(
+                run_id=RUN_ID_A,
+                manifest_seal_hex=self.seal_a,
+                target_inventory=self.entities_a,
+            )
+        self.assertIn("Initial pipeline request failed in Hrana transaction", str(ctx.exception))
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+
+        # Disable hook and attempt retry on halted run: strictly rejected fail-closed
+        self.transport_a.custom_response_hook = None
+        with self.assertRaises(JournalHaltedError):
+            self.seam_a.register_intent(
+                run_id=RUN_ID_A,
+                manifest_seal_hex=self.seal_a,
+                target_inventory=self.entities_a,
+            )
+
+        cur = self.conn_b.cursor()
+        cur.execute("SELECT COUNT(*) FROM staging_run_journal WHERE run_id = ?", (RUN_ID_A,))
+        self.assertEqual(cur.fetchone()[0], 0)
+
+    def test_cleanup_audit_timeout_latches_halt_and_prohibits_cleanup(self):
+        """Transport timeout during cleanup in-transaction audit latches HALT and prohibits automated retry."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        token2 = self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        def audit_timeout_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+            except Exception:
+                body = {}
+            reqs = body.get("requests", [])
+            is_audit = (
+                len(reqs) > 1
+                and all("SELECT *" in r.get("stmt", {}).get("sql", "").upper() for r in reqs)
+            )
+            if is_audit:
+                raise httpx.TimeoutException("Simulated timeout during Phase 2 cleanup audit dispatch")
+            return None
+
+        self.transport_a.custom_response_hook = audit_timeout_hook
+
+        with self.assertRaises(CleanupVerificationError) as ctx:
+            self.seam_a.execute_conditional_cleanup(
+                run_id=RUN_ID_A,
+                expected_fencing_token=token2,
+                manifest_seal_hex=self.seal_a,
+            )
+        self.assertIn("Phase 2 audit pipeline dispatch failed in cleanup", str(ctx.exception))
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+
+        # Disable hook and attempt automated cleanup retry: strictly rejected fail-closed
+        self.transport_a.custom_response_hook = None
+        with self.assertRaises(JournalHaltedError):
+            self.seam_a.execute_conditional_cleanup(
+                run_id=RUN_ID_A,
+                expected_fencing_token=token2,
+                manifest_seal_hex=self.seal_a,
+            )
+
+    def test_commit_with_null_result_latches_halt(self):
+        """COMMIT response with results: [null] does not crash with AttributeError, latches HALT and raises AmbiguousCommitError."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+
+        def null_commit_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+            except Exception:
+                body = {}
+            reqs = body.get("requests", [])
+            has_commit = any(
+                r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT"
+                for r in reqs
+            )
+            if has_commit:
+                try:
+                    self.transport_a.conn.rollback()
+                except Exception:
+                    pass
+                return httpx.Response(
+                    200,
+                    json={"baton": "b_null_c", "results": [None]},
+                    request=request,
+                )
+            return None
+
+        self.transport_a.custom_response_hook = null_commit_hook
+
+        with self.assertRaises(AmbiguousCommitError) as ctx:
+            self.seam_a.execute_atomic_stage_mutation(
+                run_id=RUN_ID_A,
+                expected_fencing_token=1,
+                stage="LIVE-02",
+                mutation_statements=mutations,
+                manifest_seal_hex=self.seal_a,
+            )
+        self.assertIn("Hrana COMMIT failed or unverified", str(ctx.exception))
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+
+        # Direct DB check: status is NOT EFFECT_COMMITTED
+        entry = self.seam_a.inspect_run(RUN_ID_A)
+        self.assertNotEqual(entry.status, JournalStatus.EFFECT_COMMITTED)
+
+        # Prohibit automatic retry on halted run
+        self.transport_a.custom_response_hook = None
+        with self.assertRaises(JournalHaltedError):
+            self.seam_a.execute_atomic_stage_mutation(
+                run_id=RUN_ID_A,
+                expected_fencing_token=1,
+                stage="LIVE-02",
+                mutation_statements=mutations,
+                manifest_seal_hex=self.seal_a,
+            )
+
+    def test_commit_with_invalid_json_latches_halt(self):
+        """COMMIT returning non-JSON payload latches HALT and raises AmbiguousCommitError."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+
+        def invalid_json_commit_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+            except Exception:
+                body = {}
+            reqs = body.get("requests", [])
+            has_commit = any(
+                r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT"
+                for r in reqs
+            )
+            if has_commit:
+                try:
+                    self.transport_a.conn.rollback()
+                except Exception:
+                    pass
+                return httpx.Response(
+                    200,
+                    text="<html><body>502 Bad Gateway - Proxy Error</body></html>",
+                    headers={"content-type": "text/html"},
+                    request=request,
+                )
+            return None
+
+        self.transport_a.custom_response_hook = invalid_json_commit_hook
+
+        with self.assertRaises(AmbiguousCommitError) as ctx:
+            self.seam_a.execute_atomic_stage_mutation(
+                run_id=RUN_ID_A,
+                expected_fencing_token=1,
+                stage="LIVE-02",
+                mutation_statements=mutations,
+                manifest_seal_hex=self.seal_a,
+            )
+        self.assertIn("Ambiguous COMMIT on Hrana transaction", str(ctx.exception))
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+
+        entry = self.seam_a.inspect_run(RUN_ID_A)
+        self.assertNotEqual(entry.status, JournalStatus.EFFECT_COMMITTED)
+
+        # Prohibit automatic retry on halted run
+        self.transport_a.custom_response_hook = None
+        with self.assertRaises(JournalHaltedError):
+            self.seam_a.execute_atomic_stage_mutation(
+                run_id=RUN_ID_A,
+                expected_fencing_token=1,
+                stage="LIVE-02",
+                mutation_statements=mutations,
+                manifest_seal_hex=self.seal_a,
+            )
 
 
 # =============================================================================
