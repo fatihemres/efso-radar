@@ -2073,6 +2073,73 @@ class TestMockHranaTransactionLifecycle(_BaseTwoRunnerFixture):
         self.assertFalse(self.seam_a.is_halted(RUN_ID_A))
         self.transport_a.custom_response_hook = None
 
+    def test_registration_rowcount_mismatch_with_unconfirmed_rollback_raises_ambiguous_rollback_error_and_latches_halt(self):
+        """Unresolved run + registration rowcount mismatch + unacknowledged ROLLBACK propagates AmbiguousRollbackError and latches HALT."""
+        # 1. RUN_ID_A registered and remains unresolved (ACKED)
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+
+        # 2. Intercept registration ROLLBACK for Runner B on distinct RUN_ID_B
+        def rollback_timeout_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+            except Exception:
+                body = {}
+            reqs = body.get("requests", [])
+            has_rollback = any(
+                r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK"
+                for r in reqs
+            )
+            if has_rollback:
+                raise httpx.ReadTimeout("Simulated timeout during registration ROLLBACK")
+            return None
+
+        self.transport_b.custom_response_hook = rollback_timeout_hook
+
+        # 3. Runner B attempts to register RUN_ID_B:
+        # Atomic registration query finds unresolved RUN_ID_A, affecting 0 rows instead of 1.
+        # Dispatched ROLLBACK times out, so AmbiguousRollbackError must reach the caller
+        # (NOT masked by _diagnose_registration_failure into ActiveWorkloadCollisionError).
+        with self.assertRaises(AmbiguousRollbackError) as ctx:
+            self.seam_b.register_intent(
+                run_id=RUN_ID_B,
+                manifest_seal_hex=self.seal_b,
+                target_inventory=self.entities_b,
+            )
+        self.assertIn("ROLLBACK could not be confirmed", str(ctx.exception))
+        self.assertTrue(self.seam_b.is_halted(RUN_ID_B))
+
+        # 4. Same-run retry is denied fail-closed with JournalHaltedError
+        self.transport_b.custom_response_hook = None
+        with self.assertRaises(JournalHaltedError):
+            self.seam_b.register_intent(
+                run_id=RUN_ID_B,
+                manifest_seal_hex=self.seal_b,
+                target_inventory=self.entities_b,
+            )
+
+        # 5. Positive control: when backend transaction is clean and ROLLBACK is confirmed,
+        # ordinary ActiveWorkloadCollisionError is raised and HALT is not latched.
+        if self.conn_b.in_transaction:
+            self.conn_b.rollback()
+        self.transport_b.active_batons.clear()
+        self.transport_b.in_transaction.clear()
+
+        fresh_run_id = "run_20261107T120200Z_c3d4e5f6a1b2"
+        fresh_entities = create_default_manifest_entities(fresh_run_id)
+        fresh_seal = compute_canonical_inventory_fingerprint(fresh_run_id, fresh_entities)
+        with self.assertRaises(ActiveWorkloadCollisionError) as collision_ctx:
+            self.seam_b.register_intent(
+                run_id=fresh_run_id,
+                manifest_seal_hex=fresh_seal,
+                target_inventory=fresh_entities,
+            )
+        self.assertIn(f"unresolved staging run '{RUN_ID_A}' exists", str(collision_ctx.exception))
+        self.assertFalse(self.seam_b.is_halted(fresh_run_id))
+
 
 # =============================================================================
 # Architectural Boundaries & Non-Proof Contract

@@ -830,6 +830,8 @@ class StagingJournalHranaSeam:
                     required_affected_counts=required_counts,
                     run_id=run_id,
                 )
+            except AmbiguousRollbackError:
+                raise
             except FencingConflictError:
                 self._diagnose_registration_failure(run_id)
             try:
@@ -865,6 +867,8 @@ class StagingJournalHranaSeam:
                 required_affected_counts=required_counts,
                 run_id=run_id,
             )
+        except AmbiguousRollbackError:
+            raise
         except FencingConflictError:
             self._diagnose_registration_failure(run_id)
 
