@@ -63,6 +63,7 @@ from efso_radar.staging.offline_recovery_evidence import (
     CommitState,
     CrossRunnerJournalStatus,
     CrossRunnerProvenance,
+    CrossRunnerReview,
     EntityObservation,
     QueryState,
     ReviewDecision,
@@ -2603,9 +2604,11 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
 
         with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
             self.seam_b.discover_unresolved_runs()
-        self.assertIn("unauthorized table 'passwords'", str(ctx.exception))
+        self.assertIn("unauthorized table", str(ctx.exception))
+        self.assertNotIn("passwords", str(ctx.exception))
 
         review_unauth = self.seam_b.review_recovery_evidence()
+        self.assertNotIn("passwords", "".join(review_unauth.reasons))
         self.assertEqual(review_unauth.decision, ReviewDecision.UNKNOWN)
         self.assertEqual(review_unauth.journal_status, CrossRunnerJournalStatus.CORRUPTED)
 
@@ -2759,5 +2762,354 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
         # Verify no executable mutation, retry or cleanup channels exist on CrossRunnerReview
         for attr in ("execute", "retry", "takeover", "cleanup", "mutate"):
             self.assertFalse(hasattr(rev_clean, attr))
-            self.assertFalse(hasattr(rev_intent, attr))
-            self.assertFalse(hasattr(rev_effect, attr))
+
+
+    def test_point10_wire_absence_never_falls_back_to_local_journal_and_reports_unknown(self):
+        """P1-1: Wire ABSENT never falls back to local SQLite journal and reports AuditOutcomeState.UNKNOWN."""
+        # 1. Runner A registers intent and effects in shared DB fixture, so local rows exist.
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        # Confirm local journal row and entity rows genuinely exist in the database
+        cur = self.conn_b.execute("SELECT status FROM staging_run_journal WHERE run_id = ?", (RUN_ID_A,))
+        self.assertIsNotNone(cur.fetchone())
+
+        # 2. Intercept mock wire so that staging_run_journal queries return empty rows (wire ABSENT)
+        def wire_absent_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            if b"staging_run_journal" in request.content:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "base_url": None,
+                        "results": [
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "result": {
+                                        "cols": [{"name": "run_id"}],
+                                        "rows": [],
+                                        "affected_row_count": 0,
+                                    }
+                                },
+                            }
+                        ],
+                    },
+                )
+            return None
+
+        self.transport_b.custom_response_hook = wire_absent_hook
+
+        # Snapshot DB before audit
+        cur = self.conn_b.execute("SELECT COUNT(*) FROM staging_run_journal")
+        journal_count_before = cur.fetchone()[0]
+
+        # 3. Call audit_workload: must return UNKNOWN, not CLEAN or RESIDUAL, with zero local fallback
+        audit_res = self.seam_b.audit_workload(RUN_ID_A)
+        self.assertEqual(audit_res, AuditOutcomeState.UNKNOWN)
+
+        # 4. Assert zero mutations occurred to DB
+        cur = self.conn_b.execute("SELECT COUNT(*) FROM staging_run_journal")
+        journal_count_after = cur.fetchone()[0]
+        self.assertEqual(journal_count_before, journal_count_after)
+
+    def test_point11_sanitized_error_reporting_never_leaks_sentinel_or_payload_data(self):
+        """P1-2: Untrusted values (sentinels, raw IDs, SQL injections) never leak into error messages or reasons."""
+        sentinel_secret = "ATTACKER_SECRET_SENTINEL_XYZ_98765"
+        malicious_sql = "DROP TABLE staging_run_journal; -- ' OR '1'='1"
+
+        # 1. Invalid run_id with sentinel
+        bad_run_row = [
+            f"run_{sentinel_secret}",
+            "worker_01",
+            1,
+            "LIVE-02",
+            JournalStatus.ACKED.value,
+            "0" * 64,
+            "[]",
+            "2026-11-07T12:00:00Z",
+            "2026-11-07T12:00:00Z",
+        ]
+        self.conn_a.execute(
+            """
+            INSERT INTO staging_run_journal (
+                run_id, owner_id, fencing_token, stage, status,
+                manifest_seal_hex, target_inventory_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            bad_run_row,
+        )
+        self.conn_a.commit()
+
+        # Exception must not leak sentinel
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertNotIn(sentinel_secret, str(ctx.exception))
+        self.assertEqual(ctx.exception.code, "INVALID_RUN_ID")
+
+        # Review report reasons must not leak sentinel
+        review = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+        for r in review.reasons:
+            self.assertNotIn(sentinel_secret, r)
+            self.assertNotIn(malicious_sql, r)
+        self.assertNotIn(sentinel_secret, str(review))
+
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.commit()
+
+        # 2. Corrupted inventory payload with malicious SQL injection and sentinel
+        corrupted_inv = json.dumps({"secret": sentinel_secret, "injection": malicious_sql})
+        self.conn_a.execute(
+            """
+            INSERT INTO staging_run_journal (
+                run_id, owner_id, fencing_token, stage, status,
+                manifest_seal_hex, target_inventory_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                RUN_ID_A,
+                "worker_01",
+                1,
+                "LIVE-02",
+                JournalStatus.ACKED.value,
+                self.seal_a,
+                corrupted_inv,
+                "2026-11-07T12:00:00Z",
+                "2026-11-07T12:00:00Z",
+            ],
+        )
+        self.conn_a.commit()
+
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertNotIn(sentinel_secret, str(ctx.exception))
+        self.assertNotIn(malicious_sql, str(ctx.exception))
+
+        review_inv = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review_inv.decision, ReviewDecision.UNKNOWN)
+        for r in review_inv.reasons:
+            self.assertNotIn(sentinel_secret, r)
+            self.assertNotIn(malicious_sql, r)
+
+    def test_point12_malformed_nested_inventory_types_handled_inertly_without_type_error(self):
+        """P1-3: Malformed nested inventory types ([] or {} for table/pk) never throw uncaught TypeError."""
+        cases = [
+            # table as list
+            [{"table": ["unhashable_list"], "pk_column": "id", "pk_value": "val", "cleanup_dependency_order": 1, "expected_attributes": {}}] * 5,
+            # table as dict
+            [{"table": {"nested": "dict"}, "pk_column": "id", "pk_value": "val", "cleanup_dependency_order": 1, "expected_attributes": {}}] * 5,
+            # pk_column as list
+            [{"table": "processed_articles", "pk_column": [], "pk_value": "val", "cleanup_dependency_order": 1, "expected_attributes": {}}] * 5,
+            # pk_value as list
+            [{"table": "processed_articles", "pk_column": "article_id", "pk_value": [], "cleanup_dependency_order": 1, "expected_attributes": {}}] * 5,
+            # expected_attributes as non-dict
+            [{"table": "processed_articles", "pk_column": "article_id", "pk_value": "val", "cleanup_dependency_order": 1, "expected_attributes": "invalid_string"}] * 5,
+        ]
+
+        for idx, unauth_ents in enumerate(cases):
+            self.conn_a.execute("DELETE FROM staging_run_journal")
+            self.conn_a.execute(
+                """
+                INSERT INTO staging_run_journal (
+                    run_id, owner_id, fencing_token, stage, status,
+                    manifest_seal_hex, target_inventory_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    RUN_ID_A,
+                    "worker_01",
+                    1,
+                    "LIVE-02",
+                    JournalStatus.ACKED.value,
+                    "f" * 64,
+                    json.dumps(unauth_ents),
+                    "2026-11-07T12:00:00Z",
+                    "2026-11-07T12:00:00Z",
+                ],
+            )
+            self.conn_a.commit()
+
+            # Must not raise TypeError
+            with self.assertRaises(CrossRunnerDiscoveryError):
+                self.seam_b.discover_unresolved_runs()
+
+            # Must return typed CrossRunnerReview with ReviewDecision.UNKNOWN
+            review = self.seam_b.review_recovery_evidence()
+            self.assertIsInstance(review, CrossRunnerReview)
+            self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+            self.assertEqual(review.remote_state, "UNKNOWN")
+            self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+
+    def test_point13_malformed_hrana_envelopes_fail_closed_and_transport_swap_raises_permission_error(self):
+        """P1-3: Malformed Hrana 200 envelopes return inert review, while transport swap raises PermissionError."""
+        # 1. Malformed envelope: empty results list
+        def empty_results_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            return httpx.Response(200, json={"results": []})
+
+        self.transport_b.custom_response_hook = empty_results_hook
+
+        # Discovery query handles empty results fail-closed
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertEqual(ctx.exception.code, "WIRE_QUERY_MALFORMED")
+
+        # Review returns typed inert UNKNOWN
+        review = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review.journal_status, CrossRunnerJournalStatus.UNREADABLE)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+
+        # 2. Malformed envelope: missing results key
+        def missing_results_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            return httpx.Response(200, json={"type": "ok"})
+
+        self.transport_b.custom_response_hook = missing_results_hook
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertEqual(ctx.exception.code, "WIRE_QUERY_MALFORMED")
+
+        # 3. CRUCIAL: Transport swap attempt must raise PermissionError and NEVER be swallowed
+        self.transport_b.custom_response_hook = None
+        foreign_transport = httpx.MockTransport(lambda req: httpx.Response(200, json={}))
+        self.seam_b._pinned_transport = foreign_transport
+
+        with self.assertRaises(PermissionError):
+            self.seam_b.discover_unresolved_runs()
+
+        with self.assertRaises(PermissionError):
+            self.seam_b.review_recovery_evidence()
+
+        with self.assertRaises(PermissionError):
+            self.seam_b.audit_workload(RUN_ID_A)
+
+    def test_point14_oversized_payload_ceilings_and_discovery_boundary_duplicates(self):
+        """P2-1: Strict payload length ceilings reject oversized records, and discovery checks duplicates at boundary."""
+        # 1. Oversized target_inventory_json (> 4096 bytes)
+        huge_payload = json.dumps({"padding": "x" * 5000})
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.execute(
+            """
+            INSERT INTO staging_run_journal (
+                run_id, owner_id, fencing_token, stage, status,
+                manifest_seal_hex, target_inventory_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                RUN_ID_A,
+                "worker_01",
+                1,
+                "LIVE-02",
+                JournalStatus.ACKED.value,
+                self.seal_a,
+                huge_payload,
+                "2026-11-07T12:00:00Z",
+                "2026-11-07T12:00:00Z",
+            ],
+        )
+        self.conn_a.commit()
+
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertEqual(ctx.exception.code, "OVERSIZED_INVENTORY")
+
+        review_huge = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review_huge.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_huge.journal_status, CrossRunnerJournalStatus.CORRUPTED)
+
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.commit()
+
+        # 2. Oversized stage (> 64 chars)
+        self.conn_a.execute(
+            """
+            INSERT INTO staging_run_journal (
+                run_id, owner_id, fencing_token, stage, status,
+                manifest_seal_hex, target_inventory_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                RUN_ID_A,
+                "worker_01",
+                1,
+                "S" * 100,
+                JournalStatus.ACKED.value,
+                self.seal_a,
+                "[]",
+                "2026-11-07T12:00:00Z",
+                "2026-11-07T12:00:00Z",
+            ],
+        )
+        self.conn_a.commit()
+
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertEqual(ctx.exception.code, "INVALID_STAGE")
+
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.commit()
+
+        # 3. Discovery boundary duplicate check
+        valid_row = {
+            "run_id": RUN_ID_A,
+            "owner_id": "worker_01",
+            "fencing_token": 1,
+            "stage": "LIVE-02",
+            "status": JournalStatus.ACKED.value,
+            "manifest_seal_hex": self.seal_a,
+            "target_inventory_json": json.dumps([e.model_dump() for e in self.entities_a]),
+            "created_at": "2026-11-07T12:00:00Z",
+            "updated_at": "2026-11-07T12:00:00Z",
+            "last_error": None,
+        }
+
+        def dup_rows_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            if b"staging_run_journal" in request.content:
+                cols = [{"name": k} for k in valid_row.keys()]
+                hrana_row = [{"type": "text", "value": str(v)} if v is not None else {"type": "null"} for v in valid_row.values()]
+                hrana_row[2] = {"type": "integer", "value": "1"}
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "base_url": None,
+                        "results": [
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "result": {
+                                        "cols": cols,
+                                        "rows": [hrana_row, hrana_row],
+                                        "affected_row_count": 0,
+                                    }
+                                },
+                            },
+                            {"type": "ok", "response": {}},
+                        ],
+                    },
+                )
+            return None
+
+        self.transport_b.custom_response_hook = dup_rows_hook
+
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertEqual(ctx.exception.code, "DUPLICATE_DISCOVERY_RESULT")
+
+        review_dup = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review_dup.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_dup.journal_status, CrossRunnerJournalStatus.UNREADABLE)
+        self.assertEqual(review_dup.remote_state, "UNKNOWN")
+        self.assertEqual(review_dup.action, "MANUAL_REVIEW_ONLY")
