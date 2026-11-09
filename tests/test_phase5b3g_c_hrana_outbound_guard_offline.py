@@ -28,6 +28,7 @@ from efso_radar.staging.offline_operator import (
 from efso_radar.staging.runner import (
     BudgetTrackingTransport,
     EXACT_STAGING_DESTINATION,
+    EXACT_STAGING_HOSTNAME,
     HermeticStagingTransport,
     PerRunOwnershipManifest,
     create_default_manifest_entities,
@@ -412,6 +413,199 @@ class TestGuardedHermeticHranaTransport(unittest.TestCase):
             client.execute("DROP TABLE private_data", [])
         self.assertNotIn(secret, str(context.exception))
         self.assertNotIn("private_data", str(context.exception))
+
+
+    def test_response_base_url_hardening_rejects_unsafe_destinations_and_halts(self):
+        """Responses with foreign, attacker, IP, loopback, or malformed base_url fail closed and halt."""
+        unsafe_cases = [
+            ("foreign Turso host", "https://foreign-db.turso.io/v2/pipeline"),
+            ("foreign AWS region Turso host", "https://efso-radar-staging-fatihemres.aws-us-east-1.turso.io/v2/pipeline"),
+            ("attacker controlled HTTPS host", "https://attacker.evil.com/v2/pipeline"),
+            ("loopback plaintext HTTP", "http://127.0.0.1:8080/v2/pipeline"),
+            ("loopback HTTPS with IP", "https://127.0.0.1/v2/pipeline"),
+            ("localhost plaintext HTTP", "http://localhost/v2/pipeline"),
+            ("embedded credentials", "https://user:pass@efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/v2/pipeline"),
+            ("empty username with @ userinfo delimiter", f"https://@{EXACT_STAGING_HOSTNAME}/v2/pipeline"),
+            ("empty userinfo :@ delimiter", f"https://:@{EXACT_STAGING_HOSTNAME}/v2/pipeline"),
+            ("non-standard port", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io:8080/v2/pipeline"),
+            ("unexpected path", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/admin/drop"),
+            ("query string", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/v2/pipeline?token=leak"),
+            ("fragment", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/v2/pipeline#anchor"),
+            ("path params semicolon unexpected", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/v2/pipeline;unexpected"),
+            ("CRLF injected into allowlisted URL", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io\r\n/v2/pipeline"),
+            ("TAB injected into allowlisted URL", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io\t/v2/pipeline"),
+            ("CR only injected into allowlisted URL", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io\r/v2/pipeline"),
+            ("LF only injected into allowlisted URL", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io\n/v2/pipeline"),
+            ("leading space in allowlisted URL", " https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/v2/pipeline"),
+            ("trailing space in allowlisted URL", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/v2/pipeline "),
+            ("embedded space in allowlisted URL", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io /v2/pipeline"),
+            ("control character null byte in allowlisted URL", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io\x00/v2/pipeline"),
+            ("empty string", ""),
+            ("whitespace only", "   "),
+            ("integer type", 12345),
+            ("dict type", {"url": "https://evil.com"}),
+            ("list type", ["https://evil.com"]),
+        ]
+
+        for label, unsafe_val in unsafe_cases:
+            with self.subTest(label=label):
+                guard = self.make_transport()
+                client = TursoHTTPClient(
+                    database_url=EXACT_STAGING_DESTINATION,
+                    transport=guard,
+                )
+                self.addCleanup(client.close)
+
+                # Return response containing unsafe base_url
+                fake_response = httpx.Response(
+                    200,
+                    json={
+                        "baton": "unsafe-baton-xyz",
+                        "base_url": unsafe_val,
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok"},
+                        ],
+                    },
+                )
+                with patch.object(guard._inner, "handle_request", return_value=fake_response) as backend:
+                    with self.assertRaisesRegex(MockHranaDenied, "MOCK_HRANA_DENIED_UNSAFE_BASE_URL"):
+                        client.execute(self.article.sql, list(self.article.args))
+
+                    self.assertTrue(guard.halted, f"Guard must be halted for {label}")
+                    self.assertTrue(guard.unknown, f"Guard outcome must be unknown for {label}")
+                    self.assertEqual(backend.call_count, 1)
+
+                    # Ensure any subsequent baton-bearing dispatch is permanently blocked before network dispatch
+                    with self.assertRaisesRegex(MockHranaDenied, "MOCK_HRANA_DENIED_SESSION_HALTED"):
+                        client.execute(self.read.sql, list(self.read.args))
+
+                    # Backend was not called again
+                    self.assertEqual(backend.call_count, 1)
+
+    def test_response_base_url_exact_staging_endpoint_is_accepted(self):
+        """Responses with None or exact allowlisted staging base_url succeed without altering endpoint."""
+        for label, safe_val in [
+            ("none (standard null)", None),
+            ("exact pipeline endpoint", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/v2/pipeline"),
+            ("exact pipeline endpoint with slash", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/v2/pipeline/"),
+            ("exact host root", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io"),
+            ("exact host root with slash", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/"),
+        ]:
+            with self.subTest(label=label):
+                guard = self.make_transport()
+                client = TursoHTTPClient(
+                    database_url=EXACT_STAGING_DESTINATION,
+                    transport=guard,
+                )
+                self.addCleanup(client.close)
+
+                fake_response = httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "base_url": safe_val,
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [{"name": "found"}], "rows": [[{"type": "integer", "value": 1}]]}}},
+                            {"type": "ok"},
+                        ],
+                    },
+                )
+                with patch.object(guard._inner, "handle_request", return_value=fake_response):
+                    res = client.execute(self.read.sql, list(self.read.args))
+                    self.assertEqual(res.fetchone()["found"], 1)
+                    self.assertFalse(guard.halted)
+                    self.assertFalse(guard.unknown)
+
+    def test_http_401_and_403_responses_halt_fail_closed_and_block_subsequent_dispatch(self):
+        """HTTP 401 Unauthorized and 403 Forbidden trigger fail-closed halt without leaking token or SQL."""
+        secret_token = "secret-token-test-xyz"
+        for status_code in (401, 403):
+            with self.subTest(status_code=status_code):
+                guard = self.make_transport()
+                client = TursoHTTPClient(
+                    database_url=EXACT_STAGING_DESTINATION,
+                    auth_token=secret_token,
+                    transport=guard,
+                )
+                self.addCleanup(client.close)
+
+                error_resp = httpx.Response(
+                    status_code,
+                    json={"message": f"HTTP {status_code} authentication/authorization error"},
+                )
+                with patch.object(guard._inner, "handle_request", return_value=error_resp) as backend:
+                    with self.assertRaises(MockHranaDenied) as ctx:
+                        client.execute(self.article.sql, list(self.article.args))
+
+                    self.assertIn("MOCK_HRANA_DENIED_NON_200_UNKNOWN", str(ctx.exception))
+                    self.assertNotIn(secret_token, str(ctx.exception))
+                    self.assertNotIn(self.article_id, str(ctx.exception))
+                    self.assertTrue(guard.halted)
+                    self.assertTrue(guard.unknown)
+                    self.assertEqual(backend.call_count, 1)
+
+                    # No further SQL dispatch permitted
+                    with self.assertRaisesRegex(MockHranaDenied, "MOCK_HRANA_DENIED_SESSION_HALTED"):
+                        client.execute(self.read.sql, list(self.read.args))
+                    self.assertEqual(backend.call_count, 1)
+
+    def test_non_transactional_pipeline_step_error_does_not_rollback_and_never_treated_as_success(self):
+        """In a non-transactional pipeline, statement 1 failure does not prevent statement 2 execution.
+
+        Upstream Hrana v2 HTTP semantics: individual pipeline statements execute sequentially without
+        implicit transaction encapsulation. A statement error produces an error result in the results
+        array, but subsequent statements in the batch still execute and autocommit.
+
+        Verifies:
+        - Application never interprets the pipeline as successful merely because HTTP status is 200.
+        - Application does not assume automatic rollback occurred (statement 2 persists in SQLite).
+        - Guard rejects the non-ok response, marks UNKNOWN, latches HALT, and prohibits retries.
+        """
+        test_conn = sqlite3.connect(":memory:")
+        self.addCleanup(test_conn.close)
+        for stmt in get_all_init_statements():
+            test_conn.execute(stmt)
+        test_conn.commit()
+
+        # HermeticStagingTransport configured to fail on statement 1 (fail_on_stmt_idx=1)
+        raw_mock = HermeticStagingTransport(test_conn, fail_on_stmt_idx=1)
+        budget = BudgetTrackingTransport(raw_mock)
+        guard = GuardedHermeticHranaTransport(
+            inner=budget,
+            seal=self.seal,
+            approved_intents=(self.article, self.story),
+        )
+        client = TursoHTTPClient(
+            database_url=EXACT_STAGING_DESTINATION,
+            transport=guard,
+        )
+        self.addCleanup(client.close)
+
+        # Dispatch non-transactional pipeline with statement 0 (article) and statement 1 (story)
+        with self.assertRaises(MockHranaDenied) as ctx:
+            client.execute_pipeline([
+                (self.article.sql, list(self.article.args)),
+                (self.story.sql, list(self.story.args)),
+            ])
+
+        # 1. Transport boundary never interpreted the pipeline as successful (raised MockHranaDenied)
+        self.assertIn("MOCK_HRANA_DENIED_RESPONSE_ERROR", str(ctx.exception))
+        self.assertTrue(guard.halted)
+        self.assertTrue(guard.unknown)
+
+        # 2. Server executed statement 2 despite statement 1 failure (no automatic rollback)
+        story_count = test_conn.execute("SELECT COUNT(*) FROM stories").fetchone()[0]
+        self.assertEqual(story_count, 1, "Non-transactional pipeline executed subsequent statement without rollback")
+        art_count = test_conn.execute("SELECT COUNT(*) FROM processed_articles").fetchone()[0]
+        self.assertEqual(art_count, 0, "First statement failed with error in mock transport")
+
+        # 3. Guard permanently halted: blocks retry or subsequent queries
+        with self.assertRaisesRegex(MockHranaDenied, "MOCK_HRANA_DENIED_SESSION_HALTED"):
+            client.execute(self.read.sql, list(self.read.args))
+
+        # 4. Manifest preserved on disk: cannot be deleted or treated as clean
+        self.assertTrue(self.path.exists())
 
 
 if __name__ == "__main__":

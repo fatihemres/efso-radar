@@ -24,6 +24,7 @@ import re
 import sqlite3
 import time
 from typing import Any, Callable, Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -37,6 +38,7 @@ from efso_radar.staging.offline_operator import _MUTATING_TEMPLATES, _norm
 from efso_radar.staging.runner import (
     BudgetTrackingTransport,
     EXACT_STAGING_DESTINATION,
+    EXACT_STAGING_HOSTNAME,
     HermeticStagingTransport,
     RegisteredEntity,
     create_default_manifest_entities,
@@ -177,7 +179,9 @@ _MAX_MOCK_REQUESTS = 60
 _MAX_SESSION_REQUESTS = 100
 _TEST_CUTOFF_REQUESTS = 80
 _SESSION_DEADLINE_SECONDS = 120.0
-_ISO_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+_ISO_TIMESTAMP_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?Z$"
+)
 
 
 def validate_budget_invariants(
@@ -576,7 +580,8 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
         self._session_timeout_seconds = session_timeout_seconds
         self._in_cleanup = False
         self._endpoint = normalize_turso_url(
-            EXACT_STAGING_DESTINATION, allow_localhost_http=False
+            EXACT_STAGING_DESTINATION,
+            allow_localhost_http=False
         )
         self._pending_baton: str | None = None
         self._requests = 0
@@ -850,6 +855,50 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
     def close_session(self) -> None:
         """Permanently close and invalidate this security boundary session."""
         self._session_closed = True
+
+    def _is_safe_response_base_url(self, raw_base: Any) -> bool:
+        """Validate optional Hrana v2 stream base_url returned in server response.
+
+        SAFETY INVARIANTS:
+        - None is permitted (legitimate Hrana base_url: null per official HTTP v2 specification).
+        - Any present base_url must be a strictly validated HTTPS string.
+        - Must not contain any whitespace (leading/trailing/embedded, CR/LF/TAB) or control characters.
+        - Must not contain path parameters or semicolons.
+        - Hostname must match EXACT_STAGING_HOSTNAME allowlist exactly (rejects foreign
+          Turso hosts, attacker HTTPS destinations, loopback/IP addresses).
+        - Must not contain userinfo/credentials, explicit non-standard ports, query parameters, params, or fragments.
+        - Path must be empty, '/', '/v2/pipeline', or '/v2/pipeline/'.
+        - On any discrepancy, returns False which triggers fail-closed HALT.
+        """
+        if raw_base is None:
+            return True
+        if not isinstance(raw_base, str) or not raw_base:
+            return False
+        # Reject any whitespace (including CR, LF, TAB, spaces) or ASCII/C1 control characters
+        if any(c.isspace() or ord(c) < 32 or 127 <= ord(c) <= 159 for c in raw_base):
+            return False
+        # Reject semicolons / path parameters and userinfo authority delimiter before parsing
+        if ";" in raw_base or "@" in raw_base:
+            return False
+        try:
+            parsed = urlparse(raw_base)
+            if parsed.scheme != "https":
+                return False
+            hostname = (parsed.hostname or "").lower()
+            if hostname != EXACT_STAGING_HOSTNAME:
+                return False
+            if parsed.username is not None or parsed.password is not None:
+                return False
+            if parsed.port is not None and parsed.port != 443:
+                return False
+            if parsed.query or parsed.fragment or parsed.params:
+                return False
+            norm_path = parsed.path.rstrip("/")
+            if norm_path not in ("", "/v2/pipeline"):
+                return False
+            return True
+        except Exception:
+            return False
 
     def _deny(self, code: str) -> None:
         self.halted = True
@@ -1133,6 +1182,10 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
                 self._deny("RESPONSE_SHAPE")
             if not self._session_mode and any(item.get("type") != "ok" for item in data["results"]):
                 self._deny("RESPONSE_ERROR")
+            if "base_url" in data:
+                raw_base = data.get("base_url")
+                if not self._is_safe_response_base_url(raw_base):
+                    self._deny("UNSAFE_BASE_URL")
             if action == "transaction_begin":
                 baton = data.get("baton")
                 if type(baton) is not str or not baton.strip():
