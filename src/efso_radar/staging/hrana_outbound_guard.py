@@ -860,21 +860,28 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
         """Validate optional Hrana v2 stream base_url returned in server response.
 
         SAFETY INVARIANTS:
-        - None is permitted (no stream redirection returned by provider).
+        - None is permitted (legitimate Hrana base_url: null per official HTTP v2 specification).
         - Any present base_url must be a strictly validated HTTPS string.
+        - Must not contain any whitespace (leading/trailing/embedded, CR/LF/TAB) or control characters.
+        - Must not contain path parameters or semicolons.
         - Hostname must match EXACT_STAGING_HOSTNAME allowlist exactly (rejects foreign
           Turso hosts, attacker HTTPS destinations, loopback/IP addresses).
-        - Must not contain userinfo/credentials, explicit non-standard ports, query parameters, or fragments.
-        - Path must be empty or exactly '/v2/pipeline'.
+        - Must not contain userinfo/credentials, explicit non-standard ports, query parameters, params, or fragments.
+        - Path must be empty, '/', '/v2/pipeline', or '/v2/pipeline/'.
         - On any discrepancy, returns False which triggers fail-closed HALT.
         """
         if raw_base is None:
             return True
-        if not isinstance(raw_base, str) or not raw_base.strip():
+        if not isinstance(raw_base, str) or not raw_base:
             return False
-        cleaned = raw_base.strip()
+        # Reject any whitespace (including CR, LF, TAB, spaces) or ASCII/C1 control characters
+        if any(c.isspace() or ord(c) < 32 or 127 <= ord(c) <= 159 for c in raw_base):
+            return False
+        # Reject semicolons / path parameters before parsing
+        if ";" in raw_base:
+            return False
         try:
-            parsed = urlparse(cleaned)
+            parsed = urlparse(raw_base)
             if parsed.scheme != "https":
                 return False
             hostname = (parsed.hostname or "").lower()
@@ -884,7 +891,7 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
                 return False
             if parsed.port is not None and parsed.port != 443:
                 return False
-            if parsed.query or parsed.fragment:
+            if parsed.query or parsed.fragment or parsed.params:
                 return False
             norm_path = parsed.path.rstrip("/")
             if norm_path not in ("", "/v2/pipeline"):

@@ -428,6 +428,15 @@ class TestGuardedHermeticHranaTransport(unittest.TestCase):
             ("unexpected path", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/admin/drop"),
             ("query string", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/v2/pipeline?token=leak"),
             ("fragment", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/v2/pipeline#anchor"),
+            ("path params semicolon unexpected", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/v2/pipeline;unexpected"),
+            ("CRLF injected into allowlisted URL", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io\r\n/v2/pipeline"),
+            ("TAB injected into allowlisted URL", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io\t/v2/pipeline"),
+            ("CR only injected into allowlisted URL", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io\r/v2/pipeline"),
+            ("LF only injected into allowlisted URL", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io\n/v2/pipeline"),
+            ("leading space in allowlisted URL", " https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/v2/pipeline"),
+            ("trailing space in allowlisted URL", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/v2/pipeline "),
+            ("embedded space in allowlisted URL", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io /v2/pipeline"),
+            ("control character null byte in allowlisted URL", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io\x00/v2/pipeline"),
             ("empty string", ""),
             ("whitespace only", "   "),
             ("integer type", 12345),
@@ -474,9 +483,11 @@ class TestGuardedHermeticHranaTransport(unittest.TestCase):
     def test_response_base_url_exact_staging_endpoint_is_accepted(self):
         """Responses with None or exact allowlisted staging base_url succeed without altering endpoint."""
         for label, safe_val in [
-            ("none (standard)", None),
+            ("none (standard null)", None),
             ("exact pipeline endpoint", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/v2/pipeline"),
+            ("exact pipeline endpoint with slash", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/v2/pipeline/"),
             ("exact host root", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io"),
+            ("exact host root with slash", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/"),
         ]:
             with self.subTest(label=label):
                 guard = self.make_transport()
