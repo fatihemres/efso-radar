@@ -92,6 +92,57 @@ EXPECTED_JOURNAL_INDEX_KEYS: tuple[tuple[int, int, str, int, str, int], ...] = (
     (1, 8, "updated_at", 0, "BINARY", 1),
 )
 
+def _normalize_sql(sql: str) -> str:
+    """Normalize SQL statement text for deterministic structural comparison."""
+    # Strip comments
+    s = re.sub(r"--[^\n]*", "", sql)
+    s = re.sub(r"/\*.*?\*/", "", s, flags=re.DOTALL)
+    # Strip surrounding whitespace and trailing semicolons
+    s = s.strip().rstrip(";")
+    # Collapse all whitespace sequences into a single space
+    s = re.sub(r"\s+", " ", s)
+    # Normalize CREATE TABLE IF NOT EXISTS / CREATE TABLE
+    s = re.sub(
+        r"\bCREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+",
+        "CREATE TABLE ",
+        s,
+        flags=re.IGNORECASE,
+    )
+    # Normalize CREATE INDEX IF NOT EXISTS / CREATE INDEX
+    s = re.sub(
+        r"\bCREATE\s+INDEX(?:\s+IF\s+NOT\s+EXISTS)?\s+",
+        "CREATE INDEX ",
+        s,
+        flags=re.IGNORECASE,
+    )
+    # Normalize spacing around parentheses and commas
+    s = re.sub(r"\s*\(\s*", " (", s)
+    s = re.sub(r"\s*\)\s*", ")", s)
+    s = re.sub(r"\s*,\s*", ", ", s)
+    return s.strip()
+
+
+EXPECTED_JOURNAL_TABLE_DDL_NORMALIZED: str = _normalize_sql("""
+CREATE TABLE staging_run_journal (
+    run_id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    fencing_token INTEGER NOT NULL DEFAULT 1,
+    stage TEXT NOT NULL,
+    status TEXT NOT NULL,
+    manifest_seal_hex TEXT NOT NULL,
+    target_inventory_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_error TEXT
+)
+""")
+
+EXPECTED_JOURNAL_INDEX_DDL_NORMALIZED: str = _normalize_sql("""
+CREATE INDEX idx_staging_run_journal_status
+    ON staging_run_journal (status, updated_at)
+""")
+
+
 
 class SchemaVerificationReport(BaseModel):
     """Result of candidate Schema v7 staging journal structural verification."""
@@ -155,20 +206,25 @@ def verify_staging_journal_schema(
     - Strictly read-only: NEVER creates, migrates, repairs, modifies, or drops database objects.
     - Operates ONLY on hermetic in-memory (:memory:) or OS temporary SQLite fixtures.
     - Rejects any connection with attached non-temporary databases with PermissionError.
+    - Strictly bound to 'main' schema namespace: rejects shadowing by temp or attached databases.
     - Rejects views or virtual tables impersonating staging_run_journal.
+    - Validates exact canonical DDL in main.sqlite_master, rejecting ON CONFLICT clauses,
+      CHECK constraints, foreign keys, WITHOUT ROWID, AUTOINCREMENT, or structural drift.
     - Validates exact column count (10), names, types, order, PK ordinal, NOT NULL constraints,
-      fencing_token DEFAULT 1, and nullable last_error.
+      fencing_token DEFAULT 1, and nullable last_error via PRAGMA main.table_xinfo.
+    - Validates no foreign keys via PRAGMA main.foreign_key_list.
     - Validates index idx_staging_run_journal_status (existence, non-unique, non-partial,
-      exact columns (status, updated_at), no expression keys).
+      exact columns (status, updated_at), ascending order, BINARY collation, no expression keys).
+    - Validates no unapproved extra indexes, unique constraints, or triggers on staging_run_journal.
     - Fails closed with SchemaVerificationError if raise_on_error=True (default).
     """
     _assert_hermetic_sqlite_connection(conn, "verify_staging_journal_schema")
 
     errors: list[str] = []
 
-    # 1. Inspect sqlite_master for table staging_run_journal
+    # 1. Inspect main.sqlite_master for table staging_run_journal
     cur = conn.execute(
-        "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name = 'staging_run_journal'"
+        "SELECT type, name, tbl_name, sql FROM main.sqlite_master WHERE name = 'staging_run_journal'"
     )
     table_master_rows = cur.fetchall()
     if not table_master_rows:
@@ -178,14 +234,34 @@ def verify_staging_journal_schema(
         if obj_type != "table":
             errors.append(f"Object 'staging_run_journal' has type '{obj_type}', expected 'table'.")
         if sql is None:
-            errors.append("Object 'staging_run_journal' has no SQL definition in sqlite_master.")
+            errors.append("Object 'staging_run_journal' has no SQL definition in main.sqlite_master.")
         elif sql.strip().upper().startswith("CREATE VIRTUAL TABLE"):
             errors.append("Object 'staging_run_journal' is a virtual table, not a standard table.")
+        else:
+            # Semantic DDL validation against candidate Schema v7 specification
+            if re.search(r"\bON\s+CONFLICT\b", sql, flags=re.IGNORECASE):
+                errors.append("Table 'staging_run_journal' DDL contains unapproved ON CONFLICT clause.")
+            if re.search(r"\bCHECK\b", sql, flags=re.IGNORECASE):
+                errors.append("Table 'staging_run_journal' DDL contains unapproved CHECK constraint.")
+            if re.search(r"\bFOREIGN\s+KEY\b|\bREFERENCES\b", sql, flags=re.IGNORECASE):
+                errors.append("Table 'staging_run_journal' DDL contains unapproved FOREIGN KEY constraint.")
+            if re.search(r"\bWITHOUT\s+ROWID\b", sql, flags=re.IGNORECASE):
+                errors.append("Table 'staging_run_journal' DDL specifies unsupported WITHOUT ROWID.")
+            if re.search(r"\bAUTOINCREMENT\b", sql, flags=re.IGNORECASE):
+                errors.append("Table 'staging_run_journal' DDL specifies unapproved AUTOINCREMENT.")
 
-    # 2. If table exists and is a table, inspect columns via PRAGMA table_xinfo
+            norm_table_sql = _normalize_sql(sql)
+            if norm_table_sql.upper() != EXPECTED_JOURNAL_TABLE_DDL_NORMALIZED.upper():
+                errors.append(
+                    f"Table 'staging_run_journal' DDL does not match canonical Schema v7 definition:\n"
+                    f"  got:      {norm_table_sql}\n"
+                    f"  expected: {EXPECTED_JOURNAL_TABLE_DDL_NORMALIZED}"
+                )
+
+    # 2. If table exists and is a standard table, inspect columns via PRAGMA main.table_xinfo
     # table_xinfo reveals hidden and generated columns (both VIRTUAL and STORED)
-    if not errors:
-        cur = conn.execute("PRAGMA table_xinfo(staging_run_journal)")
+    if table_master_rows and table_master_rows[0][0] == "table":
+        cur = conn.execute("PRAGMA main.table_xinfo(staging_run_journal)")
         columns = cur.fetchall()
         if len(columns) != len(EXPECTED_JOURNAL_COLUMNS):
             errors.append(
@@ -234,9 +310,17 @@ def verify_staging_journal_schema(
                         f"got hidden={act_hidden}, expected hidden={exp_hidden}."
                     )
 
-        # 3. Inspect index idx_staging_run_journal_status and unapproved indexes/constraints
+        # 3. Inspect PRAGMA main.foreign_key_list
+        cur = conn.execute("PRAGMA main.foreign_key_list(staging_run_journal)")
+        fk_rows = cur.fetchall()
+        if fk_rows:
+            errors.append(
+                f"Table 'staging_run_journal' contains unapproved foreign key(s): {fk_rows}."
+            )
+
+        # 4. Inspect index idx_staging_run_journal_status in main.sqlite_master
         cur = conn.execute(
-            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "SELECT type, name, tbl_name, sql FROM main.sqlite_master "
             f"WHERE name = '{EXPECTED_JOURNAL_INDEX_NAME}'"
         )
         idx_master_rows = cur.fetchall()
@@ -251,8 +335,19 @@ def verify_staging_journal_schema(
                     f"Index '{EXPECTED_JOURNAL_INDEX_NAME}' attached to '{idx_tbl_name}', "
                     "expected 'staging_run_journal'."
                 )
+            if idx_sql is None:
+                errors.append(f"Index '{EXPECTED_JOURNAL_INDEX_NAME}' has no SQL definition in main.sqlite_master.")
+            else:
+                norm_idx_sql = _normalize_sql(idx_sql)
+                if norm_idx_sql.upper() != EXPECTED_JOURNAL_INDEX_DDL_NORMALIZED.upper():
+                    errors.append(
+                        f"Index '{EXPECTED_JOURNAL_INDEX_NAME}' DDL does not match canonical Schema v7 definition:\n"
+                        f"  got:      {norm_idx_sql}\n"
+                        f"  expected: {EXPECTED_JOURNAL_INDEX_DDL_NORMALIZED}"
+                    )
 
-        cur = conn.execute("PRAGMA index_list(staging_run_journal)")
+        # 5. Inspect PRAGMA main.index_list for staging_run_journal
+        cur = conn.execute("PRAGMA main.index_list(staging_run_journal)")
         idx_list = cur.fetchall()
         matching_indices = [row for row in idx_list if row[1] == EXPECTED_JOURNAL_INDEX_NAME]
         if not matching_indices:
@@ -268,8 +363,8 @@ def verify_staging_journal_schema(
             if is_partial != 0:
                 errors.append(f"Index '{EXPECTED_JOURNAL_INDEX_NAME}' must be non-partial, but found partial=1.")
 
-            # Validate exact indexed keys using PRAGMA index_xinfo
-            cur = conn.execute(f"PRAGMA index_xinfo({EXPECTED_JOURNAL_INDEX_NAME})")
+            # Validate exact indexed keys using PRAGMA main.index_xinfo
+            cur = conn.execute(f"PRAGMA main.index_xinfo({EXPECTED_JOURNAL_INDEX_NAME})")
             info_rows = cur.fetchall()
             # row: (seqno, cid, name, desc, coll, key)
             key_rows = [r for r in info_rows if r[5] == 1]
@@ -329,9 +424,9 @@ def verify_staging_journal_schema(
         elif pk_index_count > 1:
             errors.append(f"Multiple ({pk_index_count}) primary key indexes on 'staging_run_journal'.")
 
-        # 4. Check for unexpected triggers on staging_run_journal
+        # 6. Check for unexpected triggers on staging_run_journal in main.sqlite_master
         cur = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'staging_run_journal'"
+            "SELECT name FROM main.sqlite_master WHERE type = 'trigger' AND tbl_name = 'staging_run_journal'"
         )
         trigger_rows = cur.fetchall()
         if trigger_rows:
@@ -351,7 +446,7 @@ def verify_staging_journal_schema(
 
     if not is_valid and raise_on_error:
         raise SchemaVerificationError(
-            f"Schema verification failed for table 'staging_run_journal':\n"
+            "Schema verification failed for table 'staging_run_journal':\n"
             + "\n".join(f"  - {err}" for err in errors)
         )
 
@@ -960,7 +1055,7 @@ class StagingOwnershipJournal:
     def _verify_table_exists(self) -> None:
         """Verify that candidate Schema v7 table exists in the test connection."""
         cursor = self._conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='staging_run_journal'"
+            "SELECT name FROM main.sqlite_master WHERE type='table' AND name='staging_run_journal'"
         )
         if not cursor.fetchone():
             raise JournalError(
@@ -1094,7 +1189,7 @@ class StagingOwnershipJournal:
 
             # B. Check and acquire lease in run_locks if table exists
             cur_tbl = self._conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='run_locks'"
+                "SELECT name FROM main.sqlite_master WHERE type='table' AND name='run_locks'"
             )
             if cur_tbl.fetchone():
                 cur_lock = self._conn.execute(

@@ -2206,6 +2206,146 @@ class TestCandidateSchemaV7StructuralValidator(unittest.TestCase):
         self.assertIn("Unexpected trigger(s) found on 'staging_run_journal': ['trg_adversarial_after_insert']", str(ctx.exception))
         conn_trg.close()
 
+    def test_semantic_ddl_integrity_fails_closed(self):
+        """Semantic DDL changes altering journal integrity fail closed."""
+        base_cols = (
+            "run_id TEXT PRIMARY KEY, "
+            "owner_id TEXT NOT NULL, "
+            "fencing_token INTEGER NOT NULL DEFAULT 1, "
+            "stage TEXT NOT NULL, "
+            "status TEXT NOT NULL, "
+            "manifest_seal_hex TEXT NOT NULL, "
+            "target_inventory_json TEXT NOT NULL, "
+            "created_at TEXT NOT NULL, "
+            "updated_at TEXT NOT NULL, "
+            "last_error TEXT"
+        )
+
+        # a) run_id TEXT PRIMARY KEY ON CONFLICT REPLACE
+        conn_replace = sqlite3.connect(":memory:")
+        replace_cols = base_cols.replace(
+            "run_id TEXT PRIMARY KEY",
+            "run_id TEXT PRIMARY KEY ON CONFLICT REPLACE",
+        )
+        conn_replace.execute(f"CREATE TABLE staging_run_journal ({replace_cols});")
+        conn_replace.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_replace)
+        self.assertIn("contains unapproved ON CONFLICT clause", str(ctx.exception))
+        conn_replace.close()
+
+        # b) run_id TEXT PRIMARY KEY ON CONFLICT IGNORE
+        conn_ignore = sqlite3.connect(":memory:")
+        ignore_cols = base_cols.replace(
+            "run_id TEXT PRIMARY KEY",
+            "run_id TEXT PRIMARY KEY ON CONFLICT IGNORE",
+        )
+        conn_ignore.execute(f"CREATE TABLE staging_run_journal ({ignore_cols});")
+        conn_ignore.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_ignore)
+        self.assertIn("contains unapproved ON CONFLICT clause", str(ctx.exception))
+        conn_ignore.close()
+
+        # c) Unexpected CHECK constraint (e.g., status <> 'MUTATING')
+        conn_check = sqlite3.connect(":memory:")
+        check_cols = base_cols.replace(
+            "status TEXT NOT NULL",
+            "status TEXT NOT NULL CHECK(status <> 'MUTATING')",
+        )
+        conn_check.execute(f"CREATE TABLE staging_run_journal ({check_cols});")
+        conn_check.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_check)
+        self.assertIn("contains unapproved CHECK constraint", str(ctx.exception))
+        conn_check.close()
+
+        # d) Unexpected FOREIGN KEY constraint
+        conn_fk = sqlite3.connect(":memory:")
+        conn_fk.execute("CREATE TABLE other_table (id TEXT PRIMARY KEY);")
+        fk_cols = base_cols + ", FOREIGN KEY (owner_id) REFERENCES other_table(id)"
+        conn_fk.execute(f"CREATE TABLE staging_run_journal ({fk_cols});")
+        conn_fk.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_fk)
+        self.assertIn("contains unapproved FOREIGN KEY constraint", str(ctx.exception))
+        conn_fk.close()
+
+        # e) Unsupported WITHOUT ROWID table
+        conn_norowid = sqlite3.connect(":memory:")
+        conn_norowid.execute(f"CREATE TABLE staging_run_journal ({base_cols}) WITHOUT ROWID;")
+        conn_norowid.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_norowid)
+        self.assertIn("specifies unsupported WITHOUT ROWID", str(ctx.exception))
+        conn_norowid.close()
+
+        # f) Unapproved AUTOINCREMENT
+        conn_auto = sqlite3.connect(":memory:")
+        auto_cols = base_cols.replace(
+            "run_id TEXT PRIMARY KEY",
+            "run_id INTEGER PRIMARY KEY AUTOINCREMENT",
+        )
+        conn_auto.execute(f"CREATE TABLE staging_run_journal ({auto_cols});")
+        conn_auto.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_auto)
+        self.assertIn("specifies unapproved AUTOINCREMENT", str(ctx.exception))
+        conn_auto.close()
+
+        # g) Index DDL divergence (partial index or unique index in SQL definition)
+        conn_idx_ddl = sqlite3.connect(":memory:")
+        conn_idx_ddl.execute(f"CREATE TABLE staging_run_journal ({base_cols});")
+        conn_idx_ddl.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at, run_id);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_idx_ddl)
+        self.assertIn("Index 'idx_staging_run_journal_status' DDL does not match canonical Schema v7 definition", str(ctx.exception))
+        conn_idx_ddl.close()
+
+    def test_schema_namespace_isolation_fails_closed_on_temp_shadow(self):
+        """Metadata validation strictly inspects 'main' and rejects temp shadowing."""
+        # a) Drifted main table shadowed by canonical temp table must fail closed
+        conn_shadow = sqlite3.connect(":memory:")
+        # main has drifted definition: only 2 columns, missing NOT NULL on owner_id
+        conn_shadow.execute("CREATE TABLE main.staging_run_journal (run_id TEXT PRIMARY KEY, owner_id TEXT);")
+        conn_shadow.execute("CREATE INDEX main.idx_staging_run_journal_status ON staging_run_journal (owner_id);")
+
+        # temp has perfectly canonical candidate Schema v7 definition
+        conn_shadow.execute("""
+        CREATE TABLE temp.staging_run_journal (
+            run_id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            fencing_token INTEGER NOT NULL DEFAULT 1,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            manifest_seal_hex TEXT NOT NULL,
+            target_inventory_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_error TEXT
+        );
+        """)
+        conn_shadow.execute("CREATE INDEX temp.idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+
+        # Verify fail-closed behavior: shadowed temp cannot cause false PASS
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_shadow)
+        self.assertIn("Table 'staging_run_journal' has 2 columns (including hidden/generated), expected 10", str(ctx.exception))
+        self.assertIn("Table 'staging_run_journal' DDL does not match canonical Schema v7 definition", str(ctx.exception))
+        conn_shadow.close()
+
+        # b) Canonical main table with drifted temp table passes cleanly
+        conn_canon = sqlite3.connect(":memory:")
+        apply_candidate_schema_v7(conn_canon)
+        # Create an unapproved/drifted table in temp with same name
+        conn_canon.execute("CREATE TABLE temp.staging_run_journal (run_id TEXT, adversarial_col TEXT);")
+        conn_canon.execute("CREATE INDEX temp.idx_staging_run_journal_status ON staging_run_journal (adversarial_col);")
+
+        report = verify_staging_journal_schema(conn_canon)
+        self.assertTrue(report.is_valid)
+        self.assertEqual(report.errors, [])
+        conn_canon.close()
+
     def test_schema_v6_and_live_ready_operator_preflight_remain_valid(self):
         """Pure Schema v6 remains untouched at version 6 and LiveReadyStagingOperator preflight succeeds."""
         self.assertEqual(CURRENT_SCHEMA_VERSION, 6)
