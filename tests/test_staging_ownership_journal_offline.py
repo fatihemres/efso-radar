@@ -2293,25 +2293,47 @@ class TestCandidateSchemaV7StructuralValidator(unittest.TestCase):
         self.assertIn("specifies unapproved AUTOINCREMENT", str(ctx.exception))
         conn_auto.close()
 
-        # g) Index DDL divergence (partial index or unique index in SQL definition)
+        # g) Index DDL divergence (extra key column in SQL definition)
         conn_idx_ddl = sqlite3.connect(":memory:")
         conn_idx_ddl.execute(f"CREATE TABLE staging_run_journal ({base_cols});")
         conn_idx_ddl.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at, run_id);")
         with self.assertRaises(SchemaVerificationError) as ctx:
             verify_staging_journal_schema(conn_idx_ddl)
         self.assertIn("Index 'idx_staging_run_journal_status' DDL does not match canonical Schema v7 definition", str(ctx.exception))
+        self.assertIn("JOURNAL_INDEX_DDL_MISMATCH", str(ctx.exception))
         conn_idx_ddl.close()
 
+        # h) Sanitized reporting: arbitrary literals in table DDL are NOT leaked into errors
+        conn_leak = sqlite3.connect(":memory:")
+        leak_cols = base_cols + ", secret_attr TEXT DEFAULT 'UNTRUSTED_LEAK_SECRET_XYZ999'"
+        conn_leak.execute(f"CREATE TABLE staging_run_journal ({leak_cols});")
+        conn_leak.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_leak)
+        self.assertIn("JOURNAL_TABLE_DDL_MISMATCH", str(ctx.exception))
+        self.assertNotIn("UNTRUSTED_LEAK_SECRET_XYZ999", str(ctx.exception))
+        conn_leak.close()
+
+        # i) Sanitized reporting: arbitrary literals in index DDL are NOT leaked into errors
+        conn_idx_leak = sqlite3.connect(":memory:")
+        conn_idx_leak.execute(f"CREATE TABLE staging_run_journal ({base_cols});")
+        conn_idx_leak.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at) WHERE status != 'SECRET_INDEX_PREDICATE_LITERAL_9999';")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_idx_leak)
+        self.assertIn("JOURNAL_INDEX_DDL_MISMATCH", str(ctx.exception))
+        self.assertNotIn("SECRET_INDEX_PREDICATE_LITERAL_9999", str(ctx.exception))
+        conn_idx_leak.close()
+
     def test_schema_namespace_isolation_fails_closed_on_temp_shadow(self):
-        """Metadata validation strictly inspects 'main' and rejects temp shadowing."""
+        """Metadata validation strictly inspects 'main' and rejects temp shadowing/triggers."""
         # a) Drifted main table shadowed by canonical temp table must fail closed
-        conn_shadow = sqlite3.connect(":memory:")
+        conn_drift_main = sqlite3.connect(":memory:")
         # main has drifted definition: only 2 columns, missing NOT NULL on owner_id
-        conn_shadow.execute("CREATE TABLE main.staging_run_journal (run_id TEXT PRIMARY KEY, owner_id TEXT);")
-        conn_shadow.execute("CREATE INDEX main.idx_staging_run_journal_status ON staging_run_journal (owner_id);")
+        conn_drift_main.execute("CREATE TABLE main.staging_run_journal (run_id TEXT PRIMARY KEY, owner_id TEXT);")
+        conn_drift_main.execute("CREATE INDEX main.idx_staging_run_journal_status ON staging_run_journal (owner_id);")
 
         # temp has perfectly canonical candidate Schema v7 definition
-        conn_shadow.execute("""
+        conn_drift_main.execute("""
         CREATE TABLE temp.staging_run_journal (
             run_id TEXT PRIMARY KEY,
             owner_id TEXT NOT NULL,
@@ -2325,26 +2347,69 @@ class TestCandidateSchemaV7StructuralValidator(unittest.TestCase):
             last_error TEXT
         );
         """)
-        conn_shadow.execute("CREATE INDEX temp.idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        conn_drift_main.execute("CREATE INDEX temp.idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
 
         # Verify fail-closed behavior: shadowed temp cannot cause false PASS
         with self.assertRaises(SchemaVerificationError) as ctx:
-            verify_staging_journal_schema(conn_shadow)
-        self.assertIn("Table 'staging_run_journal' has 2 columns (including hidden/generated), expected 10", str(ctx.exception))
-        self.assertIn("Table 'staging_run_journal' DDL does not match canonical Schema v7 definition", str(ctx.exception))
-        conn_shadow.close()
+            verify_staging_journal_schema(conn_drift_main)
+        self.assertIn("Unsafe shadowing object 'staging_run_journal'", str(ctx.exception))
+        self.assertIn("JOURNAL_TABLE_DDL_MISMATCH", str(ctx.exception))
+        conn_drift_main.close()
 
-        # b) Canonical main table with drifted temp table passes cleanly
-        conn_canon = sqlite3.connect(":memory:")
-        apply_candidate_schema_v7(conn_canon)
-        # Create an unapproved/drifted table in temp with same name
-        conn_canon.execute("CREATE TABLE temp.staging_run_journal (run_id TEXT, adversarial_col TEXT);")
-        conn_canon.execute("CREATE INDEX temp.idx_staging_run_journal_status ON staging_run_journal (adversarial_col);")
+        # b) Canonical main table with TEMP table shadow fails closed (INVALID)
+        conn_temp_tbl = sqlite3.connect(":memory:")
+        apply_candidate_schema_v7(conn_temp_tbl)
+        # Create an unapproved shadowing table in temp with same name
+        conn_temp_tbl.execute("CREATE TABLE temp.staging_run_journal (run_id TEXT, adversarial_col TEXT);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_temp_tbl)
+        self.assertIn("Unsafe shadowing object 'staging_run_journal' of type 'table' found in temp schema.", str(ctx.exception))
+        conn_temp_tbl.close()
 
-        report = verify_staging_journal_schema(conn_canon)
+        # c) Canonical main table with TEMP view shadow fails closed (INVALID)
+        conn_temp_view = sqlite3.connect(":memory:")
+        apply_candidate_schema_v7(conn_temp_view)
+        conn_temp_view.execute("CREATE VIEW temp.staging_run_journal AS SELECT 'run_1' AS run_id;")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_temp_view)
+        self.assertIn("Unsafe shadowing object 'staging_run_journal' of type 'view' found in temp schema.", str(ctx.exception))
+        conn_temp_view.close()
+
+        # d) Canonical main table with TEMP index shadow fails closed (INVALID)
+        conn_temp_idx = sqlite3.connect(":memory:")
+        apply_candidate_schema_v7(conn_temp_idx)
+        conn_temp_idx.execute("CREATE TABLE temp.other_table (id TEXT);")
+        conn_temp_idx.execute(f"CREATE INDEX temp.{EXPECTED_JOURNAL_INDEX_NAME} ON other_table (id);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_temp_idx)
+        self.assertIn(f"Unsafe shadowing object '{EXPECTED_JOURNAL_INDEX_NAME}' of type 'index' found in temp schema.", str(ctx.exception))
+        conn_temp_idx.close()
+
+        # e) Canonical main table with TEMP trigger affecting MAIN INSERT fails closed (INVALID)
+        conn_temp_trg = sqlite3.connect(":memory:")
+        apply_candidate_schema_v7(conn_temp_trg)
+        conn_temp_trg.execute("""
+        CREATE TRIGGER temp.adversarial_temp_trg
+        AFTER INSERT ON staging_run_journal
+        BEGIN
+            SELECT 1;
+        END;
+        """)
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_temp_trg)
+        self.assertIn("Unsafe trigger 'adversarial_temp_trg' targeting 'staging_run_journal' found in temp schema.", str(ctx.exception))
+        conn_temp_trg.close()
+
+        # f) Canonical main table without conflicting TEMP objects passes cleanly (VALID)
+        conn_valid = sqlite3.connect(":memory:")
+        apply_candidate_schema_v7(conn_valid)
+        # Create unrelated objects in temp schema (does not shadow staging_run_journal or its index)
+        conn_valid.execute("CREATE TABLE temp.unrelated_temp_data (data_key TEXT PRIMARY KEY, payload TEXT);")
+        conn_valid.execute("CREATE INDEX temp.idx_unrelated_data ON unrelated_temp_data (payload);")
+        report = verify_staging_journal_schema(conn_valid)
         self.assertTrue(report.is_valid)
         self.assertEqual(report.errors, [])
-        conn_canon.close()
+        conn_valid.close()
 
     def test_schema_v6_and_live_ready_operator_preflight_remain_valid(self):
         """Pure Schema v6 remains untouched at version 6 and LiveReadyStagingOperator preflight succeeds."""

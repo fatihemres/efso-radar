@@ -207,9 +207,13 @@ def verify_staging_journal_schema(
     - Operates ONLY on hermetic in-memory (:memory:) or OS temporary SQLite fixtures.
     - Rejects any connection with attached non-temporary databases with PermissionError.
     - Strictly bound to 'main' schema namespace: rejects shadowing by temp or attached databases.
+    - Rejects unsafe TEMP objects: fails closed if temp schema contains objects shadowing
+      staging_run_journal or idx_staging_run_journal_status, or triggers targeting staging_run_journal.
     - Rejects views or virtual tables impersonating staging_run_journal.
     - Validates exact canonical DDL in main.sqlite_master, rejecting ON CONFLICT clauses,
       CHECK constraints, foreign keys, WITHOUT ROWID, AUTOINCREMENT, or structural drift.
+    - Error reporting is sanitized: bounded codes (JOURNAL_TABLE_DDL_MISMATCH,
+      JOURNAL_INDEX_DDL_MISMATCH) without embedding raw untrusted DDL or sensitive literals.
     - Validates exact column count (10), names, types, order, PK ordinal, NOT NULL constraints,
       fencing_token DEFAULT 1, and nullable last_error via PRAGMA main.table_xinfo.
     - Validates no foreign keys via PRAGMA main.foreign_key_list.
@@ -222,7 +226,29 @@ def verify_staging_journal_schema(
 
     errors: list[str] = []
 
-    # 1. Inspect main.sqlite_master for table staging_run_journal
+    # 1. Inspect temp schema for unsafe shadowing or intercepting objects
+    cur = conn.execute(
+        "SELECT type, name, tbl_name FROM temp.sqlite_master "
+        "WHERE name = 'staging_run_journal' "
+        f"   OR name = '{EXPECTED_JOURNAL_INDEX_NAME}' "
+        "   OR (type = 'trigger' AND (tbl_name = 'staging_run_journal' OR sql LIKE '%staging_run_journal%'))"
+    )
+    temp_rows = cur.fetchall()
+    for t_type, t_name, t_tbl_name in temp_rows:
+        if t_name == "staging_run_journal":
+            errors.append(
+                f"Unsafe shadowing object 'staging_run_journal' of type '{t_type}' found in temp schema."
+            )
+        elif t_name == EXPECTED_JOURNAL_INDEX_NAME:
+            errors.append(
+                f"Unsafe shadowing object '{EXPECTED_JOURNAL_INDEX_NAME}' of type '{t_type}' found in temp schema."
+            )
+        elif t_type == "trigger":
+            errors.append(
+                f"Unsafe trigger '{t_name}' targeting 'staging_run_journal' found in temp schema."
+            )
+
+    # 2. Inspect main.sqlite_master for table staging_run_journal
     cur = conn.execute(
         "SELECT type, name, tbl_name, sql FROM main.sqlite_master WHERE name = 'staging_run_journal'"
     )
@@ -253,12 +279,11 @@ def verify_staging_journal_schema(
             norm_table_sql = _normalize_sql(sql)
             if norm_table_sql.upper() != EXPECTED_JOURNAL_TABLE_DDL_NORMALIZED.upper():
                 errors.append(
-                    f"Table 'staging_run_journal' DDL does not match canonical Schema v7 definition:\n"
-                    f"  got:      {norm_table_sql}\n"
-                    f"  expected: {EXPECTED_JOURNAL_TABLE_DDL_NORMALIZED}"
+                    "Table 'staging_run_journal' DDL does not match canonical Schema v7 definition "
+                    "(JOURNAL_TABLE_DDL_MISMATCH)."
                 )
 
-    # 2. If table exists and is a standard table, inspect columns via PRAGMA main.table_xinfo
+    # 3. If table exists and is a standard table, inspect columns via PRAGMA main.table_xinfo
     # table_xinfo reveals hidden and generated columns (both VIRTUAL and STORED)
     if table_master_rows and table_master_rows[0][0] == "table":
         cur = conn.execute("PRAGMA main.table_xinfo(staging_run_journal)")
@@ -310,15 +335,13 @@ def verify_staging_journal_schema(
                         f"got hidden={act_hidden}, expected hidden={exp_hidden}."
                     )
 
-        # 3. Inspect PRAGMA main.foreign_key_list
+        # 4. Inspect PRAGMA main.foreign_key_list
         cur = conn.execute("PRAGMA main.foreign_key_list(staging_run_journal)")
         fk_rows = cur.fetchall()
         if fk_rows:
-            errors.append(
-                f"Table 'staging_run_journal' contains unapproved foreign key(s): {fk_rows}."
-            )
+            errors.append("Table 'staging_run_journal' contains unapproved foreign key(s).")
 
-        # 4. Inspect index idx_staging_run_journal_status in main.sqlite_master
+        # 5. Inspect index idx_staging_run_journal_status in main.sqlite_master
         cur = conn.execute(
             "SELECT type, name, tbl_name, sql FROM main.sqlite_master "
             f"WHERE name = '{EXPECTED_JOURNAL_INDEX_NAME}'"
@@ -341,12 +364,11 @@ def verify_staging_journal_schema(
                 norm_idx_sql = _normalize_sql(idx_sql)
                 if norm_idx_sql.upper() != EXPECTED_JOURNAL_INDEX_DDL_NORMALIZED.upper():
                     errors.append(
-                        f"Index '{EXPECTED_JOURNAL_INDEX_NAME}' DDL does not match canonical Schema v7 definition:\n"
-                        f"  got:      {norm_idx_sql}\n"
-                        f"  expected: {EXPECTED_JOURNAL_INDEX_DDL_NORMALIZED}"
+                        f"Index '{EXPECTED_JOURNAL_INDEX_NAME}' DDL does not match canonical Schema v7 definition "
+                        "(JOURNAL_INDEX_DDL_MISMATCH)."
                     )
 
-        # 5. Inspect PRAGMA main.index_list for staging_run_journal
+        # 6. Inspect PRAGMA main.index_list for staging_run_journal
         cur = conn.execute("PRAGMA main.index_list(staging_run_journal)")
         idx_list = cur.fetchall()
         matching_indices = [row for row in idx_list if row[1] == EXPECTED_JOURNAL_INDEX_NAME]
@@ -424,7 +446,7 @@ def verify_staging_journal_schema(
         elif pk_index_count > 1:
             errors.append(f"Multiple ({pk_index_count}) primary key indexes on 'staging_run_journal'.")
 
-        # 6. Check for unexpected triggers on staging_run_journal in main.sqlite_master
+        # 7. Check for unexpected triggers on staging_run_journal in main.sqlite_master
         cur = conn.execute(
             "SELECT name FROM main.sqlite_master WHERE type = 'trigger' AND tbl_name = 'staging_run_journal'"
         )
