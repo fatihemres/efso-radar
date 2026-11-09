@@ -53,11 +53,18 @@ from efso_radar.staging.journal import (
 from efso_radar.staging.journal_hrana_seam import (
     AmbiguousRollbackError,
     CleanupVerificationError,
+    CrossRunnerDiscoveryError,
+    MAX_DISCOVERY_LIMIT,
     StagingJournalHranaSeam,
     build_live02_synthetic_mutations,
     _assert_fixture_isolation,
 )
 from efso_radar.staging.offline_recovery_evidence import (
+    CommitState,
+    CrossRunnerJournalStatus,
+    CrossRunnerProvenance,
+    EntityObservation,
+    QueryState,
     ReviewDecision,
 )
 from efso_radar.staging.runner import (
@@ -2161,3 +2168,596 @@ class TestArchitecturalBoundariesAndNonProofContract(_BaseTwoRunnerFixture):
         seam_doc = StagingJournalHranaSeam.__doc__ or ""
         self.assertIn("Strictly offline", seam_doc)
         self.assertIn("$0.00 / 0 TRY", seam_doc)
+
+
+# =============================================================================
+# Scenario 9: Cross-Runner Mock Wire Journal Discovery & Recovery Reconstruction
+# =============================================================================
+
+class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
+    """Adversarial cross-runner journal discovery & inert recovery evidence reconstruction over mock Hrana wire."""
+
+    def test_point1_runner_a_intent_discovered_by_runner_b_via_mock_hrana_wire_only(self):
+        """Runner A registers intent; Runner B discovers it over mock Hrana wire without knowing run ID."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+
+        # Runner B starts with empty marker dir, no manifest file, and no prior knowledge of RUN_ID_A
+        self.assertEqual(len(list(self.marker_dir_b.iterdir())), 0)
+
+        # Wire request tracing: prove the discovery genuinely traversed mock Hrana wire
+        captured_requests: list[httpx.Request] = []
+
+        def wire_spy_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            captured_requests.append(request)
+            return None
+
+        self.transport_b.custom_response_hook = wire_spy_hook
+        req_count_before = self.budget_b.request_count
+
+        discovered = self.seam_b.discover_unresolved_runs()
+
+        req_count_after = self.budget_b.request_count
+        self.assertEqual(req_count_after - req_count_before, 1, "Discovery query must traverse BudgetTrackingTransport wire")
+        self.assertEqual(len(captured_requests), 1, "Discovery query must hit HermeticStagingTransport wire")
+
+        # Verify wire request structure: POST /v2/pipeline with allowlisted SELECT
+        req = captured_requests[0]
+        self.assertEqual(req.method, "POST")
+        self.assertTrue(req.url.path.endswith("/v2/pipeline"))
+        req_body = json.loads(req.content.decode("utf-8"))
+        sql = req_body["requests"][0]["stmt"]["sql"]
+        self.assertIn("FROM staging_run_journal", sql)
+        self.assertIn("LIMIT ?", sql)
+
+        # Verify discovered record
+        self.assertEqual(len(discovered), 1)
+        entry = discovered[0]
+        self.assertEqual(entry.run_id, RUN_ID_A)
+        self.assertEqual(entry.owner_id, "gha_runner_a_worker_01")
+        self.assertEqual(entry.status, JournalStatus.ACKED)
+        self.assertEqual(entry.manifest_seal_hex, self.seal_a)
+
+        # Evidence reconstruction without passing run_id
+        review = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review.run_id, RUN_ID_A)
+        self.assertEqual(review.journal_status, CrossRunnerJournalStatus.INTENT_RECORDED)
+        self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+
+    def test_point2_runner_a_commits_effects_runner_b_reconstructs_residual_evidence_without_local_markers(self):
+        """Runner A commits synthetic effects; Runner B reconstructs residual evidence without local marker files."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        # Runner B has empty marker directory
+        self.assertEqual(len(list(self.marker_dir_b.iterdir())), 0)
+
+        # Reconstruct evidence without knowing run_id
+        review = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review.run_id, RUN_ID_A)
+        self.assertEqual(review.journal_status, CrossRunnerJournalStatus.EFFECT_COMMITTED)
+        self.assertEqual(review.decision, ReviewDecision.RESIDUAL)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+
+        # Explicit alias reconstruct_cross_runner_recovery_evidence produces identical inert outcome
+        alias_review = self.seam_b.reconstruct_cross_runner_recovery_evidence()
+        self.assertEqual(alias_review.run_id, RUN_ID_A)
+        self.assertEqual(alias_review.decision, ReviewDecision.RESIDUAL)
+        self.assertEqual(alias_review.remote_state, "UNKNOWN")
+        self.assertEqual(alias_review.action, "MANUAL_REVIEW_ONLY")
+
+    def test_point3_lost_commit_acknowledgments_never_permit_retry_or_takeover(self):
+        """Lost COMMIT acknowledgments are never interpreted as permission to retry or take over."""
+        # Case 3a: Intent COMMIT ack lost (COMMITTED_BUT_ACK_LOST)
+        with self.assertRaises(AmbiguousCommitError):
+            self.seam_a.register_intent(
+                run_id=RUN_ID_A,
+                manifest_seal_hex=self.seal_a,
+                target_inventory=self.entities_a,
+                simulate_ambiguous_commit=AmbiguousCommitOutcome.COMMITTED_BUT_ACK_LOST,
+            )
+
+        review = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review.run_id, RUN_ID_A)
+        self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+
+        # Runner B cannot retry Runner A's run or take over workload
+        with self.assertRaises(ActiveWorkloadCollisionError):
+            self.seam_b.register_intent(
+                run_id=RUN_ID_A,
+                manifest_seal_hex=self.seal_a,
+                target_inventory=self.entities_a,
+            )
+
+        with self.assertRaises(StaleOwnerError):
+            self.seam_b.execute_atomic_stage_mutation(
+                run_id=RUN_ID_A,
+                expected_fencing_token=1,
+                stage="LIVE-02",
+                mutation_statements=build_live02_synthetic_mutations(RUN_ID_A),
+            )
+
+        # Case 3b: Intent COMMIT rolled back and ack lost (ROLLED_BACK_AND_ACK_LOST)
+        fresh_run_id = "run_20261107T120500Z_c3d4e5f6a1b2"
+        fresh_entities = create_default_manifest_entities(fresh_run_id)
+        fresh_seal = compute_canonical_inventory_fingerprint(fresh_run_id, fresh_entities)
+
+        # Clean DB of prior run
+        self.conn_a.execute("DELETE FROM staging_run_journal WHERE run_id = ?", (RUN_ID_A,))
+        self.conn_a.commit()
+
+        with self.assertRaises(AmbiguousCommitError):
+            self.seam_a.register_intent(
+                run_id=fresh_run_id,
+                manifest_seal_hex=fresh_seal,
+                target_inventory=fresh_entities,
+                simulate_ambiguous_commit=AmbiguousCommitOutcome.ROLLED_BACK_AND_ACK_LOST,
+            )
+
+        discovered = self.seam_b.discover_unresolved_runs()
+        self.assertEqual(len(discovered), 0, "Rolled-back transaction leaves zero journal rows")
+        empty_review = self.seam_b.review_recovery_evidence()
+        self.assertEqual(empty_review.journal_status, CrossRunnerJournalStatus.ABSENT)
+        self.assertEqual(empty_review.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(empty_review.remote_state, "UNKNOWN")
+        self.assertEqual(empty_review.action, "MANUAL_REVIEW_ONLY")
+
+        # Case 3c: Effect COMMIT ack lost (COMMITTED_BUT_ACK_LOST)
+        run_id_3 = "run_20261107T120600Z_d4e5f6a1b2c3"
+        entities_3 = create_default_manifest_entities(run_id_3)
+        seal_3 = compute_canonical_inventory_fingerprint(run_id_3, entities_3)
+
+        self.seam_a.register_intent(
+            run_id=run_id_3,
+            manifest_seal_hex=seal_3,
+            target_inventory=entities_3,
+        )
+        mutations = build_live02_synthetic_mutations(run_id_3)
+        with self.assertRaises(AmbiguousCommitError):
+            self.seam_a.execute_atomic_stage_mutation(
+                run_id=run_id_3,
+                expected_fencing_token=1,
+                stage="LIVE-02",
+                mutation_statements=mutations,
+                manifest_seal_hex=seal_3,
+                simulate_ambiguous_commit=AmbiguousCommitOutcome.COMMITTED_BUT_ACK_LOST,
+            )
+
+        review_ambig = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review_ambig.run_id, run_id_3)
+        # Provider transaction committed effects before ACK was lost:
+        # DB status is EFFECT_COMMITTED with owned rows present -> forensic decision is RESIDUAL,
+        # but crucial safety invariants remote_state=UNKNOWN and action=MANUAL_REVIEW_ONLY remain strictly non-authorizing
+        self.assertEqual(review_ambig.journal_status, CrossRunnerJournalStatus.EFFECT_COMMITTED)
+        self.assertEqual(review_ambig.decision, ReviewDecision.RESIDUAL)
+        self.assertEqual(review_ambig.remote_state, "UNKNOWN")
+        self.assertEqual(review_ambig.action, "MANUAL_REVIEW_ONLY")
+
+        # Runner B is still strictly prohibited from taking over or mutating Runner A's run
+        with self.assertRaises(StaleOwnerError):
+            self.seam_b.execute_atomic_stage_mutation(
+                run_id=run_id_3,
+                expected_fencing_token=2,
+                stage="LIVE-02",
+                mutation_statements=mutations,
+            )
+
+    def test_point4_missing_malformed_duplicate_or_corrupted_journal_records_fail_closed(self):
+        """Missing, malformed, duplicate or corrupted journal records fail closed."""
+        # 4a: Missing records
+        discovered = self.seam_b.discover_unresolved_runs()
+        self.assertEqual(len(discovered), 0)
+        review = self.seam_b.review_recovery_evidence()
+        self.assertIsNone(review.run_id)
+        self.assertEqual(review.journal_status, CrossRunnerJournalStatus.ABSENT)
+        self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+
+        # 4b: Malformed run_id
+        self.conn_a.execute(
+            """
+            INSERT INTO staging_run_journal (
+                run_id, owner_id, fencing_token, stage, status,
+                manifest_seal_hex, target_inventory_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                "malformed_noncanonical_id",
+                "worker_01",
+                1,
+                "LIVE-02",
+                JournalStatus.ACKED.value,
+                "a" * 64,
+                "[]",
+                "2026-11-07T12:00:00Z",
+                "2026-11-07T12:00:00Z",
+            ],
+        )
+        self.conn_a.commit()
+
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertIn("invalid run_id", str(ctx.exception))
+
+        review_malformed = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review_malformed.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_malformed.journal_status, CrossRunnerJournalStatus.CORRUPTED)
+
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.commit()
+
+        # 4c: Corrupted target_inventory_json
+        self.conn_a.execute(
+            """
+            INSERT INTO staging_run_journal (
+                run_id, owner_id, fencing_token, stage, status,
+                manifest_seal_hex, target_inventory_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                RUN_ID_A,
+                "worker_01",
+                1,
+                "LIVE-02",
+                JournalStatus.ACKED.value,
+                self.seal_a,
+                "{invalid_json_content",
+                "2026-11-07T12:00:00Z",
+                "2026-11-07T12:00:00Z",
+            ],
+        )
+        self.conn_a.commit()
+
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertIn("invalid JSON", str(ctx.exception))
+
+        review_corrupt = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review_corrupt.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_corrupt.journal_status, CrossRunnerJournalStatus.CORRUPTED)
+
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.commit()
+
+        # 4d: Tampered manifest seal
+        raw_inv = json.dumps([e.model_dump() for e in self.entities_a])
+        tampered_seal = "0" * 64
+        self.conn_a.execute(
+            """
+            INSERT INTO staging_run_journal (
+                run_id, owner_id, fencing_token, stage, status,
+                manifest_seal_hex, target_inventory_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                RUN_ID_A,
+                "worker_01",
+                1,
+                "LIVE-02",
+                JournalStatus.ACKED.value,
+                tampered_seal,
+                raw_inv,
+                "2026-11-07T12:00:00Z",
+                "2026-11-07T12:00:00Z",
+            ],
+        )
+        self.conn_a.commit()
+
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertIn("manifest seal mismatch", str(ctx.exception))
+
+        review_tampered = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review_tampered.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_tampered.journal_status, CrossRunnerJournalStatus.CORRUPTED)
+
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.commit()
+
+        # 4e: Discovery result overflow (more than MAX_DISCOVERY_LIMIT runs)
+        for i in range(11):
+            r_id = f"run_20261107T12{i:02d}00Z_{i:012x}"
+            ents = create_default_manifest_entities(r_id)
+            seal = compute_canonical_inventory_fingerprint(r_id, ents)
+            self.conn_a.execute(
+                """
+                INSERT INTO staging_run_journal (
+                    run_id, owner_id, fencing_token, stage, status,
+                    manifest_seal_hex, target_inventory_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    r_id,
+                    "worker_01",
+                    1,
+                    "LIVE-02",
+                    JournalStatus.ACKED.value,
+                    seal,
+                    json.dumps([e.model_dump() for e in ents]),
+                    f"2026-11-07T12:{i:02d}:00Z",
+                    f"2026-11-07T12:{i:02d}:00Z",
+                ],
+            )
+        self.conn_a.commit()
+
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs(max_results=10)
+        self.assertIn("DISCOVERY_RESULT_OVERFLOW", str(ctx.exception))
+
+        review_overflow = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review_overflow.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_overflow.journal_status, CrossRunnerJournalStatus.UNREADABLE)
+
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.commit()
+
+        # 4f: Duplicate active runs on workload
+        for r_id in (RUN_ID_A, RUN_ID_B):
+            ents = create_default_manifest_entities(r_id)
+            seal = compute_canonical_inventory_fingerprint(r_id, ents)
+            self.conn_a.execute(
+                """
+                INSERT INTO staging_run_journal (
+                    run_id, owner_id, fencing_token, stage, status,
+                    manifest_seal_hex, target_inventory_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    r_id,
+                    "worker_01",
+                    1,
+                    "LIVE-02",
+                    JournalStatus.ACKED.value,
+                    seal,
+                    json.dumps([e.model_dump() for e in ents]),
+                    "2026-11-07T12:00:00Z",
+                    "2026-11-07T12:00:00Z",
+                ],
+            )
+        self.conn_a.commit()
+
+        review_dup = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review_dup.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_dup.journal_status, CrossRunnerJournalStatus.UNREADABLE)
+        self.assertIn("Multiple unresolved staging runs discovered", review_dup.reasons[0])
+
+    def test_point5_foreign_entities_or_ownership_mismatches_block_recovery(self):
+        """Foreign entities or ownership mismatches block recovery fail-closed."""
+        # 5a: Foreign attribution on entity row
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        # Tamper the source attribution of the article in the database fixture
+        self.conn_a.execute(
+            "UPDATE processed_articles SET source = 'FOREIGN_ATTRIBUTION' WHERE article_id = ?",
+            (f"synth_art_{RUN_ID_A}_01",),
+        )
+        self.conn_a.commit()
+
+        review = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review.run_id, RUN_ID_A)
+        self.assertEqual(review.decision, ReviewDecision.OWNERSHIP_MISMATCH_HALT)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+
+        # 5b: Unauthorized table in journal target inventory
+        unauth_ents = [
+            {
+                "table": "passwords",
+                "pk_column": "id",
+                "pk_value": "secret",
+                "cleanup_dependency_order": 1,
+                "expected_attributes": {},
+            }
+        ] * 5
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.execute(
+            """
+            INSERT INTO staging_run_journal (
+                run_id, owner_id, fencing_token, stage, status,
+                manifest_seal_hex, target_inventory_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                RUN_ID_A,
+                "worker_01",
+                1,
+                "LIVE-02",
+                JournalStatus.ACKED.value,
+                "b" * 64,
+                json.dumps(unauth_ents),
+                "2026-11-07T12:00:00Z",
+                "2026-11-07T12:00:00Z",
+            ],
+        )
+        self.conn_a.commit()
+
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertIn("unauthorized table 'passwords'", str(ctx.exception))
+
+        review_unauth = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review_unauth.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_unauth.journal_status, CrossRunnerJournalStatus.CORRUPTED)
+
+    def test_point6_transport_swapping_and_unexpected_network_dispatch_rejected(self):
+        """Transport swapping and missing transports are rejected before any network dispatch."""
+        intercepted = []
+
+        def spy_handler(request: httpx.Request) -> httpx.Response:
+            intercepted.append(request)
+            return httpx.Response(200, json={})
+
+        swapped = httpx.MockTransport(spy_handler)
+        self.client_b.transport = swapped
+
+        with self.assertRaises(PermissionError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertIn("client transport identity mismatch", str(ctx.exception))
+
+        with self.assertRaises(PermissionError) as ctx:
+            self.seam_b.review_recovery_evidence()
+        self.assertIn("client transport identity mismatch", str(ctx.exception))
+
+        with self.assertRaises(PermissionError) as ctx:
+            self.seam_b.inspect_run_wire(RUN_ID_A)
+        self.assertIn("client transport identity mismatch", str(ctx.exception))
+
+        self.assertEqual(len(intercepted), 0, "Zero HTTP requests may reach swapped transport")
+
+        # Transport is None
+        self.client_b.transport = None
+        with self.assertRaises(PermissionError):
+            self.seam_b.discover_unresolved_runs()
+
+    def test_point7_empty_or_incomplete_discovery_result_never_authorizes_new_work(self):
+        """An empty or incomplete discovery result never authorizes new work."""
+        # 7a: Empty discovery
+        review = self.seam_b.review_recovery_evidence()
+        self.assertIsNone(review.run_id)
+        self.assertEqual(review.journal_status, CrossRunnerJournalStatus.ABSENT)
+        self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+        self.assertIn("Empty discovery result never authorizes new work", review.reasons[1])
+
+        # 7b: Incomplete entity observations
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+
+        def failing_entity_query_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+                reqs = body.get("requests", [])
+                for r in reqs:
+                    sql = r.get("stmt", {}).get("sql", "")
+                    if "FROM stories" in sql:
+                        return httpx.Response(
+                            200,
+                            json={
+                                "baton": body.get("baton"),
+                                "results": [
+                                    {"type": "error", "error": {"code": "SQLITE_IOERR", "message": "Simulated disk failure"}},
+                                    {"type": "ok"},
+                                ],
+                            },
+                            request=request,
+                        )
+            except Exception:
+                pass
+            return None
+
+        self.transport_b.custom_response_hook = failing_entity_query_hook
+        review_incomplete = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review_incomplete.run_id, RUN_ID_A)
+        self.assertEqual(review_incomplete.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_incomplete.remote_state, "UNKNOWN")
+        self.assertEqual(review_incomplete.action, "MANUAL_REVIEW_ONLY")
+
+    def test_point8_discovery_and_inspection_produce_zero_database_mutations(self):
+        """Discovery and inspection paths produce zero database mutations."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        # Snapshot entire DB state across all tables before Runner B operations
+        def get_db_fingerprint(conn: sqlite3.Connection) -> dict[str, list[tuple]]:
+            tables = ("staging_run_journal", "processed_articles", "stories", "run_locks", "durable_recovery_state", "schema_migrations")
+            fp = {}
+            for t in tables:
+                cur = conn.execute(f"SELECT * FROM {t} ORDER BY 1")
+                fp[t] = cur.fetchall()
+            return fp
+
+        before_state = get_db_fingerprint(self.conn_a)
+
+        # Runner B executes all discovery & inspection paths
+        _ = self.seam_b.discover_unresolved_runs()
+        _ = self.seam_b.inspect_run_wire(RUN_ID_A)
+        _ = self.seam_b.review_recovery_evidence()
+        _ = self.seam_b.reconstruct_cross_runner_recovery_evidence()
+        _ = self.seam_b.list_unresolved_runs()
+
+        after_state = get_db_fingerprint(self.conn_a)
+        self.assertEqual(before_state, after_state, "Discovery and inspection must produce zero database mutations")
+
+    def test_point9_all_recovery_conclusions_remain_inert_and_manual_only(self):
+        """All recovery conclusions remain strictly inert with remote_state=UNKNOWN and action=MANUAL_REVIEW_ONLY."""
+        # Test clean discovery
+        rev_clean = self.seam_b.review_recovery_evidence()
+        self.assertEqual(rev_clean.remote_state, "UNKNOWN")
+        self.assertEqual(rev_clean.action, "MANUAL_REVIEW_ONLY")
+        self.assertIn(rev_clean.provenance, (CrossRunnerProvenance.HERMETIC_SIMULATION, CrossRunnerProvenance.UNVERIFIED_CANDIDATE))
+
+        # Test intent registered
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        rev_intent = self.seam_b.review_recovery_evidence()
+        self.assertEqual(rev_intent.remote_state, "UNKNOWN")
+        self.assertEqual(rev_intent.action, "MANUAL_REVIEW_ONLY")
+        self.assertIn(rev_intent.provenance, (CrossRunnerProvenance.HERMETIC_SIMULATION, CrossRunnerProvenance.UNVERIFIED_CANDIDATE))
+
+        # Test effects committed
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+        rev_effect = self.seam_b.review_recovery_evidence()
+        self.assertEqual(rev_effect.remote_state, "UNKNOWN")
+        self.assertEqual(rev_effect.action, "MANUAL_REVIEW_ONLY")
+        self.assertIn(rev_effect.provenance, (CrossRunnerProvenance.HERMETIC_SIMULATION, CrossRunnerProvenance.UNVERIFIED_CANDIDATE))
+
+        # Verify no executable mutation, retry or cleanup channels exist on CrossRunnerReview
+        for attr in ("execute", "retry", "takeover", "cleanup", "mutate"):
+            self.assertFalse(hasattr(rev_clean, attr))
+            self.assertFalse(hasattr(rev_intent, attr))
+            self.assertFalse(hasattr(rev_effect, attr))

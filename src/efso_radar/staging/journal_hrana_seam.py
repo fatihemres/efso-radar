@@ -66,6 +66,7 @@ from efso_radar.staging.offline_recovery_evidence import (
     CommitState,
     CrossRunnerJournalEntry,
     CrossRunnerJournalStatus,
+    CrossRunnerProvenance,
     CrossRunnerReview,
     EntityObservation,
     HermeticSnapshot,
@@ -95,6 +96,13 @@ class OwnershipMismatchError(JournalError, PermissionError):
 
 class AmbiguousRollbackError(FencingConflictError):
     """Raised when a fencing or CAS conflict triggers a ROLLBACK that cannot be confirmed."""
+
+
+class CrossRunnerDiscoveryError(JournalError):
+    """Raised when cross-runner mock wire discovery encounters an unexpected condition (overflow, corruption, ambiguity)."""
+
+
+MAX_DISCOVERY_LIMIT: int = 10
 
 
 def _assert_fixture_isolation(conn: sqlite3.Connection) -> None:
@@ -371,37 +379,185 @@ class StagingJournalHranaSeam:
             read_provenance=ReadProvenance.OFFLINE_LOCAL_FIXTURE_READ,
         )
 
-    def list_unresolved_runs(self) -> list[StagingJournalEntry]:
-        """Return all runs in active, mutating, or UNKNOWN statuses."""
-        cursor = self._conn.execute(
-            """
-            SELECT run_id, owner_id, fencing_token, stage, status,
-                   manifest_seal_hex, target_inventory_json, created_at, updated_at, last_error
-            FROM staging_run_journal
-            WHERE status NOT IN ('CLEANED_UP', 'ABORTED')
-            ORDER BY created_at ASC
-            """
+    def _validate_and_parse_wire_journal_row(self, row_dict: dict[str, Any]) -> StagingJournalEntry:
+        """Validate an individual journal row fetched over mock Hrana wire before admission.
+
+        Guarantees:
+        - Bounded, canonical run ID format.
+        - Canonical status within JournalStatus.
+        - Exactly 5 registered entities conforming to canonical structure.
+        - Verified manifest seal fingerprint matching inventory payload.
+        - Zero unvalidated table names or identifiers.
+        """
+        required_cols = (
+            "run_id", "owner_id", "fencing_token", "stage", "status",
+            "manifest_seal_hex", "target_inventory_json", "created_at", "updated_at"
         )
-        runs = []
-        cols = [desc[0] for desc in cursor.description]
-        for row in cursor.fetchall():
-            row_dict = dict(zip(cols, row))
-            runs.append(
-                StagingJournalEntry(
-                    run_id=row_dict["run_id"],
-                    owner_id=row_dict["owner_id"],
-                    fencing_token=row_dict["fencing_token"],
-                    stage=row_dict["stage"],
-                    status=JournalStatus(row_dict["status"]),
-                    manifest_seal_hex=row_dict["manifest_seal_hex"],
-                    target_inventory_json=row_dict["target_inventory_json"],
-                    created_at=row_dict["created_at"],
-                    updated_at=row_dict["updated_at"],
-                    last_error=row_dict.get("last_error"),
-                    read_provenance=ReadProvenance.OFFLINE_LOCAL_FIXTURE_READ,
-                )
+        for col in required_cols:
+            if col not in row_dict:
+                raise CrossRunnerDiscoveryError(f"Malformed wire journal row: missing column '{col}'.")
+
+        raw_run_id = row_dict["run_id"]
+        if not isinstance(raw_run_id, str) or not RUN_ID_REGEX.fullmatch(raw_run_id):
+            raise CrossRunnerDiscoveryError(f"Malformed wire journal row: invalid run_id '{raw_run_id}'.")
+
+        raw_owner_id = row_dict["owner_id"]
+        if not isinstance(raw_owner_id, str) or not raw_owner_id.strip() or not re.fullmatch(r"^[a-zA-Z0-9_-]{1,64}$", raw_owner_id):
+            raise CrossRunnerDiscoveryError(f"Malformed wire journal row: invalid owner_id '{raw_owner_id}'.")
+
+        raw_fence = row_dict["fencing_token"]
+        if not isinstance(raw_fence, int) or raw_fence < 1:
+            raise CrossRunnerDiscoveryError(f"Malformed wire journal row: invalid fencing_token '{raw_fence}'.")
+
+        raw_stage = row_dict["stage"]
+        if not isinstance(raw_stage, str) or not raw_stage.strip():
+            raise CrossRunnerDiscoveryError("Malformed wire journal row: empty stage.")
+
+        try:
+            status = JournalStatus(row_dict["status"])
+        except (ValueError, TypeError):
+            raise CrossRunnerDiscoveryError(f"Malformed wire journal row: invalid status '{row_dict.get('status')}'.")
+
+        raw_seal = row_dict["manifest_seal_hex"]
+        if not isinstance(raw_seal, str) or not HEX_SHA256_REGEX.fullmatch(raw_seal):
+            raise CrossRunnerDiscoveryError(f"Malformed wire journal row: invalid manifest_seal_hex '{raw_seal}'.")
+
+        raw_inv_json = row_dict["target_inventory_json"]
+        if not isinstance(raw_inv_json, str) or not raw_inv_json.strip():
+            raise CrossRunnerDiscoveryError("Malformed wire journal row: empty target_inventory_json.")
+
+        try:
+            inv_entities = json.loads(raw_inv_json)
+        except Exception as exc:
+            raise CrossRunnerDiscoveryError(f"Malformed wire journal row: invalid JSON in target_inventory_json: {exc}") from exc
+
+        if not isinstance(inv_entities, list) or len(inv_entities) != 5:
+            raise CrossRunnerDiscoveryError(
+                f"Malformed wire journal row: expected 5 registered entities, got {len(inv_entities) if isinstance(inv_entities, list) else type(inv_entities)}."
             )
-        return runs
+
+        for ent in inv_entities:
+            if not isinstance(ent, dict):
+                raise CrossRunnerDiscoveryError("Malformed wire journal row: entity in inventory is not a dictionary.")
+            tbl = ent.get("table")
+            pk_col = ent.get("pk_column")
+            pk_val = ent.get("pk_value")
+            if tbl not in ALLOWED_TABLE_PK_MAP:
+                raise CrossRunnerDiscoveryError(f"Malformed wire journal row: unauthorized table '{tbl}' in target inventory.")
+            if pk_col != ALLOWED_TABLE_PK_MAP[tbl]:
+                raise CrossRunnerDiscoveryError(f"Malformed wire journal row: PK column mismatch for table '{tbl}': expected '{ALLOWED_TABLE_PK_MAP[tbl]}', got '{pk_col}'.")
+            if not isinstance(pk_val, str) or not pk_val.strip() or len(pk_val) > 512:
+                raise CrossRunnerDiscoveryError(f"Malformed wire journal row: invalid pk_value for table '{tbl}'.")
+
+        try:
+            computed_seal = compute_canonical_inventory_fingerprint(
+                run_id=raw_run_id,
+                entities=inv_entities,
+            )
+        except Exception as exc:
+            raise CrossRunnerDiscoveryError(f"Malformed wire journal row: inventory validation error: {exc}") from exc
+
+        if computed_seal != raw_seal:
+            raise CrossRunnerDiscoveryError(
+                f"Malformed wire journal row: manifest seal mismatch for run '{raw_run_id}'. "
+                f"Stored '{raw_seal}' != computed '{computed_seal}'."
+            )
+
+        raw_created_at = row_dict["created_at"]
+        if not isinstance(raw_created_at, str) or not raw_created_at.strip():
+            raise CrossRunnerDiscoveryError("Malformed wire journal row: empty created_at.")
+        try:
+            _ = datetime.fromisoformat(raw_created_at.replace("Z", "+00:00"))
+        except Exception:
+            raise CrossRunnerDiscoveryError(f"Malformed wire journal row: invalid created_at timestamp '{raw_created_at}'.")
+
+        raw_updated_at = row_dict["updated_at"]
+        if not isinstance(raw_updated_at, str) or not raw_updated_at.strip():
+            raise CrossRunnerDiscoveryError("Malformed wire journal row: empty updated_at.")
+        try:
+            _ = datetime.fromisoformat(raw_updated_at.replace("Z", "+00:00"))
+        except Exception:
+            raise CrossRunnerDiscoveryError(f"Malformed wire journal row: invalid updated_at timestamp '{raw_updated_at}'.")
+
+        return StagingJournalEntry(
+            run_id=raw_run_id,
+            owner_id=raw_owner_id,
+            fencing_token=raw_fence,
+            stage=raw_stage,
+            status=status,
+            manifest_seal_hex=raw_seal,
+            target_inventory_json=raw_inv_json,
+            created_at=raw_created_at,
+            updated_at=raw_updated_at,
+            last_error=row_dict.get("last_error"),
+            read_provenance=ReadProvenance.UNVERIFIED_READ,
+        )
+
+    def inspect_run_wire(self, run_id: str) -> Optional[StagingJournalEntry]:
+        """Fetch current journal record for run_id strictly over mock Hrana wire."""
+        if not RUN_ID_REGEX.match(run_id):
+            raise InvalidRunIdError(f"run_id '{run_id}' is invalid.")
+
+        self._validate_hermetic_transport_identity()
+        scoped_sql = """
+        SELECT run_id, owner_id, fencing_token, stage, status,
+               manifest_seal_hex, target_inventory_json, created_at, updated_at, last_error
+        FROM staging_run_journal
+        WHERE run_id = ?
+        """
+        query_res = self._execute_guarded_client_query(scoped_sql, [run_id])
+        rows = query_res.fetchall()
+        if not rows:
+            return None
+        if len(rows) > 1:
+            raise CrossRunnerDiscoveryError(f"Duplicate journal rows found for run_id '{run_id}'.")
+
+        return self._validate_and_parse_wire_journal_row(rows[0])
+
+    def discover_unresolved_runs(
+        self,
+        *,
+        max_results: int = MAX_DISCOVERY_LIMIT,
+    ) -> list[StagingJournalEntry]:
+        """Discover unresolved staging runs strictly over mock Hrana wire without local marker files.
+
+        Guarantees:
+        - Bounded query with limit = max_results + 1 to detect result overflow fail-closed.
+        - Pure mock Hrana wire dispatch via TursoHTTPClient.execute (zero direct self._conn access).
+        - Rigorous row and inventory structure validation.
+        - Fail-closed on malformed rows, checksum mismatches, or unexpected table references.
+        """
+        if not isinstance(max_results, int) or max_results < 1 or max_results > MAX_DISCOVERY_LIMIT:
+            raise ValueError(f"max_results must be an integer between 1 and {MAX_DISCOVERY_LIMIT}.")
+
+        self._validate_hermetic_transport_identity()
+
+        discovery_sql = """
+        SELECT run_id, owner_id, fencing_token, stage, status,
+               manifest_seal_hex, target_inventory_json, created_at, updated_at, last_error
+        FROM staging_run_journal
+        WHERE status NOT IN ('CLEANED_UP', 'ABORTED')
+        ORDER BY created_at ASC
+        LIMIT ?
+        """
+        query_res = self._execute_guarded_client_query(discovery_sql, [max_results + 1])
+        raw_rows = query_res.fetchall()
+
+        if len(raw_rows) > max_results:
+            raise CrossRunnerDiscoveryError(
+                f"DISCOVERY_RESULT_OVERFLOW: discovery query returned {len(raw_rows)} rows, "
+                f"exceeding strict maximum limit of {max_results}. Fail-closed."
+            )
+
+        entries: list[StagingJournalEntry] = []
+        for r in raw_rows:
+            entries.append(self._validate_and_parse_wire_journal_row(r))
+
+        return entries
+
+    def list_unresolved_runs(self, *, max_results: int = MAX_DISCOVERY_LIMIT) -> list[StagingJournalEntry]:
+        """Return all runs in active, mutating, or UNKNOWN statuses via wire discovery."""
+        return self.discover_unresolved_runs(max_results=max_results)
 
     def propose_operator_reconciliation(
         self,
@@ -1492,7 +1648,7 @@ class StagingJournalHranaSeam:
     def audit_workload(self, run_id: str) -> AuditOutcomeState:
         """Perform an independent 3-state audit on the registered entity inventory."""
         self._validate_hermetic_transport_identity()
-        entry = self.inspect_run(run_id)
+        entry = self.inspect_run_wire(run_id) or self.inspect_run(run_id)
         if not entry:
             return AuditOutcomeState.UNKNOWN
 
@@ -1534,83 +1690,224 @@ class StagingJournalHranaSeam:
     def review_recovery_evidence(
         self,
         *,
-        run_id: str,
+        run_id: Optional[str] = None,
         manifest_bytes: Optional[bytes] = None,
     ) -> CrossRunnerReview:
-        """Inspect provider DB via Hrana and generate a typed CrossRunnerReview."""
+        """Inspect provider DB via mock Hrana wire and generate a typed CrossRunnerReview.
+
+        Can operate either in discovery mode (run_id=None) or scoped inspection mode (run_id specified).
+        Zero direct self._conn access is used during journal or entity inspection.
+        All conclusions remain strictly non-authorizing (remote_state='UNKNOWN', action='MANUAL_REVIEW_ONLY').
+        """
         self._validate_hermetic_transport_identity()
-        entry = self.inspect_run(run_id)
 
-        j_entry: Optional[CrossRunnerJournalEntry] = None
-        observations: list[EntityObservation] = []
-        commit_state = CommitState.NOT_REPORTED
+        discovered_entries: list[StagingJournalEntry] = []
+        discovery_error: Optional[Exception] = None
 
-        if entry:
-            j_status = CrossRunnerJournalStatus.INTENT_RECORDED
-            if entry.status == JournalStatus.EFFECT_COMMITTED:
-                j_status = CrossRunnerJournalStatus.EFFECT_COMMITTED
-            elif entry.status == JournalStatus.ABORTED:
-                j_status = CrossRunnerJournalStatus.ABORTED
-            elif entry.status == JournalStatus.UNKNOWN:
-                commit_state = CommitState.AMBIGUOUS
+        if run_id is None:
+            try:
+                discovered_entries = self.discover_unresolved_runs()
+            except CrossRunnerDiscoveryError as exc:
+                discovery_error = exc
+            except (TursoClientError, httpx.HTTPError) as exc:
+                return CrossRunnerReview(
+                    run_id=None,
+                    reviewing_runner_id="VALIDATED_RECOVERY_RUNNER",
+                    provenance=CrossRunnerProvenance.HERMETIC_SIMULATION,
+                    journal_status=CrossRunnerJournalStatus.UNREADABLE,
+                    decision=ReviewDecision.UNKNOWN,
+                    remote_state="UNKNOWN",
+                    action="MANUAL_REVIEW_ONLY",
+                    reasons=(f"Wire discovery query failed: {exc}", "Unreadable journal state requires manual investigation."),
+                )
 
-            registered_pks = tuple(f"{e['table']}:{e['pk_value']}" for e in entry.get_registered_entities())
-            stage_str = entry.stage if entry.stage.startswith("LIVE") else "LIVE_02"
-            if "-" in stage_str:
-                stage_str = stage_str.replace("-", "_")
+            if discovery_error is not None:
+                err_msg = str(discovery_error)
+                j_status = CrossRunnerJournalStatus.UNREADABLE if "OVERFLOW" in err_msg else CrossRunnerJournalStatus.CORRUPTED
+                return CrossRunnerReview(
+                    run_id=None,
+                    reviewing_runner_id="VALIDATED_RECOVERY_RUNNER",
+                    provenance=CrossRunnerProvenance.HERMETIC_SIMULATION,
+                    journal_status=j_status,
+                    decision=ReviewDecision.UNKNOWN,
+                    remote_state="UNKNOWN",
+                    action="MANUAL_REVIEW_ONLY",
+                    reasons=(f"Journal discovery failed closed: {err_msg}", "Corrupted journal never authorizes mutations or cleanup."),
+                )
 
-            j_entry = CrossRunnerJournalEntry(
-                run_id=entry.run_id,
-                runner_id=entry.owner_id,
-                status=j_status,
-                intent_stage=stage_str,
-                target_entities=registered_pks[:10],
-                journal_commit_state=commit_state,
-                created_at=entry.created_at,
+            if len(discovered_entries) == 0:
+                return CrossRunnerReview(
+                    run_id=None,
+                    reviewing_runner_id="VALIDATED_RECOVERY_RUNNER",
+                    provenance=CrossRunnerProvenance.HERMETIC_SIMULATION,
+                    journal_status=CrossRunnerJournalStatus.ABSENT,
+                    decision=ReviewDecision.UNKNOWN,
+                    remote_state="UNKNOWN",
+                    action="MANUAL_REVIEW_ONLY",
+                    reasons=(
+                        "No unresolved staging journal runs discovered over mock Hrana wire.",
+                        "Empty discovery result never authorizes new work or automated recovery.",
+                    ),
+                )
+
+            if len(discovered_entries) > 1:
+                return CrossRunnerReview(
+                    run_id=None,
+                    reviewing_runner_id="VALIDATED_RECOVERY_RUNNER",
+                    provenance=CrossRunnerProvenance.HERMETIC_SIMULATION,
+                    journal_status=CrossRunnerJournalStatus.UNREADABLE,
+                    decision=ReviewDecision.UNKNOWN,
+                    remote_state="UNKNOWN",
+                    action="MANUAL_REVIEW_ONLY",
+                    reasons=(
+                        f"Multiple unresolved staging runs discovered ({len(discovered_entries)} runs); conflicting active workloads.",
+                        "Cross-runner ownership ambiguity; manual review required.",
+                    ),
+                )
+
+            entry = discovered_entries[0]
+            target_run_id = entry.run_id
+        else:
+            target_run_id = run_id
+            try:
+                entry = self.inspect_run_wire(target_run_id)
+            except CrossRunnerDiscoveryError as exc:
+                return CrossRunnerReview(
+                    run_id=target_run_id if RUN_ID_REGEX.match(target_run_id) else None,
+                    reviewing_runner_id="VALIDATED_RECOVERY_RUNNER",
+                    provenance=CrossRunnerProvenance.HERMETIC_SIMULATION,
+                    journal_status=CrossRunnerJournalStatus.CORRUPTED,
+                    decision=ReviewDecision.UNKNOWN,
+                    remote_state="UNKNOWN",
+                    action="MANUAL_REVIEW_ONLY",
+                    reasons=(f"Journal row validation failed closed: {exc}", "Corrupted journal never authorizes mutations or cleanup."),
+                )
+            except (TursoClientError, httpx.HTTPError) as exc:
+                return CrossRunnerReview(
+                    run_id=target_run_id if RUN_ID_REGEX.match(target_run_id) else None,
+                    reviewing_runner_id="VALIDATED_RECOVERY_RUNNER",
+                    provenance=CrossRunnerProvenance.HERMETIC_SIMULATION,
+                    journal_status=CrossRunnerJournalStatus.UNREADABLE,
+                    decision=ReviewDecision.UNKNOWN,
+                    remote_state="UNKNOWN",
+                    action="MANUAL_REVIEW_ONLY",
+                    reasons=(f"Wire query failed or unreadable: {exc}", "Unreadable journal state requires manual investigation."),
+                )
+
+        if entry is None:
+            return CrossRunnerReview(
+                run_id=target_run_id if RUN_ID_REGEX.match(target_run_id) else None,
+                reviewing_runner_id="VALIDATED_RECOVERY_RUNNER",
+                provenance=CrossRunnerProvenance.HERMETIC_SIMULATION,
+                journal_status=CrossRunnerJournalStatus.ABSENT,
+                decision=ReviewDecision.UNKNOWN,
+                remote_state="UNKNOWN",
+                action="MANUAL_REVIEW_ONLY",
+                reasons=(
+                    "Cross-runner ownership journal is ABSENT; cannot verify ownership across runners without a persistent journal.",
+                    "Missing journal never authorizes mutations, automatic cleanup, or retries.",
+                ),
             )
 
-            # Query observations for registered entities
-            for ent in entry.get_registered_entities():
-                tbl = ent["table"]
-                pk_col = ent["pk_column"]
-                pk_val = ent["pk_value"]
-                try:
-                    res = self._execute_guarded_client_query(
-                        f"SELECT * FROM {tbl} WHERE {pk_col} = ?",
-                        [pk_val],
-                    )
-                    rows = res.fetchall()
-                    expected_keys = {pk_col} | {
-                        ("worker_id" if k == "worker_ids" else k)
-                        for k in ent.get("expected_attributes", {}).keys()
-                    }
-                    safe_rows = []
-                    for r in rows[:2]:
-                        safe_r = {str(k): str(v) for k, v in r.items() if str(k) in expected_keys and len(str(v)) <= 512}
-                        safe_rows.append(safe_r)
-                    observations.append(
-                        EntityObservation(
-                            table=tbl,
-                            pk_column=pk_col,
-                            pk_value=pk_val,
-                            query_state=QueryState.OBSERVED,
-                            rows=tuple(safe_rows),
-                        )
-                    )
-                except PermissionError:
-                    raise
-                except Exception:
-                    observations.append(
-                        EntityObservation(
-                            table=tbl,
-                            pk_column=pk_col,
-                            pk_value=pk_val,
-                            query_state=QueryState.FAILED,
-                            rows=(),
-                        )
-                    )
+        j_status = CrossRunnerJournalStatus.INTENT_RECORDED
+        commit_state = CommitState.NOT_REPORTED
 
-        seal_hex = compute_canonical_inventory_fingerprint(run_id)
+        if entry.status == JournalStatus.EFFECT_COMMITTED:
+            j_status = CrossRunnerJournalStatus.EFFECT_COMMITTED
+            commit_state = CommitState.ACKNOWLEDGED
+        elif entry.status == JournalStatus.ABORTED:
+            j_status = CrossRunnerJournalStatus.ABORTED
+        elif entry.status == JournalStatus.UNKNOWN:
+            commit_state = CommitState.AMBIGUOUS
+        elif entry.status == JournalStatus.ACKED:
+            commit_state = CommitState.ACKNOWLEDGED
+        elif entry.status == JournalStatus.INTENT_PENDING:
+            commit_state = CommitState.NOT_REPORTED
+
+        try:
+            registered_raw = entry.get_registered_entities()
+        except Exception:
+            return CrossRunnerReview(
+                run_id=entry.run_id,
+                reviewing_runner_id="VALIDATED_RECOVERY_RUNNER",
+                provenance=CrossRunnerProvenance.HERMETIC_SIMULATION,
+                journal_status=CrossRunnerJournalStatus.CORRUPTED,
+                decision=ReviewDecision.UNKNOWN,
+                remote_state="UNKNOWN",
+                action="MANUAL_REVIEW_ONLY",
+                reasons=("Corrupted target inventory JSON in journal entry.",),
+            )
+
+        registered_pks = tuple(f"{e['table']}:{e['pk_value']}" for e in registered_raw if isinstance(e, dict) and "table" in e and "pk_value" in e)
+        stage_str = entry.stage if entry.stage.startswith("LIVE") else "LIVE_02"
+        if "-" in stage_str:
+            stage_str = stage_str.replace("-", "_")
+
+        j_entry = CrossRunnerJournalEntry(
+            run_id=entry.run_id,
+            runner_id=entry.owner_id,
+            status=j_status,
+            intent_stage=stage_str,
+            target_entities=registered_pks[:10],
+            journal_commit_state=commit_state,
+            created_at=entry.created_at,
+        )
+
+        observations: list[EntityObservation] = []
+        for ent in registered_raw:
+            if not isinstance(ent, dict):
+                continue
+            tbl = ent.get("table")
+            pk_col = ent.get("pk_column")
+            pk_val = ent.get("pk_value")
+
+            if tbl not in ALLOWED_TABLE_PK_MAP or pk_col != ALLOWED_TABLE_PK_MAP[tbl]:
+                observations.append(
+                    EntityObservation(
+                        table=str(tbl)[:64] if tbl else "unauthorized",
+                        pk_column=str(pk_col)[:64] if pk_col else "unauthorized",
+                        pk_value=str(pk_val)[:512] if pk_val else "unauthorized",
+                        query_state=QueryState.FAILED,
+                        rows=(),
+                    )
+                )
+                continue
+
+            audit_sql = f"SELECT * FROM {tbl} WHERE {pk_col} = ?"
+            try:
+                res = self._execute_guarded_client_query(audit_sql, [pk_val])
+                rows = res.fetchall()
+                expected_keys = {pk_col} | {
+                    ("worker_id" if k == "worker_ids" else k)
+                    for k in ent.get("expected_attributes", {}).keys()
+                }
+                safe_rows = []
+                for r in rows[:2]:
+                    safe_r = {str(k): str(v) for k, v in r.items() if str(k) in expected_keys and len(str(v)) <= 512}
+                    safe_rows.append(safe_r)
+                observations.append(
+                    EntityObservation(
+                        table=tbl,
+                        pk_column=pk_col,
+                        pk_value=pk_val,
+                        query_state=QueryState.OBSERVED,
+                        rows=tuple(safe_rows),
+                    )
+                )
+            except PermissionError:
+                raise
+            except Exception:
+                observations.append(
+                    EntityObservation(
+                        table=tbl,
+                        pk_column=pk_col,
+                        pk_value=pk_val,
+                        query_state=QueryState.FAILED,
+                        rows=(),
+                    )
+                )
+
+        seal_hex = compute_canonical_inventory_fingerprint(entry.run_id)
         snapshot = HermeticSnapshot(
             manifest_sha256=seal_hex,
             observations=tuple(observations[:5]),
@@ -1618,8 +1915,17 @@ class StagingJournalHranaSeam:
         ) if observations else None
 
         return review_cross_runner_recovery_evidence(
-            expected_run_id=run_id,
+            expected_run_id=entry.run_id,
             reviewing_runner_id=self._owner_id,
             journal_entry=j_entry,
             snapshot=snapshot,
         )
+
+    def reconstruct_cross_runner_recovery_evidence(
+        self,
+        *,
+        run_id: Optional[str] = None,
+        manifest_bytes: Optional[bytes] = None,
+    ) -> CrossRunnerReview:
+        """Alias for review_recovery_evidence supporting unprompted cross-runner wire discovery."""
+        return self.review_recovery_evidence(run_id=run_id, manifest_bytes=manifest_bytes)
