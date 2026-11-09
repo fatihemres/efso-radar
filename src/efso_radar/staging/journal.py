@@ -227,26 +227,32 @@ def verify_staging_journal_schema(
     errors: list[str] = []
 
     # 1. Inspect temp schema for unsafe shadowing or intercepting objects
-    cur = conn.execute(
-        "SELECT type, name, tbl_name FROM temp.sqlite_master "
-        "WHERE name = 'staging_run_journal' "
-        f"   OR name = '{EXPECTED_JOURNAL_INDEX_NAME}' "
-        "   OR (type = 'trigger' AND (tbl_name = 'staging_run_journal' OR sql LIKE '%staging_run_journal%'))"
+    # 1a. Reject any trigger in temp schema completely (fail-closed defense against trigger injection)
+    cur_trg = conn.execute("SELECT 1 FROM temp.sqlite_master WHERE type = 'trigger' LIMIT 1")
+    if cur_trg.fetchone():
+        errors.append("Unsafe trigger found in temp schema (TEMP_TRIGGER_DISALLOWED).")
+
+    # 1b. Reject any shadowing object named staging_run_journal (case-insensitive)
+    cur_tbl = conn.execute(
+        "SELECT 1 FROM temp.sqlite_master "
+        "WHERE name = 'staging_run_journal' COLLATE NOCASE LIMIT 1"
     )
-    temp_rows = cur.fetchall()
-    for t_type, t_name, t_tbl_name in temp_rows:
-        if t_name == "staging_run_journal":
-            errors.append(
-                f"Unsafe shadowing object 'staging_run_journal' of type '{t_type}' found in temp schema."
-            )
-        elif t_name == EXPECTED_JOURNAL_INDEX_NAME:
-            errors.append(
-                f"Unsafe shadowing object '{EXPECTED_JOURNAL_INDEX_NAME}' of type '{t_type}' found in temp schema."
-            )
-        elif t_type == "trigger":
-            errors.append(
-                f"Unsafe trigger '{t_name}' targeting 'staging_run_journal' found in temp schema."
-            )
+    if cur_tbl.fetchone():
+        errors.append(
+            "Unsafe shadowing object 'staging_run_journal' found in temp schema "
+            "(TEMP_TABLE_SHADOW_DISALLOWED)."
+        )
+
+    # 1c. Reject any shadowing index named idx_staging_run_journal_status (case-insensitive)
+    cur_idx = conn.execute(
+        "SELECT 1 FROM temp.sqlite_master "
+        f"WHERE name = '{EXPECTED_JOURNAL_INDEX_NAME}' COLLATE NOCASE LIMIT 1"
+    )
+    if cur_idx.fetchone():
+        errors.append(
+            f"Unsafe shadowing index '{EXPECTED_JOURNAL_INDEX_NAME}' found in temp schema "
+            "(TEMP_INDEX_SHADOW_DISALLOWED)."
+        )
 
     # 2. Inspect main.sqlite_master for table staging_run_journal
     cur = conn.execute(

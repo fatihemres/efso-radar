@@ -2352,55 +2352,49 @@ class TestCandidateSchemaV7StructuralValidator(unittest.TestCase):
         # Verify fail-closed behavior: shadowed temp cannot cause false PASS
         with self.assertRaises(SchemaVerificationError) as ctx:
             verify_staging_journal_schema(conn_drift_main)
-        self.assertIn("Unsafe shadowing object 'staging_run_journal'", str(ctx.exception))
+        self.assertIn("TEMP_TABLE_SHADOW_DISALLOWED", str(ctx.exception))
         self.assertIn("JOURNAL_TABLE_DDL_MISMATCH", str(ctx.exception))
         conn_drift_main.close()
 
-        # b) Canonical main table with TEMP table shadow fails closed (INVALID)
-        conn_temp_tbl = sqlite3.connect(":memory:")
-        apply_candidate_schema_v7(conn_temp_tbl)
-        # Create an unapproved shadowing table in temp with same name
-        conn_temp_tbl.execute("CREATE TABLE temp.staging_run_journal (run_id TEXT, adversarial_col TEXT);")
+        # b) Canonical MAIN + uppercase "STAGING_RUN_JOURNAL" TEMP table fails closed (case-insensitive)
+        conn_upper_tbl = sqlite3.connect(":memory:")
+        apply_candidate_schema_v7(conn_upper_tbl)
+        conn_upper_tbl.execute('CREATE TABLE temp."STAGING_RUN_JOURNAL" (id TEXT);')
         with self.assertRaises(SchemaVerificationError) as ctx:
-            verify_staging_journal_schema(conn_temp_tbl)
-        self.assertIn("Unsafe shadowing object 'staging_run_journal' of type 'table' found in temp schema.", str(ctx.exception))
-        conn_temp_tbl.close()
+            verify_staging_journal_schema(conn_upper_tbl)
+        self.assertIn("TEMP_TABLE_SHADOW_DISALLOWED", str(ctx.exception))
+        self.assertIn("Unsafe shadowing object 'staging_run_journal' found in temp schema", str(ctx.exception))
+        conn_upper_tbl.close()
 
-        # c) Canonical main table with TEMP view shadow fails closed (INVALID)
-        conn_temp_view = sqlite3.connect(":memory:")
-        apply_candidate_schema_v7(conn_temp_view)
-        conn_temp_view.execute("CREATE VIEW temp.staging_run_journal AS SELECT 'run_1' AS run_id;")
+        # c) Canonical MAIN + differently cased TEMP index shadow fails closed (case-insensitive)
+        conn_cased_idx = sqlite3.connect(":memory:")
+        apply_candidate_schema_v7(conn_cased_idx)
+        conn_cased_idx.execute("CREATE TABLE temp.other_table (id TEXT);")
+        conn_cased_idx.execute('CREATE INDEX temp."Idx_Staging_Run_Journal_Status" ON other_table (id);')
         with self.assertRaises(SchemaVerificationError) as ctx:
-            verify_staging_journal_schema(conn_temp_view)
-        self.assertIn("Unsafe shadowing object 'staging_run_journal' of type 'view' found in temp schema.", str(ctx.exception))
-        conn_temp_view.close()
+            verify_staging_journal_schema(conn_cased_idx)
+        self.assertIn("TEMP_INDEX_SHADOW_DISALLOWED", str(ctx.exception))
+        self.assertIn(f"Unsafe shadowing index '{EXPECTED_JOURNAL_INDEX_NAME}' found in temp schema", str(ctx.exception))
+        conn_cased_idx.close()
 
-        # d) Canonical main table with TEMP index shadow fails closed (INVALID)
-        conn_temp_idx = sqlite3.connect(":memory:")
-        apply_candidate_schema_v7(conn_temp_idx)
-        conn_temp_idx.execute("CREATE TABLE temp.other_table (id TEXT);")
-        conn_temp_idx.execute(f"CREATE INDEX temp.{EXPECTED_JOURNAL_INDEX_NAME} ON other_table (id);")
-        with self.assertRaises(SchemaVerificationError) as ctx:
-            verify_staging_journal_schema(conn_temp_idx)
-        self.assertIn(f"Unsafe shadowing object '{EXPECTED_JOURNAL_INDEX_NAME}' of type 'index' found in temp schema.", str(ctx.exception))
-        conn_temp_idx.close()
-
-        # e) Canonical main table with TEMP trigger affecting MAIN INSERT fails closed (INVALID)
-        conn_temp_trg = sqlite3.connect(":memory:")
-        apply_candidate_schema_v7(conn_temp_trg)
-        conn_temp_trg.execute("""
-        CREATE TRIGGER temp.adversarial_temp_trg
-        AFTER INSERT ON staging_run_journal
+        # d) Uppercase TEMP trigger targeting MAIN with case_sensitive_like=ON fails closed
+        conn_csl_trg = sqlite3.connect(":memory:")
+        conn_csl_trg.execute("PRAGMA case_sensitive_like=ON;")
+        apply_candidate_schema_v7(conn_csl_trg)
+        conn_csl_trg.execute("""
+        CREATE TRIGGER temp."ADVERSARIAL_UPPERCASE_TRG"
+        AFTER INSERT ON "STAGING_RUN_JOURNAL"
         BEGIN
             SELECT 1;
         END;
         """)
         with self.assertRaises(SchemaVerificationError) as ctx:
-            verify_staging_journal_schema(conn_temp_trg)
-        self.assertIn("Unsafe trigger 'adversarial_temp_trg' targeting 'staging_run_journal' found in temp schema.", str(ctx.exception))
-        conn_temp_trg.close()
+            verify_staging_journal_schema(conn_csl_trg)
+        self.assertIn("TEMP_TRIGGER_DISALLOWED", str(ctx.exception))
+        self.assertNotIn("ADVERSARIAL_UPPERCASE_TRG", str(ctx.exception))
+        conn_csl_trg.close()
 
-        # f) Canonical main table without conflicting TEMP objects passes cleanly (VALID)
+        # e) Canonical MAIN without conflicting TEMP objects continues passing (VALID)
         conn_valid = sqlite3.connect(":memory:")
         apply_candidate_schema_v7(conn_valid)
         # Create unrelated objects in temp schema (does not shadow staging_run_journal or its index)
