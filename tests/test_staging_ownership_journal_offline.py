@@ -37,8 +37,17 @@ from efso_radar.repositories.schema import (
     MIGRATIONS,
     get_all_init_statements,
 )
+from efso_radar.repositories.turso_client import TursoHTTPClient
+from efso_radar.staging.live_ready_operator import LiveReadyStagingOperator
 from efso_radar.staging.journal import (
     ACTIVE_JOURNAL_STATUSES,
+    EXPECTED_JOURNAL_COLUMNS,
+    EXPECTED_JOURNAL_INDEX_NAME,
+    EXPECTED_JOURNAL_INDEX_COLUMNS,
+    EXPECTED_JOURNAL_INDEX_KEYS,
+    SchemaVerificationError,
+    SchemaVerificationReport,
+    verify_staging_journal_schema,
     LEGAL_TRANSITIONS,
     SCHEMA_V7_STAGING_JOURNAL_DDL,
     UNRESOLVED_JOURNAL_STATUSES,
@@ -70,6 +79,9 @@ from efso_radar.staging.journal import (
     _halt_marker_path,
 )
 from efso_radar.staging.runner import (
+    BudgetTrackingTransport,
+    EXACT_STAGING_DESTINATION,
+    HermeticStagingTransport,
     RUN_ID_REGEX,
     PerRunOwnershipManifest,
     RegisteredEntity,
@@ -1635,6 +1647,803 @@ class TestNonDestructiveRollback(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertEqual(row[0], JournalStatus.ACKED.value)
         conn.close()
+
+
+class TestCandidateSchemaV7StructuralValidator(unittest.TestCase):
+    """Hermetic offline test suite for candidate Schema v7 structural validator (Issue #84)."""
+
+    def test_canonical_candidate_schema_v7_passes_verification(self):
+        """Canonical candidate Schema v7 DDL passes structural verification in memory and tempfile."""
+        # 1. In-memory
+        conn_mem = sqlite3.connect(":memory:")
+        apply_candidate_schema_v7(conn_mem)
+        report_mem = verify_staging_journal_schema(conn_mem)
+        self.assertIsInstance(report_mem, SchemaVerificationReport)
+        self.assertTrue(report_mem.is_valid)
+        self.assertTrue(bool(report_mem))
+        self.assertEqual(report_mem.errors, [])
+        self.assertEqual(report_mem.table_name, "staging_run_journal")
+        self.assertTrue(len(report_mem.checked_at) > 0)
+
+        # Non-raising mode
+        rep_no_raise = verify_staging_journal_schema(conn_mem, raise_on_error=False)
+        self.assertTrue(rep_no_raise.is_valid)
+        self.assertEqual(rep_no_raise.errors, [])
+        conn_mem.close()
+
+        # 2. Tempfile SQLite fixture
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_path = Path(tmpdir) / "test_v7_canonical.db"
+            conn_file = sqlite3.connect(str(db_path))
+            try:
+                apply_candidate_schema_v7(conn_file)
+                report_file = verify_staging_journal_schema(conn_file)
+                self.assertTrue(report_file.is_valid)
+                self.assertEqual(report_file.errors, [])
+            finally:
+                conn_file.close()
+
+    def test_missing_table_fails_closed(self):
+        """Missing staging_run_journal table fails closed with SchemaVerificationError."""
+        conn = sqlite3.connect(":memory:")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn)
+        self.assertIn("Table 'staging_run_journal' does not exist", str(ctx.exception))
+
+        rep = verify_staging_journal_schema(conn, raise_on_error=False)
+        self.assertFalse(rep.is_valid)
+        self.assertFalse(bool(rep))
+        self.assertIn("Table 'staging_run_journal' does not exist.", rep.errors)
+        conn.close()
+
+    def test_column_drift_fails_closed(self):
+        """Column count, names, types, order, and nullability drift fail closed."""
+        # a) Missing column (9 columns: omitted last_error)
+        conn = sqlite3.connect(":memory:")
+        conn.execute("""
+        CREATE TABLE staging_run_journal (
+            run_id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            fencing_token INTEGER NOT NULL DEFAULT 1,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            manifest_seal_hex TEXT NOT NULL,
+            target_inventory_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """)
+        conn.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn)
+        self.assertIn("has 9 columns", str(ctx.exception))
+        conn.close()
+
+        # b) Extra column (11 columns)
+        conn = sqlite3.connect(":memory:")
+        conn.execute("""
+        CREATE TABLE staging_run_journal (
+            run_id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            fencing_token INTEGER NOT NULL DEFAULT 1,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            manifest_seal_hex TEXT NOT NULL,
+            target_inventory_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_error TEXT,
+            unexpected_extra_col TEXT
+        );
+        """)
+        conn.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn)
+        self.assertIn("has 11 columns", str(ctx.exception))
+        conn.close()
+
+        # c) Reordered columns (stage before owner_id)
+        conn = sqlite3.connect(":memory:")
+        conn.execute("""
+        CREATE TABLE staging_run_journal (
+            run_id TEXT PRIMARY KEY,
+            stage TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            fencing_token INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL,
+            manifest_seal_hex TEXT NOT NULL,
+            target_inventory_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_error TEXT
+        );
+        """)
+        conn.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn)
+        self.assertIn("Column name mismatch at position 1", str(ctx.exception))
+        conn.close()
+
+        # d) Wrong column type (fencing_token TEXT instead of INTEGER)
+        conn = sqlite3.connect(":memory:")
+        conn.execute("""
+        CREATE TABLE staging_run_journal (
+            run_id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            fencing_token TEXT NOT NULL DEFAULT '1',
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            manifest_seal_hex TEXT NOT NULL,
+            target_inventory_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_error TEXT
+        );
+        """)
+        conn.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn)
+        self.assertIn("Column 'fencing_token' type mismatch", str(ctx.exception))
+        conn.close()
+
+        # e) Wrong nullability (stage nullable instead of NOT NULL)
+        conn = sqlite3.connect(":memory:")
+        conn.execute("""
+        CREATE TABLE staging_run_journal (
+            run_id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            fencing_token INTEGER NOT NULL DEFAULT 1,
+            stage TEXT,
+            status TEXT NOT NULL,
+            manifest_seal_hex TEXT NOT NULL,
+            target_inventory_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_error TEXT
+        );
+        """)
+        conn.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn)
+        self.assertIn("Column 'stage' notnull mismatch", str(ctx.exception))
+        conn.close()
+
+        # f) Wrong nullability on last_error (last_error NOT NULL instead of nullable)
+        conn = sqlite3.connect(":memory:")
+        conn.execute("""
+        CREATE TABLE staging_run_journal (
+            run_id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            fencing_token INTEGER NOT NULL DEFAULT 1,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            manifest_seal_hex TEXT NOT NULL,
+            target_inventory_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_error TEXT NOT NULL
+        );
+        """)
+        conn.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn)
+        self.assertIn("Column 'last_error' notnull mismatch", str(ctx.exception))
+        conn.close()
+
+    def test_primary_key_and_default_drift_fail_closed(self):
+        """Primary key alterations and default value drift fail closed."""
+        # a) run_id not primary key
+        conn = sqlite3.connect(":memory:")
+        conn.execute("""
+        CREATE TABLE staging_run_journal (
+            run_id TEXT,
+            owner_id TEXT NOT NULL,
+            fencing_token INTEGER NOT NULL DEFAULT 1,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            manifest_seal_hex TEXT NOT NULL,
+            target_inventory_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_error TEXT
+        );
+        """)
+        conn.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn)
+        self.assertIn("Column 'run_id' primary key mismatch", str(ctx.exception))
+        conn.close()
+
+        # b) Composite primary key (run_id, stage)
+        conn = sqlite3.connect(":memory:")
+        conn.execute("""
+        CREATE TABLE staging_run_journal (
+            run_id TEXT,
+            owner_id TEXT NOT NULL,
+            fencing_token INTEGER NOT NULL DEFAULT 1,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            manifest_seal_hex TEXT NOT NULL,
+            target_inventory_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_error TEXT,
+            PRIMARY KEY (run_id, stage)
+        );
+        """)
+        conn.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn)
+        self.assertIn("primary key mismatch", str(ctx.exception))
+        conn.close()
+
+        # c) Incorrect fencing_token default (DEFAULT 2 instead of DEFAULT 1)
+        conn = sqlite3.connect(":memory:")
+        conn.execute("""
+        CREATE TABLE staging_run_journal (
+            run_id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            fencing_token INTEGER NOT NULL DEFAULT 2,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            manifest_seal_hex TEXT NOT NULL,
+            target_inventory_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_error TEXT
+        );
+        """)
+        conn.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn)
+        self.assertIn("Column 'fencing_token' default value mismatch", str(ctx.exception))
+        conn.close()
+
+        # d) Missing fencing_token default (no DEFAULT clause)
+        conn = sqlite3.connect(":memory:")
+        conn.execute("""
+        CREATE TABLE staging_run_journal (
+            run_id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            fencing_token INTEGER NOT NULL,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            manifest_seal_hex TEXT NOT NULL,
+            target_inventory_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_error TEXT
+        );
+        """)
+        conn.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn)
+        self.assertIn("Column 'fencing_token' default value mismatch", str(ctx.exception))
+        conn.close()
+
+    def test_index_drift_fails_closed(self):
+        """Missing, unique, partial, reordered, or expression index fails closed."""
+        base_table_sql = """
+        CREATE TABLE staging_run_journal (
+            run_id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            fencing_token INTEGER NOT NULL DEFAULT 1,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            manifest_seal_hex TEXT NOT NULL,
+            target_inventory_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_error TEXT
+        );
+        """
+        # a) Missing index
+        conn = sqlite3.connect(":memory:")
+        conn.execute(base_table_sql)
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn)
+        self.assertIn("idx_staging_run_journal_status' does not exist", str(ctx.exception))
+        conn.close()
+
+        # b) Unique index
+        conn = sqlite3.connect(":memory:")
+        conn.execute(base_table_sql)
+        conn.execute("CREATE UNIQUE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn)
+        self.assertIn("must be non-unique, but found unique=1", str(ctx.exception))
+        conn.close()
+
+        # c) Partial index
+        conn = sqlite3.connect(":memory:")
+        conn.execute(base_table_sql)
+        conn.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at) WHERE status != 'ABORTED';")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn)
+        self.assertIn("must be non-partial, but found partial=1", str(ctx.exception))
+        conn.close()
+
+        # d) Reordered index columns (updated_at, status)
+        conn = sqlite3.connect(":memory:")
+        conn.execute(base_table_sql)
+        conn.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (updated_at, status);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn)
+        self.assertIn("key 0 column name mismatch: got 'updated_at', expected 'status'", str(ctx.exception))
+        conn.close()
+
+        # e) Wrong index column (stage, updated_at)
+        conn = sqlite3.connect(":memory:")
+        conn.execute(base_table_sql)
+        conn.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (stage, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn)
+        self.assertIn("key 0 column name mismatch: got 'stage', expected 'status'", str(ctx.exception))
+        conn.close()
+
+        # f) Expression index (lower(status), updated_at)
+        conn = sqlite3.connect(":memory:")
+        conn.execute(base_table_sql)
+        conn.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (lower(status), updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn)
+        self.assertIn("is an expression key", str(ctx.exception))
+        conn.close()
+
+        # g) Descending order key (status DESC, updated_at)
+        conn = sqlite3.connect(":memory:")
+        conn.execute(base_table_sql)
+        conn.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status DESC, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn)
+        self.assertIn("sort order mismatch: got desc=1, expected desc=0 (ascending)", str(ctx.exception))
+        conn.close()
+
+        # h) Non-BINARY collation key (status COLLATE NOCASE, updated_at)
+        conn = sqlite3.connect(":memory:")
+        conn.execute(base_table_sql)
+        conn.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status COLLATE NOCASE, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn)
+        self.assertIn("collation mismatch: got 'NOCASE', expected 'BINARY'", str(ctx.exception))
+        conn.close()
+
+    def test_view_and_virtual_table_fail_safely(self):
+        """Views and virtual tables impersonating staging_run_journal fail safely."""
+        # a) View
+        conn_view = sqlite3.connect(":memory:")
+        conn_view.execute("CREATE VIEW staging_run_journal AS SELECT 'run_1' AS run_id;")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_view)
+        self.assertIn("Object 'staging_run_journal' has type 'view', expected 'table'", str(ctx.exception))
+        conn_view.close()
+
+        # b) Virtual table (fts5)
+        conn_vtab = sqlite3.connect(":memory:")
+        try:
+            conn_vtab.execute("CREATE VIRTUAL TABLE staging_run_journal USING fts5(run_id);")
+            with self.assertRaises(SchemaVerificationError) as ctx:
+                verify_staging_journal_schema(conn_vtab)
+            self.assertIn("virtual table", str(ctx.exception))
+        finally:
+            conn_vtab.close()
+
+    def test_verification_is_strictly_read_only_and_does_not_mutate(self):
+        """Verification is purely read-only and leaves schema and table rows intact."""
+        conn = sqlite3.connect(":memory:")
+        apply_candidate_schema_v7(conn)
+
+        # Insert a sample row
+        conn.execute(
+            "INSERT INTO staging_run_journal VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "run_20261109T000000Z_1234567890ab",
+                "test_runner",
+                1,
+                "LIVE-01",
+                "ACKED",
+                "a" * 64,
+                "[]",
+                "2026-11-09T00:00:00Z",
+                "2026-11-09T00:00:00Z",
+                None,
+            ),
+        )
+        conn.commit()
+
+        # Snapshot before
+        cur = conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name")
+        schema_before = cur.fetchall()
+        cur = conn.execute("SELECT * FROM staging_run_journal")
+        rows_before = cur.fetchall()
+
+        # Run verification
+        report = verify_staging_journal_schema(conn)
+        self.assertTrue(report.is_valid)
+
+        # Snapshot after
+        cur = conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name")
+        schema_after = cur.fetchall()
+        cur = conn.execute("SELECT * FROM staging_run_journal")
+        rows_after = cur.fetchall()
+
+        self.assertEqual(schema_before, schema_after)
+        self.assertEqual(rows_before, rows_after)
+        conn.close()
+
+    def test_runtime_guard_rejects_non_temp_and_attached_non_temp(self):
+        """Runtime isolation guard rejects non-temp databases and attached non-temp databases."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            fake_db = Path(temp_dir) / "test_fake_external.db"
+            conn = sqlite3.connect(str(fake_db))
+            try:
+                # 1. Main database outside temp directory
+                with patch("tempfile.gettempdir", return_value="C:\\nonexistent_other_temp_root"):
+                    with self.assertRaises(PermissionError) as ctx:
+                        verify_staging_journal_schema(conn)
+                    self.assertIn("Security violation: verify_staging_journal_schema is restricted strictly", str(ctx.exception))
+            finally:
+                conn.close()
+
+        # 2. In-memory connection with attached non-temp database
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            aux_db = Path(temp_dir) / "test_aux.db"
+            with sqlite3.connect(str(aux_db)) as aux_conn:
+                aux_conn.execute("CREATE TABLE aux_test (id INT);")
+
+            conn_mem = sqlite3.connect(":memory:")
+            conn_mem.execute(f"ATTACH DATABASE '{aux_db}' AS aux;")
+            try:
+                with patch("tempfile.gettempdir", return_value="C:\\nonexistent_other_temp_root"):
+                    with self.assertRaises(PermissionError) as ctx:
+                        verify_staging_journal_schema(conn_mem)
+                    self.assertIn("Security violation: verify_staging_journal_schema is restricted strictly", str(ctx.exception))
+            finally:
+                conn_mem.close()
+
+    def test_generated_and_hidden_columns_fail_closed(self):
+        """Generated and hidden columns (both VIRTUAL and STORED) are detected via table_xinfo and fail closed."""
+        # a) Virtual generated column
+        conn_v = sqlite3.connect(":memory:")
+        conn_v.execute("""
+        CREATE TABLE staging_run_journal (
+            run_id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            fencing_token INTEGER NOT NULL DEFAULT 1,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            manifest_seal_hex TEXT NOT NULL,
+            target_inventory_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_error TEXT,
+            extra_virtual TEXT GENERATED ALWAYS AS (owner_id || '_v') VIRTUAL
+        );
+        """)
+        conn_v.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_v)
+        self.assertIn("has 11 columns (including hidden/generated), expected 10", str(ctx.exception))
+        conn_v.close()
+
+        # b) Stored generated column
+        conn_s = sqlite3.connect(":memory:")
+        conn_s.execute("""
+        CREATE TABLE staging_run_journal (
+            run_id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            fencing_token INTEGER NOT NULL DEFAULT 1,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            manifest_seal_hex TEXT NOT NULL,
+            target_inventory_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_error TEXT,
+            extra_stored TEXT GENERATED ALWAYS AS (owner_id || '_s') STORED
+        );
+        """)
+        conn_s.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_s)
+        self.assertIn("has 11 columns (including hidden/generated), expected 10", str(ctx.exception))
+        conn_s.close()
+
+    def test_unapproved_indexes_constraints_and_triggers_fail_closed(self):
+        """Unapproved extra indexes, unique constraints, and triggers on staging_run_journal fail closed."""
+        # a) Supplementary UNIQUE constraint on owner_id in table DDL
+        conn_u = sqlite3.connect(":memory:")
+        conn_u.execute("""
+        CREATE TABLE staging_run_journal (
+            run_id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL UNIQUE,
+            fencing_token INTEGER NOT NULL DEFAULT 1,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            manifest_seal_hex TEXT NOT NULL,
+            target_inventory_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_error TEXT
+        );
+        """)
+        conn_u.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_u)
+        self.assertIn("Unexpected extra index or constraint", str(ctx.exception))
+        conn_u.close()
+
+        # b) Extra standalone non-unique index
+        conn_extra = sqlite3.connect(":memory:")
+        apply_candidate_schema_v7(conn_extra)
+        conn_extra.execute("CREATE INDEX idx_extra ON staging_run_journal (owner_id);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_extra)
+        self.assertIn("Unexpected extra index or constraint 'idx_extra'", str(ctx.exception))
+        conn_extra.close()
+
+        # c) Extra standalone UNIQUE index
+        conn_extra_u = sqlite3.connect(":memory:")
+        apply_candidate_schema_v7(conn_extra_u)
+        conn_extra_u.execute("CREATE UNIQUE INDEX idx_extra_u ON staging_run_journal (owner_id);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_extra_u)
+        self.assertIn("Unexpected extra index or constraint 'idx_extra_u'", str(ctx.exception))
+        conn_extra_u.close()
+
+        # d) Unexpected trigger on staging_run_journal
+        conn_trg = sqlite3.connect(":memory:")
+        apply_candidate_schema_v7(conn_trg)
+        conn_trg.execute("""
+        CREATE TRIGGER trg_adversarial_after_insert
+        AFTER INSERT ON staging_run_journal
+        BEGIN
+            SELECT 1;
+        END;
+        """)
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_trg)
+        self.assertIn("Unexpected trigger(s) found on 'staging_run_journal': ['trg_adversarial_after_insert']", str(ctx.exception))
+        conn_trg.close()
+
+    def test_semantic_ddl_integrity_fails_closed(self):
+        """Semantic DDL changes altering journal integrity fail closed."""
+        base_cols = (
+            "run_id TEXT PRIMARY KEY, "
+            "owner_id TEXT NOT NULL, "
+            "fencing_token INTEGER NOT NULL DEFAULT 1, "
+            "stage TEXT NOT NULL, "
+            "status TEXT NOT NULL, "
+            "manifest_seal_hex TEXT NOT NULL, "
+            "target_inventory_json TEXT NOT NULL, "
+            "created_at TEXT NOT NULL, "
+            "updated_at TEXT NOT NULL, "
+            "last_error TEXT"
+        )
+
+        # a) run_id TEXT PRIMARY KEY ON CONFLICT REPLACE
+        conn_replace = sqlite3.connect(":memory:")
+        replace_cols = base_cols.replace(
+            "run_id TEXT PRIMARY KEY",
+            "run_id TEXT PRIMARY KEY ON CONFLICT REPLACE",
+        )
+        conn_replace.execute(f"CREATE TABLE staging_run_journal ({replace_cols});")
+        conn_replace.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_replace)
+        self.assertIn("contains unapproved ON CONFLICT clause", str(ctx.exception))
+        conn_replace.close()
+
+        # b) run_id TEXT PRIMARY KEY ON CONFLICT IGNORE
+        conn_ignore = sqlite3.connect(":memory:")
+        ignore_cols = base_cols.replace(
+            "run_id TEXT PRIMARY KEY",
+            "run_id TEXT PRIMARY KEY ON CONFLICT IGNORE",
+        )
+        conn_ignore.execute(f"CREATE TABLE staging_run_journal ({ignore_cols});")
+        conn_ignore.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_ignore)
+        self.assertIn("contains unapproved ON CONFLICT clause", str(ctx.exception))
+        conn_ignore.close()
+
+        # c) Unexpected CHECK constraint (e.g., status <> 'MUTATING')
+        conn_check = sqlite3.connect(":memory:")
+        check_cols = base_cols.replace(
+            "status TEXT NOT NULL",
+            "status TEXT NOT NULL CHECK(status <> 'MUTATING')",
+        )
+        conn_check.execute(f"CREATE TABLE staging_run_journal ({check_cols});")
+        conn_check.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_check)
+        self.assertIn("contains unapproved CHECK constraint", str(ctx.exception))
+        conn_check.close()
+
+        # d) Unexpected FOREIGN KEY constraint
+        conn_fk = sqlite3.connect(":memory:")
+        conn_fk.execute("CREATE TABLE other_table (id TEXT PRIMARY KEY);")
+        fk_cols = base_cols + ", FOREIGN KEY (owner_id) REFERENCES other_table(id)"
+        conn_fk.execute(f"CREATE TABLE staging_run_journal ({fk_cols});")
+        conn_fk.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_fk)
+        self.assertIn("contains unapproved FOREIGN KEY constraint", str(ctx.exception))
+        conn_fk.close()
+
+        # e) Unsupported WITHOUT ROWID table
+        conn_norowid = sqlite3.connect(":memory:")
+        conn_norowid.execute(f"CREATE TABLE staging_run_journal ({base_cols}) WITHOUT ROWID;")
+        conn_norowid.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_norowid)
+        self.assertIn("specifies unsupported WITHOUT ROWID", str(ctx.exception))
+        conn_norowid.close()
+
+        # f) Unapproved AUTOINCREMENT
+        conn_auto = sqlite3.connect(":memory:")
+        auto_cols = base_cols.replace(
+            "run_id TEXT PRIMARY KEY",
+            "run_id INTEGER PRIMARY KEY AUTOINCREMENT",
+        )
+        conn_auto.execute(f"CREATE TABLE staging_run_journal ({auto_cols});")
+        conn_auto.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_auto)
+        self.assertIn("specifies unapproved AUTOINCREMENT", str(ctx.exception))
+        conn_auto.close()
+
+        # g) Index DDL divergence (extra key column in SQL definition)
+        conn_idx_ddl = sqlite3.connect(":memory:")
+        conn_idx_ddl.execute(f"CREATE TABLE staging_run_journal ({base_cols});")
+        conn_idx_ddl.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at, run_id);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_idx_ddl)
+        self.assertIn("Index 'idx_staging_run_journal_status' DDL does not match canonical Schema v7 definition", str(ctx.exception))
+        self.assertIn("JOURNAL_INDEX_DDL_MISMATCH", str(ctx.exception))
+        conn_idx_ddl.close()
+
+        # h) Sanitized reporting: arbitrary literals in table DDL are NOT leaked into errors
+        conn_leak = sqlite3.connect(":memory:")
+        leak_cols = base_cols + ", secret_attr TEXT DEFAULT 'UNTRUSTED_LEAK_SECRET_XYZ999'"
+        conn_leak.execute(f"CREATE TABLE staging_run_journal ({leak_cols});")
+        conn_leak.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_leak)
+        self.assertIn("JOURNAL_TABLE_DDL_MISMATCH", str(ctx.exception))
+        self.assertNotIn("UNTRUSTED_LEAK_SECRET_XYZ999", str(ctx.exception))
+        conn_leak.close()
+
+        # i) Sanitized reporting: arbitrary literals in index DDL are NOT leaked into errors
+        conn_idx_leak = sqlite3.connect(":memory:")
+        conn_idx_leak.execute(f"CREATE TABLE staging_run_journal ({base_cols});")
+        conn_idx_leak.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at) WHERE status != 'SECRET_INDEX_PREDICATE_LITERAL_9999';")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_idx_leak)
+        self.assertIn("JOURNAL_INDEX_DDL_MISMATCH", str(ctx.exception))
+        self.assertNotIn("SECRET_INDEX_PREDICATE_LITERAL_9999", str(ctx.exception))
+        conn_idx_leak.close()
+
+    def test_schema_namespace_isolation_fails_closed_on_temp_shadow(self):
+        """Metadata validation strictly inspects 'main' and rejects temp shadowing/triggers."""
+        # a) Drifted main table shadowed by canonical temp table must fail closed
+        conn_drift_main = sqlite3.connect(":memory:")
+        # main has drifted definition: only 2 columns, missing NOT NULL on owner_id
+        conn_drift_main.execute("CREATE TABLE main.staging_run_journal (run_id TEXT PRIMARY KEY, owner_id TEXT);")
+        conn_drift_main.execute("CREATE INDEX main.idx_staging_run_journal_status ON staging_run_journal (owner_id);")
+
+        # temp has perfectly canonical candidate Schema v7 definition
+        conn_drift_main.execute("""
+        CREATE TABLE temp.staging_run_journal (
+            run_id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            fencing_token INTEGER NOT NULL DEFAULT 1,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            manifest_seal_hex TEXT NOT NULL,
+            target_inventory_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_error TEXT
+        );
+        """)
+        conn_drift_main.execute("CREATE INDEX temp.idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+
+        # Verify fail-closed behavior: shadowed temp cannot cause false PASS
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_drift_main)
+        self.assertIn("TEMP_TABLE_SHADOW_DISALLOWED", str(ctx.exception))
+        self.assertIn("JOURNAL_TABLE_DDL_MISMATCH", str(ctx.exception))
+        conn_drift_main.close()
+
+        # b) Canonical MAIN + uppercase "STAGING_RUN_JOURNAL" TEMP table fails closed (case-insensitive)
+        conn_upper_tbl = sqlite3.connect(":memory:")
+        apply_candidate_schema_v7(conn_upper_tbl)
+        conn_upper_tbl.execute('CREATE TABLE temp."STAGING_RUN_JOURNAL" (id TEXT);')
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_upper_tbl)
+        self.assertIn("TEMP_TABLE_SHADOW_DISALLOWED", str(ctx.exception))
+        self.assertIn("Unsafe shadowing object 'staging_run_journal' found in temp schema", str(ctx.exception))
+        conn_upper_tbl.close()
+
+        # c) Canonical MAIN + differently cased TEMP index shadow fails closed (case-insensitive)
+        conn_cased_idx = sqlite3.connect(":memory:")
+        apply_candidate_schema_v7(conn_cased_idx)
+        conn_cased_idx.execute("CREATE TABLE temp.other_table (id TEXT);")
+        conn_cased_idx.execute('CREATE INDEX temp."Idx_Staging_Run_Journal_Status" ON other_table (id);')
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_cased_idx)
+        self.assertIn("TEMP_INDEX_SHADOW_DISALLOWED", str(ctx.exception))
+        self.assertIn(f"Unsafe shadowing index '{EXPECTED_JOURNAL_INDEX_NAME}' found in temp schema", str(ctx.exception))
+        conn_cased_idx.close()
+
+        # d) Uppercase TEMP trigger targeting MAIN with case_sensitive_like=ON fails closed
+        conn_csl_trg = sqlite3.connect(":memory:")
+        conn_csl_trg.execute("PRAGMA case_sensitive_like=ON;")
+        apply_candidate_schema_v7(conn_csl_trg)
+        conn_csl_trg.execute("""
+        CREATE TRIGGER temp."ADVERSARIAL_UPPERCASE_TRG"
+        AFTER INSERT ON "STAGING_RUN_JOURNAL"
+        BEGIN
+            SELECT 1;
+        END;
+        """)
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_csl_trg)
+        self.assertIn("TEMP_TRIGGER_DISALLOWED", str(ctx.exception))
+        self.assertNotIn("ADVERSARIAL_UPPERCASE_TRG", str(ctx.exception))
+        conn_csl_trg.close()
+
+        # e) Canonical MAIN without conflicting TEMP objects continues passing (VALID)
+        conn_valid = sqlite3.connect(":memory:")
+        apply_candidate_schema_v7(conn_valid)
+        # Create unrelated objects in temp schema (does not shadow staging_run_journal or its index)
+        conn_valid.execute("CREATE TABLE temp.unrelated_temp_data (data_key TEXT PRIMARY KEY, payload TEXT);")
+        conn_valid.execute("CREATE INDEX temp.idx_unrelated_data ON unrelated_temp_data (payload);")
+        report = verify_staging_journal_schema(conn_valid)
+        self.assertTrue(report.is_valid)
+        self.assertEqual(report.errors, [])
+        conn_valid.close()
+
+    def test_schema_v6_and_live_ready_operator_preflight_remain_valid(self):
+        """Pure Schema v6 remains untouched at version 6 and LiveReadyStagingOperator preflight succeeds."""
+        self.assertEqual(CURRENT_SCHEMA_VERSION, 6)
+
+        db = sqlite3.connect(":memory:")
+        for sql in get_all_init_statements():
+            db.execute(sql)
+        db.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at, description) "
+            "VALUES (6, '2026-10-27T14:00:00Z', 'Schema v6')"
+        )
+        db.commit()
+
+        # Confirm staging_run_journal does NOT exist in pure Schema v6
+        cur = db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='staging_run_journal'")
+        self.assertIsNone(cur.fetchone())
+
+        # Operator preflight succeeds without error
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            raw_transport = HermeticStagingTransport(db)
+            budget_transport = BudgetTrackingTransport(raw_transport)
+            client = TursoHTTPClient(
+                database_url=EXACT_STAGING_DESTINATION,
+                auth_token="synthetic-offline-only",
+                transport=budget_transport,
+            )
+            operator = LiveReadyStagingOperator(
+                client=client,
+                destination_url=EXACT_STAGING_DESTINATION,
+                manifest_dir=Path(temp_dir),
+                live_authorized=False,
+            )
+            operator._create_and_persist_manifest()
+            operator._run_live_01()
+            self.assertTrue(operator._preflight_accepted)
+            self.assertEqual(operator._preflight_provenance, "VERIFIED_IN_SESSION")
+            client.close()
+
+        db.close()
 
 
 if __name__ == "__main__":
