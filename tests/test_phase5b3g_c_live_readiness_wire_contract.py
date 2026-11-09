@@ -496,6 +496,76 @@ class TestPhase5B3GCLiveReadinessWireContract(unittest.TestCase):
         self.assertTrue(Path(report.manifest_path).exists())
         self.assertIsNotNone(report.recovery_notice)
 
+    def test_server_401_unauthorized_mid_session_halts_fail_closed_and_preserves_manifest(self):
+        """Server returning 401 Unauthorized mid-session halts fail-closed and preserves manifest."""
+        secret_token = "synthetic-offline-only"
+
+        def return_401_on_live02(req: httpx.Request) -> httpx.Response | None:
+            body = json.loads(req.content.decode("utf-8"))
+            for r in body.get("requests", []):
+                sql = r.get("stmt", {}).get("sql", "")
+                if "INSERT INTO processed_articles" in sql:
+                    return httpx.Response(401, json={"message": "Unauthorized / Token Revoked"}, request=req)
+            return None
+
+        self._custom_hook = return_401_on_live02
+        op = self._make_operator()
+        report = op.run(auto_human_window=True, human_marker="MOCK_ONLY")
+
+        self.assertEqual(report.status, LiveReadyOperatorStatus.FAILED)
+        self.assertEqual(report.audit_state, AuditOutcomeState.UNKNOWN)
+        self.assertTrue(report.manifest_preserved)
+        self.assertTrue(Path(report.manifest_path).exists())
+        self.assertIsNotNone(report.recovery_notice)
+        self.assertIn("SEPARATE_OPERATOR_REVIEWED_RECOVERY_REQUIRED", report.recovery_notice)
+
+        # Monotonic stage guards prevented jumping to LIVE-08; zero DELETE statements dispatched
+        delete_requests = [
+            req for req in self.recorded_requests
+            if "DELETE FROM" in req.content.decode("utf-8")
+        ]
+        self.assertEqual(len(delete_requests), 0)
+        self.assertTrue(op.security_boundary._session_closed)
+
+        # No token or SQL content leakage
+        for err in report.errors:
+            self.assertNotIn(secret_token, err)
+            self.assertNotIn("INSERT INTO processed_articles", err)
+
+    def test_server_403_forbidden_mid_session_halts_fail_closed_and_preserves_manifest(self):
+        """Server returning 403 Forbidden mid-session halts fail-closed and preserves manifest."""
+        secret_token = "synthetic-offline-only"
+
+        def return_403_on_live02(req: httpx.Request) -> httpx.Response | None:
+            body = json.loads(req.content.decode("utf-8"))
+            for r in body.get("requests", []):
+                sql = r.get("stmt", {}).get("sql", "")
+                if "INSERT INTO processed_articles" in sql:
+                    return httpx.Response(403, json={"message": "Forbidden / Insufficient Permissions"}, request=req)
+            return None
+
+        self._custom_hook = return_403_on_live02
+        op = self._make_operator()
+        report = op.run(auto_human_window=True, human_marker="MOCK_ONLY")
+
+        self.assertEqual(report.status, LiveReadyOperatorStatus.FAILED)
+        self.assertEqual(report.audit_state, AuditOutcomeState.UNKNOWN)
+        self.assertTrue(report.manifest_preserved)
+        self.assertTrue(Path(report.manifest_path).exists())
+        self.assertIsNotNone(report.recovery_notice)
+        self.assertIn("SEPARATE_OPERATOR_REVIEWED_RECOVERY_REQUIRED", report.recovery_notice)
+
+        delete_requests = [
+            req for req in self.recorded_requests
+            if "DELETE FROM" in req.content.decode("utf-8")
+        ]
+        self.assertEqual(len(delete_requests), 0)
+        self.assertTrue(op.security_boundary._session_closed)
+
+        for err in report.errors:
+            self.assertNotIn(secret_token, err)
+            self.assertNotIn("INSERT INTO processed_articles", err)
+
     def test_malformed_json_response_halts_session_with_unknown_and_preserves_manifest(self):
         """Malformed JSON response halts with UNKNOWN and preserves manifest."""
         def return_malformed(req: httpx.Request) -> httpx.Response | None:

@@ -67,6 +67,18 @@
 | Static safety: Python 3.12 py_compile & git diff --check | **Clean 0 return code.** Zero trailing whitespace or syntax errors. |
 | Hard operational boundaries | Strictly **$0.00 / 0 TRY**. Zero live network calls, zero Turso connections (including reads), zero credentials created, zero operational file access. STOP at Draft PR for independent review. |
 
+## 2026-11-09 — Offline Hrana Wire Safety Hardening (Issue #13 / Parent Issue #82)
+
+| Evidence / status | Verified result and scope boundary |
+| --- | --- |
+| Protected `main` baseline `74f51af8447c29f470137be8f6901b8580dcd652` | Task branch `fix/issue-13-offline-hrana-wire-hardening`. Zero unapproved commits or merges to `main`. |
+| Plan Section 7 & 5.2 reconciliation (`docs/PHASE5B3G_LIVE_STAGING_RELIABILITY_PLAN.md`) | Reconciled legacy 80-request cleanup jump with fail-closed monotonic stage-sequencing contract (§5.5.2). 80-request cutoff before LIVE-08 halts immediately with `FAILED`/`UNKNOWN`, preserves manifest on disk, marks `CLEANUP_RESERVE_EXHAUSTED`, permanently closes session, and strictly prohibits out-of-order LIVE-08 cleanup, blind retries, or automated remote recovery. Requires separate operator-reviewed recovery. |
+| Hrana response `base_url` hardening (`src/efso_radar/staging/hrana_outbound_guard.py`) | Implemented `_is_safe_response_base_url()`. Validates optional Hrana v2 stream response `base_url` before subsequent baton dispatch: requires strict HTTPS, exact hostname match (`EXACT_STAGING_HOSTNAME`), standard port (443 or default), empty or `/v2/pipeline` path, and rejects credentials, loopback/IP addresses, attacker HTTPS hosts, foreign Turso databases, queries, and fragments. Denials immediately trigger fail-closed HALT (`MockHranaDenied("MOCK_HRANA_DENIED_UNSAFE_BASE_URL")`). Enforced `00..23` hour range in `_ISO_TIMESTAMP_RE` for cross-Python calendar validity. |
+| Dedicated Hrana wire safety tests (`tests/test_phase5b3g_c_hrana_outbound_guard_offline.py`, `tests/test_phase5b3g_c_live_readiness_wire_contract.py`) | **53 passed, 52 subtests passed in 7.36s**. Verified: (1) 16 negative base_url scenarios (foreign Turso host, region mismatch, attacker HTTPS, loopback, query, fragment, credentials, etc.) and valid staging destination acceptance; (2) mid-session HTTP 401 Unauthorized and 403 Forbidden fail-closed halts, UNKNOWN audit status, zero DELETE calls dispatched, and zero token/SQL leakage; (3) upstream Hrana v2 non-transactional pipeline failure semantics demonstrating subsequent statement execution without automatic rollback, proving necessity of interactive transactions. |
+| Full hermetic test suite | **1470 passed, 4 skipped, 315 subtests passed in 189.02s** on Windows. |
+| Static safety: Ruff 0.13.3 (`E9,F63,F7,F82`) & `git diff --check` | **All checks passed!** Clean 0 return code. |
+| Hard operational boundaries | Strictly **$0.00 / 0 TRY**. Zero live network calls, zero Turso connections (including reads), Block Writes on staging strictly ON, zero credentials created. Draft PR for independent review. |
+
 ## 2026-11-06 — Controlled Staging Runner Offline Slice (Issue #82 / Issue #13 First Engineering Slice)
 
 | Evidence / status | Verified result and scope boundary |
