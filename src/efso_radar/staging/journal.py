@@ -69,15 +69,44 @@ _FORBIDDEN_SQL_KEYWORDS = re.compile(
 )
 
 
-def apply_candidate_schema_v7(conn: sqlite3.Connection) -> None:
-    """Explicitly apply candidate Schema v7 DDL to a hermetic test database.
+# Canonical column specification for candidate Schema v7 staging_run_journal:
+# (cid, name, type, notnull, dflt_value, pk)
+EXPECTED_JOURNAL_COLUMNS: tuple[tuple[int, str, str, int, Optional[str], int], ...] = (
+    (0, "run_id", "TEXT", 0, None, 1),
+    (1, "owner_id", "TEXT", 1, None, 0),
+    (2, "fencing_token", "INTEGER", 1, "1", 0),
+    (3, "stage", "TEXT", 1, None, 0),
+    (4, "status", "TEXT", 1, None, 0),
+    (5, "manifest_seal_hex", "TEXT", 1, None, 0),
+    (6, "target_inventory_json", "TEXT", 1, None, 0),
+    (7, "created_at", "TEXT", 1, None, 0),
+    (8, "updated_at", "TEXT", 1, None, 0),
+    (9, "last_error", "TEXT", 0, None, 0),
+)
 
-    CRITICAL SAFETY BOUNDARY:
-    - This function must be invoked ONLY in explicitly designed hermetic tests
-      operating on in-memory (:memory:) or temporary file SQLite fixtures.
-    - Enforces runtime isolation: rejects any connection pointing to an
-      operational database path or file outside the OS temporary directory.
-    - Default CURRENT_SCHEMA_VERSION in efso_radar.repositories.schema remains 6.
+EXPECTED_JOURNAL_INDEX_NAME = "idx_staging_run_journal_status"
+EXPECTED_JOURNAL_INDEX_COLUMNS: tuple[str, ...] = ("status", "updated_at")
+
+
+class SchemaVerificationReport(BaseModel):
+    """Result of candidate Schema v7 staging journal structural verification."""
+
+    model_config = {"frozen": True}
+
+    is_valid: bool
+    table_name: str = "staging_run_journal"
+    errors: list[str] = Field(default_factory=list)
+    checked_at: str
+
+    def __bool__(self) -> bool:
+        return self.is_valid
+
+
+def _assert_hermetic_sqlite_connection(conn: sqlite3.Connection, operation_name: str) -> None:
+    """Validate that connection operates strictly on in-memory or OS temp fixtures.
+
+    Raises PermissionError if any attached database (main or aux) is backed by
+    a non-temporary file path.
     """
     cursor = conn.execute("PRAGMA database_list")
     rows = cursor.fetchall()
@@ -90,11 +119,173 @@ def apply_candidate_schema_v7(conn: sqlite3.Connection) -> None:
                 resolved_file.relative_to(temp_dir)
             except ValueError:
                 raise PermissionError(
-                    f"Security violation: apply_candidate_schema_v7 is restricted strictly "
+                    f"Security violation: {operation_name} is restricted strictly "
                     f"to in-memory (:memory:) or temporary test directory fixtures. "
-                    f"Attempted to apply to '{resolved_file}'."
+                    f"Attempted to access '{resolved_file}'."
                 )
+
+
+def apply_candidate_schema_v7(conn: sqlite3.Connection) -> None:
+    """Explicitly apply candidate Schema v7 DDL to a hermetic test database.
+
+    CRITICAL SAFETY BOUNDARY:
+    - This function must be invoked ONLY in explicitly designed hermetic tests
+      operating on in-memory (:memory:) or temporary file SQLite fixtures.
+    - Enforces runtime isolation: rejects any connection pointing to an
+      operational database path or file outside the OS temporary directory.
+    - Default CURRENT_SCHEMA_VERSION in efso_radar.repositories.schema remains 6.
+    """
+    _assert_hermetic_sqlite_connection(conn, "apply_candidate_schema_v7")
     conn.executescript(SCHEMA_V7_STAGING_JOURNAL_DDL)
+
+
+def verify_staging_journal_schema(
+    conn: sqlite3.Connection,
+    *,
+    raise_on_error: bool = True,
+) -> SchemaVerificationReport:
+    """Validate that candidate Schema v7 staging_run_journal table and index match specification.
+
+    CRITICAL SAFETY BOUNDARIES:
+    - Strictly read-only: NEVER creates, migrates, repairs, modifies, or drops database objects.
+    - Operates ONLY on hermetic in-memory (:memory:) or OS temporary SQLite fixtures.
+    - Rejects any connection with attached non-temporary databases with PermissionError.
+    - Rejects views or virtual tables impersonating staging_run_journal.
+    - Validates exact column count (10), names, types, order, PK ordinal, NOT NULL constraints,
+      fencing_token DEFAULT 1, and nullable last_error.
+    - Validates index idx_staging_run_journal_status (existence, non-unique, non-partial,
+      exact columns (status, updated_at), no expression keys).
+    - Fails closed with SchemaVerificationError if raise_on_error=True (default).
+    """
+    _assert_hermetic_sqlite_connection(conn, "verify_staging_journal_schema")
+
+    errors: list[str] = []
+
+    # 1. Inspect sqlite_master for table staging_run_journal
+    cur = conn.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name = 'staging_run_journal'"
+    )
+    table_master_rows = cur.fetchall()
+    if not table_master_rows:
+        errors.append("Table 'staging_run_journal' does not exist.")
+    else:
+        obj_type, obj_name, tbl_name, sql = table_master_rows[0]
+        if obj_type != "table":
+            errors.append(f"Object 'staging_run_journal' has type '{obj_type}', expected 'table'.")
+        if sql is None:
+            errors.append("Object 'staging_run_journal' has no SQL definition in sqlite_master.")
+        elif sql.strip().upper().startswith("CREATE VIRTUAL TABLE"):
+            errors.append("Object 'staging_run_journal' is a virtual table, not a standard table.")
+
+    # 2. If table exists and is a table, inspect columns via PRAGMA table_info
+    if not errors:
+        cur = conn.execute("PRAGMA table_info(staging_run_journal)")
+        columns = cur.fetchall()
+        if len(columns) != len(EXPECTED_JOURNAL_COLUMNS):
+            errors.append(
+                f"Table 'staging_run_journal' has {len(columns)} columns, "
+                f"expected {len(EXPECTED_JOURNAL_COLUMNS)}."
+            )
+        else:
+            for idx, expected in enumerate(EXPECTED_JOURNAL_COLUMNS):
+                actual = columns[idx]
+                exp_cid, exp_name, exp_type, exp_notnull, exp_dflt, exp_pk = expected
+                act_cid, act_name, act_type, act_notnull, act_dflt, act_pk = actual
+
+                if act_cid != exp_cid:
+                    errors.append(
+                        f"Column ordinal mismatch at position {idx}: "
+                        f"got cid {act_cid}, expected {exp_cid}."
+                    )
+                if act_name != exp_name:
+                    errors.append(
+                        f"Column name mismatch at position {idx}: "
+                        f"got '{act_name}', expected '{exp_name}'."
+                    )
+                if act_type.upper() != exp_type.upper():
+                    errors.append(
+                        f"Column '{act_name}' type mismatch: "
+                        f"got '{act_type.upper()}', expected '{exp_type}'."
+                    )
+                if act_notnull != exp_notnull:
+                    errors.append(
+                        f"Column '{act_name}' notnull mismatch: "
+                        f"got {act_notnull}, expected {exp_notnull}."
+                    )
+                if act_dflt != exp_dflt:
+                    errors.append(
+                        f"Column '{act_name}' default value mismatch: "
+                        f"got {act_dflt!r}, expected {exp_dflt!r}."
+                    )
+                if act_pk != exp_pk:
+                    errors.append(
+                        f"Column '{act_name}' primary key mismatch: "
+                        f"got {act_pk}, expected {exp_pk}."
+                    )
+
+        # 3. Inspect index idx_staging_run_journal_status
+        cur = conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            f"WHERE name = '{EXPECTED_JOURNAL_INDEX_NAME}'"
+        )
+        idx_master_rows = cur.fetchall()
+        if not idx_master_rows:
+            errors.append(f"Index '{EXPECTED_JOURNAL_INDEX_NAME}' does not exist in sqlite_master.")
+        else:
+            idx_type, idx_name, idx_tbl_name, idx_sql = idx_master_rows[0]
+            if idx_type != "index":
+                errors.append(f"Object '{EXPECTED_JOURNAL_INDEX_NAME}' has type '{idx_type}', expected 'index'.")
+            if idx_tbl_name != "staging_run_journal":
+                errors.append(
+                    f"Index '{EXPECTED_JOURNAL_INDEX_NAME}' attached to '{idx_tbl_name}', "
+                    "expected 'staging_run_journal'."
+                )
+
+        cur = conn.execute("PRAGMA index_list(staging_run_journal)")
+        idx_list = cur.fetchall()
+        matching_indices = [row for row in idx_list if row[1] == EXPECTED_JOURNAL_INDEX_NAME]
+        if not matching_indices:
+            errors.append(
+                f"Index '{EXPECTED_JOURNAL_INDEX_NAME}' not found in PRAGMA index_list for 'staging_run_journal'."
+            )
+        else:
+            idx_row = matching_indices[0]
+            is_unique = idx_row[2]
+            is_partial = idx_row[4]
+            if is_unique != 0:
+                errors.append(f"Index '{EXPECTED_JOURNAL_INDEX_NAME}' must be non-unique, but found unique=1.")
+            if is_partial != 0:
+                errors.append(f"Index '{EXPECTED_JOURNAL_INDEX_NAME}' must be non-partial, but found partial=1.")
+
+            cur = conn.execute(f"PRAGMA index_info({EXPECTED_JOURNAL_INDEX_NAME})")
+            info_rows = cur.fetchall()
+            act_col_names = [r[2] for r in info_rows]
+            if any(name is None for name in act_col_names):
+                errors.append(
+                    f"Index '{EXPECTED_JOURNAL_INDEX_NAME}' contains expression keys."
+                )
+            elif tuple(act_col_names) != EXPECTED_JOURNAL_INDEX_COLUMNS:
+                errors.append(
+                    f"Index '{EXPECTED_JOURNAL_INDEX_NAME}' columns mismatch: "
+                    f"got {act_col_names}, expected {list(EXPECTED_JOURNAL_INDEX_COLUMNS)}."
+                )
+
+    is_valid = len(errors) == 0
+    now_utc = datetime.now(timezone.utc).isoformat()
+    report = SchemaVerificationReport(
+        is_valid=is_valid,
+        table_name="staging_run_journal",
+        errors=errors,
+        checked_at=now_utc,
+    )
+
+    if not is_valid and raise_on_error:
+        raise SchemaVerificationError(
+            f"Schema verification failed for table 'staging_run_journal':\n"
+            + "\n".join(f"  - {err}" for err in errors)
+        )
+
+    return report
 
 
 # =============================================================================
@@ -189,6 +380,10 @@ LEGAL_TRANSITIONS: dict[JournalStatus, frozenset[JournalStatus]] = {
 
 class JournalError(Exception):
     """Base error for staging ownership journal operations."""
+
+
+class SchemaVerificationError(JournalError, RuntimeError):
+    """Raised when candidate Schema v7 structural verification fails."""
 
 
 class InvalidRunIdError(JournalError, ValueError):
