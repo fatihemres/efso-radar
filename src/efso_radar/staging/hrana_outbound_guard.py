@@ -877,8 +877,8 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
         # Reject any whitespace (including CR, LF, TAB, spaces) or ASCII/C1 control characters
         if any(c.isspace() or ord(c) < 32 or 127 <= ord(c) <= 159 for c in raw_base):
             return False
-        # Reject semicolons / path parameters before parsing
-        if ";" in raw_base:
+        # Reject semicolons / path parameters and userinfo authority delimiter before parsing
+        if ";" in raw_base or "@" in raw_base:
             return False
         try:
             parsed = urlparse(raw_base)
@@ -887,7 +887,7 @@ class HranaOutboundSecurityBoundary(httpx.BaseTransport):
             hostname = (parsed.hostname or "").lower()
             if hostname != EXACT_STAGING_HOSTNAME:
                 return False
-            if parsed.username or parsed.password:
+            if parsed.username is not None or parsed.password is not None:
                 return False
             if parsed.port is not None and parsed.port != 443:
                 return False

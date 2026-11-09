@@ -28,6 +28,7 @@ from efso_radar.staging.offline_operator import (
 from efso_radar.staging.runner import (
     BudgetTrackingTransport,
     EXACT_STAGING_DESTINATION,
+    EXACT_STAGING_HOSTNAME,
     HermeticStagingTransport,
     PerRunOwnershipManifest,
     create_default_manifest_entities,
@@ -424,6 +425,8 @@ class TestGuardedHermeticHranaTransport(unittest.TestCase):
             ("loopback HTTPS with IP", "https://127.0.0.1/v2/pipeline"),
             ("localhost plaintext HTTP", "http://localhost/v2/pipeline"),
             ("embedded credentials", "https://user:pass@efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/v2/pipeline"),
+            ("empty username with @ userinfo delimiter", f"https://@{EXACT_STAGING_HOSTNAME}/v2/pipeline"),
+            ("empty userinfo :@ delimiter", f"https://:@{EXACT_STAGING_HOSTNAME}/v2/pipeline"),
             ("non-standard port", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io:8080/v2/pipeline"),
             ("unexpected path", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/admin/drop"),
             ("query string", "https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/v2/pipeline?token=leak"),
