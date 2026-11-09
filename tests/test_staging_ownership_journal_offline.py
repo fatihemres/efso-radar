@@ -44,6 +44,7 @@ from efso_radar.staging.journal import (
     EXPECTED_JOURNAL_COLUMNS,
     EXPECTED_JOURNAL_INDEX_NAME,
     EXPECTED_JOURNAL_INDEX_COLUMNS,
+    EXPECTED_JOURNAL_INDEX_KEYS,
     SchemaVerificationError,
     SchemaVerificationReport,
     verify_staging_journal_schema,
@@ -1715,7 +1716,7 @@ class TestCandidateSchemaV7StructuralValidator(unittest.TestCase):
         conn.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
         with self.assertRaises(SchemaVerificationError) as ctx:
             verify_staging_journal_schema(conn)
-        self.assertIn("has 9 columns, expected 10", str(ctx.exception))
+        self.assertIn("has 9 columns", str(ctx.exception))
         conn.close()
 
         # b) Extra column (11 columns)
@@ -1738,7 +1739,7 @@ class TestCandidateSchemaV7StructuralValidator(unittest.TestCase):
         conn.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
         with self.assertRaises(SchemaVerificationError) as ctx:
             verify_staging_journal_schema(conn)
-        self.assertIn("has 11 columns, expected 10", str(ctx.exception))
+        self.assertIn("has 11 columns", str(ctx.exception))
         conn.close()
 
         # c) Reordered columns (stage before owner_id)
@@ -1968,7 +1969,7 @@ class TestCandidateSchemaV7StructuralValidator(unittest.TestCase):
         conn.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (updated_at, status);")
         with self.assertRaises(SchemaVerificationError) as ctx:
             verify_staging_journal_schema(conn)
-        self.assertIn("columns mismatch: got ['updated_at', 'status'], expected ['status', 'updated_at']", str(ctx.exception))
+        self.assertIn("key 0 column name mismatch: got 'updated_at', expected 'status'", str(ctx.exception))
         conn.close()
 
         # e) Wrong index column (stage, updated_at)
@@ -1977,7 +1978,7 @@ class TestCandidateSchemaV7StructuralValidator(unittest.TestCase):
         conn.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (stage, updated_at);")
         with self.assertRaises(SchemaVerificationError) as ctx:
             verify_staging_journal_schema(conn)
-        self.assertIn("columns mismatch: got ['stage', 'updated_at'], expected ['status', 'updated_at']", str(ctx.exception))
+        self.assertIn("key 0 column name mismatch: got 'stage', expected 'status'", str(ctx.exception))
         conn.close()
 
         # f) Expression index (lower(status), updated_at)
@@ -1986,7 +1987,25 @@ class TestCandidateSchemaV7StructuralValidator(unittest.TestCase):
         conn.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (lower(status), updated_at);")
         with self.assertRaises(SchemaVerificationError) as ctx:
             verify_staging_journal_schema(conn)
-        self.assertIn("contains expression keys", str(ctx.exception))
+        self.assertIn("is an expression key", str(ctx.exception))
+        conn.close()
+
+        # g) Descending order key (status DESC, updated_at)
+        conn = sqlite3.connect(":memory:")
+        conn.execute(base_table_sql)
+        conn.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status DESC, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn)
+        self.assertIn("sort order mismatch: got desc=1, expected desc=0 (ascending)", str(ctx.exception))
+        conn.close()
+
+        # h) Non-BINARY collation key (status COLLATE NOCASE, updated_at)
+        conn = sqlite3.connect(":memory:")
+        conn.execute(base_table_sql)
+        conn.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status COLLATE NOCASE, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn)
+        self.assertIn("collation mismatch: got 'NOCASE', expected 'BINARY'", str(ctx.exception))
         conn.close()
 
     def test_view_and_virtual_table_fail_safely(self):
@@ -2081,6 +2100,111 @@ class TestCandidateSchemaV7StructuralValidator(unittest.TestCase):
                     self.assertIn("Security violation: verify_staging_journal_schema is restricted strictly", str(ctx.exception))
             finally:
                 conn_mem.close()
+
+    def test_generated_and_hidden_columns_fail_closed(self):
+        """Generated and hidden columns (both VIRTUAL and STORED) are detected via table_xinfo and fail closed."""
+        # a) Virtual generated column
+        conn_v = sqlite3.connect(":memory:")
+        conn_v.execute("""
+        CREATE TABLE staging_run_journal (
+            run_id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            fencing_token INTEGER NOT NULL DEFAULT 1,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            manifest_seal_hex TEXT NOT NULL,
+            target_inventory_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_error TEXT,
+            extra_virtual TEXT GENERATED ALWAYS AS (owner_id || '_v') VIRTUAL
+        );
+        """)
+        conn_v.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_v)
+        self.assertIn("has 11 columns (including hidden/generated), expected 10", str(ctx.exception))
+        conn_v.close()
+
+        # b) Stored generated column
+        conn_s = sqlite3.connect(":memory:")
+        conn_s.execute("""
+        CREATE TABLE staging_run_journal (
+            run_id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            fencing_token INTEGER NOT NULL DEFAULT 1,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            manifest_seal_hex TEXT NOT NULL,
+            target_inventory_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_error TEXT,
+            extra_stored TEXT GENERATED ALWAYS AS (owner_id || '_s') STORED
+        );
+        """)
+        conn_s.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_s)
+        self.assertIn("has 11 columns (including hidden/generated), expected 10", str(ctx.exception))
+        conn_s.close()
+
+    def test_unapproved_indexes_constraints_and_triggers_fail_closed(self):
+        """Unapproved extra indexes, unique constraints, and triggers on staging_run_journal fail closed."""
+        # a) Supplementary UNIQUE constraint on owner_id in table DDL
+        conn_u = sqlite3.connect(":memory:")
+        conn_u.execute("""
+        CREATE TABLE staging_run_journal (
+            run_id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL UNIQUE,
+            fencing_token INTEGER NOT NULL DEFAULT 1,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            manifest_seal_hex TEXT NOT NULL,
+            target_inventory_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_error TEXT
+        );
+        """)
+        conn_u.execute("CREATE INDEX idx_staging_run_journal_status ON staging_run_journal (status, updated_at);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_u)
+        self.assertIn("Unexpected extra index or constraint", str(ctx.exception))
+        conn_u.close()
+
+        # b) Extra standalone non-unique index
+        conn_extra = sqlite3.connect(":memory:")
+        apply_candidate_schema_v7(conn_extra)
+        conn_extra.execute("CREATE INDEX idx_extra ON staging_run_journal (owner_id);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_extra)
+        self.assertIn("Unexpected extra index or constraint 'idx_extra'", str(ctx.exception))
+        conn_extra.close()
+
+        # c) Extra standalone UNIQUE index
+        conn_extra_u = sqlite3.connect(":memory:")
+        apply_candidate_schema_v7(conn_extra_u)
+        conn_extra_u.execute("CREATE UNIQUE INDEX idx_extra_u ON staging_run_journal (owner_id);")
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_extra_u)
+        self.assertIn("Unexpected extra index or constraint 'idx_extra_u'", str(ctx.exception))
+        conn_extra_u.close()
+
+        # d) Unexpected trigger on staging_run_journal
+        conn_trg = sqlite3.connect(":memory:")
+        apply_candidate_schema_v7(conn_trg)
+        conn_trg.execute("""
+        CREATE TRIGGER trg_adversarial_after_insert
+        AFTER INSERT ON staging_run_journal
+        BEGIN
+            SELECT 1;
+        END;
+        """)
+        with self.assertRaises(SchemaVerificationError) as ctx:
+            verify_staging_journal_schema(conn_trg)
+        self.assertIn("Unexpected trigger(s) found on 'staging_run_journal': ['trg_adversarial_after_insert']", str(ctx.exception))
+        conn_trg.close()
 
     def test_schema_v6_and_live_ready_operator_preflight_remain_valid(self):
         """Pure Schema v6 remains untouched at version 6 and LiveReadyStagingOperator preflight succeeds."""

@@ -70,22 +70,27 @@ _FORBIDDEN_SQL_KEYWORDS = re.compile(
 
 
 # Canonical column specification for candidate Schema v7 staging_run_journal:
-# (cid, name, type, notnull, dflt_value, pk)
-EXPECTED_JOURNAL_COLUMNS: tuple[tuple[int, str, str, int, Optional[str], int], ...] = (
-    (0, "run_id", "TEXT", 0, None, 1),
-    (1, "owner_id", "TEXT", 1, None, 0),
-    (2, "fencing_token", "INTEGER", 1, "1", 0),
-    (3, "stage", "TEXT", 1, None, 0),
-    (4, "status", "TEXT", 1, None, 0),
-    (5, "manifest_seal_hex", "TEXT", 1, None, 0),
-    (6, "target_inventory_json", "TEXT", 1, None, 0),
-    (7, "created_at", "TEXT", 1, None, 0),
-    (8, "updated_at", "TEXT", 1, None, 0),
-    (9, "last_error", "TEXT", 0, None, 0),
+# (cid, name, type, notnull, dflt_value, pk, hidden)
+EXPECTED_JOURNAL_COLUMNS: tuple[tuple[int, str, str, int, Optional[str], int, int], ...] = (
+    (0, "run_id", "TEXT", 0, None, 1, 0),
+    (1, "owner_id", "TEXT", 1, None, 0, 0),
+    (2, "fencing_token", "INTEGER", 1, "1", 0, 0),
+    (3, "stage", "TEXT", 1, None, 0, 0),
+    (4, "status", "TEXT", 1, None, 0, 0),
+    (5, "manifest_seal_hex", "TEXT", 1, None, 0, 0),
+    (6, "target_inventory_json", "TEXT", 1, None, 0, 0),
+    (7, "created_at", "TEXT", 1, None, 0, 0),
+    (8, "updated_at", "TEXT", 1, None, 0, 0),
+    (9, "last_error", "TEXT", 0, None, 0, 0),
 )
 
 EXPECTED_JOURNAL_INDEX_NAME = "idx_staging_run_journal_status"
 EXPECTED_JOURNAL_INDEX_COLUMNS: tuple[str, ...] = ("status", "updated_at")
+# Canonical indexed key specification: (seqno, cid, name, desc, coll, key)
+EXPECTED_JOURNAL_INDEX_KEYS: tuple[tuple[int, int, str, int, str, int], ...] = (
+    (0, 4, "status", 0, "BINARY", 1),
+    (1, 8, "updated_at", 0, "BINARY", 1),
+)
 
 
 class SchemaVerificationReport(BaseModel):
@@ -177,20 +182,21 @@ def verify_staging_journal_schema(
         elif sql.strip().upper().startswith("CREATE VIRTUAL TABLE"):
             errors.append("Object 'staging_run_journal' is a virtual table, not a standard table.")
 
-    # 2. If table exists and is a table, inspect columns via PRAGMA table_info
+    # 2. If table exists and is a table, inspect columns via PRAGMA table_xinfo
+    # table_xinfo reveals hidden and generated columns (both VIRTUAL and STORED)
     if not errors:
-        cur = conn.execute("PRAGMA table_info(staging_run_journal)")
+        cur = conn.execute("PRAGMA table_xinfo(staging_run_journal)")
         columns = cur.fetchall()
         if len(columns) != len(EXPECTED_JOURNAL_COLUMNS):
             errors.append(
-                f"Table 'staging_run_journal' has {len(columns)} columns, "
+                f"Table 'staging_run_journal' has {len(columns)} columns (including hidden/generated), "
                 f"expected {len(EXPECTED_JOURNAL_COLUMNS)}."
             )
         else:
             for idx, expected in enumerate(EXPECTED_JOURNAL_COLUMNS):
                 actual = columns[idx]
-                exp_cid, exp_name, exp_type, exp_notnull, exp_dflt, exp_pk = expected
-                act_cid, act_name, act_type, act_notnull, act_dflt, act_pk = actual
+                exp_cid, exp_name, exp_type, exp_notnull, exp_dflt, exp_pk, exp_hidden = expected
+                act_cid, act_name, act_type, act_notnull, act_dflt, act_pk, act_hidden = actual
 
                 if act_cid != exp_cid:
                     errors.append(
@@ -222,8 +228,13 @@ def verify_staging_journal_schema(
                         f"Column '{act_name}' primary key mismatch: "
                         f"got {act_pk}, expected {exp_pk}."
                     )
+                if act_hidden != exp_hidden:
+                    errors.append(
+                        f"Column '{act_name}' hidden/generated mismatch: "
+                        f"got hidden={act_hidden}, expected hidden={exp_hidden}."
+                    )
 
-        # 3. Inspect index idx_staging_run_journal_status
+        # 3. Inspect index idx_staging_run_journal_status and unapproved indexes/constraints
         cur = conn.execute(
             "SELECT type, name, tbl_name, sql FROM sqlite_master "
             f"WHERE name = '{EXPECTED_JOURNAL_INDEX_NAME}'"
@@ -257,18 +268,77 @@ def verify_staging_journal_schema(
             if is_partial != 0:
                 errors.append(f"Index '{EXPECTED_JOURNAL_INDEX_NAME}' must be non-partial, but found partial=1.")
 
-            cur = conn.execute(f"PRAGMA index_info({EXPECTED_JOURNAL_INDEX_NAME})")
+            # Validate exact indexed keys using PRAGMA index_xinfo
+            cur = conn.execute(f"PRAGMA index_xinfo({EXPECTED_JOURNAL_INDEX_NAME})")
             info_rows = cur.fetchall()
-            act_col_names = [r[2] for r in info_rows]
-            if any(name is None for name in act_col_names):
+            # row: (seqno, cid, name, desc, coll, key)
+            key_rows = [r for r in info_rows if r[5] == 1]
+            if len(key_rows) != len(EXPECTED_JOURNAL_INDEX_KEYS):
                 errors.append(
-                    f"Index '{EXPECTED_JOURNAL_INDEX_NAME}' contains expression keys."
+                    f"Index '{EXPECTED_JOURNAL_INDEX_NAME}' has {len(key_rows)} key columns, "
+                    f"expected {len(EXPECTED_JOURNAL_INDEX_KEYS)}."
                 )
-            elif tuple(act_col_names) != EXPECTED_JOURNAL_INDEX_COLUMNS:
-                errors.append(
-                    f"Index '{EXPECTED_JOURNAL_INDEX_NAME}' columns mismatch: "
-                    f"got {act_col_names}, expected {list(EXPECTED_JOURNAL_INDEX_COLUMNS)}."
-                )
+            else:
+                for k_idx, exp_key in enumerate(EXPECTED_JOURNAL_INDEX_KEYS):
+                    act_key = key_rows[k_idx]
+                    exp_seqno, exp_cid, exp_name, exp_desc, exp_coll, exp_is_key = exp_key
+                    act_seqno, act_cid, act_name, act_desc, act_coll, act_is_key = act_key
+
+                    if act_cid < 0 or act_name is None:
+                        errors.append(
+                            f"Index '{EXPECTED_JOURNAL_INDEX_NAME}' key {k_idx} is an expression key."
+                        )
+                    else:
+                        if act_name != exp_name:
+                            errors.append(
+                                f"Index '{EXPECTED_JOURNAL_INDEX_NAME}' key {k_idx} column name mismatch: "
+                                f"got '{act_name}', expected '{exp_name}'."
+                            )
+                        if act_cid != exp_cid:
+                            errors.append(
+                                f"Index '{EXPECTED_JOURNAL_INDEX_NAME}' key {k_idx} cid mismatch: "
+                                f"got {act_cid}, expected {exp_cid}."
+                            )
+                        if act_desc != exp_desc:
+                            errors.append(
+                                f"Index '{EXPECTED_JOURNAL_INDEX_NAME}' key '{act_name}' sort order mismatch: "
+                                f"got desc={act_desc}, expected desc={exp_desc} (ascending)."
+                            )
+                        if act_coll.upper() != exp_coll.upper():
+                            errors.append(
+                                f"Index '{EXPECTED_JOURNAL_INDEX_NAME}' key '{act_name}' collation mismatch: "
+                                f"got '{act_coll.upper()}', expected '{exp_coll}'."
+                            )
+
+        # Check for unapproved extra indexes and unique constraints on staging_run_journal
+        # Only idx_staging_run_journal_status and the legitimate implicit primary key index (origin='pk') are permitted
+        pk_index_count = 0
+        for idx_row in idx_list:
+            i_name = idx_row[1]
+            i_origin = idx_row[3]
+            if i_name == EXPECTED_JOURNAL_INDEX_NAME:
+                continue
+            if i_origin == "pk":
+                pk_index_count += 1
+                continue
+            errors.append(
+                f"Unexpected extra index or constraint '{i_name}' (origin '{i_origin}') on 'staging_run_journal'."
+            )
+        if pk_index_count == 0:
+            errors.append("Implicit primary key index missing on 'staging_run_journal'.")
+        elif pk_index_count > 1:
+            errors.append(f"Multiple ({pk_index_count}) primary key indexes on 'staging_run_journal'.")
+
+        # 4. Check for unexpected triggers on staging_run_journal
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'staging_run_journal'"
+        )
+        trigger_rows = cur.fetchall()
+        if trigger_rows:
+            t_names = [r[0] for r in trigger_rows]
+            errors.append(
+                f"Unexpected trigger(s) found on 'staging_run_journal': {t_names}."
+            )
 
     is_valid = len(errors) == 0
     now_utc = datetime.now(timezone.utc).isoformat()
