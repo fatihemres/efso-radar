@@ -9,6 +9,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -230,7 +231,12 @@ class RepositoryContractTestMixin:
         self.assertEqual(fetched.headline_tr, asm1.headline_tr)
         self.assertEqual(fetched.update_count, 0)
 
-        recent = self.repo.get_recent_stories(limit=10)
+        with patch(
+            "efso_radar.repositories.sqlite.utc_now", return_value=self.now
+        ), patch(
+            "efso_radar.repositories.turso.utc_now", return_value=self.now
+        ):
+            recent = self.repo.get_recent_stories(limit=10)
         self.assertEqual(len(recent), 1)
         self.assertEqual(recent[0].story_id, story_id)
 

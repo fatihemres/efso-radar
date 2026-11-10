@@ -323,6 +323,10 @@ def _parse_hrana_exec_result(res: Any, max_rows: int = MAX_HRANA_RESULT_ROWS) ->
     if not isinstance(response_data, dict):
         raise TursoClientError(f"Malformed statement response: expected dict, got {type(response_data).__name__}.")
 
+    resp_type = response_data.get("type")
+    if resp_type != "execute":
+        raise TursoClientError(f"Unexpected statement response type: '{resp_type}'. Expected 'execute'.")
+
     exec_result = response_data.get("result")
     if not isinstance(exec_result, dict):
         raise TursoClientError(f"Malformed execute result: expected dict, got {type(exec_result).__name__}.")
@@ -515,6 +519,14 @@ class TursoHTTPClient:
         if close_res.get("type") != "ok":
             raise TursoClientError(f"Pipeline close failed with unexpected type: '{close_res.get('type')}'.")
 
+        close_resp = close_res.get("response")
+        if close_resp is not None:
+            if not isinstance(close_resp, dict) or close_resp.get("type") != "close":
+                got_type = close_resp.get("type") if isinstance(close_resp, dict) else type(close_resp).__name__
+                raise TursoClientError(
+                    f"Pipeline close response type mismatch: expected 'close', got '{got_type}'."
+                )
+
         parsed_results: list[TursoQueryResult] = []
         for res in raw_results[:-1]:
             parsed_results.append(_parse_hrana_exec_result(res, max_rows=max_rows))
@@ -596,51 +608,7 @@ class TursoHTTPClient:
                     pass
             raise TursoClientError("Turso transaction response malformed: unexpected BEGIN response type.")
 
-        # Validate and check for errors in user statements (index 1 onwards)
-        has_error = False
-        error_code = None
-        has_unexpected_type = False
-        malformed_structure = False
-
-        for idx, res in enumerate(raw_results[1:]):
-            if not isinstance(res, dict):
-                has_error = True
-                malformed_structure = True
-                break
-            res_type = res.get("type")
-            if res_type == "error":
-                has_error = True
-                err = res.get("error", {})
-                error_code = err.get("code") if isinstance(err, dict) else None
-                break
-            elif res_type != "ok":
-                has_error = True
-                has_unexpected_type = True
-                break
-            response_data = res.get("response")
-            if not isinstance(response_data, dict) or not isinstance(response_data.get("result"), dict):
-                has_error = True
-                malformed_structure = True
-                break
-
-        if has_error:
-            if baton:
-                try:
-                    client.post(
-                        self.pipeline_url,
-                        json={"baton": baton, "requests": [{"type": "execute", "stmt": {"sql": "ROLLBACK"}}, {"type": "close"}]},
-                    )
-                except Exception as rollback_exc:
-                    err_type = type(rollback_exc).__name__
-                    logger.warning("Turso transaction rollback failed (%s).", err_type)
-            if error_code is not None:
-                valid_code, category = _sanitize_hrana_error(error_code)
-                raise TursoClientError(f"Turso transaction aborted due to statement error ({valid_code}): {category}")
-            if malformed_structure:
-                raise TursoClientError("Turso transaction response malformed: statement result item is missing or invalid.")
-            raise TursoClientError("Turso transaction aborted due to unexpected statement response type.")
-
-        # All results so far are "ok", check if result list is truncated
+        # Check if result list is truncated
         if len(raw_results) < len(requests_payload):
             if baton:
                 try:
@@ -651,6 +619,48 @@ class TursoHTTPClient:
                 except Exception:
                     pass
             raise TursoClientError("Turso transaction response malformed: truncated result list.")
+
+        # Validate and parse all user statement results BEFORE issuing COMMIT
+        parsed_results: list[TursoQueryResult] = []
+        validation_error: Optional[TursoClientError] = None
+
+        for idx, res in enumerate(raw_results[1:]):
+            if not isinstance(res, dict):
+                validation_error = TursoClientError(
+                    "Turso transaction response malformed: statement result item is missing or invalid."
+                )
+                break
+            res_type = res.get("type")
+            if res_type == "error":
+                err = res.get("error", {})
+                valid_code, category = _sanitize_hrana_error(err.get("code") if isinstance(err, dict) else None)
+                validation_error = TursoClientError(
+                    f"Turso transaction aborted due to statement error ({valid_code}): {category}"
+                )
+                break
+            elif res_type != "ok":
+                validation_error = TursoClientError(
+                    "Turso transaction aborted due to unexpected statement response type."
+                )
+                break
+
+            try:
+                parsed_results.append(_parse_hrana_exec_result(res, max_rows=max_rows))
+            except TursoClientError as exc:
+                validation_error = exc
+                break
+
+        if validation_error is not None:
+            if baton:
+                try:
+                    client.post(
+                        self.pipeline_url,
+                        json={"baton": baton, "requests": [{"type": "execute", "stmt": {"sql": "ROLLBACK"}}, {"type": "close"}]},
+                    )
+                except Exception as rollback_exc:
+                    err_type = type(rollback_exc).__name__
+                    logger.warning("Turso transaction rollback failed (%s).", err_type)
+            raise validation_error
 
         # Enforce that session baton exists for multi-statement transaction
         if not baton:
@@ -732,11 +742,7 @@ class TursoHTTPClient:
                 "The transaction may or may not have committed."
             )
 
-        # Parse results for user statements (skipping BEGIN at index 0)
-        parsed_results: list[TursoQueryResult] = []
-        for res in raw_results[1:]:
-            parsed_results.append(_parse_hrana_exec_result(res, max_rows=max_rows))
-
+        # Return pre-parsed statements validated prior to COMMIT
         return parsed_results
 
     def execute(

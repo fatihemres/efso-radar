@@ -22,7 +22,7 @@ import json
 from pathlib import Path
 import sqlite3
 import tempfile
-from typing import Optional
+from typing import Any, Optional
 import unittest
 
 import httpx
@@ -30,6 +30,7 @@ import httpx
 from efso_radar.repositories.schema import get_all_init_statements
 from efso_radar.repositories.turso_client import (
     MAX_HRANA_RESPONSE_BYTES,
+    TursoAmbiguousTransactionError,
     TursoClientError,
     TursoHTTPClient,
 )
@@ -2884,14 +2885,15 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                             {
                                 "type": "ok",
                                 "response": {
+                                    "type": "execute",
                                     "result": {
                                         "cols": expected_cols,
                                         "rows": [],
                                         "affected_row_count": 0,
-                                    }
+                                    },
                                 },
                             },
-                            {"type": "ok", "response": {}},
+                            {"type": "ok", "response": {"type": "close"}},
                         ],
                     },
                 )
@@ -3180,14 +3182,15 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                             {
                                 "type": "ok",
                                 "response": {
+                                    "type": "execute",
                                     "result": {
                                         "cols": cols,
                                         "rows": [hrana_row, hrana_row],
                                         "affected_row_count": 0,
-                                    }
+                                    },
                                 },
                             },
-                            {"type": "ok", "response": {}},
+                            {"type": "ok", "response": {"type": "close"}},
                         ],
                     },
                 )
@@ -3576,14 +3579,15 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                             {
                                 "type": "ok",
                                 "response": {
+                                    "type": "execute",
                                     "result": {
                                         "cols": cols,
                                         # "rows" key deliberately missing!
                                         "affected_row_count": 0,
-                                    }
+                                    },
                                 },
                             },
-                            {"type": "ok", "response": {}},
+                            {"type": "ok", "response": {"type": "close"}},
                         ],
                     },
                 )
@@ -3615,14 +3619,15 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                             {
                                 "type": "ok",
                                 "response": {
+                                    "type": "execute",
                                     "result": {
                                         "cols": cols,
                                         "rows": [],  # explicitly present empty list
                                         "affected_row_count": 0,
-                                    }
+                                    },
                                 },
                             },
-                            {"type": "ok", "response": {}},
+                            {"type": "ok", "response": {"type": "close"}},
                         ],
                     },
                 )
@@ -3674,14 +3679,15 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                                 {
                                     "type": "ok",
                                     "response": {
+                                        "type": "execute",
                                         "result": {
                                             "cols": cols,
                                             "rows": [row_b],
                                             "affected_row_count": 0,
-                                        }
+                                        },
                                     },
                                 },
-                                {"type": "ok", "response": {}},
+                                {"type": "ok", "response": {"type": "close"}},
                             ],
                         },
                     )
@@ -3710,7 +3716,7 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
         self.transport_b.custom_response_hook = None
 
     def test_point23_pipeline_sequence_cardinality_and_close_outcome_validation(self):
-        """P1: Pipeline sequence cardinality, close outcome, and statement types are strictly validated."""
+        """P1: Pipeline sequence cardinality, close outcome, and inner/outer discriminators are strictly validated."""
         def make_client(handler):
             transport = httpx.MockTransport(handler)
             return TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=transport)
@@ -3719,7 +3725,7 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
         def handler_missing_close(req: httpx.Request) -> httpx.Response:
             return httpx.Response(
                 200,
-                json={"results": [{"type": "ok", "response": {"result": {"cols": [{"name": "x"}], "rows": []}}}]},
+                json={"results": [{"type": "ok", "response": {"type": "execute", "result": {"cols": [{"name": "x"}], "rows": []}}}]},
             )
 
         with make_client(handler_missing_close) as c:
@@ -3733,7 +3739,7 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                 200,
                 json={
                     "results": [
-                        {"type": "ok", "response": {"result": {"cols": [{"name": "x"}], "rows": []}}},
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [{"name": "x"}], "rows": []}}},
                         {"type": "error", "error": {"code": "SQLITE_IOERR", "message": "Simulated disk IO error"}},
                     ]
                 },
@@ -3745,13 +3751,13 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
             self.assertIn("Pipeline close error", str(ctx.exception))
             self.assertIn("SQLITE_IOERR", str(ctx.exception))
 
-        # 3. Unexpected close type
+        # 3. Unexpected close outer type
         def handler_unexpected_close_type(req: httpx.Request) -> httpx.Response:
             return httpx.Response(
                 200,
                 json={
                     "results": [
-                        {"type": "ok", "response": {"result": {"cols": [{"name": "x"}], "rows": []}}},
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [{"name": "x"}], "rows": []}}},
                         {"type": "pending"},
                     ]
                 },
@@ -3762,15 +3768,49 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                 c.execute("SELECT 1")
             self.assertIn("Pipeline close failed with unexpected type", str(ctx.exception))
 
-        # 4. Extra statement result (cardinality > expected)
+        # 4. Unexpected close inner discriminator (e.g. inner type is 'execute' instead of 'close')
+        def handler_bad_inner_close_type(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [{"name": "x"}], "rows": []}}},
+                        {"type": "ok", "response": {"type": "execute"}},
+                    ]
+                },
+            )
+
+        with make_client(handler_bad_inner_close_type) as c:
+            with self.assertRaises(TursoClientError) as ctx:
+                c.execute("SELECT 1")
+            self.assertIn("Pipeline close response type mismatch: expected 'close', got 'execute'.", str(ctx.exception))
+
+        # 5. Unexpected statement inner discriminator (e.g. statement inner type is 'close' instead of 'execute')
+        def handler_bad_inner_stmt_type(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"type": "ok", "response": {"type": "close", "result": {"cols": [{"name": "x"}], "rows": []}}},
+                        {"type": "ok", "response": {"type": "close"}},
+                    ]
+                },
+            )
+
+        with make_client(handler_bad_inner_stmt_type) as c:
+            with self.assertRaises(TursoClientError) as ctx:
+                c.execute("SELECT 1")
+            self.assertIn("Unexpected statement response type: 'close'. Expected 'execute'.", str(ctx.exception))
+
+        # 6. Extra statement result (cardinality > expected)
         def handler_extra_result(req: httpx.Request) -> httpx.Response:
             return httpx.Response(
                 200,
                 json={
                     "results": [
-                        {"type": "ok", "response": {"result": {"cols": [{"name": "x"}], "rows": []}}},
-                        {"type": "ok", "response": {"result": {"cols": [{"name": "y"}], "rows": []}}},
-                        {"type": "ok", "response": {}},
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [{"name": "x"}], "rows": []}}},
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [{"name": "y"}], "rows": []}}},
+                        {"type": "ok", "response": {"type": "close"}},
                     ]
                 },
             )
@@ -3780,14 +3820,14 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                 c.execute("SELECT 1")
             self.assertIn("Unexpected pipeline results count", str(ctx.exception))
 
-        # 5. Unexpected statement result type
+        # 7. Unexpected statement outer result type
         def handler_bad_stmt_type(req: httpx.Request) -> httpx.Response:
             return httpx.Response(
                 200,
                 json={
                     "results": [
                         {"type": "unknown_type"},
-                        {"type": "ok", "response": {}},
+                        {"type": "ok", "response": {"type": "close"}},
                     ]
                 },
             )
@@ -3796,6 +3836,38 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
             with self.assertRaises(TursoClientError) as ctx:
                 c.execute("SELECT 1")
             self.assertIn("Unexpected statement result type", str(ctx.exception))
+
+        # 8. Canonical positive control: canonical statement and close inner discriminators pass
+        def handler_canonical_positive(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [{"name": "v"}], "rows": [[{"type": "integer", "value": "42"}]], "affected_row_count": 0}}},
+                        {"type": "ok", "response": {"type": "close"}},
+                    ]
+                },
+            )
+
+        with make_client(handler_canonical_positive) as c:
+            res = c.execute("SELECT 42 AS v")
+            self.assertEqual(res.fetchall(), [{"v": 42}])
+
+        # 9. Mock fixture compatibility: close without inner response object passes
+        def handler_compatible_close(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [{"name": "v"}], "rows": [[{"type": "text", "value": "ok"}]], "affected_row_count": 0}}},
+                        {"type": "ok"},
+                    ]
+                },
+            )
+
+        with make_client(handler_compatible_close) as c:
+            res = c.execute("SELECT 'ok' AS v")
+            self.assertEqual(res.fetchall(), [{"v": "ok"}])
 
     def test_point24_row_width_and_cell_tag_validation(self):
         """P1: Row widths, cell tags/types, and malformed row formats are strictly validated."""
@@ -3812,14 +3884,15 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                         {
                             "type": "ok",
                             "response": {
+                                "type": "execute",
                                 "result": {
                                     "cols": [{"name": "col1"}, {"name": "col2"}],
                                     "rows": [[{"type": "text", "value": "a"}]],
                                     "affected_row_count": 0,
-                                }
+                                },
                             },
                         },
-                        {"type": "ok", "response": {}},
+                        {"type": "ok", "response": {"type": "close"}},
                     ]
                 },
             )
@@ -3838,6 +3911,7 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                         {
                             "type": "ok",
                             "response": {
+                                "type": "execute",
                                 "result": {
                                     "cols": [{"name": "col1"}, {"name": "col2"}],
                                     "rows": [
@@ -3848,10 +3922,10 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                                         ]
                                     ],
                                     "affected_row_count": 0,
-                                }
+                                },
                             },
                         },
-                        {"type": "ok", "response": {}},
+                        {"type": "ok", "response": {"type": "close"}},
                     ]
                 },
             )
@@ -3870,14 +3944,15 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                         {
                             "type": "ok",
                             "response": {
+                                "type": "execute",
                                 "result": {
                                     "cols": [{"name": "col1"}],
                                     "rows": [[{"type": "date", "value": "2026-11-10"}]],
                                     "affected_row_count": 0,
-                                }
+                                },
                             },
                         },
-                        {"type": "ok", "response": {}},
+                        {"type": "ok", "response": {"type": "close"}},
                     ]
                 },
             )
@@ -3896,14 +3971,15 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                         {
                             "type": "ok",
                             "response": {
+                                "type": "execute",
                                 "result": {
                                     "cols": [{"name": "col1"}],
                                     "rows": [["raw_string_not_dict"]],
                                     "affected_row_count": 0,
-                                }
+                                },
                             },
                         },
-                        {"type": "ok", "response": {}},
+                        {"type": "ok", "response": {"type": "close"}},
                     ]
                 },
             )
@@ -3922,14 +3998,15 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                         {
                             "type": "ok",
                             "response": {
+                                "type": "execute",
                                 "result": {
                                     "cols": [{"name": "col1"}],
                                     "rows": ["not_a_row_list"],
                                     "affected_row_count": 0,
-                                }
+                                },
                             },
                         },
-                        {"type": "ok", "response": {}},
+                        {"type": "ok", "response": {"type": "close"}},
                     ]
                 },
             )
@@ -3970,8 +4047,14 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                         json={
                             "baton": None,
                             "results": [
-                                {"type": "ok", "response": {"result": {"cols": art_cols, "rows": rows, "affected_row_count": 0}}},
-                                {"type": "ok", "response": {}},
+                                {
+                                    "type": "ok",
+                                    "response": {
+                                        "type": "execute",
+                                        "result": {"cols": art_cols, "rows": rows, "affected_row_count": 0},
+                                    },
+                                },
+                                {"type": "ok", "response": {"type": "close"}},
                             ],
                         },
                     )
@@ -4004,8 +4087,14 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                         json={
                             "baton": None,
                             "results": [
-                                {"type": "ok", "response": {"result": {"cols": art_cols, "rows": rows, "affected_row_count": 0}}},
-                                {"type": "ok", "response": {}},
+                                {
+                                    "type": "ok",
+                                    "response": {
+                                        "type": "execute",
+                                        "result": {"cols": art_cols, "rows": rows, "affected_row_count": 0},
+                                    },
+                                },
+                                {"type": "ok", "response": {"type": "close"}},
                             ],
                         },
                     )
@@ -4096,8 +4185,14 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                     json={
                         "baton": None,
                         "results": [
-                            {"type": "ok", "response": {"result": {"cols": cols, "rows": [row_aborted], "affected_row_count": 0}}},
-                            {"type": "ok", "response": {}},
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "type": "execute",
+                                    "result": {"cols": cols, "rows": [row_aborted], "affected_row_count": 0},
+                                },
+                            },
+                            {"type": "ok", "response": {"type": "close"}},
                         ],
                     },
                 )
@@ -4136,8 +4231,14 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                     json={
                         "baton": None,
                         "results": [
-                            {"type": "ok", "response": {"result": {"cols": cols, "rows": [row_bad_stage], "affected_row_count": 0}}},
-                            {"type": "ok", "response": {}},
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "type": "execute",
+                                    "result": {"cols": cols, "rows": [row_bad_stage], "affected_row_count": 0},
+                                },
+                            },
+                            {"type": "ok", "response": {"type": "close"}},
                         ],
                     },
                 )
@@ -4179,8 +4280,14 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                 200,
                 json={
                     "results": [
-                        {"type": "ok", "response": {"result": {"cols": cols, "rows": rows, "affected_row_count": 0}}},
-                        {"type": "ok", "response": {}},
+                        {
+                            "type": "ok",
+                            "response": {
+                                "type": "execute",
+                                "result": {"cols": cols, "rows": rows, "affected_row_count": 0},
+                            },
+                        },
+                        {"type": "ok", "response": {"type": "close"}},
                     ]
                 },
             )
@@ -4192,3 +4299,107 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
             # Must raise row count limit exceeded, NOT cell deserialization error!
             self.assertIn("Hrana result row count 10 exceeds maximum limit 5.", str(ctx.exception))
             self.assertNotIn("EXPLOSIVE_SENTINEL_NEVER_DESERIALIZED", str(ctx.exception))
+
+    def test_point29_pre_commit_statement_validation_and_rollback_prevents_unsafe_commit(self):
+        """P1: Statement results are validated BEFORE sending COMMIT; malformed statements abort with ROLLBACK and never dispatch COMMIT."""
+        dispatched_requests: list[dict[str, Any]] = []
+
+        def mock_tx_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_requests.append(body)
+
+            reqs = body.get("requests", [])
+            has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+            has_commit = any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in reqs)
+            has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+
+            if has_begin:
+                # Return superficially ok statement with result={} (missing cols/rows)
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": "test-baton-precommit-1",
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": {}}},  # Malformed: missing cols & rows!
+                        ],
+                    },
+                )
+            elif has_rollback:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "close"}},
+                        ],
+                    },
+                )
+            elif has_commit:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "close"}},
+                        ],
+                    },
+                )
+            return httpx.Response(500, json={"error": "Unexpected request in mock"})
+
+        transport = httpx.MockTransport(mock_tx_handler)
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=transport) as client:
+            with self.assertRaises(TursoClientError) as ctx:
+                client.execute_transaction([("INSERT INTO stories (story_id) VALUES (?)", ["EFSO-TEST"])])
+
+            # Validation error raised before commit
+            self.assertIn("Missing or invalid 'cols' list in execute result.", str(ctx.exception))
+            # Must NOT be an ambiguous commit error because COMMIT was never sent
+            self.assertNotIsInstance(ctx.exception, TursoAmbiguousTransactionError)
+
+        # Confirm that ROLLBACK was dispatched and COMMIT was NEVER dispatched!
+        commit_dispatched = any(
+            any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", []))
+            for p in dispatched_requests
+        )
+        rollback_dispatched = any(
+            any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in p.get("requests", []))
+            for p in dispatched_requests
+        )
+        self.assertFalse(commit_dispatched, "COMMIT must NEVER be dispatched when statement validation fails pre-commit")
+        self.assertTrue(rollback_dispatched, "ROLLBACK must be dispatched via baton when statement validation fails pre-commit")
+
+        # 2. Ambiguity preservation: Post-COMMIT error remains TursoAmbiguousTransactionError (UNKNOWN), never ordinary retryable error
+        dispatched_requests.clear()
+
+        def commit_network_drop_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_requests.append(body)
+            reqs = body.get("requests", [])
+            has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+            has_commit = any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in reqs)
+
+            if has_begin:
+                # Valid statement
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": "test-baton-precommit-2",
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [{"name": "id"}], "rows": []}}},
+                        ],
+                    },
+                )
+            elif has_commit:
+                raise httpx.ConnectError("Network dropped while waiting for COMMIT response")
+            return httpx.Response(500, json={"error": "Unexpected request"})
+
+        transport_drop = httpx.MockTransport(commit_network_drop_handler)
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=transport_drop) as client:
+            with self.assertRaises(TursoAmbiguousTransactionError) as ctx:
+                client.execute_transaction([("SELECT 1", [])])
+            self.assertIn("Ambiguous transaction outcome (UNKNOWN)", str(ctx.exception))
+            self.assertIn("network error during Turso COMMIT", str(ctx.exception))
