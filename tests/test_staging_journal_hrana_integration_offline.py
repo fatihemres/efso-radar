@@ -4681,6 +4681,206 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
             "COMMIT must NEVER be dispatched when statement validation fails",
         )
 
+        # Scenario E (P1-1): First response has null baton with statement validation failure -> fails closed to UNKNOWN
+        dispatched_e: list[dict[str, Any]] = []
+
+        def null_baton_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_e.append(body)
+            return httpx.Response(
+                200,
+                json={
+                    "baton": None,
+                    "results": [
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                        {"type": "ok", "response": {"type": "execute", "result": {}}},  # Malformed: triggers validation failure
+                    ],
+                },
+            )
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(null_baton_handler)) as client:
+            with self.assertRaises(TursoAmbiguousTransactionError) as ctx:
+                client.execute_transaction([("SELECT 1", [])])
+            self.assertIn("Ambiguous transaction outcome (UNKNOWN)", str(ctx.exception))
+            self.assertIn("statement validation failed but server did not return a valid session baton", str(ctx.exception))
+
+        self.assertFalse(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", [])) for p in dispatched_e),
+            "COMMIT must NEVER be dispatched when statement validation fails",
+        )
+        self.assertFalse(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in p.get("requests", [])) for p in dispatched_e),
+            "ROLLBACK cannot be dispatched without a session baton",
+        )
+
+        # Scenario F (P1-1): First response has empty string baton with statement validation failure -> fails closed to UNKNOWN
+        dispatched_f: list[dict[str, Any]] = []
+
+        def empty_baton_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_f.append(body)
+            return httpx.Response(
+                200,
+                json={
+                    "baton": "",
+                    "results": [
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                        {"type": "ok", "response": {"type": "execute", "result": {}}},
+                    ],
+                },
+            )
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(empty_baton_handler)) as client:
+            with self.assertRaises(TursoAmbiguousTransactionError) as ctx:
+                client.execute_transaction([("SELECT 1", [])])
+            self.assertIn("Ambiguous transaction outcome (UNKNOWN)", str(ctx.exception))
+            self.assertIn("statement validation failed but server did not return a valid session baton", str(ctx.exception))
+
+        self.assertFalse(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", [])) for p in dispatched_f),
+            "COMMIT must NEVER be dispatched when statement validation fails",
+        )
+
+        # Scenario G (P1-2): Rollback response execute result missing cols/rows (result={}) -> fails closed to UNKNOWN
+        dispatched_g: list[dict[str, Any]] = []
+
+        def rollback_empty_result_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_g.append(body)
+            reqs = body.get("requests", [])
+            has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+            has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+
+            if has_begin:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": "test-baton-rb-emptyres",
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": {}}},
+                        ],
+                    },
+                )
+            elif has_rollback:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {}}},  # Malformed: missing cols & rows!
+                            {"type": "ok", "response": {"type": "close"}},
+                        ],
+                    },
+                )
+            return httpx.Response(500, json={"error": "Unexpected request"})
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(rollback_empty_result_handler)) as client:
+            with self.assertRaises(TursoAmbiguousTransactionError) as ctx:
+                client.execute_transaction([("SELECT 1", [])])
+            self.assertIn("Ambiguous transaction outcome (UNKNOWN)", str(ctx.exception))
+            self.assertIn("statement validation failed and ROLLBACK execution response was malformed", str(ctx.exception))
+
+        self.assertFalse(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", [])) for p in dispatched_g),
+            "COMMIT must NEVER be dispatched when statement validation fails",
+        )
+
+        # Scenario H (P1-2): Rollback response cardinality > 2 (extra trailing error result) -> fails closed to UNKNOWN
+        dispatched_h: list[dict[str, Any]] = []
+
+        def rollback_extra_result_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_h.append(body)
+            reqs = body.get("requests", [])
+            has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+            has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+
+            if has_begin:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": "test-baton-rb-extrares",
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": {}}},
+                        ],
+                    },
+                )
+            elif has_rollback:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "close"}},
+                            {"type": "error", "error": {"code": "SQLITE_ERROR", "message": "trailing error"}},
+                        ],
+                    },
+                )
+            return httpx.Response(500, json={"error": "Unexpected request"})
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(rollback_extra_result_handler)) as client:
+            with self.assertRaises(TursoAmbiguousTransactionError) as ctx:
+                client.execute_transaction([("SELECT 1", [])])
+            self.assertIn("Ambiguous transaction outcome (UNKNOWN)", str(ctx.exception))
+            self.assertIn("statement validation failed and rollback result list was missing, truncated, or had extra results", str(ctx.exception))
+
+        self.assertFalse(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", [])) for p in dispatched_h),
+            "COMMIT must NEVER be dispatched when statement validation fails",
+        )
+
+        # Scenario I: Positive control: verified rollback preserves original validation error and never dispatches COMMIT
+        dispatched_i: list[dict[str, Any]] = []
+
+        def rollback_canonical_verified_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_i.append(body)
+            reqs = body.get("requests", [])
+            has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+            has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+
+            if has_begin:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": "test-baton-rb-verified",
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": {}}},  # Malformed statement triggers validation error
+                        ],
+                    },
+                )
+            elif has_rollback:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "close"}},
+                        ],
+                    },
+                )
+            return httpx.Response(500, json={"error": "Unexpected request"})
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(rollback_canonical_verified_handler)) as client:
+            with self.assertRaises(TursoClientError) as ctx:
+                client.execute_transaction([("SELECT 1", [])])
+            self.assertIn("Missing or invalid 'cols' list in execute result.", str(ctx.exception))
+            self.assertNotIsInstance(ctx.exception, TursoAmbiguousTransactionError)
+
+        self.assertFalse(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", [])) for p in dispatched_i),
+            "COMMIT must NEVER be dispatched when statement validation fails",
+        )
+        self.assertTrue(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in p.get("requests", [])) for p in dispatched_i),
+            "ROLLBACK must be dispatched via baton when statement validation fails",
+        )
+
     def test_point31_sanitized_error_reporting_no_untrusted_sentinel_leakage(self):
         """P2: Untrusted Hrana discriminators, tags, and cell types never leak into exceptions or active tracebacks."""
         # 1. Pipeline close response type mismatch does not leak untrusted discriminator

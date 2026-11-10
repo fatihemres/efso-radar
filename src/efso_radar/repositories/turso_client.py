@@ -690,78 +690,80 @@ class TursoHTTPClient:
                 break
 
         if validation_error is not None:
-            if baton:
-                try:
-                    rb_resp = client.post(
-                        self.pipeline_url,
-                        json={"baton": baton, "requests": [{"type": "execute", "stmt": {"sql": "ROLLBACK"}}, {"type": "close"}]},
-                    )
-                except httpx.HTTPError as exc:
-                    err_type = type(exc).__name__
-                    raise TursoAmbiguousTransactionError(
-                        f"Ambiguous transaction outcome (UNKNOWN): statement validation failed and rollback network request failed ({err_type}). "
-                        "The transaction state is unverified."
-                    ) from None
+            if not baton or not isinstance(baton, str) or not baton.strip():
+                raise TursoAmbiguousTransactionError(
+                    "Ambiguous transaction outcome (UNKNOWN): statement validation failed but server did not return a valid session baton to verify rollback. "
+                    "The transaction state is unverified."
+                )
 
-                if rb_resp.status_code != 200:
-                    raise TursoAmbiguousTransactionError(
-                        f"Ambiguous transaction outcome (UNKNOWN): statement validation failed and rollback returned HTTP status {rb_resp.status_code}. "
-                        "The transaction state is unverified."
-                    )
+            try:
+                rb_resp = client.post(
+                    self.pipeline_url,
+                    json={"baton": baton, "requests": [{"type": "execute", "stmt": {"sql": "ROLLBACK"}}, {"type": "close"}]},
+                )
+            except httpx.HTTPError as exc:
+                err_type = type(exc).__name__
+                raise TursoAmbiguousTransactionError(
+                    f"Ambiguous transaction outcome (UNKNOWN): statement validation failed and rollback network request failed ({err_type}). "
+                    "The transaction state is unverified."
+                ) from None
 
-                try:
-                    rb_data = rb_resp.json()
-                except Exception as exc:
-                    err_type = type(exc).__name__
-                    raise TursoAmbiguousTransactionError(
-                        f"Ambiguous transaction outcome (UNKNOWN): statement validation failed and rollback response was malformed JSON ({err_type}). "
-                        "The transaction state is unverified."
-                    ) from None
+            if rb_resp.status_code != 200:
+                raise TursoAmbiguousTransactionError(
+                    f"Ambiguous transaction outcome (UNKNOWN): statement validation failed and rollback returned HTTP status {rb_resp.status_code}. "
+                    "The transaction state is unverified."
+                )
 
-                if not isinstance(rb_data, dict):
-                    raise TursoAmbiguousTransactionError(
-                        "Ambiguous transaction outcome (UNKNOWN): statement validation failed and rollback response root is not an object. "
-                        "The transaction state is unverified."
-                    )
+            try:
+                rb_data = rb_resp.json()
+            except Exception as exc:
+                err_type = type(exc).__name__
+                raise TursoAmbiguousTransactionError(
+                    f"Ambiguous transaction outcome (UNKNOWN): statement validation failed and rollback response was malformed JSON ({err_type}). "
+                    "The transaction state is unverified."
+                ) from None
 
-                rb_results = rb_data.get("results")
-                if not isinstance(rb_results, list) or len(rb_results) < 2:
-                    raise TursoAmbiguousTransactionError(
-                        "Ambiguous transaction outcome (UNKNOWN): statement validation failed and rollback result list was missing or truncated. "
-                        "The transaction state is unverified."
-                    )
+            if not isinstance(rb_data, dict):
+                raise TursoAmbiguousTransactionError(
+                    "Ambiguous transaction outcome (UNKNOWN): statement validation failed and rollback response root is not an object. "
+                    "The transaction state is unverified."
+                )
 
-                rb_exec = rb_results[0]
-                if not isinstance(rb_exec, dict) or rb_exec.get("type") != "ok":
-                    raise TursoAmbiguousTransactionError(
-                        "Ambiguous transaction outcome (UNKNOWN): statement validation failed and ROLLBACK execution was not confirmed. "
-                        "The transaction state is unverified."
-                    )
-                rb_exec_resp = rb_exec.get("response")
-                if (
-                    not isinstance(rb_exec_resp, dict)
-                    or rb_exec_resp.get("type") != "execute"
-                    or not isinstance(rb_exec_resp.get("result"), dict)
-                ):
-                    raise TursoAmbiguousTransactionError(
-                        "Ambiguous transaction outcome (UNKNOWN): statement validation failed and ROLLBACK execution response was malformed. "
-                        "The transaction state is unverified."
-                    )
+            rb_results = rb_data.get("results")
+            if not isinstance(rb_results, list) or len(rb_results) != 2:
+                raise TursoAmbiguousTransactionError(
+                    "Ambiguous transaction outcome (UNKNOWN): statement validation failed and rollback result list was missing, truncated, or had extra results. "
+                    "The transaction state is unverified."
+                )
 
-                rb_close = rb_results[1]
-                if not isinstance(rb_close, dict) or rb_close.get("type") != "ok":
-                    raise TursoAmbiguousTransactionError(
-                        "Ambiguous transaction outcome (UNKNOWN): statement validation failed and pipeline close was not confirmed. "
-                        "The transaction state is unverified."
-                    )
-                rb_close_resp = rb_close.get("response")
-                if rb_close_resp is not None and (
-                    not isinstance(rb_close_resp, dict) or rb_close_resp.get("type") != "close"
-                ):
-                    raise TursoAmbiguousTransactionError(
-                        "Ambiguous transaction outcome (UNKNOWN): statement validation failed and pipeline close response type was invalid. "
-                        "The transaction state is unverified."
-                    )
+            rb_exec = rb_results[0]
+            if not isinstance(rb_exec, dict) or rb_exec.get("type") != "ok":
+                raise TursoAmbiguousTransactionError(
+                    "Ambiguous transaction outcome (UNKNOWN): statement validation failed and ROLLBACK execution was not confirmed. "
+                    "The transaction state is unverified."
+                )
+            try:
+                _parse_hrana_exec_result(rb_exec)
+            except Exception:
+                raise TursoAmbiguousTransactionError(
+                    "Ambiguous transaction outcome (UNKNOWN): statement validation failed and ROLLBACK execution response was malformed. "
+                    "The transaction state is unverified."
+                ) from None
+
+            rb_close = rb_results[1]
+            if not isinstance(rb_close, dict) or rb_close.get("type") != "ok":
+                raise TursoAmbiguousTransactionError(
+                    "Ambiguous transaction outcome (UNKNOWN): statement validation failed and pipeline close was not confirmed. "
+                    "The transaction state is unverified."
+                )
+            rb_close_resp = rb_close.get("response")
+            if rb_close_resp is not None and (
+                not isinstance(rb_close_resp, dict) or rb_close_resp.get("type") != "close"
+            ):
+                raise TursoAmbiguousTransactionError(
+                    "Ambiguous transaction outcome (UNKNOWN): statement validation failed and pipeline close response type was invalid. "
+                    "The transaction state is unverified."
+                )
 
             raise validation_error
 
