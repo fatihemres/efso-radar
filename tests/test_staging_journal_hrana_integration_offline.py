@@ -3783,7 +3783,8 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
         with make_client(handler_bad_inner_close_type) as c:
             with self.assertRaises(TursoClientError) as ctx:
                 c.execute("SELECT 1")
-            self.assertIn("Pipeline close response type mismatch: expected 'close', got 'execute'.", str(ctx.exception))
+            self.assertIn("Pipeline close response type mismatch: expected 'close'.", str(ctx.exception))
+            self.assertNotIn("execute", str(ctx.exception))
 
         # 5. Unexpected statement inner discriminator (e.g. statement inner type is 'close' instead of 'execute')
         def handler_bad_inner_stmt_type(req: httpx.Request) -> httpx.Response:
@@ -3791,7 +3792,7 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                 200,
                 json={
                     "results": [
-                        {"type": "ok", "response": {"type": "close", "result": {"cols": [{"name": "x"}], "rows": []}}},
+                        {"type": "ok", "response": {"type": "SECRET_STMT_TYPE_SENTINEL", "result": {"cols": [{"name": "x"}], "rows": []}}},
                         {"type": "ok", "response": {"type": "close"}},
                     ]
                 },
@@ -3800,7 +3801,8 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
         with make_client(handler_bad_inner_stmt_type) as c:
             with self.assertRaises(TursoClientError) as ctx:
                 c.execute("SELECT 1")
-            self.assertIn("Unexpected statement response type: 'close'. Expected 'execute'.", str(ctx.exception))
+            self.assertIn("Unexpected statement response type. Expected 'execute'.", str(ctx.exception))
+            self.assertNotIn("SECRET_STMT_TYPE_SENTINEL", str(ctx.exception))
 
         # 6. Extra statement result (cardinality > expected)
         def handler_extra_result(req: httpx.Request) -> httpx.Response:
@@ -3826,7 +3828,7 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                 200,
                 json={
                     "results": [
-                        {"type": "unknown_type"},
+                        {"type": "SECRET_OUTER_RESULT_TYPE_SENTINEL"},
                         {"type": "ok", "response": {"type": "close"}},
                     ]
                 },
@@ -3835,7 +3837,8 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
         with make_client(handler_bad_stmt_type) as c:
             with self.assertRaises(TursoClientError) as ctx:
                 c.execute("SELECT 1")
-            self.assertIn("Unexpected statement result type", str(ctx.exception))
+            self.assertEqual("Unexpected statement result type. Expected 'ok'.", str(ctx.exception))
+            self.assertNotIn("SECRET_OUTER_RESULT_TYPE_SENTINEL", str(ctx.exception))
 
         # 8. Canonical positive control: canonical statement and close inner discriminators pass
         def handler_canonical_positive(req: httpx.Request) -> httpx.Response:
@@ -3935,7 +3938,7 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                 c.execute("SELECT col1, col2")
             self.assertIn("Row width mismatch at index 0: expected 2 cells, got 3.", str(ctx.exception))
 
-        # 3. Unsupported cell type tag (e.g. 'date')
+        # 3. Unsupported cell type tag (with secret sentinel: must not leak)
         def handler_unknown_tag(req: httpx.Request) -> httpx.Response:
             return httpx.Response(
                 200,
@@ -3947,7 +3950,7 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                                 "type": "execute",
                                 "result": {
                                     "cols": [{"name": "col1"}],
-                                    "rows": [[{"type": "date", "value": "2026-11-10"}]],
+                                    "rows": [[{"type": "SECRET_CELL_TAG_SENTINEL", "value": "2026-11-10"}]],
                                     "affected_row_count": 0,
                                 },
                             },
@@ -3960,7 +3963,8 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
         with make_client(handler_unknown_tag) as c:
             with self.assertRaises(TursoClientError) as ctx:
                 c.execute("SELECT col1")
-            self.assertIn("Unrecognized or unsupported Hrana cell type: 'date'.", str(ctx.exception))
+            self.assertEqual("Unrecognized or unsupported Hrana cell type.", str(ctx.exception))
+            self.assertNotIn("SECRET_CELL_TAG_SENTINEL", str(ctx.exception))
 
         # 4. Malformed cell: non-dict
         def handler_non_dict_cell(req: httpx.Request) -> httpx.Response:
@@ -4015,6 +4019,114 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
             with self.assertRaises(TursoClientError) as ctx:
                 c.execute("SELECT col1")
             self.assertIn("Invalid row format at index 0: expected list", str(ctx.exception))
+
+        # 6. Malformed integer cells: booleans, floats, nulls, and non-decimal strings must fail closed
+        malformed_int_cases = [
+            True,
+            False,
+            1.5,
+            None,
+            "1.5",
+            "abc",
+            " 123 ",
+            9999999999999999999999999999999999999999,
+        ]
+        for bad_int in malformed_int_cases:
+            def handler_bad_int(req: httpx.Request, val=bad_int) -> httpx.Response:
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": [
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "type": "execute",
+                                    "result": {
+                                        "cols": [{"name": "col1"}],
+                                        "rows": [[{"type": "integer", "value": val}]],
+                                        "affected_row_count": 0,
+                                    },
+                                },
+                            },
+                            {"type": "ok", "response": {"type": "close"}},
+                        ]
+                    },
+                )
+            with make_client(handler_bad_int) as c:
+                with self.assertRaises(TursoClientError) as ctx:
+                    c.execute("SELECT col1")
+                self.assertIn("Invalid integer value in Hrana cell.", str(ctx.exception))
+
+        # 7. Malformed float cells: booleans, nulls, inf, nan, non-numeric strings must fail closed
+        malformed_float_cases = [
+            True,
+            False,
+            None,
+            "nan",
+            "inf",
+            "-inf",
+            "abc",
+        ]
+        for bad_float in malformed_float_cases:
+            def handler_bad_float(req: httpx.Request, val=bad_float) -> httpx.Response:
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": [
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "type": "execute",
+                                    "result": {
+                                        "cols": [{"name": "col1"}],
+                                        "rows": [[{"type": "float", "value": val}]],
+                                        "affected_row_count": 0,
+                                    },
+                                },
+                            },
+                            {"type": "ok", "response": {"type": "close"}},
+                        ]
+                    },
+                )
+            with make_client(handler_bad_float) as c:
+                with self.assertRaises(TursoClientError) as ctx:
+                    c.execute("SELECT col1")
+                self.assertIn("Invalid float value in Hrana cell.", str(ctx.exception))
+
+        # 8. Valid integer and float positive control
+        def handler_valid_nums(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "type": "ok",
+                            "response": {
+                                "type": "execute",
+                                "result": {
+                                    "cols": [{"name": "i1"}, {"name": "i2"}, {"name": "f1"}, {"name": "f2"}],
+                                    "rows": [[
+                                        {"type": "integer", "value": 42},
+                                        {"type": "integer", "value": "-100"},
+                                        {"type": "float", "value": 3.14},
+                                        {"type": "float", "value": "-2.5"},
+                                    ]],
+                                    "affected_row_count": 0,
+                                },
+                            },
+                        },
+                        {"type": "ok", "response": {"type": "close"}},
+                    ]
+                },
+            )
+        with make_client(handler_valid_nums) as c:
+            res = c.execute("SELECT 1, 2, 3, 4")
+            rows = res.fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["i1"], 42)
+            self.assertEqual(rows[0]["i2"], -100)
+            self.assertEqual(rows[0]["f1"], 3.14)
+            self.assertEqual(rows[0]["f2"], -2.5)
 
     def test_point25_audit_workload_exact_pk_identity_and_cardinality(self):
         """P1: audit_workload strictly verifies exact PK identity and cardinality (ambiguity -> UNKNOWN, foreign -> HALT)."""
@@ -4403,3 +4515,206 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                 client.execute_transaction([("SELECT 1", [])])
             self.assertIn("Ambiguous transaction outcome (UNKNOWN)", str(ctx.exception))
             self.assertIn("network error during Turso COMMIT", str(ctx.exception))
+
+    def test_point30_pre_commit_validation_unverified_rollback_fails_closed(self):
+        """P1: Unverified or failed rollback during pre-COMMIT statement validation failure raises TursoAmbiguousTransactionError (UNKNOWN/HALT)."""
+        # Scenario A: Rollback network drop
+        dispatched_a: list[dict[str, Any]] = []
+
+        def rollback_network_error_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_a.append(body)
+            reqs = body.get("requests", [])
+            has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+            has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+
+            if has_begin:
+                # Return malformed statement result to trigger validation failure
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": "test-baton-rb-drop",
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": {}}},  # Malformed: missing cols & rows
+                        ],
+                    },
+                )
+            elif has_rollback:
+                raise httpx.ConnectError("Network dropped during ROLLBACK request")
+            return httpx.Response(500, json={"error": "Unexpected request"})
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(rollback_network_error_handler)) as client:
+            with self.assertRaises(TursoAmbiguousTransactionError) as ctx:
+                client.execute_transaction([("SELECT 1", [])])
+            self.assertIn("Ambiguous transaction outcome (UNKNOWN)", str(ctx.exception))
+            self.assertIn("statement validation failed and rollback network request failed (ConnectError)", str(ctx.exception))
+
+        self.assertFalse(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", [])) for p in dispatched_a),
+            "COMMIT must NEVER be dispatched when statement validation fails",
+        )
+
+        # Scenario B: Rollback HTTP 500 error
+        dispatched_b: list[dict[str, Any]] = []
+
+        def rollback_http_error_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_b.append(body)
+            reqs = body.get("requests", [])
+            has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+            has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+
+            if has_begin:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": "test-baton-rb-http500",
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": {}}},
+                        ],
+                    },
+                )
+            elif has_rollback:
+                return httpx.Response(500, text="Internal Server Error")
+            return httpx.Response(500, json={"error": "Unexpected request"})
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(rollback_http_error_handler)) as client:
+            with self.assertRaises(TursoAmbiguousTransactionError) as ctx:
+                client.execute_transaction([("SELECT 1", [])])
+            self.assertIn("Ambiguous transaction outcome (UNKNOWN)", str(ctx.exception))
+            self.assertIn("statement validation failed and rollback returned HTTP status 500", str(ctx.exception))
+
+        self.assertFalse(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", [])) for p in dispatched_b),
+            "COMMIT must NEVER be dispatched when statement validation fails",
+        )
+
+        # Scenario C: Rollback returns execution error / unconfirmed rollback
+        dispatched_c: list[dict[str, Any]] = []
+
+        def rollback_stmt_error_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_c.append(body)
+            reqs = body.get("requests", [])
+            has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+            has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+
+            if has_begin:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": "test-baton-rb-error",
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": {}}},
+                        ],
+                    },
+                )
+            elif has_rollback:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {"type": "error", "error": {"code": "SQLITE_BUSY", "message": "locked"}},
+                            {"type": "ok", "response": {"type": "close"}},
+                        ],
+                    },
+                )
+            return httpx.Response(500, json={"error": "Unexpected request"})
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(rollback_stmt_error_handler)) as client:
+            with self.assertRaises(TursoAmbiguousTransactionError) as ctx:
+                client.execute_transaction([("SELECT 1", [])])
+            self.assertIn("Ambiguous transaction outcome (UNKNOWN)", str(ctx.exception))
+            self.assertIn("statement validation failed and ROLLBACK execution was not confirmed", str(ctx.exception))
+
+        self.assertFalse(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", [])) for p in dispatched_c),
+            "COMMIT must NEVER be dispatched when statement validation fails",
+        )
+
+        # Scenario D: Rollback returns unconfirmed close
+        dispatched_d: list[dict[str, Any]] = []
+
+        def rollback_bad_close_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_d.append(body)
+            reqs = body.get("requests", [])
+            has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+            has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+
+            if has_begin:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": "test-baton-rb-badclose",
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": {}}},
+                        ],
+                    },
+                )
+            elif has_rollback:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "pending"},
+                        ],
+                    },
+                )
+            return httpx.Response(500, json={"error": "Unexpected request"})
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(rollback_bad_close_handler)) as client:
+            with self.assertRaises(TursoAmbiguousTransactionError) as ctx:
+                client.execute_transaction([("SELECT 1", [])])
+            self.assertIn("Ambiguous transaction outcome (UNKNOWN)", str(ctx.exception))
+            self.assertIn("statement validation failed and pipeline close was not confirmed", str(ctx.exception))
+
+        self.assertFalse(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", [])) for p in dispatched_d),
+            "COMMIT must NEVER be dispatched when statement validation fails",
+        )
+
+    def test_point31_sanitized_error_reporting_no_untrusted_sentinel_leakage(self):
+        """P2: Untrusted Hrana discriminators, tags, and cell types never leak into exceptions or active tracebacks."""
+        # 1. Pipeline close response type mismatch does not leak untrusted discriminator
+        def close_sentinel_handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [{"name": "x"}], "rows": []}}},
+                        {"type": "ok", "response": {"type": "EXPLOSIVE_CLOSE_SENTINEL_xyz123"}},
+                    ]
+                },
+            )
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(close_sentinel_handler)) as client:
+            with self.assertRaises(TursoClientError) as ctx:
+                client.execute("SELECT 1")
+            self.assertEqual("Pipeline close response type mismatch: expected 'close'.", str(ctx.exception))
+            self.assertNotIn("EXPLOSIVE_CLOSE_SENTINEL_xyz123", str(ctx.exception))
+
+        # 2. Unexpected close outer type does not leak untrusted discriminator
+        def close_outer_sentinel_handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [{"name": "x"}], "rows": []}}},
+                        {"type": "EXPLOSIVE_CLOSE_OUTER_SENTINEL_abc456"},
+                    ]
+                },
+            )
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(close_outer_sentinel_handler)) as client:
+            with self.assertRaises(TursoClientError) as ctx:
+                client.execute("SELECT 1")
+            self.assertEqual("Pipeline close failed with unexpected type. Expected 'ok'.", str(ctx.exception))
+            self.assertNotIn("EXPLOSIVE_CLOSE_OUTER_SENTINEL_abc456", str(ctx.exception))
