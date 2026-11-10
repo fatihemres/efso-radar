@@ -2762,6 +2762,8 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
         # Verify no executable mutation, retry or cleanup channels exist on CrossRunnerReview
         for attr in ("execute", "retry", "takeover", "cleanup", "mutate"):
             self.assertFalse(hasattr(rev_clean, attr))
+            self.assertFalse(hasattr(rev_intent, attr))
+            self.assertFalse(hasattr(rev_effect, attr))
 
 
     def test_point10_wire_absence_never_falls_back_to_local_journal_and_reports_unknown(self):
@@ -2785,7 +2787,23 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
         cur = self.conn_b.execute("SELECT status FROM staging_run_journal WHERE run_id = ?", (RUN_ID_A,))
         self.assertIsNotNone(cur.fetchone())
 
-        # 2. Intercept mock wire so that staging_run_journal queries return empty rows (wire ABSENT)
+        # 2. Intercept mock wire so that staging_run_journal queries return a valid empty row set (genuine wire ABSENT)
+        expected_cols = [
+            {"name": c}
+            for c in (
+                "run_id",
+                "owner_id",
+                "fencing_token",
+                "stage",
+                "status",
+                "manifest_seal_hex",
+                "target_inventory_json",
+                "created_at",
+                "updated_at",
+                "last_error",
+            )
+        ]
+
         def wire_absent_hook(request: httpx.Request) -> Optional[httpx.Response]:
             if b"staging_run_journal" in request.content:
                 return httpx.Response(
@@ -2798,18 +2816,22 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                                 "type": "ok",
                                 "response": {
                                     "result": {
-                                        "cols": [{"name": "run_id"}],
+                                        "cols": expected_cols,
                                         "rows": [],
                                         "affected_row_count": 0,
                                     }
                                 },
-                            }
+                            },
+                            {"type": "ok", "response": {}},
                         ],
                     },
                 )
             return None
 
         self.transport_b.custom_response_hook = wire_absent_hook
+
+        # Confirm that inspect_run_wire genuinely succeeds and returns None (valid wire read returning zero rows)
+        self.assertIsNone(self.seam_b.inspect_run_wire(RUN_ID_A))
 
         # Snapshot DB before audit
         cur = self.conn_b.execute("SELECT COUNT(*) FROM staging_run_journal")
@@ -3113,3 +3135,202 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
         self.assertEqual(review_dup.journal_status, CrossRunnerJournalStatus.UNREADABLE)
         self.assertEqual(review_dup.remote_state, "UNKNOWN")
         self.assertEqual(review_dup.action, "MANUAL_REVIEW_ONLY")
+    def test_point15_forged_foreign_pk_with_matching_seal_fails_closed_before_entity_select(self):
+        """P1-1: A forged foreign PK with a recomputed matching seal fails closed before any entity SELECT."""
+        forged_run_id = RUN_ID_A
+        # Create forged 5-entity inventory: allowlisted table processed_articles, but targeting a foreign victim PK
+        forged_entities = [e.model_dump() for e in create_default_manifest_entities(forged_run_id)]
+        forged_pk = "victim_secret_art_999"
+        forged_entities[0]["pk_value"] = forged_pk
+
+        # Recompute a matching seal over this forged inventory
+        matching_seal = compute_canonical_inventory_fingerprint(forged_run_id, entities=forged_entities)
+
+        # Insert forged record into staging_run_journal
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.execute(
+            """
+            INSERT INTO staging_run_journal (
+                run_id, owner_id, fencing_token, stage, status,
+                manifest_seal_hex, target_inventory_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                forged_run_id,
+                "worker_01",
+                1,
+                "LIVE-02",
+                JournalStatus.ACKED.value,
+                matching_seal,
+                json.dumps(forged_entities),
+                "2026-11-07T12:00:00Z",
+                "2026-11-07T12:00:00Z",
+            ],
+        )
+        self.conn_a.commit()
+
+        # Set up request spy on Runner B transport to trace all executed wire queries
+        captured_sql: list[str] = []
+
+        def spy_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+                for req in body.get("requests", []):
+                    stmt = req.get("stmt", {})
+                    if "sql" in stmt:
+                        captured_sql.append(stmt["sql"])
+            except Exception:
+                pass
+            return None
+
+        self.transport_b.custom_response_hook = spy_hook
+
+        # 1. Wire discovery must fail closed
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertEqual(ctx.exception.code, "INVENTORY_VALIDATION_ERROR")
+        self.assertNotIn(forged_pk, str(ctx.exception))
+
+        # 2. Wire inspection / recovery review must report CORRUPTED / UNKNOWN inert review
+        review = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review.journal_status, CrossRunnerJournalStatus.CORRUPTED)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+        self.assertNotIn(forged_pk, str(review))
+
+        # 3. CRUCIAL: Query tracing proves zero foreign-target reads occurred
+        # No SELECT statement must contain the forged foreign PK or target the foreign article
+        for sql in captured_sql:
+            self.assertNotIn(forged_pk, sql)
+            # Only allowlisted discovery SELECT on staging_run_journal should have run
+            self.assertTrue(
+                "staging_run_journal" in sql or "BEGIN" in sql or "COMMIT" in sql,
+                f"Unexpected entity query executed: {sql}",
+            )
+
+    def test_point16_malformed_hrana_integer_cell_suppresses_chained_exception_and_traceback_leakage(self):
+        """P1-2: Malformed Hrana integer cell with sentinel suppresses chained exception and traceback leakage."""
+        import traceback
+
+        sentinel_secret = "ATTACKER_SECRET_INT_SENTINEL_987654321"
+
+        # Mock wire returns an integer cell whose value string contains the sentinel
+        def malformed_int_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            if b"staging_run_journal" in request.content:
+                cols = [
+                    {"name": c}
+                    for c in (
+                        "run_id",
+                        "owner_id",
+                        "fencing_token",
+                        "stage",
+                        "status",
+                        "manifest_seal_hex",
+                        "target_inventory_json",
+                        "created_at",
+                        "updated_at",
+                        "last_error",
+                    )
+                ]
+                malformed_row = [
+                    {"type": "text", "value": RUN_ID_A},
+                    {"type": "text", "value": "worker_01"},
+                    {"type": "integer", "value": sentinel_secret},  # Malformed integer cell!
+                    {"type": "text", "value": "LIVE-02"},
+                    {"type": "text", "value": JournalStatus.ACKED.value},
+                    {"type": "text", "value": self.seal_a},
+                    {"type": "text", "value": json.dumps([e.model_dump() for e in self.entities_a])},
+                    {"type": "text", "value": "2026-11-07T12:00:00Z"},
+                    {"type": "text", "value": "2026-11-07T12:00:00Z"},
+                    {"type": "null"},
+                ]
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "base_url": None,
+                        "results": [
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "result": {
+                                        "cols": cols,
+                                        "rows": [malformed_row],
+                                        "affected_row_count": 0,
+                                    }
+                                },
+                            },
+                            {"type": "ok", "response": {}},
+                        ],
+                    },
+                )
+            return None
+
+        self.transport_b.custom_response_hook = malformed_int_hook
+
+        # 1. Direct discovery raises CrossRunnerDiscoveryError
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+
+        err = ctx.exception
+        self.assertEqual(err.code, "WIRE_QUERY_MALFORMED")
+        self.assertNotIn(sentinel_secret, str(err))
+
+        # Verify that chained exception context / cause is completely suppressed
+        self.assertIsNone(err.__cause__)
+        self.assertTrue(err.__suppress_context__)
+
+        # Format complete exception traceback as an error logger would
+        tb_lines = traceback.format_exception(type(err), err, err.__traceback__)
+        tb_text = "".join(tb_lines)
+
+        # Sentinel must NOT appear in formatted traceback
+        self.assertNotIn(sentinel_secret, tb_text)
+
+        # 2. Review evidence returns inert UNKNOWN / UNREADABLE
+        review = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review.journal_status, CrossRunnerJournalStatus.UNREADABLE)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+        self.assertNotIn(sentinel_secret, str(review))
+
+    def test_point17_malformed_query_metadata_fails_to_unreadable_never_reported_as_absent(self):
+        """P2-2: Malformed execute metadata in 2-element results array reports UNREADABLE, never genuine ABSENT."""
+        # Mock wire returns execute + close results, but execute result has empty response/cols metadata
+        def malformed_meta_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            if b"staging_run_journal" in request.content:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "base_url": None,
+                        "results": [
+                            {"type": "ok", "response": {}},  # Missing result / cols!
+                            {"type": "ok", "response": {}},
+                        ],
+                    },
+                )
+            return None
+
+        self.transport_b.custom_response_hook = malformed_meta_hook
+
+        # 1. Direct discovery must fail closed with WIRE_QUERY_MALFORMED
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertEqual(ctx.exception.code, "WIRE_QUERY_MALFORMED")
+
+        # 2. Review evidence must classify this as UNREADABLE, NEVER genuine ABSENT
+        review = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review.journal_status, CrossRunnerJournalStatus.UNREADABLE)
+        self.assertNotEqual(review.journal_status, CrossRunnerJournalStatus.ABSENT)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+
+        # 3. Scoped inspection also classifies as UNREADABLE, never ABSENT
+        review_scoped = self.seam_b.review_recovery_evidence(run_id=RUN_ID_A)
+        self.assertEqual(review_scoped.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_scoped.journal_status, CrossRunnerJournalStatus.UNREADABLE)
+        self.assertNotEqual(review_scoped.journal_status, CrossRunnerJournalStatus.ABSENT)
