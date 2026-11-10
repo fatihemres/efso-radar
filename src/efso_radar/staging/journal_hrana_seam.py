@@ -140,6 +140,71 @@ EXPECTED_JOURNAL_QUERY_COLS: tuple[str, ...] = (
     "last_error",
 )
 
+EXPECTED_ENTITY_QUERY_COLS: dict[str, tuple[str, ...]] = {
+    "processed_articles": (
+        "article_id",
+        "canonical_url",
+        "title",
+        "source",
+        "published_at",
+        "processed_at",
+    ),
+    "stories": (
+        "story_id",
+        "headline_tr",
+        "category",
+        "first_seen_at",
+        "last_updated_at",
+        "article_ids_json",
+        "update_count",
+        "is_active",
+    ),
+    "run_locks": (
+        "lock_key",
+        "worker_id",
+        "acquired_at",
+        "expires_at",
+        "heartbeat_at",
+    ),
+    "durable_recovery_state": (
+        "state_key",
+        "stage",
+        "worker_id",
+        "batch_id",
+        "last_processed_id",
+        "state_json",
+        "created_at",
+        "updated_at",
+    ),
+}
+
+
+def _is_valid_entity_result_metadata(
+    tbl: str,
+    pk_col: str,
+    exp_attrs: Optional[dict[str, Any]],
+    res: Any,
+) -> bool:
+    """Validate that query result metadata from mock Hrana wire is credible for an allowlisted entity."""
+    if tbl not in ALLOWED_TABLE_PK_MAP or pk_col != ALLOWED_TABLE_PK_MAP[tbl]:
+        return False
+    cols = getattr(res, "cols", None)
+    if not isinstance(cols, (list, tuple)) or not cols:
+        return False
+    if not all(isinstance(c, str) and c for c in cols):
+        return False
+    expected_cols = EXPECTED_ENTITY_QUERY_COLS.get(tbl)
+    if expected_cols is None or tuple(cols) != expected_cols:
+        return False
+    if pk_col not in cols:
+        return False
+    if isinstance(exp_attrs, dict):
+        for k in exp_attrs.keys():
+            expected_attr_col = "worker_id" if (tbl == "run_locks" and k == "worker_ids") else k
+            if expected_attr_col not in cols:
+                return False
+    return True
+
 
 def _assert_fixture_isolation(conn: sqlite3.Connection) -> None:
     """Enforce that the connection is strictly in-memory or points to an OS temp file."""
@@ -683,8 +748,8 @@ class StagingJournalHranaSeam:
 
     def inspect_run_wire(self, run_id: str) -> Optional[StagingJournalEntry]:
         """Fetch current journal record for run_id strictly over mock Hrana wire."""
-        if not RUN_ID_REGEX.match(run_id):
-            raise InvalidRunIdError(f"run_id '{run_id}' is invalid.")
+        if not isinstance(run_id, str) or not RUN_ID_REGEX.fullmatch(run_id):
+            raise InvalidRunIdError("Invalid run_id format.")
 
         self._validate_hermetic_transport_identity()
         scoped_sql = """
@@ -1886,12 +1951,15 @@ class StagingJournalHranaSeam:
             tbl = ent["table"]
             pk_col = ent["pk_column"]
             pk_val = ent["pk_value"]
+            exp_attrs = ent.get("expected_attributes", {})
 
             try:
                 res = self._execute_guarded_client_query(
                     f"SELECT * FROM {tbl} WHERE {pk_col} = ?",
                     [pk_val],
                 )
+                if not _is_valid_entity_result_metadata(tbl, pk_col, exp_attrs, res):
+                    return AuditOutcomeState.UNKNOWN
                 rows = res.fetchall()
             except PermissionError:
                 raise
@@ -1997,6 +2065,20 @@ class StagingJournalHranaSeam:
             entry = discovered_entries[0]
             target_run_id = entry.run_id
         else:
+            if not isinstance(run_id, str) or not RUN_ID_REGEX.fullmatch(run_id):
+                return CrossRunnerReview(
+                    run_id=None,
+                    reviewing_runner_id="VALIDATED_RECOVERY_RUNNER",
+                    provenance=CrossRunnerProvenance.HERMETIC_SIMULATION,
+                    journal_status=CrossRunnerJournalStatus.UNREADABLE,
+                    decision=ReviewDecision.UNKNOWN,
+                    remote_state="UNKNOWN",
+                    action="MANUAL_REVIEW_ONLY",
+                    reasons=(
+                        "Invalid run_id provided for scoped recovery review.",
+                        "Malformed scoped input never authorizes mutations, automatic cleanup, or retries.",
+                    ),
+                )
             target_run_id = run_id
             try:
                 entry = self.inspect_run_wire(target_run_id)
@@ -2009,7 +2091,7 @@ class StagingJournalHranaSeam:
                     else CrossRunnerJournalStatus.CORRUPTED
                 )
                 return CrossRunnerReview(
-                    run_id=target_run_id if RUN_ID_REGEX.match(target_run_id) else None,
+                    run_id=target_run_id if (isinstance(target_run_id, str) and RUN_ID_REGEX.fullmatch(target_run_id)) else None,
                     reviewing_runner_id="VALIDATED_RECOVERY_RUNNER",
                     provenance=CrossRunnerProvenance.HERMETIC_SIMULATION,
                     journal_status=j_status,
@@ -2023,7 +2105,7 @@ class StagingJournalHranaSeam:
                 )
             except Exception:
                 return CrossRunnerReview(
-                    run_id=target_run_id if RUN_ID_REGEX.match(target_run_id) else None,
+                    run_id=target_run_id if (isinstance(target_run_id, str) and RUN_ID_REGEX.fullmatch(target_run_id)) else None,
                     reviewing_runner_id="VALIDATED_RECOVERY_RUNNER",
                     provenance=CrossRunnerProvenance.HERMETIC_SIMULATION,
                     journal_status=CrossRunnerJournalStatus.UNREADABLE,
@@ -2038,7 +2120,7 @@ class StagingJournalHranaSeam:
 
         if entry is None:
             return CrossRunnerReview(
-                run_id=target_run_id if RUN_ID_REGEX.match(target_run_id) else None,
+                run_id=target_run_id if (isinstance(target_run_id, str) and RUN_ID_REGEX.fullmatch(target_run_id)) else None,
                 reviewing_runner_id="VALIDATED_RECOVERY_RUNNER",
                 provenance=CrossRunnerProvenance.HERMETIC_SIMULATION,
                 journal_status=CrossRunnerJournalStatus.ABSENT,
@@ -2149,8 +2231,22 @@ class StagingJournalHranaSeam:
             audit_sql = f"SELECT * FROM {tbl} WHERE {pk_col} = ?"
             try:
                 res = self._execute_guarded_client_query(audit_sql, [pk_val])
-                rows = res.fetchall()
                 exp_attrs = ent.get("expected_attributes")
+                if not _is_valid_entity_result_metadata(
+                    tbl, pk_col, exp_attrs if isinstance(exp_attrs, dict) else {}, res
+                ):
+                    observations.append(
+                        EntityObservation(
+                            table=tbl,
+                            pk_column=pk_col,
+                            pk_value=pk_val,
+                            query_state=QueryState.FAILED,
+                            rows=(),
+                        )
+                    )
+                    continue
+
+                rows = res.fetchall()
                 expected_keys = {pk_col} | {
                     ("worker_id" if k == "worker_ids" else k)
                     for k in (exp_attrs.keys() if isinstance(exp_attrs, dict) else ())

@@ -39,6 +39,7 @@ from efso_radar.staging.journal import (
     FencingConflictError,
     HaltMarkerPersistenceError,
     InvalidJournalTransitionError,
+    InvalidRunIdError,
     JournalError,
     JournalExecutionPattern,
     JournalHaltedError,
@@ -3334,3 +3335,151 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
         self.assertEqual(review_scoped.decision, ReviewDecision.UNKNOWN)
         self.assertEqual(review_scoped.journal_status, CrossRunnerJournalStatus.UNREADABLE)
         self.assertNotEqual(review_scoped.journal_status, CrossRunnerJournalStatus.ABSENT)
+
+    def test_point18_malformed_entity_select_response_fails_closed_to_unknown_never_clean(self):
+        """P1: Malformed entity SELECT response fails closed to UNKNOWN; never misclassified as CLEAN."""
+        # 1. Runner A registers intent and executes mutations (EFFECT_COMMITTED)
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        # 2. Hook returns valid response for staging_run_journal, but malformed response for entity SELECTs
+        # TursoHTTPClient.execute_pipeline receives: 2-element results array where execute result is {"type": "ok", "response": {}}
+        entity_select_counter = 0
+
+        def malformed_entity_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            nonlocal entity_select_counter
+            # Let journal query succeed through real transport by returning None
+            if b"staging_run_journal" in request.content:
+                return None
+            # For entity queries, return HTTP 200 with 2-element results array with malformed empty response
+            entity_select_counter += 1
+            return httpx.Response(
+                200,
+                json={
+                    "baton": None,
+                    "base_url": None,
+                    "results": [
+                        {"type": "ok", "response": {}},  # Malformed: missing cols and result dict!
+                        {"type": "ok", "response": {}},
+                    ],
+                },
+                request=request,
+            )
+
+        self.transport_b.custom_response_hook = malformed_entity_hook
+
+        # Snapshot DB before Runner B audit & review
+        cur = self.conn_b.execute("SELECT COUNT(*) FROM staging_run_journal")
+        journal_count_before = cur.fetchone()[0]
+
+        # 3. audit_workload must NOT return CLEAN; must return UNKNOWN
+        audit_outcome = self.seam_b.audit_workload(RUN_ID_A)
+        self.assertNotEqual(audit_outcome, AuditOutcomeState.CLEAN)
+        self.assertEqual(audit_outcome, AuditOutcomeState.UNKNOWN)
+
+        # 4. review_recovery_evidence must return UNKNOWN, not REVIEW_REQUIRED or CLEAN
+        review = self.seam_b.review_recovery_evidence(run_id=RUN_ID_A)
+        self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+
+        # 5. Verify that entity observation query uncertainty is recorded in reasons
+        self.assertTrue(
+            any("Entity observation query uncertainty detected" in r for r in review.reasons),
+            f"Expected query uncertainty reason in {review.reasons}",
+        )
+
+        # 6. Verify mock wire requests were actually dispatched
+        self.assertGreater(entity_select_counter, 0)
+
+        # 7. Assert zero database mutations occurred
+        cur = self.conn_b.execute("SELECT COUNT(*) FROM staging_run_journal")
+        journal_count_after = cur.fetchone()[0]
+        self.assertEqual(journal_count_before, journal_count_after)
+
+    def test_point19_legitimate_zero_row_entity_select_with_valid_metadata_distinguished(self):
+        """P1 positive: Legitimate zero-row entity SELECT with valid metadata correctly distinguishes CLEAN / REVIEW_REQUIRED."""
+        # 1. Runner A registers intent only (no mutations executed, entities table remains empty)
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        # Manually update journal status to EFFECT_COMMITTED to test genuine empty-effect review
+        self.conn_a.execute(
+            "UPDATE staging_run_journal SET status = ? WHERE run_id = ?",
+            (JournalStatus.EFFECT_COMMITTED.value, RUN_ID_A),
+        )
+        self.conn_a.commit()
+
+        # Runner B queries the wire without mock hook (queries against real SQLite fixture)
+        # In SQLite fixture, entity tables exist with canonical schema, but rows are empty!
+        # Thus cols are valid canonical columns, and rows is []
+
+        # 1. audit_workload returns CLEAN because entity metadata is valid and 0 rows found
+        audit_outcome = self.seam_b.audit_workload(RUN_ID_A)
+        self.assertEqual(audit_outcome, AuditOutcomeState.CLEAN)
+
+        # 2. review_recovery_evidence returns REVIEW_REQUIRED because EFFECT_COMMITTED with genuine 0 rows observed
+        review = self.seam_b.review_recovery_evidence(run_id=RUN_ID_A)
+        self.assertEqual(review.decision, ReviewDecision.REVIEW_REQUIRED)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+        self.assertTrue(
+            any("no entity rows observed; review required" in r for r in review.reasons),
+            f"Expected no entity rows observed reason in {review.reasons}",
+        )
+
+    def test_point20_scoped_run_id_sanitization_and_type_safety_regressions(self):
+        """P2: Scoped run_id validation rejects non-string and invalid IDs with static error, zero leakage, zero TypeError."""
+        sentinel_secret = "ATTACKER_SECRET_SENTINEL_RUN_ID_999"
+
+        # 1. inspect_run_wire: wrong types must raise InvalidRunIdError without TypeError
+        for bad_val in (123, 45.6, None, [], {}, object()):
+            with self.assertRaises(InvalidRunIdError) as ctx:
+                self.seam_b.inspect_run_wire(bad_val)  # type: ignore[arg-type]
+            self.assertEqual(str(ctx.exception), "Invalid run_id format.")
+
+        # 2. inspect_run_wire: invalid sentinel string must not leak sentinel
+        with self.assertRaises(InvalidRunIdError) as ctx:
+            self.seam_b.inspect_run_wire(f"run_{sentinel_secret}")
+        self.assertEqual(str(ctx.exception), "Invalid run_id format.")
+        self.assertNotIn(sentinel_secret, str(ctx.exception))
+
+        # 3. review_recovery_evidence: wrong types must return inert sanitized review, zero TypeError
+        for bad_val in (123, 45.6, [], {}, object()):
+            review = self.seam_b.review_recovery_evidence(run_id=bad_val)  # type: ignore[arg-type]
+            self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+            self.assertEqual(review.journal_status, CrossRunnerJournalStatus.UNREADABLE)
+            self.assertEqual(review.remote_state, "UNKNOWN")
+            self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+            self.assertIsNone(review.run_id)
+
+        # 4. review_recovery_evidence: sentinel string must return inert sanitized review without leaking sentinel
+        bad_run_str = f"run_{sentinel_secret}"
+        review = self.seam_b.review_recovery_evidence(run_id=bad_run_str)
+        self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review.journal_status, CrossRunnerJournalStatus.UNREADABLE)
+        self.assertIsNone(review.run_id)
+        self.assertNotIn(sentinel_secret, str(review))
+
+        # 5. reconstruct_cross_runner_recovery_evidence alias preserves exact same sanitization
+        review_alias = self.seam_b.reconstruct_cross_runner_recovery_evidence(run_id=123)  # type: ignore[arg-type]
+        self.assertEqual(review_alias.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_alias.journal_status, CrossRunnerJournalStatus.UNREADABLE)
+        self.assertIsNone(review_alias.run_id)
+
+        # 6. audit_workload: non-string and sentinel strings return UNKNOWN without TypeError or crash
+        self.assertEqual(self.seam_b.audit_workload(123), AuditOutcomeState.UNKNOWN)  # type: ignore[arg-type]
+        self.assertEqual(self.seam_b.audit_workload(bad_run_str), AuditOutcomeState.UNKNOWN)
