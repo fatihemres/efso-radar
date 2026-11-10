@@ -29,6 +29,7 @@ import httpx
 
 from efso_radar.repositories.schema import get_all_init_statements
 from efso_radar.repositories.turso_client import (
+    MAX_HRANA_RESPONSE_BYTES,
     TursoClientError,
     TursoHTTPClient,
 )
@@ -55,6 +56,8 @@ from efso_radar.staging.journal_hrana_seam import (
     AmbiguousRollbackError,
     CleanupVerificationError,
     CrossRunnerDiscoveryError,
+    EXPECTED_ENTITY_QUERY_COLS,
+    EXPECTED_JOURNAL_QUERY_COLS,
     MAX_DISCOVERY_LIMIT,
     StagingJournalHranaSeam,
     build_live02_synthetic_mutations,
@@ -2298,25 +2301,76 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                 mutation_statements=build_live02_synthetic_mutations(RUN_ID_A),
             )
 
-        # Case 3b: Intent COMMIT rolled back and ack lost (ROLLED_BACK_AND_ACK_LOST)
+        # Case 3b: Wire-dispatched intent COMMIT where ACK is dropped over the wire
         fresh_run_id = "run_20261107T120500Z_c3d4e5f6a1b2"
         fresh_entities = create_default_manifest_entities(fresh_run_id)
         fresh_seal = compute_canonical_inventory_fingerprint(fresh_run_id, fresh_entities)
 
         # Clean DB of prior run
-        self.conn_a.execute("DELETE FROM staging_run_journal WHERE run_id = ?", (RUN_ID_A,))
+        self.conn_a.execute("DELETE FROM staging_run_journal")
         self.conn_a.commit()
+
+        commit_dispatched = False
+
+        def drop_commit_ack_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            nonlocal commit_dispatched
+            if b"COMMIT" in request.content:
+                commit_dispatched = True
+                # Actually commit on underlying provider SQLite before dropping network ACK
+                self.conn_a.commit()
+                raise httpx.ReadTimeout("Simulated dropped COMMIT acknowledgment over mock Hrana wire", request=request)
+            return None
+
+        self.transport_a.custom_response_hook = drop_commit_ack_hook
 
         with self.assertRaises(AmbiguousCommitError):
             self.seam_a.register_intent(
                 run_id=fresh_run_id,
                 manifest_seal_hex=fresh_seal,
                 target_inventory=fresh_entities,
+            )
+
+        self.assertTrue(commit_dispatched, "COMMIT request must be actually dispatched over mock wire")
+        self.transport_a.custom_response_hook = None
+        self.assertTrue(self.seam_a.is_halted(fresh_run_id))
+
+        # Runner B discovers the run that was committed on provider before ACK was lost
+        discovered_3b = self.seam_b.discover_unresolved_runs()
+        self.assertEqual(len(discovered_3b), 1)
+        self.assertEqual(discovered_3b[0].run_id, fresh_run_id)
+
+        review_3b = self.seam_b.review_recovery_evidence(run_id=fresh_run_id)
+        self.assertEqual(review_3b.run_id, fresh_run_id)
+        self.assertEqual(review_3b.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_3b.remote_state, "UNKNOWN")
+        self.assertEqual(review_3b.action, "MANUAL_REVIEW_ONLY")
+
+        # Runner B cannot retry Runner A's run or take over workload
+        with self.assertRaises(ActiveWorkloadCollisionError):
+            self.seam_b.register_intent(
+                run_id=fresh_run_id,
+                manifest_seal_hex=fresh_seal,
+                target_inventory=fresh_entities,
+            )
+
+        # Case 3b-2: Intent COMMIT rolled back and ack lost (ROLLED_BACK_AND_ACK_LOST)
+        rollback_run_id = "run_20261107T120501Z_e5f6a1b2c3d4"
+        rb_entities = create_default_manifest_entities(rollback_run_id)
+        rb_seal = compute_canonical_inventory_fingerprint(rollback_run_id, rb_entities)
+
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.commit()
+
+        with self.assertRaises(AmbiguousCommitError):
+            self.seam_a.register_intent(
+                run_id=rollback_run_id,
+                manifest_seal_hex=rb_seal,
+                target_inventory=rb_entities,
                 simulate_ambiguous_commit=AmbiguousCommitOutcome.ROLLED_BACK_AND_ACK_LOST,
             )
 
-        discovered = self.seam_b.discover_unresolved_runs()
-        self.assertEqual(len(discovered), 0, "Rolled-back transaction leaves zero journal rows")
+        discovered_rb = self.seam_b.discover_unresolved_runs()
+        self.assertEqual(len(discovered_rb), 0, "Rolled-back transaction leaves zero journal rows")
         empty_review = self.seam_b.review_recovery_evidence()
         self.assertEqual(empty_review.journal_status, CrossRunnerJournalStatus.ABSENT)
         self.assertEqual(empty_review.decision, ReviewDecision.UNKNOWN)
@@ -2654,12 +2708,22 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
         self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
         self.assertIn("Empty discovery result never authorizes new work", review.reasons[1])
 
-        # 7b: Incomplete entity observations
+        # 7b: Incomplete / failed entity observations changes credible baseline from REVIEW_REQUIRED to UNKNOWN
         self.seam_a.register_intent(
             run_id=RUN_ID_A,
             manifest_seal_hex=self.seal_a,
             target_inventory=self.entities_a,
         )
+        # Set status to EFFECT_COMMITTED so nominal baseline without failure is REVIEW_REQUIRED
+        self.conn_a.execute(
+            "UPDATE staging_run_journal SET status = ? WHERE run_id = ?",
+            (JournalStatus.EFFECT_COMMITTED.value, RUN_ID_A),
+        )
+        self.conn_a.commit()
+
+        # Without failure, baseline is REVIEW_REQUIRED
+        baseline_review = self.seam_b.review_recovery_evidence()
+        self.assertEqual(baseline_review.decision, ReviewDecision.REVIEW_REQUIRED)
 
         def failing_entity_query_hook(request: httpx.Request) -> Optional[httpx.Response]:
             try:
@@ -2674,7 +2738,7 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                                 "baton": body.get("baton"),
                                 "results": [
                                     {"type": "error", "error": {"code": "SQLITE_IOERR", "message": "Simulated disk failure"}},
-                                    {"type": "ok"},
+                                    {"type": "ok", "response": {"type": "close"}},
                                 ],
                             },
                             request=request,
@@ -2686,9 +2750,13 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
         self.transport_b.custom_response_hook = failing_entity_query_hook
         review_incomplete = self.seam_b.review_recovery_evidence()
         self.assertEqual(review_incomplete.run_id, RUN_ID_A)
+        # Proves failed entity query actively flipped decision from REVIEW_REQUIRED to UNKNOWN
         self.assertEqual(review_incomplete.decision, ReviewDecision.UNKNOWN)
         self.assertEqual(review_incomplete.remote_state, "UNKNOWN")
         self.assertEqual(review_incomplete.action, "MANUAL_REVIEW_ONLY")
+        self.assertTrue(
+            any("Entity observation query uncertainty detected" in r for r in review_incomplete.reasons)
+        )
 
     def test_point8_discovery_and_inspection_produce_zero_database_mutations(self):
         """Discovery and inspection paths produce zero database mutations."""
@@ -3271,23 +3339,26 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
         self.transport_b.custom_response_hook = malformed_int_hook
 
         # 1. Direct discovery raises CrossRunnerDiscoveryError
-        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+        try:
             self.seam_b.discover_unresolved_runs()
+            self.fail("Expected CrossRunnerDiscoveryError")
+        except CrossRunnerDiscoveryError as err:
+            # Check in active exception traceback via traceback.format_exc() while live in sys.exc_info()
+            active_tb = traceback.format_exc()
+            self.assertNotIn(sentinel_secret, active_tb)
+            self.assertEqual(err.code, "WIRE_QUERY_MALFORMED")
+            self.assertNotIn(sentinel_secret, str(err))
 
-        err = ctx.exception
-        self.assertEqual(err.code, "WIRE_QUERY_MALFORMED")
-        self.assertNotIn(sentinel_secret, str(err))
+            # Verify that chained exception context / cause is completely suppressed
+            self.assertIsNone(err.__cause__)
+            self.assertTrue(err.__suppress_context__)
 
-        # Verify that chained exception context / cause is completely suppressed
-        self.assertIsNone(err.__cause__)
-        self.assertTrue(err.__suppress_context__)
+            # Format complete exception traceback as an error logger would
+            tb_lines = traceback.format_exception(type(err), err, err.__traceback__)
+            tb_text = "".join(tb_lines)
 
-        # Format complete exception traceback as an error logger would
-        tb_lines = traceback.format_exception(type(err), err, err.__traceback__)
-        tb_text = "".join(tb_lines)
-
-        # Sentinel must NOT appear in formatted traceback
-        self.assertNotIn(sentinel_secret, tb_text)
+            # Sentinel must NOT appear in formatted traceback
+            self.assertNotIn(sentinel_secret, tb_text)
 
         # 2. Review evidence returns inert UNKNOWN / UNREADABLE
         review = self.seam_b.review_recovery_evidence()
@@ -3483,3 +3554,641 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
         # 6. audit_workload: non-string and sentinel strings return UNKNOWN without TypeError or crash
         self.assertEqual(self.seam_b.audit_workload(123), AuditOutcomeState.UNKNOWN)  # type: ignore[arg-type]
         self.assertEqual(self.seam_b.audit_workload(bad_run_str), AuditOutcomeState.UNKNOWN)
+
+    def test_point21_missing_raw_rows_field_rejected_fails_closed_to_unknown(self):
+        """P1: Missing raw 'rows' field in execute response is rejected fail-closed to UNKNOWN."""
+        # Setup journal entry for RUN_ID_A
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+
+        # 1. Wire returns cols but completely omits 'rows' key
+        def missing_rows_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            if b"staging_run_journal" in request.content:
+                cols = [{"name": c} for c in EXPECTED_JOURNAL_QUERY_COLS]
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "result": {
+                                        "cols": cols,
+                                        # "rows" key deliberately missing!
+                                        "affected_row_count": 0,
+                                    }
+                                },
+                            },
+                            {"type": "ok", "response": {}},
+                        ],
+                    },
+                )
+            return None
+
+        self.transport_b.custom_response_hook = missing_rows_hook
+
+        # Direct discovery fails closed with WIRE_QUERY_MALFORMED
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertEqual(ctx.exception.code, "WIRE_QUERY_MALFORMED")
+
+        # Review evidence returns UNKNOWN and UNREADABLE, never CLEAN or takeover
+        review = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review.journal_status, CrossRunnerJournalStatus.UNREADABLE)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+
+        # 2. Positive control: Explicit empty rows list 'rows: []' is accepted
+        def empty_rows_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            if b"staging_run_journal" in request.content:
+                cols = [{"name": c} for c in EXPECTED_JOURNAL_QUERY_COLS]
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "result": {
+                                        "cols": cols,
+                                        "rows": [],  # explicitly present empty list
+                                        "affected_row_count": 0,
+                                    }
+                                },
+                            },
+                            {"type": "ok", "response": {}},
+                        ],
+                    },
+                )
+            return None
+
+        self.transport_b.custom_response_hook = empty_rows_hook
+        discovered = self.seam_b.discover_unresolved_runs()
+        self.assertEqual(len(discovered), 0)
+        self.transport_b.custom_response_hook = None
+
+    def test_point22_scoped_run_id_mismatch_rejected_before_entity_select(self):
+        """P1: inspect_run_wire and review fail closed on mismatched run_id before entity SELECT."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+
+        # Wire returns a valid journal row for RUN_ID_B when asked for RUN_ID_A
+        entity_select_dispatched = False
+
+        def mismatched_run_id_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            nonlocal entity_select_dispatched
+            body = json.loads(request.content.decode("utf-8"))
+            for req in body.get("requests", []):
+                stmt = req.get("stmt", {})
+                sql = stmt.get("sql", "")
+                if "FROM staging_run_journal" in sql:
+                    cols = [{"name": c} for c in EXPECTED_JOURNAL_QUERY_COLS]
+                    ents_b = create_default_manifest_entities(RUN_ID_B)
+                    seal_b = compute_canonical_inventory_fingerprint(RUN_ID_B, ents_b)
+                    row_b = [
+                        {"type": "text", "value": RUN_ID_B},  # Foreign run_id!
+                        {"type": "text", "value": "worker_01"},
+                        {"type": "integer", "value": 1},
+                        {"type": "text", "value": "LIVE-02"},
+                        {"type": "text", "value": JournalStatus.ACKED.value},
+                        {"type": "text", "value": seal_b},
+                        {"type": "text", "value": json.dumps([e.model_dump() for e in ents_b])},
+                        {"type": "text", "value": "2026-11-07T12:00:00Z"},
+                        {"type": "text", "value": "2026-11-07T12:00:00Z"},
+                        {"type": "null"},
+                    ]
+                    return httpx.Response(
+                        200,
+                        json={
+                            "baton": None,
+                            "results": [
+                                {
+                                    "type": "ok",
+                                    "response": {
+                                        "result": {
+                                            "cols": cols,
+                                            "rows": [row_b],
+                                            "affected_row_count": 0,
+                                        }
+                                    },
+                                },
+                                {"type": "ok", "response": {}},
+                            ],
+                        },
+                    )
+                for tbl in ("articles", "notification_claims", "editorial_decisions", "admin_alerts", "run_locks"):
+                    if f"FROM {tbl}" in sql:
+                        entity_select_dispatched = True
+            return None
+
+        self.transport_b.custom_response_hook = mismatched_run_id_hook
+
+        # 1. Direct inspect_run_wire for RUN_ID_A must raise RUN_ID_MISMATCH
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.inspect_run_wire(RUN_ID_A)
+        self.assertEqual(ctx.exception.code, "RUN_ID_MISMATCH")
+
+        # 2. review_recovery_evidence for RUN_ID_A must return OWNERSHIP_MISMATCH_HALT
+        review = self.seam_b.review_recovery_evidence(run_id=RUN_ID_A)
+        self.assertEqual(review.run_id, RUN_ID_A)
+        self.assertEqual(review.decision, ReviewDecision.OWNERSHIP_MISMATCH_HALT)
+        self.assertEqual(review.journal_status, CrossRunnerJournalStatus.CORRUPTED)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+
+        # 3. CRITICAL: Entity SELECT was NEVER dispatched
+        self.assertFalse(entity_select_dispatched, "Entity observation queries must not be dispatched on run_id mismatch")
+        self.transport_b.custom_response_hook = None
+
+    def test_point23_pipeline_sequence_cardinality_and_close_outcome_validation(self):
+        """P1: Pipeline sequence cardinality, close outcome, and statement types are strictly validated."""
+        def make_client(handler):
+            transport = httpx.MockTransport(handler)
+            return TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=transport)
+
+        # 1. Missing close result in pipeline (cardinality mismatch)
+        def handler_missing_close(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"results": [{"type": "ok", "response": {"result": {"cols": [{"name": "x"}], "rows": []}}}]},
+            )
+
+        with make_client(handler_missing_close) as c:
+            with self.assertRaises(TursoClientError) as ctx:
+                c.execute("SELECT 1")
+            self.assertIn("Unexpected pipeline results count", str(ctx.exception))
+
+        # 2. Errored close result
+        def handler_errored_close(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"type": "ok", "response": {"result": {"cols": [{"name": "x"}], "rows": []}}},
+                        {"type": "error", "error": {"code": "SQLITE_IOERR", "message": "Simulated disk IO error"}},
+                    ]
+                },
+            )
+
+        with make_client(handler_errored_close) as c:
+            with self.assertRaises(TursoClientError) as ctx:
+                c.execute("SELECT 1")
+            self.assertIn("Pipeline close error", str(ctx.exception))
+            self.assertIn("SQLITE_IOERR", str(ctx.exception))
+
+        # 3. Unexpected close type
+        def handler_unexpected_close_type(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"type": "ok", "response": {"result": {"cols": [{"name": "x"}], "rows": []}}},
+                        {"type": "pending"},
+                    ]
+                },
+            )
+
+        with make_client(handler_unexpected_close_type) as c:
+            with self.assertRaises(TursoClientError) as ctx:
+                c.execute("SELECT 1")
+            self.assertIn("Pipeline close failed with unexpected type", str(ctx.exception))
+
+        # 4. Extra statement result (cardinality > expected)
+        def handler_extra_result(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"type": "ok", "response": {"result": {"cols": [{"name": "x"}], "rows": []}}},
+                        {"type": "ok", "response": {"result": {"cols": [{"name": "y"}], "rows": []}}},
+                        {"type": "ok", "response": {}},
+                    ]
+                },
+            )
+
+        with make_client(handler_extra_result) as c:
+            with self.assertRaises(TursoClientError) as ctx:
+                c.execute("SELECT 1")
+            self.assertIn("Unexpected pipeline results count", str(ctx.exception))
+
+        # 5. Unexpected statement result type
+        def handler_bad_stmt_type(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"type": "unknown_type"},
+                        {"type": "ok", "response": {}},
+                    ]
+                },
+            )
+
+        with make_client(handler_bad_stmt_type) as c:
+            with self.assertRaises(TursoClientError) as ctx:
+                c.execute("SELECT 1")
+            self.assertIn("Unexpected statement result type", str(ctx.exception))
+
+    def test_point24_row_width_and_cell_tag_validation(self):
+        """P1: Row widths, cell tags/types, and malformed row formats are strictly validated."""
+        def make_client(handler):
+            transport = httpx.MockTransport(handler)
+            return TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=transport)
+
+        # 1. Row width mismatch: 2 cols expected, 1 cell received
+        def handler_short_row(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "type": "ok",
+                            "response": {
+                                "result": {
+                                    "cols": [{"name": "col1"}, {"name": "col2"}],
+                                    "rows": [[{"type": "text", "value": "a"}]],
+                                    "affected_row_count": 0,
+                                }
+                            },
+                        },
+                        {"type": "ok", "response": {}},
+                    ]
+                },
+            )
+
+        with make_client(handler_short_row) as c:
+            with self.assertRaises(TursoClientError) as ctx:
+                c.execute("SELECT col1, col2")
+            self.assertIn("Row width mismatch at index 0: expected 2 cells, got 1.", str(ctx.exception))
+
+        # 2. Row width mismatch: 2 cols expected, 3 cells received
+        def handler_long_row(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "type": "ok",
+                            "response": {
+                                "result": {
+                                    "cols": [{"name": "col1"}, {"name": "col2"}],
+                                    "rows": [
+                                        [
+                                            {"type": "text", "value": "a"},
+                                            {"type": "text", "value": "b"},
+                                            {"type": "text", "value": "c"},
+                                        ]
+                                    ],
+                                    "affected_row_count": 0,
+                                }
+                            },
+                        },
+                        {"type": "ok", "response": {}},
+                    ]
+                },
+            )
+
+        with make_client(handler_long_row) as c:
+            with self.assertRaises(TursoClientError) as ctx:
+                c.execute("SELECT col1, col2")
+            self.assertIn("Row width mismatch at index 0: expected 2 cells, got 3.", str(ctx.exception))
+
+        # 3. Unsupported cell type tag (e.g. 'date')
+        def handler_unknown_tag(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "type": "ok",
+                            "response": {
+                                "result": {
+                                    "cols": [{"name": "col1"}],
+                                    "rows": [[{"type": "date", "value": "2026-11-10"}]],
+                                    "affected_row_count": 0,
+                                }
+                            },
+                        },
+                        {"type": "ok", "response": {}},
+                    ]
+                },
+            )
+
+        with make_client(handler_unknown_tag) as c:
+            with self.assertRaises(TursoClientError) as ctx:
+                c.execute("SELECT col1")
+            self.assertIn("Unrecognized or unsupported Hrana cell type: 'date'.", str(ctx.exception))
+
+        # 4. Malformed cell: non-dict
+        def handler_non_dict_cell(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "type": "ok",
+                            "response": {
+                                "result": {
+                                    "cols": [{"name": "col1"}],
+                                    "rows": [["raw_string_not_dict"]],
+                                    "affected_row_count": 0,
+                                }
+                            },
+                        },
+                        {"type": "ok", "response": {}},
+                    ]
+                },
+            )
+
+        with make_client(handler_non_dict_cell) as c:
+            with self.assertRaises(TursoClientError) as ctx:
+                c.execute("SELECT col1")
+            self.assertIn("Malformed Hrana cell: expected dict", str(ctx.exception))
+
+        # 5. Malformed row: non-list
+        def handler_non_list_row(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "type": "ok",
+                            "response": {
+                                "result": {
+                                    "cols": [{"name": "col1"}],
+                                    "rows": ["not_a_row_list"],
+                                    "affected_row_count": 0,
+                                }
+                            },
+                        },
+                        {"type": "ok", "response": {}},
+                    ]
+                },
+            )
+
+        with make_client(handler_non_list_row) as c:
+            with self.assertRaises(TursoClientError) as ctx:
+                c.execute("SELECT col1")
+            self.assertIn("Invalid row format at index 0: expected list", str(ctx.exception))
+
+    def test_point25_audit_workload_exact_pk_identity_and_cardinality(self):
+        """P1: audit_workload strictly verifies exact PK identity and cardinality (ambiguity -> UNKNOWN, foreign -> HALT)."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+
+        art_cols = [{"name": c} for c in EXPECTED_ENTITY_QUERY_COLS["processed_articles"]]
+
+        # 1. Foreign PK returned for entity query -> OWNERSHIP_MISMATCH_HALT
+        def foreign_pk_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            body = json.loads(request.content.decode("utf-8"))
+            for req in body.get("requests", []):
+                stmt = req.get("stmt", {})
+                sql = stmt.get("sql", "")
+                if "FROM processed_articles WHERE article_id = ?" in sql:
+                    # Return a row with foreign PK 'art_FOREIGN_123' despite matching other attributes
+                    rows = [[
+                        {"type": "text", "value": "art_FOREIGN_123"},
+                        {"type": "text", "value": "https://example.com/art"},
+                        {"type": "text", "value": f"SYNTH_ARTICLE_{RUN_ID_A}_01"},
+                        {"type": "text", "value": "staging_synth_test"},
+                        {"type": "text", "value": "2026-11-07T12:00:00Z"},
+                        {"type": "text", "value": "2026-11-07T12:00:00Z"},
+                    ]]
+                    return httpx.Response(
+                        200,
+                        json={
+                            "baton": None,
+                            "results": [
+                                {"type": "ok", "response": {"result": {"cols": art_cols, "rows": rows, "affected_row_count": 0}}},
+                                {"type": "ok", "response": {}},
+                            ],
+                        },
+                    )
+            return None
+
+        self.transport_b.custom_response_hook = foreign_pk_hook
+        outcome_foreign = self.seam_b.audit_workload(RUN_ID_A)
+        self.assertEqual(outcome_foreign, AuditOutcomeState.OWNERSHIP_MISMATCH_HALT)
+
+        # 2. Duplicate rows returned for PK query (ambiguous cardinality) -> UNKNOWN
+        def duplicate_pk_rows_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            body = json.loads(request.content.decode("utf-8"))
+            for req in body.get("requests", []):
+                stmt = req.get("stmt", {})
+                sql = stmt.get("sql", "")
+                if "FROM processed_articles WHERE article_id = ?" in sql:
+                    # Return 2 rows for single PK query
+                    target_pk = self.entities_a[0].pk_value
+                    single_row = [
+                        {"type": "text", "value": target_pk},
+                        {"type": "text", "value": "https://example.com/art"},
+                        {"type": "text", "value": f"SYNTH_ARTICLE_{RUN_ID_A}_01"},
+                        {"type": "text", "value": "staging_synth_test"},
+                        {"type": "text", "value": "2026-11-07T12:00:00Z"},
+                        {"type": "text", "value": "2026-11-07T12:00:00Z"},
+                    ]
+                    rows = [single_row, single_row]
+                    return httpx.Response(
+                        200,
+                        json={
+                            "baton": None,
+                            "results": [
+                                {"type": "ok", "response": {"result": {"cols": art_cols, "rows": rows, "affected_row_count": 0}}},
+                                {"type": "ok", "response": {}},
+                            ],
+                        },
+                    )
+            return None
+
+        self.transport_b.custom_response_hook = duplicate_pk_rows_hook
+        outcome_dup = self.seam_b.audit_workload(RUN_ID_A)
+        self.assertEqual(outcome_dup, AuditOutcomeState.UNKNOWN)
+        self.transport_b.custom_response_hook = None
+
+    def test_point26_hermetic_transport_guard_three_no_dispatch_spy_regressions(self):
+        """P1: Hermetic transport guard strictly checks exact type, mounted routes, and destination without wire dispatch."""
+        spy_call_count = 0
+
+        def spy_handler(req: httpx.Request) -> httpx.Response:
+            nonlocal spy_call_count
+            spy_call_count += 1
+            return httpx.Response(200, json={})
+
+        # 1. Subclass or duck-typed boundary object with same __name__ but not exact type
+        class FakeHranaOutboundSecurityBoundary(httpx.BaseTransport):
+            def __init__(self, inner):
+                self._inner = inner
+            def handle_request(self, request):
+                return self._inner.handle_request(request)
+
+        fake_boundary = FakeHranaOutboundSecurityBoundary(httpx.MockTransport(spy_handler))
+        client_fake_boundary = TursoHTTPClient(
+            database_url=EXACT_STAGING_DESTINATION,
+            transport=fake_boundary,
+        )
+        with self.assertRaises(PermissionError) as ctx:
+            StagingJournalHranaSeam(
+                client=client_fake_boundary,
+                owner_id="worker_02",
+            )
+        self.assertIn("Hermetic security boundary violation", str(ctx.exception))
+        self.assertIn("FakeHranaOutboundSecurityBoundary", str(ctx.exception))
+        self.assertEqual(spy_call_count, 0, "No wire requests must be dispatched on invalid boundary type")
+
+        # 2. HTTP client with custom mounted route bypassing default transport
+        raw_http = self.seam_b._client._get_client()
+        raw_http._mounts["https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/v2"] = httpx.MockTransport(spy_handler)
+
+        try:
+            with self.assertRaises(PermissionError) as ctx:
+                self.seam_b._get_guarded_http_client()
+            self.assertIn("custom mounted route detected on HTTP client", str(ctx.exception))
+            self.assertEqual(spy_call_count, 0, "No wire requests must be dispatched when mounted route detected")
+        finally:
+            raw_http._mounts.pop("https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/v2", None)
+
+        # 3. Client with mismatched destination URL
+        client_bad_url = TursoHTTPClient(
+            database_url="libsql://evil-turso-database.turso.io",
+            transport=self.budget_b,
+        )
+        with self.assertRaises(PermissionError) as ctx:
+            StagingJournalHranaSeam(
+                client=client_bad_url,
+                owner_id="worker_02",
+            )
+        self.assertIn("does not match approved", str(ctx.exception))
+        self.assertEqual(spy_call_count, 0, "No wire requests must be dispatched on mismatched destination URL")
+
+    def test_point27_discovery_terminal_status_and_stage_constraint(self):
+        """P2: Injected terminal statuses in discovery and unsupported stages fail closed."""
+        # 1. Terminal status (ABORTED) injected into discovery results
+        def terminal_status_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            if b"staging_run_journal" in request.content:
+                cols = [{"name": c} for c in EXPECTED_JOURNAL_QUERY_COLS]
+                ents = create_default_manifest_entities(RUN_ID_A)
+                seal = compute_canonical_inventory_fingerprint(RUN_ID_A, ents)
+                row_aborted = [
+                    {"type": "text", "value": RUN_ID_A},
+                    {"type": "text", "value": "worker_01"},
+                    {"type": "integer", "value": 1},
+                    {"type": "text", "value": "LIVE-02"},
+                    {"type": "text", "value": JournalStatus.ABORTED.value},  # Terminal status!
+                    {"type": "text", "value": seal},
+                    {"type": "text", "value": json.dumps([e.model_dump() for e in ents])},
+                    {"type": "text", "value": "2026-11-07T12:00:00Z"},
+                    {"type": "text", "value": "2026-11-07T12:00:00Z"},
+                    {"type": "null"},
+                ]
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {"type": "ok", "response": {"result": {"cols": cols, "rows": [row_aborted], "affected_row_count": 0}}},
+                            {"type": "ok", "response": {}},
+                        ],
+                    },
+                )
+            return None
+
+        self.transport_b.custom_response_hook = terminal_status_hook
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertEqual(ctx.exception.code, "TERMINAL_STATUS_DISCOVERED")
+        self.assertIn("Terminal journal status discovered", str(ctx.exception))
+
+        review_term = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review_term.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_term.journal_status, CrossRunnerJournalStatus.CORRUPTED)
+
+        # 2. Unsupported / non-canonical stage (e.g. 'LIVE_99_HOSTILE')
+        def non_canonical_stage_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            if b"staging_run_journal" in request.content:
+                cols = [{"name": c} for c in EXPECTED_JOURNAL_QUERY_COLS]
+                ents = create_default_manifest_entities(RUN_ID_A)
+                seal = compute_canonical_inventory_fingerprint(RUN_ID_A, ents)
+                row_bad_stage = [
+                    {"type": "text", "value": RUN_ID_A},
+                    {"type": "text", "value": "worker_01"},
+                    {"type": "integer", "value": 1},
+                    {"type": "text", "value": "LIVE_99_HOSTILE"},  # Non-canonical stage!
+                    {"type": "text", "value": JournalStatus.ACKED.value},
+                    {"type": "text", "value": seal},
+                    {"type": "text", "value": json.dumps([e.model_dump() for e in ents])},
+                    {"type": "text", "value": "2026-11-07T12:00:00Z"},
+                    {"type": "text", "value": "2026-11-07T12:00:00Z"},
+                    {"type": "null"},
+                ]
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {"type": "ok", "response": {"result": {"cols": cols, "rows": [row_bad_stage], "affected_row_count": 0}}},
+                            {"type": "ok", "response": {}},
+                        ],
+                    },
+                )
+            return None
+
+        self.transport_b.custom_response_hook = non_canonical_stage_hook
+        # review_recovery_evidence must NOT coerce to LIVE_02; must fail closed to CORRUPTED / UNKNOWN
+        review_stage = self.seam_b.review_recovery_evidence(run_id=RUN_ID_A)
+        self.assertEqual(review_stage.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_stage.journal_status, CrossRunnerJournalStatus.CORRUPTED)
+        self.assertEqual(review_stage.remote_state, "UNKNOWN")
+        self.assertEqual(review_stage.action, "MANUAL_REVIEW_ONLY")
+        self.assertTrue(
+            any("Unsupported or noncanonical journal intent stage" in r for r in review_stage.reasons)
+        )
+        self.transport_b.custom_response_hook = None
+
+    def test_point28_response_byte_and_row_count_ceilings_before_deserialization(self):
+        """P2: Response-byte ceiling and row-count limits are strictly enforced before cell deserialization."""
+        # 1. Response-byte ceiling (> 5 MB)
+        oversized_content = b'{"results": []}' + (b" " * (MAX_HRANA_RESPONSE_BYTES + 1024))
+        def oversized_byte_handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=oversized_content, headers={"Content-Type": "application/json"})
+
+        transport_oversized = httpx.MockTransport(oversized_byte_handler)
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=transport_oversized) as client:
+            with self.assertRaises(TursoClientError) as ctx:
+                client.execute("SELECT 1")
+            self.assertIn("exceeds maximum allowed limit", str(ctx.exception))
+
+        # 2. Row count ceiling enforced before cell deserialization
+        # Construct a response with 10 rows when max_rows is 5,
+        # with an explosive sentinel cell that would raise ValueError if deserialized
+        cols = [{"name": "col1"}]
+        rows = [[{"type": "integer", "value": "EXPLOSIVE_SENTINEL_NEVER_DESERIALIZED"}] for _ in range(10)]
+
+        def large_rows_handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"type": "ok", "response": {"result": {"cols": cols, "rows": rows, "affected_row_count": 0}}},
+                        {"type": "ok", "response": {}},
+                    ]
+                },
+            )
+
+        transport_large = httpx.MockTransport(large_rows_handler)
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=transport_large) as client:
+            with self.assertRaises(TursoClientError) as ctx:
+                client.execute("SELECT col1", max_rows=5)
+            # Must raise row count limit exceeded, NOT cell deserialization error!
+            self.assertIn("Hrana result row count 10 exceeds maximum limit 5.", str(ctx.exception))
+            self.assertNotIn("EXPLOSIVE_SENTINEL_NEVER_DESERIALIZED", str(ctx.exception))

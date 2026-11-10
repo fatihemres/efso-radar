@@ -260,22 +260,111 @@ def serialize_hrana_arg(val: Any) -> dict[str, Any]:
         return {"type": "text", "value": str(val)}
 
 
-def deserialize_hrana_value(item: dict[str, Any]) -> Any:
+MAX_HRANA_RESULT_ROWS: int = 5000
+MAX_HRANA_RESPONSE_BYTES: int = 5 * 1024 * 1024  # 5 MB
+
+
+def deserialize_hrana_value(item: Any) -> Any:
     """Deserialize a Hrana/libSQL v2 value into a native Python object."""
-    val_type = item.get("type", "null")
+    if not isinstance(item, dict):
+        raise TursoClientError(f"Malformed Hrana cell: expected dict, got {type(item).__name__}.")
+
+    val_type = item.get("type")
     if val_type == "null":
         return None
     elif val_type == "integer":
         raw = item.get("value")
-        return int(raw) if raw is not None else None
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except Exception:
+            raise TursoClientError("Invalid integer value in Hrana cell.") from None
     elif val_type == "float":
-        return float(item.get("value", 0.0))
+        raw = item.get("value")
+        if raw is None:
+            return 0.0
+        try:
+            return float(raw)
+        except Exception:
+            raise TursoClientError("Invalid float value in Hrana cell.") from None
     elif val_type == "text":
-        return item.get("value", "")
+        raw = item.get("value")
+        if not isinstance(raw, str):
+            raise TursoClientError("Invalid text value in Hrana cell.")
+        return raw
     elif val_type == "blob":
-        raw_b64 = item.get("base64", "")
-        return base64.b64decode(raw_b64)
-    return item.get("value")
+        raw_b64 = item.get("base64")
+        if not isinstance(raw_b64, str):
+            raise TursoClientError("Invalid blob value in Hrana cell.")
+        try:
+            return base64.b64decode(raw_b64)
+        except Exception:
+            raise TursoClientError("Invalid base64 payload in Hrana blob cell.") from None
+    else:
+        raise TursoClientError(f"Unrecognized or unsupported Hrana cell type: '{val_type}'.")
+
+
+def _parse_hrana_exec_result(res: Any, max_rows: int = MAX_HRANA_RESULT_ROWS) -> TursoQueryResult:
+    """Validate and decode a single Hrana execute statement result object."""
+    if not isinstance(res, dict):
+        raise TursoClientError(f"Malformed statement result: expected dict, got {type(res).__name__}.")
+
+    res_type = res.get("type")
+    if res_type == "error":
+        err = res.get("error", {})
+        valid_code, category = _sanitize_hrana_error(err.get("code") if isinstance(err, dict) else None)
+        raise TursoClientError(f"Turso statement execution error ({valid_code}): {category}")
+
+    if res_type != "ok":
+        raise TursoClientError(f"Unexpected statement result type: '{res_type}'. Expected 'ok'.")
+
+    response_data = res.get("response")
+    if not isinstance(response_data, dict):
+        raise TursoClientError(f"Malformed statement response: expected dict, got {type(response_data).__name__}.")
+
+    exec_result = response_data.get("result")
+    if not isinstance(exec_result, dict):
+        raise TursoClientError(f"Malformed execute result: expected dict, got {type(exec_result).__name__}.")
+
+    raw_cols = exec_result.get("cols")
+    if not isinstance(raw_cols, list):
+        raise TursoClientError("Missing or invalid 'cols' list in execute result.")
+
+    cols: list[str] = []
+    for i, c in enumerate(raw_cols):
+        if not isinstance(c, dict) or not isinstance(c.get("name"), str) or not c.get("name"):
+            raise TursoClientError(f"Invalid column descriptor at index {i} in Hrana result.")
+        cols.append(c["name"])
+
+    raw_rows = exec_result.get("rows")
+    if not isinstance(raw_rows, list):
+        raise TursoClientError("Missing or invalid 'rows' list in execute result.")
+
+    if len(raw_rows) > max_rows:
+        raise TursoClientError(f"Hrana result row count {len(raw_rows)} exceeds maximum limit {max_rows}.")
+
+    parsed_rows: list[dict[str, Any]] = []
+    for row_idx, row in enumerate(raw_rows):
+        if not isinstance(row, (list, tuple)):
+            raise TursoClientError(f"Invalid row format at index {row_idx}: expected list, got {type(row).__name__}.")
+        if len(row) != len(cols):
+            raise TursoClientError(
+                f"Row width mismatch at index {row_idx}: expected {len(cols)} cells, got {len(row)}."
+            )
+        row_dict = {}
+        for col_name, cell in zip(cols, row):
+            row_dict[col_name] = deserialize_hrana_value(cell)
+        parsed_rows.append(row_dict)
+
+    affected = exec_result.get("affected_row_count", 0)
+    if not isinstance(affected, int) or affected < 0:
+        affected = 0
+    last_id = exec_result.get("last_insert_rowid")
+    if last_id is not None and (not isinstance(last_id, int) or last_id < 0):
+        last_id = None
+
+    return TursoQueryResult(cols, parsed_rows, affected, last_id)
 
 
 class TursoQueryResult:
@@ -311,6 +400,7 @@ class TursoHTTPClient:
         transport: Optional[httpx.BaseTransport] = None,
         read_only: bool = False,
     ):
+        self.database_url = database_url
         self.pipeline_url = normalize_turso_url(database_url, allow_localhost_http=True)
         self.masked_url = mask_turso_url(self.pipeline_url)
         self.auth_token = auth_token.strip() if auth_token else ""
@@ -356,7 +446,9 @@ class TursoHTTPClient:
         return bool(row and row.get("ping") == 1)
 
     def execute_pipeline(
-        self, statements: list[tuple[str, list[Any]]]
+        self,
+        statements: list[tuple[str, list[Any]]],
+        max_rows: int = MAX_HRANA_RESULT_ROWS,
     ) -> list[TursoQueryResult]:
         """Execute multiple SQL statements with parameters in a single HTTP pipeline request."""
         if not statements:
@@ -388,38 +480,51 @@ class TursoHTTPClient:
         if resp.status_code != 200:
             raise TursoClientError(_format_http_status_error(resp.status_code))
 
-        data = resp.json()
-        raw_results = data.get("results", [])
+        if len(resp.content) > MAX_HRANA_RESPONSE_BYTES:
+            raise TursoClientError(
+                f"Response payload size {len(resp.content)} bytes exceeds maximum allowed limit {MAX_HRANA_RESPONSE_BYTES}."
+            )
+
+        try:
+            data = resp.json()
+        except Exception as exc:
+            err_type = type(exc).__name__
+            raise TursoClientError(f"Turso response malformed: invalid JSON payload ({err_type}).") from None
+
+        if not isinstance(data, dict):
+            raise TursoClientError("Turso response malformed: response root is not an object.")
+
+        raw_results = data.get("results")
+        if not isinstance(raw_results, list):
+            raise TursoClientError("Turso response malformed: missing or invalid results list.")
+
+        expected_count = len(statements) + 1
+        if len(raw_results) != expected_count:
+            raise TursoClientError(
+                f"Unexpected pipeline results count: expected {expected_count}, got {len(raw_results)}."
+            )
+
+        # Validate close response (last element)
+        close_res = raw_results[-1]
+        if not isinstance(close_res, dict):
+            raise TursoClientError("Malformed pipeline close result: expected dict.")
+        if close_res.get("type") == "error":
+            err = close_res.get("error", {})
+            valid_code, category = _sanitize_hrana_error(err.get("code") if isinstance(err, dict) else None)
+            raise TursoClientError(f"Pipeline close error ({valid_code}): {category}")
+        if close_res.get("type") != "ok":
+            raise TursoClientError(f"Pipeline close failed with unexpected type: '{close_res.get('type')}'.")
+
         parsed_results: list[TursoQueryResult] = []
-
-        for idx, res in enumerate(raw_results[:-1]):  # Exclude close response
-            res_type = res.get("type")
-            if res_type == "error":
-                err = res.get("error", {})
-                valid_code, category = _sanitize_hrana_error(err.get("code"))
-                raise TursoClientError(f"Turso statement {idx} error ({valid_code}): {category}")
-
-            response_data = res.get("response", {})
-            exec_result = response_data.get("result", {})
-
-            cols = [c.get("name", f"col_{i}") for i, c in enumerate(exec_result.get("cols", []))]
-            rows_data = exec_result.get("rows", [])
-            parsed_rows: list[dict[str, Any]] = []
-
-            for row in rows_data:
-                row_dict = {}
-                for col_name, cell in zip(cols, row):
-                    row_dict[col_name] = deserialize_hrana_value(cell)
-                parsed_rows.append(row_dict)
-
-            affected = exec_result.get("affected_row_count", 0)
-            last_id = exec_result.get("last_insert_rowid")
-            parsed_results.append(TursoQueryResult(cols, parsed_rows, affected, last_id))
+        for res in raw_results[:-1]:
+            parsed_results.append(_parse_hrana_exec_result(res, max_rows=max_rows))
 
         return parsed_results
 
     def execute_transaction(
-        self, statements: list[tuple[str, list[Any]]]
+        self,
+        statements: list[tuple[str, list[Any]]],
+        max_rows: int = MAX_HRANA_RESULT_ROWS,
     ) -> list[TursoQueryResult]:
         """Execute multiple SQL statements atomically in an explicit transaction over /v2/pipeline."""
         if not statements:
@@ -630,27 +735,20 @@ class TursoHTTPClient:
         # Parse results for user statements (skipping BEGIN at index 0)
         parsed_results: list[TursoQueryResult] = []
         for res in raw_results[1:]:
-            response_data = res.get("response", {})
-            exec_result = response_data.get("result", {})
-            cols = [c.get("name", f"col_{i}") for i, c in enumerate(exec_result.get("cols", []))]
-            rows_data = exec_result.get("rows", [])
-            parsed_rows: list[dict[str, Any]] = []
-            for row in rows_data:
-                row_dict = {}
-                for col_name, cell in zip(cols, row):
-                    row_dict[col_name] = deserialize_hrana_value(cell)
-                parsed_rows.append(row_dict)
-            affected = exec_result.get("affected_row_count", 0)
-            last_id = exec_result.get("last_insert_rowid")
-            parsed_results.append(TursoQueryResult(cols, parsed_rows, affected, last_id))
+            parsed_results.append(_parse_hrana_exec_result(res, max_rows=max_rows))
 
         return parsed_results
 
-    def execute(self, sql: str, args: Optional[list[Any]] = None) -> TursoQueryResult:
+    def execute(
+        self,
+        sql: str,
+        args: Optional[list[Any]] = None,
+        max_rows: int = MAX_HRANA_RESULT_ROWS,
+    ) -> TursoQueryResult:
         """Execute a single SQL statement."""
         if self.read_only:
             validate_read_only_sql(sql)
-        results = self.execute_pipeline([(sql, args or [])])
+        results = self.execute_pipeline([(sql, args or [])], max_rows=max_rows)
         return results[0]
 
     def executescript(self, script: str) -> None:

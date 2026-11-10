@@ -25,6 +25,7 @@ from typing import Any, Optional, Sequence
 import httpx
 
 from efso_radar.repositories.turso_client import (
+    MAX_HRANA_RESULT_ROWS,
     TursoAmbiguousTransactionError,
     TursoClientError,
     TursoHTTPClient,
@@ -76,6 +77,8 @@ from efso_radar.staging.offline_recovery_evidence import (
 )
 from efso_radar.staging.runner import (
     ALLOWED_TABLE_PK_MAP,
+    EXACT_STAGING_DESTINATION,
+    EXACT_STAGING_HTTPS_URL,
     RUN_ID_REGEX,
     AuditOutcomeState,
     BudgetTrackingTransport,
@@ -84,6 +87,7 @@ from efso_radar.staging.runner import (
     RegisteredEntity,
     create_default_manifest_entities,
 )
+from efso_radar.staging.hrana_outbound_guard import HranaOutboundSecurityBoundary
 
 
 class CleanupVerificationError(JournalError, RuntimeError):
@@ -327,6 +331,18 @@ class StagingJournalHranaSeam:
                 "and strictly rejects read_only=True clients."
             )
 
+        pipeline_url = getattr(client, "pipeline_url", None)
+        if pipeline_url != f"{EXACT_STAGING_HTTPS_URL}/v2/pipeline":
+            raise PermissionError(
+                f"Hermetic security boundary violation: client pipeline_url '{pipeline_url}' does not match approved '{EXACT_STAGING_HTTPS_URL}/v2/pipeline'."
+            )
+
+        database_url = getattr(client, "database_url", None)
+        if database_url != EXACT_STAGING_DESTINATION:
+            raise PermissionError(
+                f"Hermetic security boundary violation: client database_url '{database_url}' does not match approved '{EXACT_STAGING_DESTINATION}'."
+            )
+
         # Require a fresh TursoHTTPClient instance with no previously initialized or cached internal HTTP client
         if getattr(client, "_client", None) is not None:
             raise PermissionError(
@@ -341,7 +357,7 @@ class StagingJournalHranaSeam:
         inner = transport
         if type(inner) is BudgetTrackingTransport:
             inner = inner.inner
-        if type(inner).__name__ == "HranaOutboundSecurityBoundary":
+        if type(inner) is HranaOutboundSecurityBoundary:
             inner = getattr(inner, "_inner", None)
         if type(inner) is not HermeticStagingTransport:
             raise PermissionError(
@@ -774,7 +790,13 @@ class StagingJournalHranaSeam:
                 code="DUPLICATE_ROWS",
             )
 
-        return self._validate_and_parse_wire_journal_row(rows[0])
+        entry = self._validate_and_parse_wire_journal_row(rows[0])
+        if entry.run_id != run_id:
+            raise CrossRunnerDiscoveryError(
+                "Wire returned journal entry for mismatched run_id.",
+                code="RUN_ID_MISMATCH",
+            )
+        return entry
 
     def discover_unresolved_runs(
         self,
@@ -802,7 +824,11 @@ class StagingJournalHranaSeam:
         ORDER BY created_at ASC
         LIMIT ?
         """
-        query_res = self._execute_guarded_client_query(discovery_sql, [max_results + 1])
+        query_res = self._execute_guarded_client_query(
+            discovery_sql,
+            [max_results + 1],
+            max_rows=max_results + 1,
+        )
         cols = getattr(query_res, "cols", None)
         if not cols or len(cols) != len(EXPECTED_JOURNAL_QUERY_COLS) or tuple(cols) != EXPECTED_JOURNAL_QUERY_COLS:
             raise CrossRunnerDiscoveryError(
@@ -821,6 +847,11 @@ class StagingJournalHranaSeam:
         seen_run_ids: set[str] = set()
         for r in raw_rows:
             entry = self._validate_and_parse_wire_journal_row(r)
+            if entry.status in (JournalStatus.CLEANED_UP, JournalStatus.ABORTED):
+                raise CrossRunnerDiscoveryError(
+                    "Terminal journal status discovered in unresolved query results.",
+                    code="TERMINAL_STATUS_DISCOVERED",
+                )
             if entry.run_id in seen_run_ids:
                 raise CrossRunnerDiscoveryError(
                     "Duplicate run_id discovered in unresolved journal results.",
@@ -858,6 +889,14 @@ class StagingJournalHranaSeam:
         if getattr(self._client, "read_only", False):
             raise PermissionError("Hermetic security boundary violation: mutating pipeline on read_only client.")
 
+        pipeline_url = getattr(self._client, "pipeline_url", None)
+        if pipeline_url != f"{EXACT_STAGING_HTTPS_URL}/v2/pipeline":
+            raise PermissionError("Hermetic security boundary violation: pipeline_url destination mismatch.")
+
+        database_url = getattr(self._client, "database_url", None)
+        if database_url != EXACT_STAGING_DESTINATION:
+            raise PermissionError("Hermetic security boundary violation: database_url destination mismatch.")
+
         current_transport = getattr(self._client, "transport", None)
         if current_transport is None:
             raise PermissionError("Hermetic security boundary violation: client transport is None.")
@@ -873,7 +912,7 @@ class StagingJournalHranaSeam:
         inner = current_transport
         if type(inner) is BudgetTrackingTransport:
             inner = inner.inner
-        if type(inner).__name__ == "HranaOutboundSecurityBoundary":
+        if type(inner) is HranaOutboundSecurityBoundary:
             inner = getattr(inner, "_inner", None)
         if inner is not self._pinned_inner_transport or type(inner) is not HermeticStagingTransport:
             raise PermissionError(
@@ -903,19 +942,27 @@ class StagingJournalHranaSeam:
         actual_transport = getattr(http_client, "_transport", None)
         if actual_transport is not None and actual_transport is not self._pinned_transport:
             raise PermissionError("Hermetic security boundary violation: underlying HTTP client transport mismatch.")
+        mounts = getattr(http_client, "_mounts", {})
+        if mounts and any(m is not self._pinned_transport for m in mounts.values()):
+            raise PermissionError("Hermetic security boundary violation: custom mounted route detected on HTTP client.")
         return http_client
 
-    def _execute_guarded_client_query(self, sql: str, params: Optional[list[Any]] = None) -> Any:
+    def _execute_guarded_client_query(
+        self,
+        sql: str,
+        params: Optional[list[Any]] = None,
+        max_rows: int = MAX_HRANA_RESULT_ROWS,
+    ) -> Any:
         """Execute a single query via client while enforcing transport identity guards beforehand."""
         self._validate_hermetic_transport_identity()
         _ = self._get_guarded_http_client()
         try:
-            return self._client.execute(sql, params)
+            return self._client.execute(sql, params, max_rows=max_rows)
         except PermissionError:
             raise
         except CrossRunnerDiscoveryError:
             raise
-        except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError, TursoClientError, httpx.HTTPError):
+        except Exception:
             raise CrossRunnerDiscoveryError(
                 "Wire query failed or returned malformed envelope.",
                 code="WIRE_QUERY_MALFORMED",
@@ -1966,10 +2013,18 @@ class StagingJournalHranaSeam:
             except Exception:
                 return AuditOutcomeState.UNKNOWN
 
-            if rows:
-                found_any = True
+            if len(rows) > 1:
+                # Ambiguous cardinality: primary key query returned multiple rows
+                return AuditOutcomeState.UNKNOWN
+
+            if len(rows) == 1:
                 row = rows[0]
-                for exp_k, exp_v in ent.get("expected_attributes", {}).items():
+                actual_pk = row.get(pk_col)
+                if actual_pk != pk_val:
+                    # Foreign row returned for this entity query!
+                    return AuditOutcomeState.OWNERSHIP_MISMATCH_HALT
+
+                for exp_k, exp_v in exp_attrs.items():
                     col_name = "worker_id" if (tbl == "run_locks" and exp_k == "worker_ids") else exp_k
                     actual_val = row.get(col_name)
                     if isinstance(exp_v, list):
@@ -1977,6 +2032,7 @@ class StagingJournalHranaSeam:
                             return AuditOutcomeState.OWNERSHIP_MISMATCH_HALT
                     elif actual_val != exp_v:
                         return AuditOutcomeState.OWNERSHIP_MISMATCH_HALT
+                found_any = True
 
         if found_any:
             return AuditOutcomeState.RESIDUAL
@@ -2085,6 +2141,20 @@ class StagingJournalHranaSeam:
             except PermissionError:
                 raise
             except CrossRunnerDiscoveryError as exc:
+                if exc.code == "RUN_ID_MISMATCH":
+                    return CrossRunnerReview(
+                        run_id=target_run_id,
+                        reviewing_runner_id="VALIDATED_RECOVERY_RUNNER",
+                        provenance=CrossRunnerProvenance.HERMETIC_SIMULATION,
+                        journal_status=CrossRunnerJournalStatus.CORRUPTED,
+                        decision=ReviewDecision.OWNERSHIP_MISMATCH_HALT,
+                        remote_state="UNKNOWN",
+                        action="MANUAL_REVIEW_ONLY",
+                        reasons=(
+                            "Wire returned journal entry for mismatched run_id.",
+                            "Cross-runner ownership mismatch; execution halted.",
+                        ),
+                    )
                 j_status = (
                     CrossRunnerJournalStatus.UNREADABLE
                     if exc.code in ("WIRE_QUERY_MALFORMED", "DUPLICATE_ROWS")
@@ -2187,10 +2257,22 @@ class StagingJournalHranaSeam:
                 ),
             )
 
+        if entry.stage not in ("LIVE-01", "LIVE-02", "LIVE_01", "LIVE_02"):
+            return CrossRunnerReview(
+                run_id=target_run_id if (isinstance(target_run_id, str) and RUN_ID_REGEX.fullmatch(target_run_id)) else None,
+                reviewing_runner_id="VALIDATED_RECOVERY_RUNNER",
+                provenance=CrossRunnerProvenance.HERMETIC_SIMULATION,
+                journal_status=CrossRunnerJournalStatus.CORRUPTED,
+                decision=ReviewDecision.UNKNOWN,
+                remote_state="UNKNOWN",
+                action="MANUAL_REVIEW_ONLY",
+                reasons=(
+                    "Unsupported or noncanonical journal intent stage in wire entry.",
+                    "Corrupted journal never authorizes mutations, automatic cleanup, or retries.",
+                ),
+            )
+        stage_str = entry.stage.replace("-", "_")
         registered_pks = tuple(f"{e['table']}:{e['pk_value']}" for e in registered_raw if isinstance(e, dict) and "table" in e and "pk_value" in e)
-        stage_str = entry.stage if entry.stage.startswith("LIVE") else "LIVE_02"
-        if "-" in stage_str:
-            stage_str = stage_str.replace("-", "_")
 
         j_entry = CrossRunnerJournalEntry(
             run_id=entry.run_id,
@@ -2286,7 +2368,7 @@ class StagingJournalHranaSeam:
         ) if observations else None
 
         return review_cross_runner_recovery_evidence(
-            expected_run_id=entry.run_id,
+            expected_run_id=target_run_id,
             reviewing_runner_id=self._owner_id,
             journal_entry=j_entry,
             snapshot=snapshot,
