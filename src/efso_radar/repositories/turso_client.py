@@ -296,7 +296,10 @@ def deserialize_hrana_value(item: Any) -> Any:
         if isinstance(raw, bool) or raw is None:
             raise TursoClientError("Invalid float value in Hrana cell.")
         if isinstance(raw, (int, float)):
-            val = float(raw)
+            try:
+                val = float(raw)
+            except (OverflowError, ValueError, TypeError):
+                raise TursoClientError("Invalid float value in Hrana cell.") from None
             if math.isnan(val) or math.isinf(val):
                 raise TursoClientError("Invalid float value in Hrana cell.")
             return val
@@ -306,7 +309,7 @@ def deserialize_hrana_value(item: Any) -> Any:
                     val = float(raw)
                     if not (math.isnan(val) or math.isinf(val)):
                         return val
-                except Exception:
+                except (OverflowError, ValueError, TypeError):
                     pass
             raise TursoClientError("Invalid float value in Hrana cell.")
         raise TursoClientError("Invalid float value in Hrana cell.")
@@ -743,12 +746,18 @@ class TursoHTTPClient:
                     "The transaction state is unverified."
                 )
             try:
-                _parse_hrana_exec_result(rb_exec)
+                rb_query_result = _parse_hrana_exec_result(rb_exec)
             except Exception:
                 raise TursoAmbiguousTransactionError(
                     "Ambiguous transaction outcome (UNKNOWN): statement validation failed and ROLLBACK execution response was malformed. "
                     "The transaction state is unverified."
                 ) from None
+
+            if rb_query_result.cols or rb_query_result.rows:
+                raise TursoAmbiguousTransactionError(
+                    "Ambiguous transaction outcome (UNKNOWN): statement validation failed and ROLLBACK execution returned unexpected columns or rows. "
+                    "The transaction state is unverified."
+                )
 
             rb_close = rb_results[1]
             if not isinstance(rb_close, dict) or rb_close.get("type") != "ok":

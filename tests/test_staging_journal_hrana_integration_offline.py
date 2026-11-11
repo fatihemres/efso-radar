@@ -33,6 +33,7 @@ from efso_radar.repositories.turso_client import (
     TursoAmbiguousTransactionError,
     TursoClientError,
     TursoHTTPClient,
+    deserialize_hrana_value,
 )
 from efso_radar.staging.journal import (
     ActiveWorkloadCollisionError,
@@ -4057,7 +4058,7 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                     c.execute("SELECT col1")
                 self.assertIn("Invalid integer value in Hrana cell.", str(ctx.exception))
 
-        # 7. Malformed float cells: booleans, nulls, inf, nan, non-numeric strings must fail closed
+        # 7. Malformed float cells: booleans, nulls, inf, nan, non-numeric strings, and overflow integers must fail closed
         malformed_float_cases = [
             True,
             False,
@@ -4066,6 +4067,8 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
             "inf",
             "-inf",
             "abc",
+            10**400,  # 401-digit integer causing OverflowError in float()
+            "1e500",  # overflow string
         ]
         for bad_float in malformed_float_cases:
             def handler_bad_float(req: httpx.Request, val=bad_float) -> httpx.Response:
@@ -4092,6 +4095,13 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                 with self.assertRaises(TursoClientError) as ctx:
                     c.execute("SELECT col1")
                 self.assertIn("Invalid float value in Hrana cell.", str(ctx.exception))
+                self.assertIsNone(ctx.exception.__cause__)
+
+        # Direct decoder overflow suppression test
+        with self.assertRaises(TursoClientError) as ctx_direct:
+            deserialize_hrana_value({"type": "float", "value": 10**400})
+        self.assertEqual("Invalid float value in Hrana cell.", str(ctx_direct.exception))
+        self.assertIsNone(ctx_direct.exception.__cause__)
 
         # 8. Valid integer and float positive control
         def handler_valid_nums(req: httpx.Request) -> httpx.Response:
@@ -4829,6 +4839,114 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
 
         self.assertFalse(
             any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", [])) for p in dispatched_h),
+            "COMMIT must NEVER be dispatched when statement validation fails",
+        )
+
+        # Scenario J (P1 Review #8): ROLLBACK response returns structurally valid but nonempty columns and rows -> fails closed to UNKNOWN
+        dispatched_j: list[dict[str, Any]] = []
+
+        def rollback_nonempty_result_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_j.append(body)
+            reqs = body.get("requests", [])
+            has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+            has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+
+            if has_begin:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": "test-baton-rb-nonempty",
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": {}}},
+                        ],
+                    },
+                )
+            elif has_rollback:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "type": "execute",
+                                    "result": {
+                                        "cols": [{"name": "foreign"}],
+                                        "rows": [[{"type": "integer", "value": 1}]],
+                                    },
+                                },
+                            },
+                            {"type": "ok", "response": {"type": "close"}},
+                        ],
+                    },
+                )
+            return httpx.Response(500, json={"error": "Unexpected request"})
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(rollback_nonempty_result_handler)) as client:
+            with self.assertRaises(TursoAmbiguousTransactionError) as ctx:
+                client.execute_transaction([("SELECT 1", [])])
+            self.assertIn("Ambiguous transaction outcome (UNKNOWN)", str(ctx.exception))
+            self.assertIn("statement validation failed and ROLLBACK execution returned unexpected columns or rows", str(ctx.exception))
+
+        self.assertFalse(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", [])) for p in dispatched_j),
+            "COMMIT must NEVER be dispatched when statement validation fails",
+        )
+
+        # Scenario K (P1 Review #8): ROLLBACK response returns nonempty columns with empty rows -> fails closed to UNKNOWN
+        dispatched_k: list[dict[str, Any]] = []
+
+        def rollback_cols_only_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_k.append(body)
+            reqs = body.get("requests", [])
+            has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+            has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+
+            if has_begin:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": "test-baton-rb-colsonly",
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": {}}},
+                        ],
+                    },
+                )
+            elif has_rollback:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "type": "execute",
+                                    "result": {
+                                        "cols": [{"name": "unexpected_col"}],
+                                        "rows": [],
+                                    },
+                                },
+                            },
+                            {"type": "ok", "response": {"type": "close"}},
+                        ],
+                    },
+                )
+            return httpx.Response(500, json={"error": "Unexpected request"})
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(rollback_cols_only_handler)) as client:
+            with self.assertRaises(TursoAmbiguousTransactionError) as ctx:
+                client.execute_transaction([("SELECT 1", [])])
+            self.assertIn("Ambiguous transaction outcome (UNKNOWN)", str(ctx.exception))
+            self.assertIn("statement validation failed and ROLLBACK execution returned unexpected columns or rows", str(ctx.exception))
+
+        self.assertFalse(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", [])) for p in dispatched_k),
             "COMMIT must NEVER be dispatched when statement validation fails",
         )
 
