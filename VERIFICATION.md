@@ -407,6 +407,21 @@ python -W error -m efso_radar.staging.runner --help
 
 CI source: [.github/workflows/ci.yml](.github/workflows/ci.yml). **2026-11-05 observed CI:** hosted Linux Python 3.11/3.12 pytest matrix, Windows smoke Python 3.12 and `static-safety` (Ruff), all PASS at [exact-main run #41997240442](https://github.com/fatihemres/efso-radar/actions/runs/41997240442). Earlier comments about no Windows job describe a historical inspection, NOT the current workflow. Do not assert standalone CodeQL, release pipeline or unobserved checks.
 
+## Issue #97 Offline Write-Path Hardening Evidence (Task Branch, 2026-11-11)
+
+Work performed under PO CODE GO ([Issue #97 Comment 6790009104](https://github.com/fatihemres/efso-radar/issues/97#issuecomment-6790009104)) on task branch `feat/issue-97-offline-write-path-security` branched from protected `main @ 8dcd663f557fa071fc043ddf999f5359b62362e3`.
+
+| What | Exact evidence / environment | Result and boundary |
+| --- | --- | --- |
+| Transaction ACK integrity (P1) | `_validate_transaction_control_ack` in `src/efso_radar/staging/journal_hrana_seam.py` | Strictly validates COMMIT and ROLLBACK execution acknowledgments: requires exact 1-element result cardinality, outer `type == "ok"`, inner `response.type == "execute"`, and canonical empty transaction-control structure (`cols: []`, `rows: []`). Inner close-shaped (`type == "close"`), missing-field, non-empty, or truncated ACKs fail closed to `AmbiguousCommitError` / `AmbiguousRollbackError` and latch local HALT. |
+| Cleanup ownership validation (P1) | `execute_conditional_cleanup` in `src/efso_radar/staging/journal_hrana_seam.py` | Persisted target inventory validated against `PerRunOwnershipManifest`, sealed manifest (`HEX_SHA256_REGEX`), run identity binding (`run_id in pk_val`), and non-empty `expected_attributes` before constructing or dispatching any `DELETE` statement. Forged, foreign, or tampered records fail closed to `OwnershipMismatchError` / `ManifestTamperedError` with **0 DELETE dispatch** verified by request spy. |
+| HALT marker sanitization (P2) | `_latch_local_halt` and `_sanitize_halt_reason` in `src/efso_radar/staging/journal_hrana_seam.py` | Allowlisted bounded reason codes (`HALT_REASON_CATALOG`) and fixed constant descriptions. Untrusted wire responses, SQL fragments, identifiers, exception chains, and secret sentinels are strictly suppressed (`from None`). Durable atomic file creation with `O_CREAT | O_EXCL` and `os.fsync`. |
+| Focused adversarial offline suite | Windows Python 3.14.3 / 3.12, `$env:PYTHONPATH='src'; pytest tests/test_staging_journal_hrana_integration_offline.py -q` | **96 passed in 17.30s**; zero network calls. Includes 13 new adversarial tests in `TestIssue97WritePathSecurity` covering all P1/P2 scenarios. |
+| Staging & Phase 5B.3G test suites | Windows Python 3.14.3 / 3.12, `$env:PYTHONPATH='src'; pytest tests/test_staging_*.py tests/test_phase5b3g_*.py -q` | **795 passed, 4 skipped, 170 subtests passed in 50.13s**; zero network calls. |
+| Repository parity suite | Windows Python 3.14.3 / 3.12, `$env:PYTHONPATH='src'; pytest tests/test_repository_parity.py -v` | **42 passed in 3.14s** across SQLite and mocked Turso backends. |
+| Static safety lint | `.venv\Scripts\python.exe -m ruff check --target-version py311 --select E9,F63,F7,F82 src scripts tests` | **PASS (All checks passed!)** |
+| Whitespace and diff check | `git diff --check` | **PASS (clean, 0 whitespace/newline issues)** |
+
 ## Release and validation gates
 
 - **IMPLEMENTED:** Code committed to a task branch. **VERIFIED:** tests/review with identifiable SHA and environment. **INTEGRATED:** merged on `main`. **ACCEPTED:** explicit PO acceptance. **LIVE:** separate operational authorization and observed evidence. Different gates.

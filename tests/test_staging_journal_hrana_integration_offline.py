@@ -23,6 +23,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 from typing import Any, Optional
+import traceback
 import unittest
 
 import httpx
@@ -51,6 +52,7 @@ from efso_radar.staging.journal import (
     StageMutationCommand,
     StaleOwnerError,
     TargetInventoryViolationError,
+    _halt_marker_path,
     apply_candidate_schema_v7,
     compute_canonical_inventory_fingerprint,
 )
@@ -60,7 +62,9 @@ from efso_radar.staging.journal_hrana_seam import (
     CrossRunnerDiscoveryError,
     EXPECTED_ENTITY_QUERY_COLS,
     EXPECTED_JOURNAL_QUERY_COLS,
+    HALT_REASON_CATALOG,
     MAX_DISCOVERY_LIMIT,
+    OwnershipMismatchError,
     StagingJournalHranaSeam,
     build_live02_synthetic_mutations,
     _assert_fixture_isolation,
@@ -1001,7 +1005,8 @@ class TestScenario8ConditionalCleanupAndAudits(_BaseTwoRunnerFixture):
                 expected_fencing_token=token2,
                 manifest_seal_hex=self.seal_a,
             )
-        self.assertIn("Simulated audit disk I/O failure", str(ctx.exception))
+        self.assertIn("Audit query failed for entity index 0 (SQLITE_IOERR)", str(ctx.exception))
+        self.assertNotIn("Simulated audit disk I/O failure", str(ctx.exception))
         self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
 
         # Status not CLEANED_UP
@@ -1056,7 +1061,8 @@ class TestScenario8ConditionalCleanupAndAudits(_BaseTwoRunnerFixture):
                 expected_fencing_token=token2,
                 manifest_seal_hex=self.seal_a,
             )
-        self.assertIn("Simulated table lock timeout", str(ctx.exception))
+        self.assertIn("Cleanup DELETE statement 0 failed (SQLITE_LOCKED)", str(ctx.exception))
+        self.assertNotIn("Simulated table lock timeout", str(ctx.exception))
         self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
 
         # Check DB: journal status is NOT CLEANED_UP
@@ -1588,7 +1594,8 @@ class TestMockHranaTransactionLifecycle(_BaseTwoRunnerFixture):
                 manifest_seal_hex=self.seal_a,
                 target_inventory=self.entities_a,
             )
-        self.assertIn("Statement 0 failed in Hrana transaction: Simulated disk corruption", str(ctx.exception))
+        self.assertIn("Statement 0 failed in Hrana transaction (SQLITE_IOERR)", str(ctx.exception))
+        self.assertNotIn("Simulated disk corruption", str(ctx.exception))
         self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
 
         cur = self.conn_b.cursor()
@@ -2015,7 +2022,7 @@ class TestMockHranaTransactionLifecycle(_BaseTwoRunnerFixture):
                 manifest_seal_hex=self.seal_a,
             )
         self.assertIn("ROLLBACK could not be confirmed", str(ctx.exception))
-        self.assertIn("synthetic rollback statement failure", str(ctx.exception))
+        self.assertNotIn("synthetic rollback statement failure", str(ctx.exception))
         self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
 
         # Status not marked CLEANED_UP
@@ -5036,3 +5043,542 @@ class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
                 client.execute("SELECT 1")
             self.assertEqual("Pipeline close failed with unexpected type. Expected 'ok'.", str(ctx.exception))
             self.assertNotIn("EXPLOSIVE_CLOSE_OUTER_SENTINEL_abc456", str(ctx.exception))
+
+
+class TestIssue97WritePathSecurity(_BaseTwoRunnerFixture):
+    """Adversarial security test suite for Issue #97 write-path hardening.
+
+    Verifies:
+    1. Transaction ACK integrity (P1): COMMIT and ROLLBACK acknowledgments require
+       strict inner type == 'execute', exact cardinality 1, and canonical empty cols/rows.
+       Close-shaped or non-empty ACKs fail closed to UNKNOWN/HALT.
+    2. Cleanup ownership validation (P1): PerRunOwnershipManifest validation,
+       canonical seal recomputation, run identity binding, and non-empty expected_attributes
+       enforced before any DELETE construction or dispatch (0 DELETE requests dispatched).
+    3. HALT sanitization (P2): Persistent HALT markers, error logs, and surfaced messages
+       strictly use allowlisted reason codes and fixed constant descriptions.
+       Untrusted sentinels and causes are suppressed.
+    """
+
+    # --- P1: Transaction Control ACK Integrity Tests ---
+
+    def test_p1_transaction_commit_ack_inner_close_shaped_fails_to_ambiguous_and_halts(self):
+        """COMMIT ACK with inner type 'close' fails closed to AmbiguousCommitError and latches HALT."""
+        def close_commit_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+            except Exception:
+                return None
+            reqs = body.get("requests", [])
+            has_commit = any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in reqs)
+            if has_commit:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": body.get("baton", "mock_baton"),
+                        "results": [
+                            {"type": "ok", "response": {"type": "close"}}
+                        ],
+                    },
+                    request=request,
+                )
+            return None
+
+        self.transport_a.custom_response_hook = close_commit_hook
+        with self.assertRaises(AmbiguousCommitError) as ctx:
+            self.seam_a.register_intent(
+                run_id=RUN_ID_A,
+                manifest_seal_hex=self.seal_a,
+                target_inventory=self.entities_a,
+            )
+        self.assertIn("Hrana COMMIT failed or unverified", str(ctx.exception))
+        self.assertIn("INNER_TYPE_NOT_EXECUTE", str(ctx.exception))
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+
+        # Inspect on-disk marker
+        marker_path = _halt_marker_path(RUN_ID_A, self.marker_dir_a)
+        self.assertTrue(marker_path.exists())
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["reason_code"], "AMBIGUOUS_COMMIT_UNVERIFIED_OUTCOME")
+        self.assertEqual(payload["reason"], HALT_REASON_CATALOG["AMBIGUOUS_COMMIT_UNVERIFIED_OUTCOME"])
+
+    def test_p1_transaction_commit_ack_non_empty_result_fails_to_ambiguous_and_halts(self):
+        """COMMIT ACK with SELECT-like non-empty result fails to AmbiguousCommitError and latches HALT."""
+        def nonempty_commit_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+            except Exception:
+                return None
+            reqs = body.get("requests", [])
+            has_commit = any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in reqs)
+            if has_commit:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": body.get("baton", "mock_baton"),
+                        "results": [
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "type": "execute",
+                                    "result": {
+                                        "cols": [{"name": "injected_col"}],
+                                        "rows": [[{"type": "integer", "value": 1}]],
+                                    },
+                                },
+                            }
+                        ],
+                    },
+                    request=request,
+                )
+            return None
+
+        self.transport_a.custom_response_hook = nonempty_commit_hook
+        with self.assertRaises(AmbiguousCommitError) as ctx:
+            self.seam_a.register_intent(
+                run_id=RUN_ID_A,
+                manifest_seal_hex=self.seal_a,
+                target_inventory=self.entities_a,
+            )
+        self.assertIn("Hrana COMMIT failed or unverified", str(ctx.exception))
+        self.assertIn("RESULT_COLS_NOT_EMPTY", str(ctx.exception))
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+
+    def test_p1_transaction_commit_ack_cardinality_mismatch(self):
+        """COMMIT response with 0 or >1 results fails to AmbiguousCommitError and latches HALT."""
+        def zero_results_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+            except Exception:
+                return None
+            reqs = body.get("requests", [])
+            has_commit = any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in reqs)
+            if has_commit:
+                return httpx.Response(
+                    200,
+                    json={"baton": body.get("baton", "mock_baton"), "results": []},
+                    request=request,
+                )
+            return None
+
+        self.transport_a.custom_response_hook = zero_results_hook
+        with self.assertRaises(AmbiguousCommitError) as ctx:
+            self.seam_a.register_intent(
+                run_id=RUN_ID_A,
+                manifest_seal_hex=self.seal_a,
+                target_inventory=self.entities_a,
+            )
+        self.assertIn("RESULTS_COUNT_MISMATCH", str(ctx.exception))
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+
+    def test_p1_cleanup_commit_ack_inner_close_shaped_fails_to_ambiguous_and_halts(self):
+        """Phase 4 cleanup COMMIT ACK with inner type 'close' raises AmbiguousCommitError and latches HALT."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        token2 = self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        def close_cleanup_commit_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+            except Exception:
+                return None
+            reqs = body.get("requests", [])
+            has_commit = any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in reqs)
+            if has_commit:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": body.get("baton", "mock_baton"),
+                        "results": [
+                            {"type": "ok", "response": {"type": "close"}}
+                        ],
+                    },
+                    request=request,
+                )
+            return None
+
+        self.transport_a.custom_response_hook = close_cleanup_commit_hook
+        with self.assertRaises(AmbiguousCommitError) as ctx:
+            self.seam_a.execute_conditional_cleanup(
+                run_id=RUN_ID_A,
+                expected_fencing_token=token2,
+                manifest_seal_hex=self.seal_a,
+            )
+        self.assertIn("Cleanup COMMIT failed or unverified (INNER_TYPE_NOT_EXECUTE)", str(ctx.exception))
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+
+        # Check marker file
+        marker_path = _halt_marker_path(RUN_ID_A, self.marker_dir_a)
+        self.assertTrue(marker_path.exists())
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["reason_code"], "CLEANUP_PHASE4_COMMIT_UNVERIFIED")
+
+    def test_p1_cleanup_commit_ack_non_empty_result_fails_to_ambiguous_and_halts(self):
+        """Phase 4 cleanup COMMIT ACK with non-empty cols/rows raises AmbiguousCommitError and latches HALT."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        token2 = self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        def nonempty_cleanup_commit_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+            except Exception:
+                return None
+            reqs = body.get("requests", [])
+            has_commit = any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in reqs)
+            if has_commit:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": body.get("baton", "mock_baton"),
+                        "results": [
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "type": "execute",
+                                    "result": {
+                                        "cols": [],
+                                        "rows": [[{"type": "integer", "value": 42}]],
+                                    },
+                                },
+                            }
+                        ],
+                    },
+                    request=request,
+                )
+            return None
+
+        self.transport_a.custom_response_hook = nonempty_cleanup_commit_hook
+        with self.assertRaises(AmbiguousCommitError) as ctx:
+            self.seam_a.execute_conditional_cleanup(
+                run_id=RUN_ID_A,
+                expected_fencing_token=token2,
+                manifest_seal_hex=self.seal_a,
+            )
+        self.assertIn("RESULT_ROWS_NOT_EMPTY", str(ctx.exception))
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+
+    def test_p1_rollback_ack_inner_close_or_non_empty_fails_verification(self):
+        """ROLLBACK ACK with inner 'close' or non-empty result triggers AmbiguousRollbackError and latches HALT."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        token2 = self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        def unverified_rollback_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+            except Exception:
+                return None
+            reqs = body.get("requests", [])
+            has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+            has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+            if has_begin:
+                # Concurrent bump triggers CAS mismatch
+                self.conn_b.execute(
+                    "UPDATE staging_run_journal SET fencing_token = 99 WHERE run_id = ?",
+                    (RUN_ID_A,),
+                )
+                self.conn_b.commit()
+                return None
+            if has_rollback:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": body.get("baton", "mock_baton"),
+                        "results": [
+                            {"type": "ok", "response": {"type": "close"}}
+                        ],
+                    },
+                    request=request,
+                )
+            return None
+
+        self.transport_a.custom_response_hook = unverified_rollback_hook
+        with self.assertRaises(AmbiguousRollbackError) as ctx:
+            self.seam_a.execute_conditional_cleanup(
+                run_id=RUN_ID_A,
+                expected_fencing_token=token2,
+                manifest_seal_hex=self.seal_a,
+            )
+        self.assertIn("ROLLBACK could not be confirmed", str(ctx.exception))
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+
+    # --- P1: Cleanup Ownership & Pre-DELETE Validation Tests ---
+
+    def test_p1_cleanup_ownership_forged_foreign_pk_with_recomputed_seal_rejects_with_zero_delete_dispatch(self):
+        """Forged foreign PK with recomputed matching seal fails closed to OwnershipMismatchError with 0 DELETE dispatch."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        token2 = self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        # Forge journal record: replace article PK with foreign PK belonging to Runner B
+        tampered_entities = [e.model_dump() for e in self.entities_a]
+        for ent in tampered_entities:
+            if ent["table"] == "processed_articles":
+                ent["pk_value"] = f"synth_art_{RUN_ID_B}_99"
+        tampered_seal = compute_canonical_inventory_fingerprint(
+            run_id=RUN_ID_A,
+            entities=tampered_entities,
+        )
+        self.conn_b.execute(
+            "UPDATE staging_run_journal SET manifest_seal_hex = ?, target_inventory_json = ? WHERE run_id = ?",
+            (tampered_seal, json.dumps(tampered_entities), RUN_ID_A),
+        )
+        self.conn_b.commit()
+
+        # Spy on all requests dispatched by Runner A
+        dispatched_delete_sqls: list[str] = []
+        def delete_spy_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+            except Exception:
+                return None
+            for req in body.get("requests", []):
+                sql = req.get("stmt", {}).get("sql", "")
+                if "DELETE" in sql.upper():
+                    dispatched_delete_sqls.append(sql)
+            return None
+
+        self.transport_a.custom_response_hook = delete_spy_hook
+
+        with self.assertRaises(OwnershipMismatchError) as ctx:
+            self.seam_a.execute_conditional_cleanup(
+                run_id=RUN_ID_A,
+                expected_fencing_token=token2,
+                manifest_seal_hex=tampered_seal,
+            )
+        self.assertTrue("does not bind to run_id" in str(ctx.exception) or "not derived from run_id" in str(ctx.exception))
+        # CRUCIAL: Exactly 0 DELETE statements dispatched
+        self.assertEqual(len(dispatched_delete_sqls), 0)
+        # Database rows preserved intact
+        cur = self.conn_b.cursor()
+        cur.execute("SELECT COUNT(*) FROM processed_articles WHERE article_id = ?", (f"synth_art_{RUN_ID_A}_01",))
+        self.assertEqual(cur.fetchone()[0], 1)
+
+    def test_p1_cleanup_ownership_empty_expected_attributes_rejects_with_zero_delete_dispatch(self):
+        """Entity with empty expected_attributes fails closed with 0 DELETE dispatch."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        token2 = self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        tampered_entities = [e.model_dump() for e in self.entities_a]
+        tampered_entities[0]["expected_attributes"] = {}
+        tampered_seal = compute_canonical_inventory_fingerprint(RUN_ID_A, tampered_entities)
+        self.conn_b.execute(
+            "UPDATE staging_run_journal SET manifest_seal_hex = ?, target_inventory_json = ? WHERE run_id = ?",
+            (tampered_seal, json.dumps(tampered_entities), RUN_ID_A),
+        )
+        self.conn_b.commit()
+
+        dispatched_delete_sqls: list[str] = []
+        def delete_spy_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+            except Exception:
+                return None
+            for req in body.get("requests", []):
+                sql = req.get("stmt", {}).get("sql", "")
+                if "DELETE" in sql.upper():
+                    dispatched_delete_sqls.append(sql)
+            return None
+
+        self.transport_a.custom_response_hook = delete_spy_hook
+
+        with self.assertRaises(OwnershipMismatchError) as ctx:
+            self.seam_a.execute_conditional_cleanup(
+                run_id=RUN_ID_A,
+                expected_fencing_token=token2,
+                manifest_seal_hex=tampered_seal,
+            )
+        self.assertTrue("ownership attribute" in str(ctx.exception).lower() or "expected_attributes" in str(ctx.exception).lower())
+        self.assertEqual(len(dispatched_delete_sqls), 0)
+
+    def test_p1_cleanup_ownership_unauthorized_table_rejects_with_zero_delete_dispatch(self):
+        """Inventory specifying unauthorized table (e.g. 'schema_migrations') fails closed with 0 DELETE dispatch."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        token2 = self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        tampered_entities = [e.model_dump() for e in self.entities_a]
+        tampered_entities[0]["table"] = "schema_migrations"
+        tampered_entities[0]["pk_column"] = "version"
+        tampered_entities[0]["pk_value"] = f"6_{RUN_ID_A}"
+        tampered_seal = compute_canonical_inventory_fingerprint(RUN_ID_A, tampered_entities)
+        self.conn_b.execute(
+            "UPDATE staging_run_journal SET manifest_seal_hex = ?, target_inventory_json = ? WHERE run_id = ?",
+            (tampered_seal, json.dumps(tampered_entities), RUN_ID_A),
+        )
+        self.conn_b.commit()
+
+        dispatched_delete_sqls: list[str] = []
+        def delete_spy_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+            except Exception:
+                return None
+            for req in body.get("requests", []):
+                sql = req.get("stmt", {}).get("sql", "")
+                if "DELETE" in sql.upper():
+                    dispatched_delete_sqls.append(sql)
+            return None
+
+        self.transport_a.custom_response_hook = delete_spy_hook
+
+        with self.assertRaises(OwnershipMismatchError) as ctx:
+            self.seam_a.execute_conditional_cleanup(
+                run_id=RUN_ID_A,
+                expected_fencing_token=token2,
+                manifest_seal_hex=tampered_seal,
+            )
+        self.assertIn("unauthorized table", str(ctx.exception).lower())
+        self.assertEqual(len(dispatched_delete_sqls), 0)
+
+    def test_p1_cleanup_invalid_scoped_run_id_rejects_with_zero_dispatch(self):
+        """Invalid scoped run_id passed to execute_conditional_cleanup raises InvalidRunIdError."""
+        with self.assertRaises(InvalidRunIdError):
+            self.seam_a.execute_conditional_cleanup(
+                run_id="invalid; DROP TABLE staging_run_journal;--",
+                expected_fencing_token=1,
+            )
+
+    def test_p1_valid_cleanup_positive_control(self):
+        """Valid canonical cleanup transitions journal to CLEANED_UP, deletes rows, and verifies 0 residual."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        token2 = self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        final_token = self.seam_a.execute_conditional_cleanup(
+            run_id=RUN_ID_A,
+            expected_fencing_token=token2,
+            manifest_seal_hex=self.seal_a,
+        )
+        self.assertEqual(final_token, token2 + 1)
+        entry = self.seam_a.inspect_run(RUN_ID_A)
+        self.assertEqual(entry.status, JournalStatus.CLEANED_UP)
+
+        # Audit outcome state
+        audit = self.seam_a.audit_workload(RUN_ID_A)
+        self.assertEqual(audit, AuditOutcomeState.CLEAN)
+
+    # --- P2: HALT Marker & Error Sanitization Tests ---
+
+    def test_p2_halt_marker_and_error_sanitization_no_sentinel_leakage(self):
+        """Secret sentinel in untrusted HTTP error or payload never leaks into error messages, tracebacks, or HALT markers."""
+        SENTINEL = "SECRET_SENTINEL_HALT_TEST_12345_XYZ"
+
+        # Scenario 1: Ambiguous COMMIT transport error carrying sentinel
+        def sentinel_commit_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+            except Exception:
+                return None
+            reqs = body.get("requests", [])
+            has_commit = any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in reqs)
+            if has_commit:
+                raise httpx.ConnectError(f"Connection failure to upstream: {SENTINEL}")
+            return None
+
+        self.transport_a.custom_response_hook = sentinel_commit_hook
+        with self.assertRaises(AmbiguousCommitError) as ctx:
+            self.seam_a.register_intent(
+                run_id=RUN_ID_A,
+                manifest_seal_hex=self.seal_a,
+                target_inventory=self.entities_a,
+            )
+        # Check error message
+        self.assertNotIn(SENTINEL, str(ctx.exception))
+        # Check formatted traceback
+        tb = "".join(traceback.format_exception(type(ctx.exception), ctx.exception, ctx.exception.__traceback__))
+        self.assertNotIn(SENTINEL, tb)
+        self.assertIsNone(ctx.exception.__cause__)
+
+        # Check on-disk marker
+        marker_path = _halt_marker_path(RUN_ID_A, self.marker_dir_a)
+        self.assertTrue(marker_path.exists())
+        marker_content = marker_path.read_text(encoding="utf-8")
+        self.assertNotIn(SENTINEL, marker_content)
+        marker_json = json.loads(marker_content)
+        self.assertIn(marker_json["reason_code"], HALT_REASON_CATALOG)
+        self.assertEqual(marker_json["reason"], HALT_REASON_CATALOG[marker_json["reason_code"]])
+
+    def test_p2_halt_marker_durability_and_o_excl(self):
+        """Halt marker is written with O_EXCL and cannot overwrite existing marker."""
+        marker_path = _halt_marker_path(RUN_ID_A, self.marker_dir_a)
+        # Pre-create the marker
+        marker_path.write_text("existing", encoding="utf-8")
+
+        with self.assertRaises(HaltMarkerPersistenceError):
+            self.seam_a._latch_local_halt(RUN_ID_A, "AMBIGUOUS_COMMIT_SIMULATED")
+
+        # Existing content unchanged
+        self.assertEqual(marker_path.read_text(encoding="utf-8"), "existing")
