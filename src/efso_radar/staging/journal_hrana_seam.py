@@ -1219,7 +1219,13 @@ class StagingJournalHranaSeam:
         expected_results_count = 1 + len(statements)
         if not isinstance(results, list) or len(results) != expected_results_count:
             if baton:
-                self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="batch results shape mismatch")
+                rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="batch results shape mismatch")
+                if not rb_ok:
+                    self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
+                    raise AmbiguousRollbackError(
+                        f"Hrana results shape mismatch and ROLLBACK could not be confirmed ({rb_code}). "
+                        "Transaction outcome UNKNOWN; run locally HALTED."
+                    ) from None
             self._latch_local_halt(run_id, "RESULTS_CARDINALITY_MISMATCH")
             raise TursoClientError(
                 f"Malformed or truncated Hrana transaction results: expected {expected_results_count}, "
@@ -1237,7 +1243,13 @@ class StagingJournalHranaSeam:
             or (begin_resp_type is not None and begin_resp_type != "execute")
         ):
             if baton:
-                self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="BEGIN failed")
+                rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="BEGIN failed")
+                if not rb_ok:
+                    self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
+                    raise AmbiguousRollbackError(
+                        f"Failed to start Hrana transaction (BEGIN failed) and ROLLBACK could not be confirmed ({rb_code}). "
+                        "Transaction outcome UNKNOWN; run locally HALTED."
+                    ) from None
             self._latch_local_halt(run_id, "BEGIN_STATEMENT_FAILED")
             raise TursoClientError("Failed to start Hrana transaction: BEGIN statement execution failed.")
 
@@ -1254,7 +1266,13 @@ class StagingJournalHranaSeam:
                 err_dict = s_res.get("error", {}) if isinstance(s_res, dict) and isinstance(s_res.get("error"), dict) else {}
                 valid_code, category = _sanitize_hrana_error(err_dict.get("code"))
                 if baton:
-                    self._dispatch_verified_rollback(baton=baton, run_id=run_id, context=f"statement {idx} failed")
+                    rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context=f"statement {idx} failed")
+                    if not rb_ok:
+                        self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
+                        raise AmbiguousRollbackError(
+                            f"Statement {idx} failed in Hrana transaction ({valid_code}) and ROLLBACK could not be confirmed ({rb_code}). "
+                            "Transaction outcome UNKNOWN; run locally HALTED."
+                        ) from None
                 self._latch_local_halt(run_id, "STATEMENT_EXECUTION_FAILED")
                 raise TursoClientError(f"Statement {idx} failed in Hrana transaction ({valid_code}): {category}")
 
@@ -1574,8 +1592,8 @@ class StagingJournalHranaSeam:
             )
         if manifest_seal_hex is not None and manifest_seal_hex != entry.manifest_seal_hex:
             raise ManifestTamperedError(
-                f"Provided manifest_seal_hex '{manifest_seal_hex}' does not match registered seal '{entry.manifest_seal_hex}'."
-            )
+                "Provided manifest_seal_hex does not match registered seal."
+            ) from None
 
         validate_status_transition(entry.status, JournalStatus.MUTATING)
 
@@ -1714,7 +1732,7 @@ class StagingJournalHranaSeam:
     ) -> int:
         """Execute fail-closed conditional cleanup with in-transaction audit verification."""
         if not isinstance(run_id, str) or not RUN_ID_REGEX.fullmatch(run_id):
-            raise InvalidRunIdError(f"Invalid scoped run_id format for cleanup: '{run_id}'.")
+            raise InvalidRunIdError("Invalid scoped run_id format for cleanup.")
 
         if self.is_halted(run_id):
             raise JournalHaltedError(f"Run '{run_id}' is locally HALTED. Cleanup rejected fail-closed.")
@@ -1726,11 +1744,11 @@ class StagingJournalHranaSeam:
             raise FencingConflictError(f"Run '{run_id}' not found in staging_run_journal.")
         if entry.run_id != run_id:
             raise OwnershipMismatchError(
-                f"Journal record run_id '{entry.run_id}' does not match requested run_id '{run_id}'."
+                "Journal record run_id does not match requested run_id."
             )
         if entry.owner_id != self._owner_id:
             raise StaleOwnerError(
-                f"Cleanup ownership violation: runner '{self._owner_id}' is not registered owner '{entry.owner_id}' for run '{run_id}'."
+                "Cleanup ownership violation: runner is not registered owner for run."
             )
         if entry.fencing_token != expected_fencing_token:
             raise FencingConflictError(
@@ -1738,31 +1756,33 @@ class StagingJournalHranaSeam:
             )
 
         if not isinstance(entry.manifest_seal_hex, str) or not HEX_SHA256_REGEX.fullmatch(entry.manifest_seal_hex):
-            raise ManifestTamperedError("Stored manifest seal is not a valid 64-char lowercase hex string.")
+            self._latch_local_halt(run_id, "CLEANUP_OWNERSHIP_VIOLATION")
+            raise ManifestTamperedError("Stored manifest seal is not a valid 64-char lowercase hex string.") from None
 
         if manifest_seal_hex is not None:
             if not isinstance(manifest_seal_hex, str) or not HEX_SHA256_REGEX.fullmatch(manifest_seal_hex):
-                raise ManifestTamperedError("Provided manifest_seal_hex is not a valid 64-char lowercase hex string.")
+                self._latch_local_halt(run_id, "CLEANUP_OWNERSHIP_VIOLATION")
+                raise ManifestTamperedError("Provided manifest_seal_hex is not a valid 64-char lowercase hex string.") from None
             if manifest_seal_hex != entry.manifest_seal_hex:
-                raise ManifestTamperedError(
-                    f"Provided manifest_seal_hex '{manifest_seal_hex}' does not match registered seal '{entry.manifest_seal_hex}'."
-                )
+                self._latch_local_halt(run_id, "CLEANUP_OWNERSHIP_VIOLATION")
+                raise ManifestTamperedError("Provided manifest_seal_hex does not match registered seal.") from None
 
         validate_status_transition(entry.status, JournalStatus.CLEANUP_PENDING)
 
         raw_inv_json = entry.target_inventory_json
         if not isinstance(raw_inv_json, str) or not raw_inv_json.strip() or len(raw_inv_json) > 65536:
-            raise ManifestTamperedError("Invalid or oversized target_inventory_json in journal record.")
+            self._latch_local_halt(run_id, "CLEANUP_OWNERSHIP_VIOLATION")
+            raise ManifestTamperedError("Invalid or oversized target_inventory_json in journal record.") from None
 
         try:
             raw_entities = json.loads(raw_inv_json)
-        except Exception as exc:
-            raise ManifestTamperedError(f"Malformed target_inventory_json JSON: {exc}") from exc
+        except Exception:
+            self._latch_local_halt(run_id, "CLEANUP_OWNERSHIP_VIOLATION")
+            raise ManifestTamperedError("Malformed target_inventory_json structure.") from None
 
         if not isinstance(raw_entities, list) or len(raw_entities) != 5:
-            raise ManifestTamperedError(
-                f"Cleanup target inventory must contain exactly 5 canonical entities, got {len(raw_entities) if isinstance(raw_entities, list) else type(raw_entities)}."
-            )
+            self._latch_local_halt(run_id, "CLEANUP_OWNERSHIP_VIOLATION")
+            raise ManifestTamperedError("Cleanup target inventory must contain exactly 5 canonical entities.") from None
 
         try:
             PerRunOwnershipManifest.validate_payload({
@@ -1772,19 +1792,23 @@ class StagingJournalHranaSeam:
                 "registered_entities": raw_entities,
             })
         except Exception as exc:
+            self._latch_local_halt(run_id, "CLEANUP_OWNERSHIP_VIOLATION")
             msg = str(exc).lower()
-            if "not derived from run_id" in msg or "attribute" in msg or "table" in msg or "pk" in msg:
-                raise OwnershipMismatchError(f"Target inventory ownership violation: {exc}") from exc
-            raise ManifestTamperedError(f"Target inventory failed PerRunOwnershipManifest validation: {exc}") from exc
+            if "not derived from run_id" in msg or "pk" in msg:
+                raise OwnershipMismatchError("Target inventory ownership violation: PK not derived from run_id.") from None
+            if "attribute" in msg or "expected_attributes" in msg:
+                raise OwnershipMismatchError("Target inventory ownership violation: ownership attribute mismatch or missing expected_attributes.") from None
+            if "table" in msg:
+                raise OwnershipMismatchError("Target inventory ownership violation: unauthorized table.") from None
+            raise ManifestTamperedError("Target inventory failed canonical manifest validation.") from None
 
         recomputed_seal = compute_canonical_inventory_fingerprint(
             run_id=run_id,
             entities=raw_entities,
         )
         if recomputed_seal != entry.manifest_seal_hex:
-            raise ManifestTamperedError(
-                f"Recomputed inventory fingerprint '{recomputed_seal}' does not match registered seal '{entry.manifest_seal_hex}'."
-            )
+            self._latch_local_halt(run_id, "CLEANUP_OWNERSHIP_VIOLATION")
+            raise ManifestTamperedError("Recomputed inventory fingerprint does not match registered seal.") from None
 
         registered_entities = entry.get_registered_entities()
         sorted_entities = sorted(
@@ -1810,26 +1834,35 @@ class StagingJournalHranaSeam:
             exp_attrs = ent.get("expected_attributes")
 
             if not isinstance(tbl, str) or tbl not in ALLOWED_TABLE_PK_MAP:
-                raise OwnershipMismatchError(f"Unauthorized or invalid table '{tbl}' in cleanup inventory.")
+                self._latch_local_halt(run_id, "CLEANUP_OWNERSHIP_VIOLATION")
+                raise OwnershipMismatchError("Target inventory ownership violation: unauthorized table in cleanup inventory.") from None
             if not isinstance(pk_col, str) or pk_col != ALLOWED_TABLE_PK_MAP[tbl]:
-                raise OwnershipMismatchError(f"Invalid primary key column '{pk_col}' for table '{tbl}'.")
+                self._latch_local_halt(run_id, "CLEANUP_OWNERSHIP_VIOLATION")
+                raise OwnershipMismatchError("Target inventory ownership violation: invalid primary key column for table in cleanup inventory.") from None
             if not ident_pattern.fullmatch(tbl) or not ident_pattern.fullmatch(pk_col):
-                raise OwnershipMismatchError(f"Invalid SQL identifier in table '{tbl}' or column '{pk_col}'.")
+                self._latch_local_halt(run_id, "CLEANUP_OWNERSHIP_VIOLATION")
+                raise OwnershipMismatchError("Target inventory ownership violation: invalid SQL identifier in cleanup inventory.") from None
             if not isinstance(pk_val, str) or not pk_val.strip() or len(pk_val) > 256:
-                raise OwnershipMismatchError(f"Invalid pk_value for table '{tbl}'.")
+                self._latch_local_halt(run_id, "CLEANUP_OWNERSHIP_VIOLATION")
+                raise OwnershipMismatchError("Target inventory ownership violation: invalid pk_value in cleanup inventory.") from None
             if run_id not in pk_val:
-                raise OwnershipMismatchError(f"Entity pk_value '{pk_val}' does not bind to run_id '{run_id}'.")
+                self._latch_local_halt(run_id, "CLEANUP_OWNERSHIP_VIOLATION")
+                raise OwnershipMismatchError("Target inventory ownership violation: entity pk_value does not bind to run_id.") from None
             if not isinstance(exp_attrs, dict) or not exp_attrs:
-                raise OwnershipMismatchError(f"Entity for table '{tbl}' has empty or invalid expected_attributes.")
+                self._latch_local_halt(run_id, "CLEANUP_OWNERSHIP_VIOLATION")
+                raise OwnershipMismatchError("Target inventory ownership violation: entity has empty or missing expected_attributes.") from None
 
             for attr_k, attr_v in exp_attrs.items():
                 if not isinstance(attr_k, str) or not ident_pattern.fullmatch(attr_k):
-                    raise OwnershipMismatchError(f"Invalid attribute column name '{attr_k}' in table '{tbl}'.")
+                    self._latch_local_halt(run_id, "CLEANUP_OWNERSHIP_VIOLATION")
+                    raise OwnershipMismatchError("Target inventory ownership violation: invalid attribute column name in cleanup inventory.") from None
                 if isinstance(attr_v, list):
                     if not attr_v or not all(isinstance(v, (str, int)) and len(str(v)) <= 512 for v in attr_v):
-                        raise OwnershipMismatchError(f"Invalid attribute list values for column '{attr_k}' in table '{tbl}'.")
+                        self._latch_local_halt(run_id, "CLEANUP_OWNERSHIP_VIOLATION")
+                        raise OwnershipMismatchError("Target inventory ownership violation: invalid attribute list values in cleanup inventory.") from None
                 elif not (isinstance(attr_v, (str, int)) and len(str(attr_v)) <= 512):
-                    raise OwnershipMismatchError(f"Invalid attribute value for column '{attr_k}' in table '{tbl}'.")
+                    self._latch_local_halt(run_id, "CLEANUP_OWNERSHIP_VIOLATION")
+                    raise OwnershipMismatchError("Target inventory ownership violation: invalid attribute value in cleanup inventory.") from None
 
         new_fencing_token = expected_fencing_token + 1
 
@@ -1919,7 +1952,13 @@ class StagingJournalHranaSeam:
 
         expected_results1_count = 2 + len(sorted_entities)
         if not isinstance(results1, list) or len(results1) != expected_results1_count:
-            self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 1 truncated cleanup response")
+            rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 1 truncated cleanup response")
+            if not rb_ok:
+                self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
+                raise AmbiguousRollbackError(
+                    f"Truncated Phase 1 cleanup response and ROLLBACK could not be confirmed ({rb_code}). "
+                    "Transaction outcome UNKNOWN; run locally HALTED."
+                ) from None
             self._latch_local_halt(run_id, "CLEANUP_PHASE1_TRUNCATED")
             raise CleanupVerificationError(
                 f"Truncated Phase 1 cleanup response: expected {expected_results1_count}, "
@@ -1935,7 +1974,13 @@ class StagingJournalHranaSeam:
             or begin_res.get("type") != "ok"
             or (begin_resp_type is not None and begin_resp_type != "execute")
         ):
-            self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 1 BEGIN failed")
+            rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 1 BEGIN failed")
+            if not rb_ok:
+                self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
+                raise AmbiguousRollbackError(
+                    f"Failed to begin cleanup transaction and ROLLBACK could not be confirmed ({rb_code}). "
+                    "Transaction outcome UNKNOWN; run locally HALTED."
+                ) from None
             self._latch_local_halt(run_id, "BEGIN_STATEMENT_FAILED")
             raise TursoClientError("Failed to begin cleanup transaction.")
 
@@ -1962,6 +2007,12 @@ class StagingJournalHranaSeam:
         cas_resp_type = cas_resp_obj.get("type") if isinstance(cas_resp_obj, dict) else None
         if cas_resp_type is not None and cas_resp_type != "execute":
             rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="cleanup CAS malformed response")
+            if not rb_ok:
+                self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
+                raise AmbiguousRollbackError(
+                    f"Cleanup CAS response malformed, and ROLLBACK could not be confirmed ({rb_code}). "
+                    "Transaction outcome UNKNOWN; run locally HALTED."
+                ) from None
             self._latch_local_halt(run_id, "CLEANUP_PHASE1_MALFORMED")
             raise FencingConflictError("Cleanup CAS response malformed. Transaction rolled back fail-closed.")
 
@@ -1999,6 +2050,12 @@ class StagingJournalHranaSeam:
                     run_id=run_id,
                     context=f"DELETE statement {del_idx} failed",
                 )
+                if not rb_ok:
+                    self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
+                    raise AmbiguousRollbackError(
+                        f"Cleanup DELETE statement {del_idx} failed ({valid_code}), and ROLLBACK could not be confirmed ({rb_code}). "
+                        "Transaction outcome UNKNOWN; run locally HALTED."
+                    ) from None
                 self._latch_local_halt(run_id, "CLEANUP_PHASE1_FAILED")
                 raise CleanupVerificationError(
                     f"Cleanup DELETE statement {del_idx} failed ({valid_code}). Transaction rolled back."
@@ -2021,12 +2078,24 @@ class StagingJournalHranaSeam:
         except PermissionError:
             raise
         except (TursoAmbiguousTransactionError, TursoClientError, httpx.HTTPError, Exception):
-            self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 2 audit dispatch failed")
+            rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 2 audit dispatch failed")
+            if not rb_ok:
+                self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
+                raise AmbiguousRollbackError(
+                    f"Phase 2 audit pipeline dispatch failed and ROLLBACK could not be confirmed ({rb_code}). "
+                    "Transaction outcome UNKNOWN; run locally HALTED."
+                ) from None
             self._latch_local_halt(run_id, "CLEANUP_PHASE2_AUDIT_FAILED")
             raise CleanupVerificationError("Phase 2 audit pipeline dispatch failed in cleanup. Run locally HALTED.") from None
 
         if not isinstance(res2, dict):
-            self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 2 malformed response")
+            rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 2 malformed response")
+            if not rb_ok:
+                self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
+                raise AmbiguousRollbackError(
+                    f"Malformed Phase 2 audit response and ROLLBACK could not be confirmed ({rb_code}). "
+                    "Transaction outcome UNKNOWN; run locally HALTED."
+                ) from None
             self._latch_local_halt(run_id, "CLEANUP_PHASE2_AUDIT_MALFORMED")
             raise CleanupVerificationError("Malformed Phase 2 audit response. Run locally HALTED.")
 
@@ -2035,7 +2104,13 @@ class StagingJournalHranaSeam:
 
         expected_audit_count = len(sorted_entities)
         if not isinstance(results2, list) or len(results2) != expected_audit_count:
-            self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 2 truncated response")
+            rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 2 truncated response")
+            if not rb_ok:
+                self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
+                raise AmbiguousRollbackError(
+                    f"Truncated in-transaction cleanup audit response and ROLLBACK could not be confirmed ({rb_code}). "
+                    "Transaction outcome UNKNOWN; run locally HALTED."
+                ) from None
             self._latch_local_halt(run_id, "CLEANUP_PHASE2_AUDIT_TRUNCATED")
             raise CleanupVerificationError(
                 f"Truncated in-transaction cleanup audit response: expected {expected_audit_count}, "
@@ -2082,7 +2157,13 @@ class StagingJournalHranaSeam:
                 break
 
         if residual_detected:
-            self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 2 residual detected")
+            rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 2 residual detected")
+            if not rb_ok:
+                self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
+                raise AmbiguousRollbackError(
+                    f"In-transaction cleanup audit failed, and ROLLBACK could not be confirmed ({rb_code}). "
+                    "Transaction outcome UNKNOWN; run locally HALTED."
+                ) from None
             self._latch_local_halt(run_id, "CLEANUP_RESIDUAL_DETECTED")
             raise CleanupVerificationError(
                 f"In-transaction cleanup audit failed: {residual_detected}. "
@@ -2123,14 +2204,26 @@ class StagingJournalHranaSeam:
         except PermissionError:
             raise
         except (TursoAmbiguousTransactionError, TursoClientError, httpx.HTTPError, Exception):
-            self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 3 dispatch failed")
+            rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 3 dispatch failed")
+            if not rb_ok:
+                self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
+                raise AmbiguousRollbackError(
+                    f"Phase 3 finalization dispatch failed and ROLLBACK could not be confirmed ({rb_code}). "
+                    "Transaction outcome UNKNOWN; run locally HALTED."
+                ) from None
             self._latch_local_halt(run_id, "CLEANUP_PHASE3_FAILED")
             raise CleanupVerificationError(
                 "Phase 3 finalization pipeline dispatch failed in cleanup. Run locally HALTED."
             ) from None
 
         if not isinstance(res3, dict):
-            self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 3 malformed response")
+            rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 3 malformed response")
+            if not rb_ok:
+                self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
+                raise AmbiguousRollbackError(
+                    f"Malformed Phase 3 finalization response and ROLLBACK could not be confirmed ({rb_code}). "
+                    "Transaction outcome UNKNOWN; run locally HALTED."
+                ) from None
             self._latch_local_halt(run_id, "CLEANUP_PHASE3_MALFORMED")
             raise CleanupVerificationError("Malformed Phase 3 finalization response. Run locally HALTED.")
 
@@ -2139,7 +2232,13 @@ class StagingJournalHranaSeam:
 
         expected_prep_count = len(req3)
         if not isinstance(results3, list) or len(results3) != expected_prep_count:
-            self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 3 truncated prep response")
+            rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 3 truncated prep response")
+            if not rb_ok:
+                self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
+                raise AmbiguousRollbackError(
+                    f"Truncated Phase 3 cleanup preparation response and ROLLBACK could not be confirmed ({rb_code}). "
+                    "Transaction outcome UNKNOWN; run locally HALTED."
+                ) from None
             self._latch_local_halt(run_id, "CLEANUP_PHASE3_TRUNCATED")
             raise CleanupVerificationError(
                 f"Truncated Phase 3 cleanup preparation response: expected {expected_prep_count}, "
@@ -2156,14 +2255,13 @@ class StagingJournalHranaSeam:
             ):
                 err_dict = p_res.get("error", {}) if isinstance(p_res, dict) and isinstance(p_res.get("error"), dict) else {}
                 valid_code, _ = _sanitize_hrana_error(err_dict.get("code"))
-                self._dispatch_verified_rollback(baton=baton, run_id=run_id, context=f"Phase 3 statement {p_idx} failed")
-                self._latch_local_halt(run_id, "CLEANUP_PHASE3_STATEMENT_FAILED")
-                raise CleanupVerificationError(
-                    f"Cleanup finalization statement {p_idx} failed ({valid_code}). Transaction rolled back."
-                )
-                err_dict = p_res.get("error", {}) if isinstance(p_res, dict) and isinstance(p_res.get("error"), dict) else {}
-                valid_code, _ = _sanitize_hrana_error(err_dict.get("code"))
-                self._dispatch_verified_rollback(baton=baton, run_id=run_id, context=f"Phase 3 statement {p_idx} failed")
+                rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context=f"Phase 3 statement {p_idx} failed")
+                if not rb_ok:
+                    self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
+                    raise AmbiguousRollbackError(
+                        f"Cleanup finalization statement {p_idx} failed ({valid_code}), and ROLLBACK could not be confirmed ({rb_code}). "
+                        "Transaction outcome UNKNOWN; run locally HALTED."
+                    ) from None
                 self._latch_local_halt(run_id, "CLEANUP_PHASE3_STATEMENT_FAILED")
                 raise CleanupVerificationError(
                     f"Cleanup finalization statement {p_idx} failed ({valid_code}). Transaction rolled back."
@@ -2175,7 +2273,13 @@ class StagingJournalHranaSeam:
         last_res_dict = last_resp_obj.get("result") if isinstance(last_resp_obj, dict) else None
         affected_journal = last_res_dict.get("affected_row_count", 0) if isinstance(last_res_dict, dict) else None
         if affected_journal != 1:
-            self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 3 journal UPDATE != 1")
+            rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 3 journal UPDATE != 1")
+            if not rb_ok:
+                self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
+                raise AmbiguousRollbackError(
+                    f"Journal UPDATE to CLEANED_UP affected {affected_journal} rows (expected 1), and ROLLBACK could not be confirmed ({rb_code}). "
+                    "Transaction outcome UNKNOWN; run locally HALTED."
+                ) from None
             self._latch_local_halt(run_id, "CLEANUP_PHASE3_ROWCOUNT_MISMATCH")
             raise CleanupVerificationError(
                 f"Failed to update journal status to CLEANED_UP: affected {affected_journal} rows (expected 1). "

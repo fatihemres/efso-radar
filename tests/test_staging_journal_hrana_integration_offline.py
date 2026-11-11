@@ -1034,6 +1034,24 @@ class TestScenario8ConditionalCleanupAndAudits(_BaseTwoRunnerFixture):
                 body = json.loads(request.content.decode("utf-8"))
                 reqs = body.get("requests", [])
                 has_delete = any("DELETE FROM" in r.get("stmt", {}).get("sql", "").upper() for r in reqs)
+                has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+                if has_rollback:
+                    return httpx.Response(
+                        200,
+                        json={
+                            "baton": body.get("baton"),
+                            "results": [
+                                {
+                                    "type": "ok",
+                                    "response": {
+                                        "type": "execute",
+                                        "result": {"cols": [], "rows": []},
+                                    },
+                                }
+                            ],
+                        },
+                        request=request,
+                    )
                 if has_delete:
                     results = [
                         {"type": "ok", "response": {"result": {"affected_row_count": 0, "rows": []}}},  # BEGIN
@@ -1531,6 +1549,27 @@ class TestMockHranaTransactionLifecycle(_BaseTwoRunnerFixture):
                     r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN"
                     for r in reqs
                 )
+                has_rollback = any(
+                    r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK"
+                    for r in reqs
+                )
+                if has_rollback:
+                    return httpx.Response(
+                        200,
+                        json={
+                            "baton": body.get("baton"),
+                            "results": [
+                                {
+                                    "type": "ok",
+                                    "response": {
+                                        "type": "execute",
+                                        "result": {"cols": [], "rows": []},
+                                    },
+                                }
+                            ],
+                        },
+                        request=request,
+                    )
                 if has_begin:
                     return httpx.Response(
                         200,
@@ -1569,6 +1608,27 @@ class TestMockHranaTransactionLifecycle(_BaseTwoRunnerFixture):
                     r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN"
                     for r in reqs
                 )
+                has_rollback = any(
+                    r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK"
+                    for r in reqs
+                )
+                if has_rollback:
+                    return httpx.Response(
+                        200,
+                        json={
+                            "baton": body.get("baton"),
+                            "results": [
+                                {
+                                    "type": "ok",
+                                    "response": {
+                                        "type": "execute",
+                                        "result": {"cols": [], "rows": []},
+                                    },
+                                }
+                            ],
+                        },
+                        request=request,
+                    )
                 if has_begin:
                     results = [{"type": "ok", "response": {"result": {"affected_row_count": 0, "rows": []}}}]
                     results.append({
@@ -5333,6 +5393,240 @@ class TestIssue97WritePathSecurity(_BaseTwoRunnerFixture):
         self.assertIn("ROLLBACK could not be confirmed", str(ctx.exception))
         self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
 
+    def test_p1_cleanup_cas_malformed_response_fault_matrix(self):
+        """Fault matrix for Phase 1 CAS statement failure across confirmed vs unverified rollback."""
+        scenarios = [
+            ("confirmed", FencingConflictError, "CLEANUP_PHASE1_FAILED", "Cleanup CAS failed (UNKNOWN). Transaction rolled back fail-closed."),
+            ("503", AmbiguousRollbackError, "AMBIGUOUS_ROLLBACK_UNVERIFIED", "ROLLBACK could not be confirmed (ROLLBACK_TRANSPORT_ERROR)"),
+            ("timeout", AmbiguousRollbackError, "AMBIGUOUS_ROLLBACK_UNVERIFIED", "ROLLBACK could not be confirmed (ROLLBACK_TRANSPORT_ERROR)"),
+            ("inner_close", AmbiguousRollbackError, "AMBIGUOUS_ROLLBACK_UNVERIFIED", "ROLLBACK_VERIFICATION_FAILED_INNER_TYPE_NOT_EXECUTE"),
+        ]
+
+        for idx, (rb_scenario, expected_exc, expected_reason_code, expected_msg_substr) in enumerate(scenarios, start=1):
+            with self.subTest(scenario=rb_scenario):
+                # Clean up previous state
+                self.transport_a.custom_response_hook = None
+                self.conn_a.rollback()
+                self.transport_a.active_batons.clear()
+                self.transport_a.in_transaction.clear()
+                self.conn_a.execute("DELETE FROM staging_run_journal")
+                self.conn_a.execute("DELETE FROM run_locks")
+                self.conn_a.commit()
+
+                sub_run_id = f"run_20261107T12100{idx}Z_a1b2c3d4e5{idx:02d}"
+                sub_entities = create_default_manifest_entities(sub_run_id)
+                sub_seal = compute_canonical_inventory_fingerprint(sub_run_id, sub_entities)
+
+                self.seam_a.register_intent(
+                    run_id=sub_run_id,
+                    manifest_seal_hex=sub_seal,
+                    target_inventory=sub_entities,
+                )
+                mutations = build_live02_synthetic_mutations(sub_run_id)
+                token = self.seam_a.execute_atomic_stage_mutation(
+                    run_id=sub_run_id,
+                    expected_fencing_token=1,
+                    stage="LIVE-02",
+                    mutation_statements=mutations,
+                    manifest_seal_hex=sub_seal,
+                )
+
+                def fault_hook(request: httpx.Request) -> Optional[httpx.Response]:
+                    try:
+                        body = json.loads(request.content.decode("utf-8"))
+                    except Exception:
+                        return None
+                    reqs = body.get("requests", [])
+                    has_delete = any("DELETE FROM" in r.get("stmt", {}).get("sql", "").upper() for r in reqs)
+                    has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+
+                    if has_delete:
+                        # Return malformed CAS response (type != "ok")
+                        results = [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": [], "affected_row_count": 0}}},  # BEGIN
+                            {"type": "error", "error": {"code": "UNKNOWN"}},  # CAS failed
+                        ]
+                        for _ in range(len(reqs) - 2):
+                            results.append({"type": "ok", "response": {"type": "execute", "result": {"affected_row_count": 0}}})
+                        return httpx.Response(
+                            200,
+                            json={"baton": body.get("baton", "b_cas_fault"), "results": results},
+                            request=request,
+                        )
+
+                    if has_rollback:
+                        if rb_scenario == "confirmed":
+                            return httpx.Response(
+                                200,
+                                json={
+                                    "baton": body.get("baton"),
+                                    "results": [
+                                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}}
+                                    ],
+                                },
+                                request=request,
+                            )
+                        elif rb_scenario == "503":
+                            return httpx.Response(503, json={"error": "Service Unavailable"}, request=request)
+                        elif rb_scenario == "timeout":
+                            raise httpx.ReadTimeout("Simulated timeout during rollback", request=request)
+                        elif rb_scenario == "inner_close":
+                            return httpx.Response(
+                                200,
+                                json={
+                                    "baton": body.get("baton"),
+                                    "results": [
+                                        {"type": "ok", "response": {"type": "close"}}
+                                    ],
+                                },
+                                request=request,
+                            )
+                    return None
+
+                self.transport_a.custom_response_hook = fault_hook
+                try:
+                    with self.assertRaises(expected_exc) as ctx:
+                        self.seam_a.execute_conditional_cleanup(
+                            run_id=sub_run_id,
+                            expected_fencing_token=token,
+                            manifest_seal_hex=sub_seal,
+                        )
+                    self.assertIn(expected_msg_substr, str(ctx.exception))
+                    self.assertTrue(self.seam_a.is_halted(sub_run_id))
+
+                    marker_path = _halt_marker_path(sub_run_id, self.marker_dir_a)
+                    self.assertTrue(marker_path.exists())
+                    payload = json.loads(marker_path.read_text(encoding="utf-8"))
+                    self.assertEqual(payload["reason_code"], expected_reason_code)
+                    self.assertEqual(payload["reason"], HALT_REASON_CATALOG[expected_reason_code])
+
+                    # Verify subsequent attempt remains blocked
+                    with self.assertRaises(JournalHaltedError):
+                        self.seam_a.execute_conditional_cleanup(
+                            run_id=sub_run_id,
+                            expected_fencing_token=token,
+                            manifest_seal_hex=sub_seal,
+                        )
+                finally:
+                    self.transport_a.custom_response_hook = None
+
+    def test_p1_cleanup_delete_error_fault_matrix(self):
+        """Fault matrix for Phase 1 DELETE statement error across confirmed vs unverified rollback."""
+        scenarios = [
+            ("confirmed", CleanupVerificationError, "CLEANUP_PHASE1_FAILED", "Cleanup DELETE statement 0 failed (SQLITE_CONSTRAINT). Transaction rolled back."),
+            ("503", AmbiguousRollbackError, "AMBIGUOUS_ROLLBACK_UNVERIFIED", "ROLLBACK could not be confirmed (ROLLBACK_TRANSPORT_ERROR)"),
+            ("timeout", AmbiguousRollbackError, "AMBIGUOUS_ROLLBACK_UNVERIFIED", "ROLLBACK could not be confirmed (ROLLBACK_TRANSPORT_ERROR)"),
+            ("inner_close", AmbiguousRollbackError, "AMBIGUOUS_ROLLBACK_UNVERIFIED", "ROLLBACK_VERIFICATION_FAILED_INNER_TYPE_NOT_EXECUTE"),
+        ]
+
+        for idx, (rb_scenario, expected_exc, expected_reason_code, expected_msg_substr) in enumerate(scenarios, start=1):
+            with self.subTest(scenario=rb_scenario):
+                # Clean up previous state
+                self.transport_a.custom_response_hook = None
+                self.conn_a.rollback()
+                self.transport_a.active_batons.clear()
+                self.transport_a.in_transaction.clear()
+                self.conn_a.execute("DELETE FROM staging_run_journal")
+                self.conn_a.execute("DELETE FROM run_locks")
+                self.conn_a.commit()
+
+                sub_run_id = f"run_20261107T12110{idx}Z_a1b2c3d4e5{idx:02d}"
+                sub_entities = create_default_manifest_entities(sub_run_id)
+                sub_seal = compute_canonical_inventory_fingerprint(sub_run_id, sub_entities)
+
+                self.seam_a.register_intent(
+                    run_id=sub_run_id,
+                    manifest_seal_hex=sub_seal,
+                    target_inventory=sub_entities,
+                )
+                mutations = build_live02_synthetic_mutations(sub_run_id)
+                token = self.seam_a.execute_atomic_stage_mutation(
+                    run_id=sub_run_id,
+                    expected_fencing_token=1,
+                    stage="LIVE-02",
+                    mutation_statements=mutations,
+                    manifest_seal_hex=sub_seal,
+                )
+
+                def fault_hook(request: httpx.Request) -> Optional[httpx.Response]:
+                    try:
+                        body = json.loads(request.content.decode("utf-8"))
+                    except Exception:
+                        return None
+                    reqs = body.get("requests", [])
+                    has_delete = any("DELETE FROM" in r.get("stmt", {}).get("sql", "").upper() for r in reqs)
+                    has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+
+                    if has_delete:
+                        results = [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": [], "affected_row_count": 0}}},  # BEGIN
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": [], "affected_row_count": 1}}},  # CAS
+                            {"type": "error", "error": {"code": "SQLITE_CONSTRAINT"}},  # DELETE statement 0 failed
+                        ]
+                        for _ in range(len(reqs) - 3):
+                            results.append({"type": "ok", "response": {"type": "execute", "result": {"affected_row_count": 0}}})
+                        return httpx.Response(
+                            200,
+                            json={"baton": body.get("baton", "b_del_fault"), "results": results},
+                            request=request,
+                        )
+
+                    if has_rollback:
+                        if rb_scenario == "confirmed":
+                            return httpx.Response(
+                                200,
+                                json={
+                                    "baton": body.get("baton"),
+                                    "results": [
+                                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}}
+                                    ],
+                                },
+                                request=request,
+                            )
+                        elif rb_scenario == "503":
+                            return httpx.Response(503, json={"error": "Service Unavailable"}, request=request)
+                        elif rb_scenario == "timeout":
+                            raise httpx.ReadTimeout("Simulated timeout during rollback", request=request)
+                        elif rb_scenario == "inner_close":
+                            return httpx.Response(
+                                200,
+                                json={
+                                    "baton": body.get("baton"),
+                                    "results": [
+                                        {"type": "ok", "response": {"type": "close"}}
+                                    ],
+                                },
+                                request=request,
+                            )
+                    return None
+
+                self.transport_a.custom_response_hook = fault_hook
+                try:
+                    with self.assertRaises(expected_exc) as ctx:
+                        self.seam_a.execute_conditional_cleanup(
+                            run_id=sub_run_id,
+                            expected_fencing_token=token,
+                            manifest_seal_hex=sub_seal,
+                        )
+                    self.assertIn(expected_msg_substr, str(ctx.exception))
+                    self.assertTrue(self.seam_a.is_halted(sub_run_id))
+
+                    marker_path = _halt_marker_path(sub_run_id, self.marker_dir_a)
+                    self.assertTrue(marker_path.exists())
+                    payload = json.loads(marker_path.read_text(encoding="utf-8"))
+                    self.assertEqual(payload["reason_code"], expected_reason_code)
+                    self.assertEqual(payload["reason"], HALT_REASON_CATALOG[expected_reason_code])
+
+                    # Verify subsequent attempt remains blocked
+                    with self.assertRaises(JournalHaltedError):
+                        self.seam_a.execute_conditional_cleanup(
+                            run_id=sub_run_id,
+                            expected_fencing_token=token,
+                            manifest_seal_hex=sub_seal,
+                        )
+                finally:
+                    self.transport_a.custom_response_hook = None
+
     # --- P1: Cleanup Ownership & Pre-DELETE Validation Tests ---
 
     def test_p1_cleanup_ownership_forged_foreign_pk_with_recomputed_seal_rejects_with_zero_delete_dispatch(self):
@@ -5387,13 +5681,29 @@ class TestIssue97WritePathSecurity(_BaseTwoRunnerFixture):
                 expected_fencing_token=token2,
                 manifest_seal_hex=tampered_seal,
             )
-        self.assertTrue("does not bind to run_id" in str(ctx.exception) or "not derived from run_id" in str(ctx.exception))
+        self.assertIn("Target inventory ownership violation: PK not derived from run_id.", str(ctx.exception))
         # CRUCIAL: Exactly 0 DELETE statements dispatched
         self.assertEqual(len(dispatched_delete_sqls), 0)
         # Database rows preserved intact
         cur = self.conn_b.cursor()
         cur.execute("SELECT COUNT(*) FROM processed_articles WHERE article_id = ?", (f"synth_art_{RUN_ID_A}_01",))
         self.assertEqual(cur.fetchone()[0], 1)
+
+        # Persistent HALT latched for owned run
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+        marker_path = _halt_marker_path(RUN_ID_A, self.marker_dir_a)
+        self.assertTrue(marker_path.exists())
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["reason_code"], "CLEANUP_OWNERSHIP_VIOLATION")
+        self.assertEqual(payload["reason"], HALT_REASON_CATALOG["CLEANUP_OWNERSHIP_VIOLATION"])
+
+        # Subsequent attempts remain blocked fail-closed
+        with self.assertRaises(JournalHaltedError):
+            self.seam_a.execute_conditional_cleanup(
+                run_id=RUN_ID_A,
+                expected_fencing_token=token2,
+                manifest_seal_hex=tampered_seal,
+            )
 
     def test_p1_cleanup_ownership_empty_expected_attributes_rejects_with_zero_delete_dispatch(self):
         """Entity with empty expected_attributes fails closed with 0 DELETE dispatch."""
@@ -5440,8 +5750,24 @@ class TestIssue97WritePathSecurity(_BaseTwoRunnerFixture):
                 expected_fencing_token=token2,
                 manifest_seal_hex=tampered_seal,
             )
-        self.assertTrue("ownership attribute" in str(ctx.exception).lower() or "expected_attributes" in str(ctx.exception).lower())
+        self.assertIn("Target inventory ownership violation: ownership attribute mismatch or missing expected_attributes.", str(ctx.exception))
         self.assertEqual(len(dispatched_delete_sqls), 0)
+
+        # Persistent HALT latched for owned run
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+        marker_path = _halt_marker_path(RUN_ID_A, self.marker_dir_a)
+        self.assertTrue(marker_path.exists())
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["reason_code"], "CLEANUP_OWNERSHIP_VIOLATION")
+        self.assertEqual(payload["reason"], HALT_REASON_CATALOG["CLEANUP_OWNERSHIP_VIOLATION"])
+
+        # Subsequent attempts remain blocked fail-closed
+        with self.assertRaises(JournalHaltedError):
+            self.seam_a.execute_conditional_cleanup(
+                run_id=RUN_ID_A,
+                expected_fencing_token=token2,
+                manifest_seal_hex=tampered_seal,
+            )
 
     def test_p1_cleanup_ownership_unauthorized_table_rejects_with_zero_delete_dispatch(self):
         """Inventory specifying unauthorized table (e.g. 'schema_migrations') fails closed with 0 DELETE dispatch."""
@@ -5490,16 +5816,38 @@ class TestIssue97WritePathSecurity(_BaseTwoRunnerFixture):
                 expected_fencing_token=token2,
                 manifest_seal_hex=tampered_seal,
             )
-        self.assertIn("unauthorized table", str(ctx.exception).lower())
+        self.assertIn("Target inventory ownership violation: unauthorized table.", str(ctx.exception))
         self.assertEqual(len(dispatched_delete_sqls), 0)
+
+        # Persistent HALT latched for owned run
+        self.assertTrue(self.seam_a.is_halted(RUN_ID_A))
+        marker_path = _halt_marker_path(RUN_ID_A, self.marker_dir_a)
+        self.assertTrue(marker_path.exists())
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["reason_code"], "CLEANUP_OWNERSHIP_VIOLATION")
+        self.assertEqual(payload["reason"], HALT_REASON_CATALOG["CLEANUP_OWNERSHIP_VIOLATION"])
+
+        # Subsequent attempts remain blocked fail-closed
+        with self.assertRaises(JournalHaltedError):
+            self.seam_a.execute_conditional_cleanup(
+                run_id=RUN_ID_A,
+                expected_fencing_token=token2,
+                manifest_seal_hex=tampered_seal,
+            )
 
     def test_p1_cleanup_invalid_scoped_run_id_rejects_with_zero_dispatch(self):
         """Invalid scoped run_id passed to execute_conditional_cleanup raises InvalidRunIdError."""
-        with self.assertRaises(InvalidRunIdError):
+        malformed_id = "invalid; DROP TABLE staging_run_journal;--SECRET_SENTINEL_RUN_ID"
+        with self.assertRaises(InvalidRunIdError) as ctx:
             self.seam_a.execute_conditional_cleanup(
-                run_id="invalid; DROP TABLE staging_run_journal;--",
+                run_id=malformed_id,
                 expected_fencing_token=1,
             )
+        self.assertEqual(str(ctx.exception), "Invalid scoped run_id format for cleanup.")
+        self.assertNotIn("SECRET_SENTINEL", str(ctx.exception))
+        # Ensure no halt marker was written for unauthenticated / invalid run ID
+        self.assertFalse(self.seam_a.is_halted(malformed_id))
+        self.assertFalse(_halt_marker_path(malformed_id, self.marker_dir_a).exists())
 
     def test_p1_valid_cleanup_positive_control(self):
         """Valid canonical cleanup transitions journal to CLEANED_UP, deletes rows, and verifies 0 residual."""
@@ -5549,18 +5897,20 @@ class TestIssue97WritePathSecurity(_BaseTwoRunnerFixture):
             return None
 
         self.transport_a.custom_response_hook = sentinel_commit_hook
-        with self.assertRaises(AmbiguousCommitError) as ctx:
+        try:
             self.seam_a.register_intent(
                 run_id=RUN_ID_A,
                 manifest_seal_hex=self.seal_a,
                 target_inventory=self.entities_a,
             )
-        # Check error message
-        self.assertNotIn(SENTINEL, str(ctx.exception))
-        # Check formatted traceback
-        tb = "".join(traceback.format_exception(type(ctx.exception), ctx.exception, ctx.exception.__traceback__))
-        self.assertNotIn(SENTINEL, tb)
-        self.assertIsNone(ctx.exception.__cause__)
+            self.fail("Expected AmbiguousCommitError was not raised")
+        except AmbiguousCommitError as exc:
+            # Active traceback captured while inside exception handler
+            active_tb = traceback.format_exc()
+            self.assertGreater(len(active_tb), 0)
+            self.assertNotIn(SENTINEL, active_tb)
+            self.assertNotIn(SENTINEL, str(exc))
+            self.assertIsNone(exc.__cause__)
 
         # Check on-disk marker
         marker_path = _halt_marker_path(RUN_ID_A, self.marker_dir_a)
@@ -5570,6 +5920,81 @@ class TestIssue97WritePathSecurity(_BaseTwoRunnerFixture):
         marker_json = json.loads(marker_content)
         self.assertIn(marker_json["reason_code"], HALT_REASON_CATALOG)
         self.assertEqual(marker_json["reason"], HALT_REASON_CATALOG[marker_json["reason_code"]])
+
+        # Scenario 2: Tampered manifest in database containing sentinel inside pk_value
+        run_id_s2 = "run_20261107T122000Z_b2c3d4e5f6a1"
+        entities_s2 = create_default_manifest_entities(run_id_s2)
+        seal_s2 = compute_canonical_inventory_fingerprint(run_id_s2, entities_s2)
+
+        # Reset transport and fixture DB from Scenario 1 dropped commit
+        self.transport_a.custom_response_hook = None
+        self.conn_a.rollback()
+        self.transport_a.active_batons.clear()
+        self.transport_a.in_transaction.clear()
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.execute("DELETE FROM run_locks")
+        self.conn_a.commit()
+
+        self.seam_a.register_intent(
+            run_id=run_id_s2,
+            manifest_seal_hex=seal_s2,
+            target_inventory=entities_s2,
+        )
+        mutations_s2 = build_live02_synthetic_mutations(run_id_s2)
+        token2_s2 = self.seam_a.execute_atomic_stage_mutation(
+            run_id=run_id_s2,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations_s2,
+            manifest_seal_hex=seal_s2,
+        )
+
+        tampered_entities_s2 = [e.model_dump() for e in entities_s2]
+        tampered_entities_s2[0]["pk_value"] = f"foreign_art_{SENTINEL}"
+        tampered_seal_s2 = compute_canonical_inventory_fingerprint(run_id_s2, tampered_entities_s2)
+        self.conn_b.execute(
+            "UPDATE staging_run_journal SET manifest_seal_hex = ?, target_inventory_json = ? WHERE run_id = ?",
+            (tampered_seal_s2, json.dumps(tampered_entities_s2), run_id_s2),
+        )
+        self.conn_b.commit()
+
+        dispatched_delete_sqls: list[str] = []
+        def delete_spy_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+            except Exception:
+                return None
+            for req in body.get("requests", []):
+                sql = req.get("stmt", {}).get("sql", "")
+                if "DELETE" in sql.upper():
+                    dispatched_delete_sqls.append(sql)
+            return None
+
+        self.transport_a.custom_response_hook = delete_spy_hook
+
+        try:
+            self.seam_a.execute_conditional_cleanup(
+                run_id=run_id_s2,
+                expected_fencing_token=token2_s2,
+                manifest_seal_hex=tampered_seal_s2,
+            )
+            self.fail("Expected OwnershipMismatchError was not raised")
+        except OwnershipMismatchError as exc:
+            active_tb = traceback.format_exc()
+            self.assertGreater(len(active_tb), 0)
+            self.assertNotIn(SENTINEL, active_tb)
+            self.assertNotIn(SENTINEL, str(exc))
+            self.assertIsNone(exc.__cause__)
+
+        self.assertEqual(len(dispatched_delete_sqls), 0)
+        self.assertTrue(self.seam_a.is_halted(run_id_s2))
+        marker_path_s2 = _halt_marker_path(run_id_s2, self.marker_dir_a)
+        self.assertTrue(marker_path_s2.exists())
+        marker_content_s2 = marker_path_s2.read_text(encoding="utf-8")
+        self.assertNotIn(SENTINEL, marker_content_s2)
+        marker_json_s2 = json.loads(marker_content_s2)
+        self.assertEqual(marker_json_s2["reason_code"], "CLEANUP_OWNERSHIP_VIOLATION")
+        self.assertEqual(marker_json_s2["reason"], HALT_REASON_CATALOG["CLEANUP_OWNERSHIP_VIOLATION"])
 
     def test_p2_halt_marker_durability_and_o_excl(self):
         """Halt marker is written with O_EXCL and cannot overwrite existing marker."""
