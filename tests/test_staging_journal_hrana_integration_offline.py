@@ -22,15 +22,18 @@ import json
 from pathlib import Path
 import sqlite3
 import tempfile
-from typing import Optional
+from typing import Any, Optional
 import unittest
 
 import httpx
 
 from efso_radar.repositories.schema import get_all_init_statements
 from efso_radar.repositories.turso_client import (
+    MAX_HRANA_RESPONSE_BYTES,
+    TursoAmbiguousTransactionError,
     TursoClientError,
     TursoHTTPClient,
+    deserialize_hrana_value,
 )
 from efso_radar.staging.journal import (
     ActiveWorkloadCollisionError,
@@ -39,6 +42,7 @@ from efso_radar.staging.journal import (
     FencingConflictError,
     HaltMarkerPersistenceError,
     InvalidJournalTransitionError,
+    InvalidRunIdError,
     JournalError,
     JournalExecutionPattern,
     JournalHaltedError,
@@ -53,11 +57,21 @@ from efso_radar.staging.journal import (
 from efso_radar.staging.journal_hrana_seam import (
     AmbiguousRollbackError,
     CleanupVerificationError,
+    CrossRunnerDiscoveryError,
+    EXPECTED_ENTITY_QUERY_COLS,
+    EXPECTED_JOURNAL_QUERY_COLS,
+    MAX_DISCOVERY_LIMIT,
     StagingJournalHranaSeam,
     build_live02_synthetic_mutations,
     _assert_fixture_isolation,
 )
 from efso_radar.staging.offline_recovery_evidence import (
+    CommitState,
+    CrossRunnerJournalStatus,
+    CrossRunnerProvenance,
+    CrossRunnerReview,
+    EntityObservation,
+    QueryState,
     ReviewDecision,
 )
 from efso_radar.staging.runner import (
@@ -2161,3 +2175,2864 @@ class TestArchitecturalBoundariesAndNonProofContract(_BaseTwoRunnerFixture):
         seam_doc = StagingJournalHranaSeam.__doc__ or ""
         self.assertIn("Strictly offline", seam_doc)
         self.assertIn("$0.00 / 0 TRY", seam_doc)
+
+
+# =============================================================================
+# Scenario 9: Cross-Runner Mock Wire Journal Discovery & Recovery Reconstruction
+# =============================================================================
+
+class TestScenario9CrossRunnerMockWireDiscovery(_BaseTwoRunnerFixture):
+    """Adversarial cross-runner journal discovery & inert recovery evidence reconstruction over mock Hrana wire."""
+
+    def test_point1_runner_a_intent_discovered_by_runner_b_via_mock_hrana_wire_only(self):
+        """Runner A registers intent; Runner B discovers it over mock Hrana wire without knowing run ID."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+
+        # Runner B starts with empty marker dir, no manifest file, and no prior knowledge of RUN_ID_A
+        self.assertEqual(len(list(self.marker_dir_b.iterdir())), 0)
+
+        # Wire request tracing: prove the discovery genuinely traversed mock Hrana wire
+        captured_requests: list[httpx.Request] = []
+
+        def wire_spy_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            captured_requests.append(request)
+            return None
+
+        self.transport_b.custom_response_hook = wire_spy_hook
+        req_count_before = self.budget_b.request_count
+
+        discovered = self.seam_b.discover_unresolved_runs()
+
+        req_count_after = self.budget_b.request_count
+        self.assertEqual(req_count_after - req_count_before, 1, "Discovery query must traverse BudgetTrackingTransport wire")
+        self.assertEqual(len(captured_requests), 1, "Discovery query must hit HermeticStagingTransport wire")
+
+        # Verify wire request structure: POST /v2/pipeline with allowlisted SELECT
+        req = captured_requests[0]
+        self.assertEqual(req.method, "POST")
+        self.assertTrue(req.url.path.endswith("/v2/pipeline"))
+        req_body = json.loads(req.content.decode("utf-8"))
+        sql = req_body["requests"][0]["stmt"]["sql"]
+        self.assertIn("FROM staging_run_journal", sql)
+        self.assertIn("LIMIT ?", sql)
+
+        # Verify discovered record
+        self.assertEqual(len(discovered), 1)
+        entry = discovered[0]
+        self.assertEqual(entry.run_id, RUN_ID_A)
+        self.assertEqual(entry.owner_id, "gha_runner_a_worker_01")
+        self.assertEqual(entry.status, JournalStatus.ACKED)
+        self.assertEqual(entry.manifest_seal_hex, self.seal_a)
+
+        # Evidence reconstruction without passing run_id
+        review = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review.run_id, RUN_ID_A)
+        self.assertEqual(review.journal_status, CrossRunnerJournalStatus.INTENT_RECORDED)
+        self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+
+    def test_point2_runner_a_commits_effects_runner_b_reconstructs_residual_evidence_without_local_markers(self):
+        """Runner A commits synthetic effects; Runner B reconstructs residual evidence without local marker files."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        # Runner B has empty marker directory
+        self.assertEqual(len(list(self.marker_dir_b.iterdir())), 0)
+
+        # Reconstruct evidence without knowing run_id
+        review = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review.run_id, RUN_ID_A)
+        self.assertEqual(review.journal_status, CrossRunnerJournalStatus.EFFECT_COMMITTED)
+        self.assertEqual(review.decision, ReviewDecision.RESIDUAL)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+
+        # Explicit alias reconstruct_cross_runner_recovery_evidence produces identical inert outcome
+        alias_review = self.seam_b.reconstruct_cross_runner_recovery_evidence()
+        self.assertEqual(alias_review.run_id, RUN_ID_A)
+        self.assertEqual(alias_review.decision, ReviewDecision.RESIDUAL)
+        self.assertEqual(alias_review.remote_state, "UNKNOWN")
+        self.assertEqual(alias_review.action, "MANUAL_REVIEW_ONLY")
+
+    def test_point3_lost_commit_acknowledgments_never_permit_retry_or_takeover(self):
+        """Lost COMMIT acknowledgments are never interpreted as permission to retry or take over."""
+        # Case 3a: Intent COMMIT ack lost (COMMITTED_BUT_ACK_LOST)
+        with self.assertRaises(AmbiguousCommitError):
+            self.seam_a.register_intent(
+                run_id=RUN_ID_A,
+                manifest_seal_hex=self.seal_a,
+                target_inventory=self.entities_a,
+                simulate_ambiguous_commit=AmbiguousCommitOutcome.COMMITTED_BUT_ACK_LOST,
+            )
+
+        review = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review.run_id, RUN_ID_A)
+        self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+
+        # Runner B cannot retry Runner A's run or take over workload
+        with self.assertRaises(ActiveWorkloadCollisionError):
+            self.seam_b.register_intent(
+                run_id=RUN_ID_A,
+                manifest_seal_hex=self.seal_a,
+                target_inventory=self.entities_a,
+            )
+
+        with self.assertRaises(StaleOwnerError):
+            self.seam_b.execute_atomic_stage_mutation(
+                run_id=RUN_ID_A,
+                expected_fencing_token=1,
+                stage="LIVE-02",
+                mutation_statements=build_live02_synthetic_mutations(RUN_ID_A),
+            )
+
+        # Case 3b: Wire-dispatched intent COMMIT where ACK is dropped over the wire
+        fresh_run_id = "run_20261107T120500Z_c3d4e5f6a1b2"
+        fresh_entities = create_default_manifest_entities(fresh_run_id)
+        fresh_seal = compute_canonical_inventory_fingerprint(fresh_run_id, fresh_entities)
+
+        # Clean DB of prior run
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.commit()
+
+        commit_dispatched = False
+
+        def drop_commit_ack_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            nonlocal commit_dispatched
+            if b"COMMIT" in request.content:
+                commit_dispatched = True
+                # Actually commit on underlying provider SQLite before dropping network ACK
+                self.conn_a.commit()
+                raise httpx.ReadTimeout("Simulated dropped COMMIT acknowledgment over mock Hrana wire", request=request)
+            return None
+
+        self.transport_a.custom_response_hook = drop_commit_ack_hook
+
+        with self.assertRaises(AmbiguousCommitError):
+            self.seam_a.register_intent(
+                run_id=fresh_run_id,
+                manifest_seal_hex=fresh_seal,
+                target_inventory=fresh_entities,
+            )
+
+        self.assertTrue(commit_dispatched, "COMMIT request must be actually dispatched over mock wire")
+        self.transport_a.custom_response_hook = None
+        self.assertTrue(self.seam_a.is_halted(fresh_run_id))
+
+        # Runner B discovers the run that was committed on provider before ACK was lost
+        discovered_3b = self.seam_b.discover_unresolved_runs()
+        self.assertEqual(len(discovered_3b), 1)
+        self.assertEqual(discovered_3b[0].run_id, fresh_run_id)
+
+        review_3b = self.seam_b.review_recovery_evidence(run_id=fresh_run_id)
+        self.assertEqual(review_3b.run_id, fresh_run_id)
+        self.assertEqual(review_3b.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_3b.remote_state, "UNKNOWN")
+        self.assertEqual(review_3b.action, "MANUAL_REVIEW_ONLY")
+
+        # Runner B cannot retry Runner A's run or take over workload
+        with self.assertRaises(ActiveWorkloadCollisionError):
+            self.seam_b.register_intent(
+                run_id=fresh_run_id,
+                manifest_seal_hex=fresh_seal,
+                target_inventory=fresh_entities,
+            )
+
+        # Case 3b-2: Intent COMMIT rolled back and ack lost (ROLLED_BACK_AND_ACK_LOST)
+        rollback_run_id = "run_20261107T120501Z_e5f6a1b2c3d4"
+        rb_entities = create_default_manifest_entities(rollback_run_id)
+        rb_seal = compute_canonical_inventory_fingerprint(rollback_run_id, rb_entities)
+
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.commit()
+
+        with self.assertRaises(AmbiguousCommitError):
+            self.seam_a.register_intent(
+                run_id=rollback_run_id,
+                manifest_seal_hex=rb_seal,
+                target_inventory=rb_entities,
+                simulate_ambiguous_commit=AmbiguousCommitOutcome.ROLLED_BACK_AND_ACK_LOST,
+            )
+
+        discovered_rb = self.seam_b.discover_unresolved_runs()
+        self.assertEqual(len(discovered_rb), 0, "Rolled-back transaction leaves zero journal rows")
+        empty_review = self.seam_b.review_recovery_evidence()
+        self.assertEqual(empty_review.journal_status, CrossRunnerJournalStatus.ABSENT)
+        self.assertEqual(empty_review.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(empty_review.remote_state, "UNKNOWN")
+        self.assertEqual(empty_review.action, "MANUAL_REVIEW_ONLY")
+
+        # Case 3c: Effect COMMIT ack lost (COMMITTED_BUT_ACK_LOST)
+        run_id_3 = "run_20261107T120600Z_d4e5f6a1b2c3"
+        entities_3 = create_default_manifest_entities(run_id_3)
+        seal_3 = compute_canonical_inventory_fingerprint(run_id_3, entities_3)
+
+        self.seam_a.register_intent(
+            run_id=run_id_3,
+            manifest_seal_hex=seal_3,
+            target_inventory=entities_3,
+        )
+        mutations = build_live02_synthetic_mutations(run_id_3)
+        with self.assertRaises(AmbiguousCommitError):
+            self.seam_a.execute_atomic_stage_mutation(
+                run_id=run_id_3,
+                expected_fencing_token=1,
+                stage="LIVE-02",
+                mutation_statements=mutations,
+                manifest_seal_hex=seal_3,
+                simulate_ambiguous_commit=AmbiguousCommitOutcome.COMMITTED_BUT_ACK_LOST,
+            )
+
+        review_ambig = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review_ambig.run_id, run_id_3)
+        # Provider transaction committed effects before ACK was lost:
+        # DB status is EFFECT_COMMITTED with owned rows present -> forensic decision is RESIDUAL,
+        # but crucial safety invariants remote_state=UNKNOWN and action=MANUAL_REVIEW_ONLY remain strictly non-authorizing
+        self.assertEqual(review_ambig.journal_status, CrossRunnerJournalStatus.EFFECT_COMMITTED)
+        self.assertEqual(review_ambig.decision, ReviewDecision.RESIDUAL)
+        self.assertEqual(review_ambig.remote_state, "UNKNOWN")
+        self.assertEqual(review_ambig.action, "MANUAL_REVIEW_ONLY")
+
+        # Runner B is still strictly prohibited from taking over or mutating Runner A's run
+        with self.assertRaises(StaleOwnerError):
+            self.seam_b.execute_atomic_stage_mutation(
+                run_id=run_id_3,
+                expected_fencing_token=2,
+                stage="LIVE-02",
+                mutation_statements=mutations,
+            )
+
+    def test_point4_missing_malformed_duplicate_or_corrupted_journal_records_fail_closed(self):
+        """Missing, malformed, duplicate or corrupted journal records fail closed."""
+        # 4a: Missing records
+        discovered = self.seam_b.discover_unresolved_runs()
+        self.assertEqual(len(discovered), 0)
+        review = self.seam_b.review_recovery_evidence()
+        self.assertIsNone(review.run_id)
+        self.assertEqual(review.journal_status, CrossRunnerJournalStatus.ABSENT)
+        self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+
+        # 4b: Malformed run_id
+        self.conn_a.execute(
+            """
+            INSERT INTO staging_run_journal (
+                run_id, owner_id, fencing_token, stage, status,
+                manifest_seal_hex, target_inventory_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                "malformed_noncanonical_id",
+                "worker_01",
+                1,
+                "LIVE-02",
+                JournalStatus.ACKED.value,
+                "a" * 64,
+                "[]",
+                "2026-11-07T12:00:00Z",
+                "2026-11-07T12:00:00Z",
+            ],
+        )
+        self.conn_a.commit()
+
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertIn("invalid run_id", str(ctx.exception))
+
+        review_malformed = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review_malformed.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_malformed.journal_status, CrossRunnerJournalStatus.CORRUPTED)
+
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.commit()
+
+        # 4c: Corrupted target_inventory_json
+        self.conn_a.execute(
+            """
+            INSERT INTO staging_run_journal (
+                run_id, owner_id, fencing_token, stage, status,
+                manifest_seal_hex, target_inventory_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                RUN_ID_A,
+                "worker_01",
+                1,
+                "LIVE-02",
+                JournalStatus.ACKED.value,
+                self.seal_a,
+                "{invalid_json_content",
+                "2026-11-07T12:00:00Z",
+                "2026-11-07T12:00:00Z",
+            ],
+        )
+        self.conn_a.commit()
+
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertIn("invalid JSON", str(ctx.exception))
+
+        review_corrupt = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review_corrupt.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_corrupt.journal_status, CrossRunnerJournalStatus.CORRUPTED)
+
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.commit()
+
+        # 4d: Tampered manifest seal
+        raw_inv = json.dumps([e.model_dump() for e in self.entities_a])
+        tampered_seal = "0" * 64
+        self.conn_a.execute(
+            """
+            INSERT INTO staging_run_journal (
+                run_id, owner_id, fencing_token, stage, status,
+                manifest_seal_hex, target_inventory_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                RUN_ID_A,
+                "worker_01",
+                1,
+                "LIVE-02",
+                JournalStatus.ACKED.value,
+                tampered_seal,
+                raw_inv,
+                "2026-11-07T12:00:00Z",
+                "2026-11-07T12:00:00Z",
+            ],
+        )
+        self.conn_a.commit()
+
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertIn("manifest seal mismatch", str(ctx.exception))
+
+        review_tampered = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review_tampered.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_tampered.journal_status, CrossRunnerJournalStatus.CORRUPTED)
+
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.commit()
+
+        # 4e: Discovery result overflow (more than MAX_DISCOVERY_LIMIT runs)
+        for i in range(11):
+            r_id = f"run_20261107T12{i:02d}00Z_{i:012x}"
+            ents = create_default_manifest_entities(r_id)
+            seal = compute_canonical_inventory_fingerprint(r_id, ents)
+            self.conn_a.execute(
+                """
+                INSERT INTO staging_run_journal (
+                    run_id, owner_id, fencing_token, stage, status,
+                    manifest_seal_hex, target_inventory_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    r_id,
+                    "worker_01",
+                    1,
+                    "LIVE-02",
+                    JournalStatus.ACKED.value,
+                    seal,
+                    json.dumps([e.model_dump() for e in ents]),
+                    f"2026-11-07T12:{i:02d}:00Z",
+                    f"2026-11-07T12:{i:02d}:00Z",
+                ],
+            )
+        self.conn_a.commit()
+
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs(max_results=10)
+        self.assertIn("DISCOVERY_RESULT_OVERFLOW", str(ctx.exception))
+
+        review_overflow = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review_overflow.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_overflow.journal_status, CrossRunnerJournalStatus.UNREADABLE)
+
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.commit()
+
+        # 4f: Duplicate active runs on workload
+        for r_id in (RUN_ID_A, RUN_ID_B):
+            ents = create_default_manifest_entities(r_id)
+            seal = compute_canonical_inventory_fingerprint(r_id, ents)
+            self.conn_a.execute(
+                """
+                INSERT INTO staging_run_journal (
+                    run_id, owner_id, fencing_token, stage, status,
+                    manifest_seal_hex, target_inventory_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    r_id,
+                    "worker_01",
+                    1,
+                    "LIVE-02",
+                    JournalStatus.ACKED.value,
+                    seal,
+                    json.dumps([e.model_dump() for e in ents]),
+                    "2026-11-07T12:00:00Z",
+                    "2026-11-07T12:00:00Z",
+                ],
+            )
+        self.conn_a.commit()
+
+        review_dup = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review_dup.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_dup.journal_status, CrossRunnerJournalStatus.UNREADABLE)
+        self.assertIn("Multiple unresolved staging runs discovered", review_dup.reasons[0])
+
+    def test_point5_foreign_entities_or_ownership_mismatches_block_recovery(self):
+        """Foreign entities or ownership mismatches block recovery fail-closed."""
+        # 5a: Foreign attribution on entity row
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        # Tamper the source attribution of the article in the database fixture
+        self.conn_a.execute(
+            "UPDATE processed_articles SET source = 'FOREIGN_ATTRIBUTION' WHERE article_id = ?",
+            (f"synth_art_{RUN_ID_A}_01",),
+        )
+        self.conn_a.commit()
+
+        review = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review.run_id, RUN_ID_A)
+        self.assertEqual(review.decision, ReviewDecision.OWNERSHIP_MISMATCH_HALT)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+
+        # 5b: Unauthorized table in journal target inventory
+        unauth_ents = [
+            {
+                "table": "passwords",
+                "pk_column": "id",
+                "pk_value": "secret",
+                "cleanup_dependency_order": 1,
+                "expected_attributes": {},
+            }
+        ] * 5
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.execute(
+            """
+            INSERT INTO staging_run_journal (
+                run_id, owner_id, fencing_token, stage, status,
+                manifest_seal_hex, target_inventory_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                RUN_ID_A,
+                "worker_01",
+                1,
+                "LIVE-02",
+                JournalStatus.ACKED.value,
+                "b" * 64,
+                json.dumps(unauth_ents),
+                "2026-11-07T12:00:00Z",
+                "2026-11-07T12:00:00Z",
+            ],
+        )
+        self.conn_a.commit()
+
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertIn("unauthorized table", str(ctx.exception))
+        self.assertNotIn("passwords", str(ctx.exception))
+
+        review_unauth = self.seam_b.review_recovery_evidence()
+        self.assertNotIn("passwords", "".join(review_unauth.reasons))
+        self.assertEqual(review_unauth.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_unauth.journal_status, CrossRunnerJournalStatus.CORRUPTED)
+
+    def test_point6_transport_swapping_and_unexpected_network_dispatch_rejected(self):
+        """Transport swapping and missing transports are rejected before any network dispatch."""
+        intercepted = []
+
+        def spy_handler(request: httpx.Request) -> httpx.Response:
+            intercepted.append(request)
+            return httpx.Response(200, json={})
+
+        swapped = httpx.MockTransport(spy_handler)
+        self.client_b.transport = swapped
+
+        with self.assertRaises(PermissionError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertIn("client transport identity mismatch", str(ctx.exception))
+
+        with self.assertRaises(PermissionError) as ctx:
+            self.seam_b.review_recovery_evidence()
+        self.assertIn("client transport identity mismatch", str(ctx.exception))
+
+        with self.assertRaises(PermissionError) as ctx:
+            self.seam_b.inspect_run_wire(RUN_ID_A)
+        self.assertIn("client transport identity mismatch", str(ctx.exception))
+
+        self.assertEqual(len(intercepted), 0, "Zero HTTP requests may reach swapped transport")
+
+        # Transport is None
+        self.client_b.transport = None
+        with self.assertRaises(PermissionError):
+            self.seam_b.discover_unresolved_runs()
+
+    def test_point7_empty_or_incomplete_discovery_result_never_authorizes_new_work(self):
+        """An empty or incomplete discovery result never authorizes new work."""
+        # 7a: Empty discovery
+        review = self.seam_b.review_recovery_evidence()
+        self.assertIsNone(review.run_id)
+        self.assertEqual(review.journal_status, CrossRunnerJournalStatus.ABSENT)
+        self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+        self.assertIn("Empty discovery result never authorizes new work", review.reasons[1])
+
+        # 7b: Incomplete / failed entity observations changes credible baseline from REVIEW_REQUIRED to UNKNOWN
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        # Set status to EFFECT_COMMITTED so nominal baseline without failure is REVIEW_REQUIRED
+        self.conn_a.execute(
+            "UPDATE staging_run_journal SET status = ? WHERE run_id = ?",
+            (JournalStatus.EFFECT_COMMITTED.value, RUN_ID_A),
+        )
+        self.conn_a.commit()
+
+        # Without failure, baseline is REVIEW_REQUIRED
+        baseline_review = self.seam_b.review_recovery_evidence()
+        self.assertEqual(baseline_review.decision, ReviewDecision.REVIEW_REQUIRED)
+
+        def failing_entity_query_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+                reqs = body.get("requests", [])
+                for r in reqs:
+                    sql = r.get("stmt", {}).get("sql", "")
+                    if "FROM stories" in sql:
+                        return httpx.Response(
+                            200,
+                            json={
+                                "baton": body.get("baton"),
+                                "results": [
+                                    {"type": "error", "error": {"code": "SQLITE_IOERR", "message": "Simulated disk failure"}},
+                                    {"type": "ok", "response": {"type": "close"}},
+                                ],
+                            },
+                            request=request,
+                        )
+            except Exception:
+                pass
+            return None
+
+        self.transport_b.custom_response_hook = failing_entity_query_hook
+        review_incomplete = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review_incomplete.run_id, RUN_ID_A)
+        # Proves failed entity query actively flipped decision from REVIEW_REQUIRED to UNKNOWN
+        self.assertEqual(review_incomplete.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_incomplete.remote_state, "UNKNOWN")
+        self.assertEqual(review_incomplete.action, "MANUAL_REVIEW_ONLY")
+        self.assertTrue(
+            any("Entity observation query uncertainty detected" in r for r in review_incomplete.reasons)
+        )
+
+    def test_point8_discovery_and_inspection_produce_zero_database_mutations(self):
+        """Discovery and inspection paths produce zero database mutations."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        # Snapshot entire DB state across all tables before Runner B operations
+        def get_db_fingerprint(conn: sqlite3.Connection) -> dict[str, list[tuple]]:
+            tables = ("staging_run_journal", "processed_articles", "stories", "run_locks", "durable_recovery_state", "schema_migrations")
+            fp = {}
+            for t in tables:
+                cur = conn.execute(f"SELECT * FROM {t} ORDER BY 1")
+                fp[t] = cur.fetchall()
+            return fp
+
+        before_state = get_db_fingerprint(self.conn_a)
+
+        # Runner B executes all discovery & inspection paths
+        _ = self.seam_b.discover_unresolved_runs()
+        _ = self.seam_b.inspect_run_wire(RUN_ID_A)
+        _ = self.seam_b.review_recovery_evidence()
+        _ = self.seam_b.reconstruct_cross_runner_recovery_evidence()
+        _ = self.seam_b.list_unresolved_runs()
+
+        after_state = get_db_fingerprint(self.conn_a)
+        self.assertEqual(before_state, after_state, "Discovery and inspection must produce zero database mutations")
+
+    def test_point9_all_recovery_conclusions_remain_inert_and_manual_only(self):
+        """All recovery conclusions remain strictly inert with remote_state=UNKNOWN and action=MANUAL_REVIEW_ONLY."""
+        # Test clean discovery
+        rev_clean = self.seam_b.review_recovery_evidence()
+        self.assertEqual(rev_clean.remote_state, "UNKNOWN")
+        self.assertEqual(rev_clean.action, "MANUAL_REVIEW_ONLY")
+        self.assertIn(rev_clean.provenance, (CrossRunnerProvenance.HERMETIC_SIMULATION, CrossRunnerProvenance.UNVERIFIED_CANDIDATE))
+
+        # Test intent registered
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        rev_intent = self.seam_b.review_recovery_evidence()
+        self.assertEqual(rev_intent.remote_state, "UNKNOWN")
+        self.assertEqual(rev_intent.action, "MANUAL_REVIEW_ONLY")
+        self.assertIn(rev_intent.provenance, (CrossRunnerProvenance.HERMETIC_SIMULATION, CrossRunnerProvenance.UNVERIFIED_CANDIDATE))
+
+        # Test effects committed
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+        rev_effect = self.seam_b.review_recovery_evidence()
+        self.assertEqual(rev_effect.remote_state, "UNKNOWN")
+        self.assertEqual(rev_effect.action, "MANUAL_REVIEW_ONLY")
+        self.assertIn(rev_effect.provenance, (CrossRunnerProvenance.HERMETIC_SIMULATION, CrossRunnerProvenance.UNVERIFIED_CANDIDATE))
+
+        # Verify no executable mutation, retry or cleanup channels exist on CrossRunnerReview
+        for attr in ("execute", "retry", "takeover", "cleanup", "mutate"):
+            self.assertFalse(hasattr(rev_clean, attr))
+            self.assertFalse(hasattr(rev_intent, attr))
+            self.assertFalse(hasattr(rev_effect, attr))
+
+
+    def test_point10_wire_absence_never_falls_back_to_local_journal_and_reports_unknown(self):
+        """P1-1: Wire ABSENT never falls back to local SQLite journal and reports AuditOutcomeState.UNKNOWN."""
+        # 1. Runner A registers intent and effects in shared DB fixture, so local rows exist.
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        # Confirm local journal row and entity rows genuinely exist in the database
+        cur = self.conn_b.execute("SELECT status FROM staging_run_journal WHERE run_id = ?", (RUN_ID_A,))
+        self.assertIsNotNone(cur.fetchone())
+
+        # 2. Intercept mock wire so that staging_run_journal queries return a valid empty row set (genuine wire ABSENT)
+        expected_cols = [
+            {"name": c}
+            for c in (
+                "run_id",
+                "owner_id",
+                "fencing_token",
+                "stage",
+                "status",
+                "manifest_seal_hex",
+                "target_inventory_json",
+                "created_at",
+                "updated_at",
+                "last_error",
+            )
+        ]
+
+        def wire_absent_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            if b"staging_run_journal" in request.content:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "base_url": None,
+                        "results": [
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "type": "execute",
+                                    "result": {
+                                        "cols": expected_cols,
+                                        "rows": [],
+                                        "affected_row_count": 0,
+                                    },
+                                },
+                            },
+                            {"type": "ok", "response": {"type": "close"}},
+                        ],
+                    },
+                )
+            return None
+
+        self.transport_b.custom_response_hook = wire_absent_hook
+
+        # Confirm that inspect_run_wire genuinely succeeds and returns None (valid wire read returning zero rows)
+        self.assertIsNone(self.seam_b.inspect_run_wire(RUN_ID_A))
+
+        # Snapshot DB before audit
+        cur = self.conn_b.execute("SELECT COUNT(*) FROM staging_run_journal")
+        journal_count_before = cur.fetchone()[0]
+
+        # 3. Call audit_workload: must return UNKNOWN, not CLEAN or RESIDUAL, with zero local fallback
+        audit_res = self.seam_b.audit_workload(RUN_ID_A)
+        self.assertEqual(audit_res, AuditOutcomeState.UNKNOWN)
+
+        # 4. Assert zero mutations occurred to DB
+        cur = self.conn_b.execute("SELECT COUNT(*) FROM staging_run_journal")
+        journal_count_after = cur.fetchone()[0]
+        self.assertEqual(journal_count_before, journal_count_after)
+
+    def test_point11_sanitized_error_reporting_never_leaks_sentinel_or_payload_data(self):
+        """P1-2: Untrusted values (sentinels, raw IDs, SQL injections) never leak into error messages or reasons."""
+        sentinel_secret = "ATTACKER_SECRET_SENTINEL_XYZ_98765"
+        malicious_sql = "DROP TABLE staging_run_journal; -- ' OR '1'='1"
+
+        # 1. Invalid run_id with sentinel
+        bad_run_row = [
+            f"run_{sentinel_secret}",
+            "worker_01",
+            1,
+            "LIVE-02",
+            JournalStatus.ACKED.value,
+            "0" * 64,
+            "[]",
+            "2026-11-07T12:00:00Z",
+            "2026-11-07T12:00:00Z",
+        ]
+        self.conn_a.execute(
+            """
+            INSERT INTO staging_run_journal (
+                run_id, owner_id, fencing_token, stage, status,
+                manifest_seal_hex, target_inventory_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            bad_run_row,
+        )
+        self.conn_a.commit()
+
+        # Exception must not leak sentinel
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertNotIn(sentinel_secret, str(ctx.exception))
+        self.assertEqual(ctx.exception.code, "INVALID_RUN_ID")
+
+        # Review report reasons must not leak sentinel
+        review = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+        for r in review.reasons:
+            self.assertNotIn(sentinel_secret, r)
+            self.assertNotIn(malicious_sql, r)
+        self.assertNotIn(sentinel_secret, str(review))
+
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.commit()
+
+        # 2. Corrupted inventory payload with malicious SQL injection and sentinel
+        corrupted_inv = json.dumps({"secret": sentinel_secret, "injection": malicious_sql})
+        self.conn_a.execute(
+            """
+            INSERT INTO staging_run_journal (
+                run_id, owner_id, fencing_token, stage, status,
+                manifest_seal_hex, target_inventory_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                RUN_ID_A,
+                "worker_01",
+                1,
+                "LIVE-02",
+                JournalStatus.ACKED.value,
+                self.seal_a,
+                corrupted_inv,
+                "2026-11-07T12:00:00Z",
+                "2026-11-07T12:00:00Z",
+            ],
+        )
+        self.conn_a.commit()
+
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertNotIn(sentinel_secret, str(ctx.exception))
+        self.assertNotIn(malicious_sql, str(ctx.exception))
+
+        review_inv = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review_inv.decision, ReviewDecision.UNKNOWN)
+        for r in review_inv.reasons:
+            self.assertNotIn(sentinel_secret, r)
+            self.assertNotIn(malicious_sql, r)
+
+    def test_point12_malformed_nested_inventory_types_handled_inertly_without_type_error(self):
+        """P1-3: Malformed nested inventory types ([] or {} for table/pk) never throw uncaught TypeError."""
+        cases = [
+            # table as list
+            [{"table": ["unhashable_list"], "pk_column": "id", "pk_value": "val", "cleanup_dependency_order": 1, "expected_attributes": {}}] * 5,
+            # table as dict
+            [{"table": {"nested": "dict"}, "pk_column": "id", "pk_value": "val", "cleanup_dependency_order": 1, "expected_attributes": {}}] * 5,
+            # pk_column as list
+            [{"table": "processed_articles", "pk_column": [], "pk_value": "val", "cleanup_dependency_order": 1, "expected_attributes": {}}] * 5,
+            # pk_value as list
+            [{"table": "processed_articles", "pk_column": "article_id", "pk_value": [], "cleanup_dependency_order": 1, "expected_attributes": {}}] * 5,
+            # expected_attributes as non-dict
+            [{"table": "processed_articles", "pk_column": "article_id", "pk_value": "val", "cleanup_dependency_order": 1, "expected_attributes": "invalid_string"}] * 5,
+        ]
+
+        for idx, unauth_ents in enumerate(cases):
+            self.conn_a.execute("DELETE FROM staging_run_journal")
+            self.conn_a.execute(
+                """
+                INSERT INTO staging_run_journal (
+                    run_id, owner_id, fencing_token, stage, status,
+                    manifest_seal_hex, target_inventory_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    RUN_ID_A,
+                    "worker_01",
+                    1,
+                    "LIVE-02",
+                    JournalStatus.ACKED.value,
+                    "f" * 64,
+                    json.dumps(unauth_ents),
+                    "2026-11-07T12:00:00Z",
+                    "2026-11-07T12:00:00Z",
+                ],
+            )
+            self.conn_a.commit()
+
+            # Must not raise TypeError
+            with self.assertRaises(CrossRunnerDiscoveryError):
+                self.seam_b.discover_unresolved_runs()
+
+            # Must return typed CrossRunnerReview with ReviewDecision.UNKNOWN
+            review = self.seam_b.review_recovery_evidence()
+            self.assertIsInstance(review, CrossRunnerReview)
+            self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+            self.assertEqual(review.remote_state, "UNKNOWN")
+            self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+
+    def test_point13_malformed_hrana_envelopes_fail_closed_and_transport_swap_raises_permission_error(self):
+        """P1-3: Malformed Hrana 200 envelopes return inert review, while transport swap raises PermissionError."""
+        # 1. Malformed envelope: empty results list
+        def empty_results_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            return httpx.Response(200, json={"results": []})
+
+        self.transport_b.custom_response_hook = empty_results_hook
+
+        # Discovery query handles empty results fail-closed
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertEqual(ctx.exception.code, "WIRE_QUERY_MALFORMED")
+
+        # Review returns typed inert UNKNOWN
+        review = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review.journal_status, CrossRunnerJournalStatus.UNREADABLE)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+
+        # 2. Malformed envelope: missing results key
+        def missing_results_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            return httpx.Response(200, json={"type": "ok"})
+
+        self.transport_b.custom_response_hook = missing_results_hook
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertEqual(ctx.exception.code, "WIRE_QUERY_MALFORMED")
+
+        # 3. CRUCIAL: Transport swap attempt must raise PermissionError and NEVER be swallowed
+        self.transport_b.custom_response_hook = None
+        foreign_transport = httpx.MockTransport(lambda req: httpx.Response(200, json={}))
+        self.seam_b._pinned_transport = foreign_transport
+
+        with self.assertRaises(PermissionError):
+            self.seam_b.discover_unresolved_runs()
+
+        with self.assertRaises(PermissionError):
+            self.seam_b.review_recovery_evidence()
+
+        with self.assertRaises(PermissionError):
+            self.seam_b.audit_workload(RUN_ID_A)
+
+    def test_point14_oversized_payload_ceilings_and_discovery_boundary_duplicates(self):
+        """P2-1: Strict payload length ceilings reject oversized records, and discovery checks duplicates at boundary."""
+        # 1. Oversized target_inventory_json (> 4096 bytes)
+        huge_payload = json.dumps({"padding": "x" * 5000})
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.execute(
+            """
+            INSERT INTO staging_run_journal (
+                run_id, owner_id, fencing_token, stage, status,
+                manifest_seal_hex, target_inventory_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                RUN_ID_A,
+                "worker_01",
+                1,
+                "LIVE-02",
+                JournalStatus.ACKED.value,
+                self.seal_a,
+                huge_payload,
+                "2026-11-07T12:00:00Z",
+                "2026-11-07T12:00:00Z",
+            ],
+        )
+        self.conn_a.commit()
+
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertEqual(ctx.exception.code, "OVERSIZED_INVENTORY")
+
+        review_huge = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review_huge.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_huge.journal_status, CrossRunnerJournalStatus.CORRUPTED)
+
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.commit()
+
+        # 2. Oversized stage (> 64 chars)
+        self.conn_a.execute(
+            """
+            INSERT INTO staging_run_journal (
+                run_id, owner_id, fencing_token, stage, status,
+                manifest_seal_hex, target_inventory_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                RUN_ID_A,
+                "worker_01",
+                1,
+                "S" * 100,
+                JournalStatus.ACKED.value,
+                self.seal_a,
+                "[]",
+                "2026-11-07T12:00:00Z",
+                "2026-11-07T12:00:00Z",
+            ],
+        )
+        self.conn_a.commit()
+
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertEqual(ctx.exception.code, "INVALID_STAGE")
+
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.commit()
+
+        # 3. Discovery boundary duplicate check
+        valid_row = {
+            "run_id": RUN_ID_A,
+            "owner_id": "worker_01",
+            "fencing_token": 1,
+            "stage": "LIVE-02",
+            "status": JournalStatus.ACKED.value,
+            "manifest_seal_hex": self.seal_a,
+            "target_inventory_json": json.dumps([e.model_dump() for e in self.entities_a]),
+            "created_at": "2026-11-07T12:00:00Z",
+            "updated_at": "2026-11-07T12:00:00Z",
+            "last_error": None,
+        }
+
+        def dup_rows_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            if b"staging_run_journal" in request.content:
+                cols = [{"name": k} for k in valid_row.keys()]
+                hrana_row = [{"type": "text", "value": str(v)} if v is not None else {"type": "null"} for v in valid_row.values()]
+                hrana_row[2] = {"type": "integer", "value": "1"}
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "base_url": None,
+                        "results": [
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "type": "execute",
+                                    "result": {
+                                        "cols": cols,
+                                        "rows": [hrana_row, hrana_row],
+                                        "affected_row_count": 0,
+                                    },
+                                },
+                            },
+                            {"type": "ok", "response": {"type": "close"}},
+                        ],
+                    },
+                )
+            return None
+
+        self.transport_b.custom_response_hook = dup_rows_hook
+
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertEqual(ctx.exception.code, "DUPLICATE_DISCOVERY_RESULT")
+
+        review_dup = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review_dup.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_dup.journal_status, CrossRunnerJournalStatus.UNREADABLE)
+        self.assertEqual(review_dup.remote_state, "UNKNOWN")
+        self.assertEqual(review_dup.action, "MANUAL_REVIEW_ONLY")
+    def test_point15_forged_foreign_pk_with_matching_seal_fails_closed_before_entity_select(self):
+        """P1-1: A forged foreign PK with a recomputed matching seal fails closed before any entity SELECT."""
+        forged_run_id = RUN_ID_A
+        # Create forged 5-entity inventory: allowlisted table processed_articles, but targeting a foreign victim PK
+        forged_entities = [e.model_dump() for e in create_default_manifest_entities(forged_run_id)]
+        forged_pk = "victim_secret_art_999"
+        forged_entities[0]["pk_value"] = forged_pk
+
+        # Recompute a matching seal over this forged inventory
+        matching_seal = compute_canonical_inventory_fingerprint(forged_run_id, entities=forged_entities)
+
+        # Insert forged record into staging_run_journal
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.execute(
+            """
+            INSERT INTO staging_run_journal (
+                run_id, owner_id, fencing_token, stage, status,
+                manifest_seal_hex, target_inventory_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                forged_run_id,
+                "worker_01",
+                1,
+                "LIVE-02",
+                JournalStatus.ACKED.value,
+                matching_seal,
+                json.dumps(forged_entities),
+                "2026-11-07T12:00:00Z",
+                "2026-11-07T12:00:00Z",
+            ],
+        )
+        self.conn_a.commit()
+
+        # Set up request spy on Runner B transport to trace all executed wire queries
+        captured_sql: list[str] = []
+
+        def spy_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+                for req in body.get("requests", []):
+                    stmt = req.get("stmt", {})
+                    if "sql" in stmt:
+                        captured_sql.append(stmt["sql"])
+            except Exception:
+                pass
+            return None
+
+        self.transport_b.custom_response_hook = spy_hook
+
+        # 1. Wire discovery must fail closed
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertEqual(ctx.exception.code, "INVENTORY_VALIDATION_ERROR")
+        self.assertNotIn(forged_pk, str(ctx.exception))
+
+        # 2. Wire inspection / recovery review must report CORRUPTED / UNKNOWN inert review
+        review = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review.journal_status, CrossRunnerJournalStatus.CORRUPTED)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+        self.assertNotIn(forged_pk, str(review))
+
+        # 3. CRUCIAL: Query tracing proves zero foreign-target reads occurred
+        # No SELECT statement must contain the forged foreign PK or target the foreign article
+        for sql in captured_sql:
+            self.assertNotIn(forged_pk, sql)
+            # Only allowlisted discovery SELECT on staging_run_journal should have run
+            self.assertTrue(
+                "staging_run_journal" in sql or "BEGIN" in sql or "COMMIT" in sql,
+                f"Unexpected entity query executed: {sql}",
+            )
+
+    def test_point16_malformed_hrana_integer_cell_suppresses_chained_exception_and_traceback_leakage(self):
+        """P1-2: Malformed Hrana integer cell with sentinel suppresses chained exception and traceback leakage."""
+        import traceback
+
+        sentinel_secret = "ATTACKER_SECRET_INT_SENTINEL_987654321"
+
+        # Mock wire returns an integer cell whose value string contains the sentinel
+        def malformed_int_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            if b"staging_run_journal" in request.content:
+                cols = [
+                    {"name": c}
+                    for c in (
+                        "run_id",
+                        "owner_id",
+                        "fencing_token",
+                        "stage",
+                        "status",
+                        "manifest_seal_hex",
+                        "target_inventory_json",
+                        "created_at",
+                        "updated_at",
+                        "last_error",
+                    )
+                ]
+                malformed_row = [
+                    {"type": "text", "value": RUN_ID_A},
+                    {"type": "text", "value": "worker_01"},
+                    {"type": "integer", "value": sentinel_secret},  # Malformed integer cell!
+                    {"type": "text", "value": "LIVE-02"},
+                    {"type": "text", "value": JournalStatus.ACKED.value},
+                    {"type": "text", "value": self.seal_a},
+                    {"type": "text", "value": json.dumps([e.model_dump() for e in self.entities_a])},
+                    {"type": "text", "value": "2026-11-07T12:00:00Z"},
+                    {"type": "text", "value": "2026-11-07T12:00:00Z"},
+                    {"type": "null"},
+                ]
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "base_url": None,
+                        "results": [
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "result": {
+                                        "cols": cols,
+                                        "rows": [malformed_row],
+                                        "affected_row_count": 0,
+                                    }
+                                },
+                            },
+                            {"type": "ok", "response": {}},
+                        ],
+                    },
+                )
+            return None
+
+        self.transport_b.custom_response_hook = malformed_int_hook
+
+        # 1. Direct discovery raises CrossRunnerDiscoveryError
+        try:
+            self.seam_b.discover_unresolved_runs()
+            self.fail("Expected CrossRunnerDiscoveryError")
+        except CrossRunnerDiscoveryError as err:
+            # Check in active exception traceback via traceback.format_exc() while live in sys.exc_info()
+            active_tb = traceback.format_exc()
+            self.assertNotIn(sentinel_secret, active_tb)
+            self.assertEqual(err.code, "WIRE_QUERY_MALFORMED")
+            self.assertNotIn(sentinel_secret, str(err))
+
+            # Verify that chained exception context / cause is completely suppressed
+            self.assertIsNone(err.__cause__)
+            self.assertTrue(err.__suppress_context__)
+
+            # Format complete exception traceback as an error logger would
+            tb_lines = traceback.format_exception(type(err), err, err.__traceback__)
+            tb_text = "".join(tb_lines)
+
+            # Sentinel must NOT appear in formatted traceback
+            self.assertNotIn(sentinel_secret, tb_text)
+
+        # 2. Review evidence returns inert UNKNOWN / UNREADABLE
+        review = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review.journal_status, CrossRunnerJournalStatus.UNREADABLE)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+        self.assertNotIn(sentinel_secret, str(review))
+
+    def test_point17_malformed_query_metadata_fails_to_unreadable_never_reported_as_absent(self):
+        """P2-2: Malformed execute metadata in 2-element results array reports UNREADABLE, never genuine ABSENT."""
+        # Mock wire returns execute + close results, but execute result has empty response/cols metadata
+        def malformed_meta_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            if b"staging_run_journal" in request.content:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "base_url": None,
+                        "results": [
+                            {"type": "ok", "response": {}},  # Missing result / cols!
+                            {"type": "ok", "response": {}},
+                        ],
+                    },
+                )
+            return None
+
+        self.transport_b.custom_response_hook = malformed_meta_hook
+
+        # 1. Direct discovery must fail closed with WIRE_QUERY_MALFORMED
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertEqual(ctx.exception.code, "WIRE_QUERY_MALFORMED")
+
+        # 2. Review evidence must classify this as UNREADABLE, NEVER genuine ABSENT
+        review = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review.journal_status, CrossRunnerJournalStatus.UNREADABLE)
+        self.assertNotEqual(review.journal_status, CrossRunnerJournalStatus.ABSENT)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+
+        # 3. Scoped inspection also classifies as UNREADABLE, never ABSENT
+        review_scoped = self.seam_b.review_recovery_evidence(run_id=RUN_ID_A)
+        self.assertEqual(review_scoped.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_scoped.journal_status, CrossRunnerJournalStatus.UNREADABLE)
+        self.assertNotEqual(review_scoped.journal_status, CrossRunnerJournalStatus.ABSENT)
+
+    def test_point18_malformed_entity_select_response_fails_closed_to_unknown_never_clean(self):
+        """P1: Malformed entity SELECT response fails closed to UNKNOWN; never misclassified as CLEAN."""
+        # 1. Runner A registers intent and executes mutations (EFFECT_COMMITTED)
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        mutations = build_live02_synthetic_mutations(RUN_ID_A)
+        self.seam_a.execute_atomic_stage_mutation(
+            run_id=RUN_ID_A,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=self.seal_a,
+        )
+
+        # 2. Hook returns valid response for staging_run_journal, but malformed response for entity SELECTs
+        # TursoHTTPClient.execute_pipeline receives: 2-element results array where execute result is {"type": "ok", "response": {}}
+        entity_select_counter = 0
+
+        def malformed_entity_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            nonlocal entity_select_counter
+            # Let journal query succeed through real transport by returning None
+            if b"staging_run_journal" in request.content:
+                return None
+            # For entity queries, return HTTP 200 with 2-element results array with malformed empty response
+            entity_select_counter += 1
+            return httpx.Response(
+                200,
+                json={
+                    "baton": None,
+                    "base_url": None,
+                    "results": [
+                        {"type": "ok", "response": {}},  # Malformed: missing cols and result dict!
+                        {"type": "ok", "response": {}},
+                    ],
+                },
+                request=request,
+            )
+
+        self.transport_b.custom_response_hook = malformed_entity_hook
+
+        # Snapshot DB before Runner B audit & review
+        cur = self.conn_b.execute("SELECT COUNT(*) FROM staging_run_journal")
+        journal_count_before = cur.fetchone()[0]
+
+        # 3. audit_workload must NOT return CLEAN; must return UNKNOWN
+        audit_outcome = self.seam_b.audit_workload(RUN_ID_A)
+        self.assertNotEqual(audit_outcome, AuditOutcomeState.CLEAN)
+        self.assertEqual(audit_outcome, AuditOutcomeState.UNKNOWN)
+
+        # 4. review_recovery_evidence must return UNKNOWN, not REVIEW_REQUIRED or CLEAN
+        review = self.seam_b.review_recovery_evidence(run_id=RUN_ID_A)
+        self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+
+        # 5. Verify that entity observation query uncertainty is recorded in reasons
+        self.assertTrue(
+            any("Entity observation query uncertainty detected" in r for r in review.reasons),
+            f"Expected query uncertainty reason in {review.reasons}",
+        )
+
+        # 6. Verify mock wire requests were actually dispatched
+        self.assertGreater(entity_select_counter, 0)
+
+        # 7. Assert zero database mutations occurred
+        cur = self.conn_b.execute("SELECT COUNT(*) FROM staging_run_journal")
+        journal_count_after = cur.fetchone()[0]
+        self.assertEqual(journal_count_before, journal_count_after)
+
+    def test_point19_legitimate_zero_row_entity_select_with_valid_metadata_distinguished(self):
+        """P1 positive: Legitimate zero-row entity SELECT with valid metadata correctly distinguishes CLEAN / REVIEW_REQUIRED."""
+        # 1. Runner A registers intent only (no mutations executed, entities table remains empty)
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+        # Manually update journal status to EFFECT_COMMITTED to test genuine empty-effect review
+        self.conn_a.execute(
+            "UPDATE staging_run_journal SET status = ? WHERE run_id = ?",
+            (JournalStatus.EFFECT_COMMITTED.value, RUN_ID_A),
+        )
+        self.conn_a.commit()
+
+        # Runner B queries the wire without mock hook (queries against real SQLite fixture)
+        # In SQLite fixture, entity tables exist with canonical schema, but rows are empty!
+        # Thus cols are valid canonical columns, and rows is []
+
+        # 1. audit_workload returns CLEAN because entity metadata is valid and 0 rows found
+        audit_outcome = self.seam_b.audit_workload(RUN_ID_A)
+        self.assertEqual(audit_outcome, AuditOutcomeState.CLEAN)
+
+        # 2. review_recovery_evidence returns REVIEW_REQUIRED because EFFECT_COMMITTED with genuine 0 rows observed
+        review = self.seam_b.review_recovery_evidence(run_id=RUN_ID_A)
+        self.assertEqual(review.decision, ReviewDecision.REVIEW_REQUIRED)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+        self.assertTrue(
+            any("no entity rows observed; review required" in r for r in review.reasons),
+            f"Expected no entity rows observed reason in {review.reasons}",
+        )
+
+    def test_point20_scoped_run_id_sanitization_and_type_safety_regressions(self):
+        """P2: Scoped run_id validation rejects non-string and invalid IDs with static error, zero leakage, zero TypeError."""
+        sentinel_secret = "ATTACKER_SECRET_SENTINEL_RUN_ID_999"
+
+        # 1. inspect_run_wire: wrong types must raise InvalidRunIdError without TypeError
+        for bad_val in (123, 45.6, None, [], {}, object()):
+            with self.assertRaises(InvalidRunIdError) as ctx:
+                self.seam_b.inspect_run_wire(bad_val)  # type: ignore[arg-type]
+            self.assertEqual(str(ctx.exception), "Invalid run_id format.")
+
+        # 2. inspect_run_wire: invalid sentinel string must not leak sentinel
+        with self.assertRaises(InvalidRunIdError) as ctx:
+            self.seam_b.inspect_run_wire(f"run_{sentinel_secret}")
+        self.assertEqual(str(ctx.exception), "Invalid run_id format.")
+        self.assertNotIn(sentinel_secret, str(ctx.exception))
+
+        # 3. review_recovery_evidence: wrong types must return inert sanitized review, zero TypeError
+        for bad_val in (123, 45.6, [], {}, object()):
+            review = self.seam_b.review_recovery_evidence(run_id=bad_val)  # type: ignore[arg-type]
+            self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+            self.assertEqual(review.journal_status, CrossRunnerJournalStatus.UNREADABLE)
+            self.assertEqual(review.remote_state, "UNKNOWN")
+            self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+            self.assertIsNone(review.run_id)
+
+        # 4. review_recovery_evidence: sentinel string must return inert sanitized review without leaking sentinel
+        bad_run_str = f"run_{sentinel_secret}"
+        review = self.seam_b.review_recovery_evidence(run_id=bad_run_str)
+        self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review.journal_status, CrossRunnerJournalStatus.UNREADABLE)
+        self.assertIsNone(review.run_id)
+        self.assertNotIn(sentinel_secret, str(review))
+
+        # 5. reconstruct_cross_runner_recovery_evidence alias preserves exact same sanitization
+        review_alias = self.seam_b.reconstruct_cross_runner_recovery_evidence(run_id=123)  # type: ignore[arg-type]
+        self.assertEqual(review_alias.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_alias.journal_status, CrossRunnerJournalStatus.UNREADABLE)
+        self.assertIsNone(review_alias.run_id)
+
+        # 6. audit_workload: non-string and sentinel strings return UNKNOWN without TypeError or crash
+        self.assertEqual(self.seam_b.audit_workload(123), AuditOutcomeState.UNKNOWN)  # type: ignore[arg-type]
+        self.assertEqual(self.seam_b.audit_workload(bad_run_str), AuditOutcomeState.UNKNOWN)
+
+    def test_point21_missing_raw_rows_field_rejected_fails_closed_to_unknown(self):
+        """P1: Missing raw 'rows' field in execute response is rejected fail-closed to UNKNOWN."""
+        # Setup journal entry for RUN_ID_A
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+
+        # 1. Wire returns cols but completely omits 'rows' key
+        def missing_rows_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            if b"staging_run_journal" in request.content:
+                cols = [{"name": c} for c in EXPECTED_JOURNAL_QUERY_COLS]
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "type": "execute",
+                                    "result": {
+                                        "cols": cols,
+                                        # "rows" key deliberately missing!
+                                        "affected_row_count": 0,
+                                    },
+                                },
+                            },
+                            {"type": "ok", "response": {"type": "close"}},
+                        ],
+                    },
+                )
+            return None
+
+        self.transport_b.custom_response_hook = missing_rows_hook
+
+        # Direct discovery fails closed with WIRE_QUERY_MALFORMED
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertEqual(ctx.exception.code, "WIRE_QUERY_MALFORMED")
+
+        # Review evidence returns UNKNOWN and UNREADABLE, never CLEAN or takeover
+        review = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review.journal_status, CrossRunnerJournalStatus.UNREADABLE)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+
+        # 2. Positive control: Explicit empty rows list 'rows: []' is accepted
+        def empty_rows_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            if b"staging_run_journal" in request.content:
+                cols = [{"name": c} for c in EXPECTED_JOURNAL_QUERY_COLS]
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "type": "execute",
+                                    "result": {
+                                        "cols": cols,
+                                        "rows": [],  # explicitly present empty list
+                                        "affected_row_count": 0,
+                                    },
+                                },
+                            },
+                            {"type": "ok", "response": {"type": "close"}},
+                        ],
+                    },
+                )
+            return None
+
+        self.transport_b.custom_response_hook = empty_rows_hook
+        discovered = self.seam_b.discover_unresolved_runs()
+        self.assertEqual(len(discovered), 0)
+        self.transport_b.custom_response_hook = None
+
+    def test_point22_scoped_run_id_mismatch_rejected_before_entity_select(self):
+        """P1: inspect_run_wire and review fail closed on mismatched run_id before entity SELECT."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+
+        # Wire returns a valid journal row for RUN_ID_B when asked for RUN_ID_A
+        entity_select_dispatched = False
+
+        def mismatched_run_id_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            nonlocal entity_select_dispatched
+            body = json.loads(request.content.decode("utf-8"))
+            for req in body.get("requests", []):
+                stmt = req.get("stmt", {})
+                sql = stmt.get("sql", "")
+                if "FROM staging_run_journal" in sql:
+                    cols = [{"name": c} for c in EXPECTED_JOURNAL_QUERY_COLS]
+                    ents_b = create_default_manifest_entities(RUN_ID_B)
+                    seal_b = compute_canonical_inventory_fingerprint(RUN_ID_B, ents_b)
+                    row_b = [
+                        {"type": "text", "value": RUN_ID_B},  # Foreign run_id!
+                        {"type": "text", "value": "worker_01"},
+                        {"type": "integer", "value": 1},
+                        {"type": "text", "value": "LIVE-02"},
+                        {"type": "text", "value": JournalStatus.ACKED.value},
+                        {"type": "text", "value": seal_b},
+                        {"type": "text", "value": json.dumps([e.model_dump() for e in ents_b])},
+                        {"type": "text", "value": "2026-11-07T12:00:00Z"},
+                        {"type": "text", "value": "2026-11-07T12:00:00Z"},
+                        {"type": "null"},
+                    ]
+                    return httpx.Response(
+                        200,
+                        json={
+                            "baton": None,
+                            "results": [
+                                {
+                                    "type": "ok",
+                                    "response": {
+                                        "type": "execute",
+                                        "result": {
+                                            "cols": cols,
+                                            "rows": [row_b],
+                                            "affected_row_count": 0,
+                                        },
+                                    },
+                                },
+                                {"type": "ok", "response": {"type": "close"}},
+                            ],
+                        },
+                    )
+                for tbl in ("articles", "notification_claims", "editorial_decisions", "admin_alerts", "run_locks"):
+                    if f"FROM {tbl}" in sql:
+                        entity_select_dispatched = True
+            return None
+
+        self.transport_b.custom_response_hook = mismatched_run_id_hook
+
+        # 1. Direct inspect_run_wire for RUN_ID_A must raise RUN_ID_MISMATCH
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.inspect_run_wire(RUN_ID_A)
+        self.assertEqual(ctx.exception.code, "RUN_ID_MISMATCH")
+
+        # 2. review_recovery_evidence for RUN_ID_A must return OWNERSHIP_MISMATCH_HALT
+        review = self.seam_b.review_recovery_evidence(run_id=RUN_ID_A)
+        self.assertEqual(review.run_id, RUN_ID_A)
+        self.assertEqual(review.decision, ReviewDecision.OWNERSHIP_MISMATCH_HALT)
+        self.assertEqual(review.journal_status, CrossRunnerJournalStatus.CORRUPTED)
+        self.assertEqual(review.remote_state, "UNKNOWN")
+        self.assertEqual(review.action, "MANUAL_REVIEW_ONLY")
+
+        # 3. CRITICAL: Entity SELECT was NEVER dispatched
+        self.assertFalse(entity_select_dispatched, "Entity observation queries must not be dispatched on run_id mismatch")
+        self.transport_b.custom_response_hook = None
+
+    def test_point23_pipeline_sequence_cardinality_and_close_outcome_validation(self):
+        """P1: Pipeline sequence cardinality, close outcome, and inner/outer discriminators are strictly validated."""
+        def make_client(handler):
+            transport = httpx.MockTransport(handler)
+            return TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=transport)
+
+        # 1. Missing close result in pipeline (cardinality mismatch)
+        def handler_missing_close(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"results": [{"type": "ok", "response": {"type": "execute", "result": {"cols": [{"name": "x"}], "rows": []}}}]},
+            )
+
+        with make_client(handler_missing_close) as c:
+            with self.assertRaises(TursoClientError) as ctx:
+                c.execute("SELECT 1")
+            self.assertIn("Unexpected pipeline results count", str(ctx.exception))
+
+        # 2. Errored close result
+        def handler_errored_close(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [{"name": "x"}], "rows": []}}},
+                        {"type": "error", "error": {"code": "SQLITE_IOERR", "message": "Simulated disk IO error"}},
+                    ]
+                },
+            )
+
+        with make_client(handler_errored_close) as c:
+            with self.assertRaises(TursoClientError) as ctx:
+                c.execute("SELECT 1")
+            self.assertIn("Pipeline close error", str(ctx.exception))
+            self.assertIn("SQLITE_IOERR", str(ctx.exception))
+
+        # 3. Unexpected close outer type
+        def handler_unexpected_close_type(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [{"name": "x"}], "rows": []}}},
+                        {"type": "pending"},
+                    ]
+                },
+            )
+
+        with make_client(handler_unexpected_close_type) as c:
+            with self.assertRaises(TursoClientError) as ctx:
+                c.execute("SELECT 1")
+            self.assertIn("Pipeline close failed with unexpected type", str(ctx.exception))
+
+        # 4. Unexpected close inner discriminator (e.g. inner type is 'execute' instead of 'close')
+        def handler_bad_inner_close_type(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [{"name": "x"}], "rows": []}}},
+                        {"type": "ok", "response": {"type": "execute"}},
+                    ]
+                },
+            )
+
+        with make_client(handler_bad_inner_close_type) as c:
+            with self.assertRaises(TursoClientError) as ctx:
+                c.execute("SELECT 1")
+            self.assertIn("Pipeline close response type mismatch: expected 'close'.", str(ctx.exception))
+            self.assertNotIn("execute", str(ctx.exception))
+
+        # 5. Unexpected statement inner discriminator (e.g. statement inner type is 'close' instead of 'execute')
+        def handler_bad_inner_stmt_type(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"type": "ok", "response": {"type": "SECRET_STMT_TYPE_SENTINEL", "result": {"cols": [{"name": "x"}], "rows": []}}},
+                        {"type": "ok", "response": {"type": "close"}},
+                    ]
+                },
+            )
+
+        with make_client(handler_bad_inner_stmt_type) as c:
+            with self.assertRaises(TursoClientError) as ctx:
+                c.execute("SELECT 1")
+            self.assertIn("Unexpected statement response type. Expected 'execute'.", str(ctx.exception))
+            self.assertNotIn("SECRET_STMT_TYPE_SENTINEL", str(ctx.exception))
+
+        # 6. Extra statement result (cardinality > expected)
+        def handler_extra_result(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [{"name": "x"}], "rows": []}}},
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [{"name": "y"}], "rows": []}}},
+                        {"type": "ok", "response": {"type": "close"}},
+                    ]
+                },
+            )
+
+        with make_client(handler_extra_result) as c:
+            with self.assertRaises(TursoClientError) as ctx:
+                c.execute("SELECT 1")
+            self.assertIn("Unexpected pipeline results count", str(ctx.exception))
+
+        # 7. Unexpected statement outer result type
+        def handler_bad_stmt_type(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"type": "SECRET_OUTER_RESULT_TYPE_SENTINEL"},
+                        {"type": "ok", "response": {"type": "close"}},
+                    ]
+                },
+            )
+
+        with make_client(handler_bad_stmt_type) as c:
+            with self.assertRaises(TursoClientError) as ctx:
+                c.execute("SELECT 1")
+            self.assertEqual("Unexpected statement result type. Expected 'ok'.", str(ctx.exception))
+            self.assertNotIn("SECRET_OUTER_RESULT_TYPE_SENTINEL", str(ctx.exception))
+
+        # 8. Canonical positive control: canonical statement and close inner discriminators pass
+        def handler_canonical_positive(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [{"name": "v"}], "rows": [[{"type": "integer", "value": "42"}]], "affected_row_count": 0}}},
+                        {"type": "ok", "response": {"type": "close"}},
+                    ]
+                },
+            )
+
+        with make_client(handler_canonical_positive) as c:
+            res = c.execute("SELECT 42 AS v")
+            self.assertEqual(res.fetchall(), [{"v": 42}])
+
+        # 9. Mock fixture compatibility: close without inner response object passes
+        def handler_compatible_close(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [{"name": "v"}], "rows": [[{"type": "text", "value": "ok"}]], "affected_row_count": 0}}},
+                        {"type": "ok"},
+                    ]
+                },
+            )
+
+        with make_client(handler_compatible_close) as c:
+            res = c.execute("SELECT 'ok' AS v")
+            self.assertEqual(res.fetchall(), [{"v": "ok"}])
+
+    def test_point24_row_width_and_cell_tag_validation(self):
+        """P1: Row widths, cell tags/types, and malformed row formats are strictly validated."""
+        def make_client(handler):
+            transport = httpx.MockTransport(handler)
+            return TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=transport)
+
+        # 1. Row width mismatch: 2 cols expected, 1 cell received
+        def handler_short_row(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "type": "ok",
+                            "response": {
+                                "type": "execute",
+                                "result": {
+                                    "cols": [{"name": "col1"}, {"name": "col2"}],
+                                    "rows": [[{"type": "text", "value": "a"}]],
+                                    "affected_row_count": 0,
+                                },
+                            },
+                        },
+                        {"type": "ok", "response": {"type": "close"}},
+                    ]
+                },
+            )
+
+        with make_client(handler_short_row) as c:
+            with self.assertRaises(TursoClientError) as ctx:
+                c.execute("SELECT col1, col2")
+            self.assertIn("Row width mismatch at index 0: expected 2 cells, got 1.", str(ctx.exception))
+
+        # 2. Row width mismatch: 2 cols expected, 3 cells received
+        def handler_long_row(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "type": "ok",
+                            "response": {
+                                "type": "execute",
+                                "result": {
+                                    "cols": [{"name": "col1"}, {"name": "col2"}],
+                                    "rows": [
+                                        [
+                                            {"type": "text", "value": "a"},
+                                            {"type": "text", "value": "b"},
+                                            {"type": "text", "value": "c"},
+                                        ]
+                                    ],
+                                    "affected_row_count": 0,
+                                },
+                            },
+                        },
+                        {"type": "ok", "response": {"type": "close"}},
+                    ]
+                },
+            )
+
+        with make_client(handler_long_row) as c:
+            with self.assertRaises(TursoClientError) as ctx:
+                c.execute("SELECT col1, col2")
+            self.assertIn("Row width mismatch at index 0: expected 2 cells, got 3.", str(ctx.exception))
+
+        # 3. Unsupported cell type tag (with secret sentinel: must not leak)
+        def handler_unknown_tag(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "type": "ok",
+                            "response": {
+                                "type": "execute",
+                                "result": {
+                                    "cols": [{"name": "col1"}],
+                                    "rows": [[{"type": "SECRET_CELL_TAG_SENTINEL", "value": "2026-11-10"}]],
+                                    "affected_row_count": 0,
+                                },
+                            },
+                        },
+                        {"type": "ok", "response": {"type": "close"}},
+                    ]
+                },
+            )
+
+        with make_client(handler_unknown_tag) as c:
+            with self.assertRaises(TursoClientError) as ctx:
+                c.execute("SELECT col1")
+            self.assertEqual("Unrecognized or unsupported Hrana cell type.", str(ctx.exception))
+            self.assertNotIn("SECRET_CELL_TAG_SENTINEL", str(ctx.exception))
+
+        # 4. Malformed cell: non-dict
+        def handler_non_dict_cell(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "type": "ok",
+                            "response": {
+                                "type": "execute",
+                                "result": {
+                                    "cols": [{"name": "col1"}],
+                                    "rows": [["raw_string_not_dict"]],
+                                    "affected_row_count": 0,
+                                },
+                            },
+                        },
+                        {"type": "ok", "response": {"type": "close"}},
+                    ]
+                },
+            )
+
+        with make_client(handler_non_dict_cell) as c:
+            with self.assertRaises(TursoClientError) as ctx:
+                c.execute("SELECT col1")
+            self.assertIn("Malformed Hrana cell: expected dict", str(ctx.exception))
+
+        # 5. Malformed row: non-list
+        def handler_non_list_row(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "type": "ok",
+                            "response": {
+                                "type": "execute",
+                                "result": {
+                                    "cols": [{"name": "col1"}],
+                                    "rows": ["not_a_row_list"],
+                                    "affected_row_count": 0,
+                                },
+                            },
+                        },
+                        {"type": "ok", "response": {"type": "close"}},
+                    ]
+                },
+            )
+
+        with make_client(handler_non_list_row) as c:
+            with self.assertRaises(TursoClientError) as ctx:
+                c.execute("SELECT col1")
+            self.assertIn("Invalid row format at index 0: expected list", str(ctx.exception))
+
+        # 6. Malformed integer cells: booleans, floats, nulls, and non-decimal strings must fail closed
+        malformed_int_cases = [
+            True,
+            False,
+            1.5,
+            None,
+            "1.5",
+            "abc",
+            " 123 ",
+            9999999999999999999999999999999999999999,
+        ]
+        for bad_int in malformed_int_cases:
+            def handler_bad_int(req: httpx.Request, val=bad_int) -> httpx.Response:
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": [
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "type": "execute",
+                                    "result": {
+                                        "cols": [{"name": "col1"}],
+                                        "rows": [[{"type": "integer", "value": val}]],
+                                        "affected_row_count": 0,
+                                    },
+                                },
+                            },
+                            {"type": "ok", "response": {"type": "close"}},
+                        ]
+                    },
+                )
+            with make_client(handler_bad_int) as c:
+                with self.assertRaises(TursoClientError) as ctx:
+                    c.execute("SELECT col1")
+                self.assertIn("Invalid integer value in Hrana cell.", str(ctx.exception))
+
+        # 7. Malformed float cells: booleans, nulls, inf, nan, non-numeric strings, and overflow integers must fail closed
+        malformed_float_cases = [
+            True,
+            False,
+            None,
+            "nan",
+            "inf",
+            "-inf",
+            "abc",
+            10**400,  # 401-digit integer causing OverflowError in float()
+            "1e500",  # overflow string
+        ]
+        for bad_float in malformed_float_cases:
+            def handler_bad_float(req: httpx.Request, val=bad_float) -> httpx.Response:
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": [
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "type": "execute",
+                                    "result": {
+                                        "cols": [{"name": "col1"}],
+                                        "rows": [[{"type": "float", "value": val}]],
+                                        "affected_row_count": 0,
+                                    },
+                                },
+                            },
+                            {"type": "ok", "response": {"type": "close"}},
+                        ]
+                    },
+                )
+            with make_client(handler_bad_float) as c:
+                with self.assertRaises(TursoClientError) as ctx:
+                    c.execute("SELECT col1")
+                self.assertIn("Invalid float value in Hrana cell.", str(ctx.exception))
+                self.assertIsNone(ctx.exception.__cause__)
+
+        # Direct decoder overflow suppression test
+        with self.assertRaises(TursoClientError) as ctx_direct:
+            deserialize_hrana_value({"type": "float", "value": 10**400})
+        self.assertEqual("Invalid float value in Hrana cell.", str(ctx_direct.exception))
+        self.assertIsNone(ctx_direct.exception.__cause__)
+
+        # 8. Valid integer and float positive control
+        def handler_valid_nums(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "type": "ok",
+                            "response": {
+                                "type": "execute",
+                                "result": {
+                                    "cols": [{"name": "i1"}, {"name": "i2"}, {"name": "f1"}, {"name": "f2"}],
+                                    "rows": [[
+                                        {"type": "integer", "value": 42},
+                                        {"type": "integer", "value": "-100"},
+                                        {"type": "float", "value": 3.14},
+                                        {"type": "float", "value": "-2.5"},
+                                    ]],
+                                    "affected_row_count": 0,
+                                },
+                            },
+                        },
+                        {"type": "ok", "response": {"type": "close"}},
+                    ]
+                },
+            )
+        with make_client(handler_valid_nums) as c:
+            res = c.execute("SELECT 1, 2, 3, 4")
+            rows = res.fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["i1"], 42)
+            self.assertEqual(rows[0]["i2"], -100)
+            self.assertEqual(rows[0]["f1"], 3.14)
+            self.assertEqual(rows[0]["f2"], -2.5)
+
+    def test_point25_audit_workload_exact_pk_identity_and_cardinality(self):
+        """P1: audit_workload strictly verifies exact PK identity and cardinality (ambiguity -> UNKNOWN, foreign -> HALT)."""
+        self.seam_a.register_intent(
+            run_id=RUN_ID_A,
+            manifest_seal_hex=self.seal_a,
+            target_inventory=self.entities_a,
+        )
+
+        art_cols = [{"name": c} for c in EXPECTED_ENTITY_QUERY_COLS["processed_articles"]]
+
+        # 1. Foreign PK returned for entity query -> OWNERSHIP_MISMATCH_HALT
+        def foreign_pk_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            body = json.loads(request.content.decode("utf-8"))
+            for req in body.get("requests", []):
+                stmt = req.get("stmt", {})
+                sql = stmt.get("sql", "")
+                if "FROM processed_articles WHERE article_id = ?" in sql:
+                    # Return a row with foreign PK 'art_FOREIGN_123' despite matching other attributes
+                    rows = [[
+                        {"type": "text", "value": "art_FOREIGN_123"},
+                        {"type": "text", "value": "https://example.com/art"},
+                        {"type": "text", "value": f"SYNTH_ARTICLE_{RUN_ID_A}_01"},
+                        {"type": "text", "value": "staging_synth_test"},
+                        {"type": "text", "value": "2026-11-07T12:00:00Z"},
+                        {"type": "text", "value": "2026-11-07T12:00:00Z"},
+                    ]]
+                    return httpx.Response(
+                        200,
+                        json={
+                            "baton": None,
+                            "results": [
+                                {
+                                    "type": "ok",
+                                    "response": {
+                                        "type": "execute",
+                                        "result": {"cols": art_cols, "rows": rows, "affected_row_count": 0},
+                                    },
+                                },
+                                {"type": "ok", "response": {"type": "close"}},
+                            ],
+                        },
+                    )
+            return None
+
+        self.transport_b.custom_response_hook = foreign_pk_hook
+        outcome_foreign = self.seam_b.audit_workload(RUN_ID_A)
+        self.assertEqual(outcome_foreign, AuditOutcomeState.OWNERSHIP_MISMATCH_HALT)
+
+        # 2. Duplicate rows returned for PK query (ambiguous cardinality) -> UNKNOWN
+        def duplicate_pk_rows_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            body = json.loads(request.content.decode("utf-8"))
+            for req in body.get("requests", []):
+                stmt = req.get("stmt", {})
+                sql = stmt.get("sql", "")
+                if "FROM processed_articles WHERE article_id = ?" in sql:
+                    # Return 2 rows for single PK query
+                    target_pk = self.entities_a[0].pk_value
+                    single_row = [
+                        {"type": "text", "value": target_pk},
+                        {"type": "text", "value": "https://example.com/art"},
+                        {"type": "text", "value": f"SYNTH_ARTICLE_{RUN_ID_A}_01"},
+                        {"type": "text", "value": "staging_synth_test"},
+                        {"type": "text", "value": "2026-11-07T12:00:00Z"},
+                        {"type": "text", "value": "2026-11-07T12:00:00Z"},
+                    ]
+                    rows = [single_row, single_row]
+                    return httpx.Response(
+                        200,
+                        json={
+                            "baton": None,
+                            "results": [
+                                {
+                                    "type": "ok",
+                                    "response": {
+                                        "type": "execute",
+                                        "result": {"cols": art_cols, "rows": rows, "affected_row_count": 0},
+                                    },
+                                },
+                                {"type": "ok", "response": {"type": "close"}},
+                            ],
+                        },
+                    )
+            return None
+
+        self.transport_b.custom_response_hook = duplicate_pk_rows_hook
+        outcome_dup = self.seam_b.audit_workload(RUN_ID_A)
+        self.assertEqual(outcome_dup, AuditOutcomeState.UNKNOWN)
+        self.transport_b.custom_response_hook = None
+
+    def test_point26_hermetic_transport_guard_three_no_dispatch_spy_regressions(self):
+        """P1: Hermetic transport guard strictly checks exact type, mounted routes, and destination without wire dispatch."""
+        spy_call_count = 0
+
+        def spy_handler(req: httpx.Request) -> httpx.Response:
+            nonlocal spy_call_count
+            spy_call_count += 1
+            return httpx.Response(200, json={})
+
+        # 1. Subclass or duck-typed boundary object with same __name__ but not exact type
+        class FakeHranaOutboundSecurityBoundary(httpx.BaseTransport):
+            def __init__(self, inner):
+                self._inner = inner
+            def handle_request(self, request):
+                return self._inner.handle_request(request)
+
+        fake_boundary = FakeHranaOutboundSecurityBoundary(httpx.MockTransport(spy_handler))
+        client_fake_boundary = TursoHTTPClient(
+            database_url=EXACT_STAGING_DESTINATION,
+            transport=fake_boundary,
+        )
+        with self.assertRaises(PermissionError) as ctx:
+            StagingJournalHranaSeam(
+                client=client_fake_boundary,
+                owner_id="worker_02",
+            )
+        self.assertIn("Hermetic security boundary violation", str(ctx.exception))
+        self.assertIn("FakeHranaOutboundSecurityBoundary", str(ctx.exception))
+        self.assertEqual(spy_call_count, 0, "No wire requests must be dispatched on invalid boundary type")
+
+        # 2. HTTP client with custom mounted route bypassing default transport
+        raw_http = self.seam_b._client._get_client()
+        raw_http._mounts["https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/v2"] = httpx.MockTransport(spy_handler)
+
+        try:
+            with self.assertRaises(PermissionError) as ctx:
+                self.seam_b._get_guarded_http_client()
+            self.assertIn("custom mounted route detected on HTTP client", str(ctx.exception))
+            self.assertEqual(spy_call_count, 0, "No wire requests must be dispatched when mounted route detected")
+        finally:
+            raw_http._mounts.pop("https://efso-radar-staging-fatihemres.aws-eu-north-1.turso.io/v2", None)
+
+        # 3. Client with mismatched destination URL
+        client_bad_url = TursoHTTPClient(
+            database_url="libsql://evil-turso-database.turso.io",
+            transport=self.budget_b,
+        )
+        with self.assertRaises(PermissionError) as ctx:
+            StagingJournalHranaSeam(
+                client=client_bad_url,
+                owner_id="worker_02",
+            )
+        self.assertIn("does not match approved", str(ctx.exception))
+        self.assertEqual(spy_call_count, 0, "No wire requests must be dispatched on mismatched destination URL")
+
+    def test_point27_discovery_terminal_status_and_stage_constraint(self):
+        """P2: Injected terminal statuses in discovery and unsupported stages fail closed."""
+        # 1. Terminal status (ABORTED) injected into discovery results
+        def terminal_status_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            if b"staging_run_journal" in request.content:
+                cols = [{"name": c} for c in EXPECTED_JOURNAL_QUERY_COLS]
+                ents = create_default_manifest_entities(RUN_ID_A)
+                seal = compute_canonical_inventory_fingerprint(RUN_ID_A, ents)
+                row_aborted = [
+                    {"type": "text", "value": RUN_ID_A},
+                    {"type": "text", "value": "worker_01"},
+                    {"type": "integer", "value": 1},
+                    {"type": "text", "value": "LIVE-02"},
+                    {"type": "text", "value": JournalStatus.ABORTED.value},  # Terminal status!
+                    {"type": "text", "value": seal},
+                    {"type": "text", "value": json.dumps([e.model_dump() for e in ents])},
+                    {"type": "text", "value": "2026-11-07T12:00:00Z"},
+                    {"type": "text", "value": "2026-11-07T12:00:00Z"},
+                    {"type": "null"},
+                ]
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "type": "execute",
+                                    "result": {"cols": cols, "rows": [row_aborted], "affected_row_count": 0},
+                                },
+                            },
+                            {"type": "ok", "response": {"type": "close"}},
+                        ],
+                    },
+                )
+            return None
+
+        self.transport_b.custom_response_hook = terminal_status_hook
+        with self.assertRaises(CrossRunnerDiscoveryError) as ctx:
+            self.seam_b.discover_unresolved_runs()
+        self.assertEqual(ctx.exception.code, "TERMINAL_STATUS_DISCOVERED")
+        self.assertIn("Terminal journal status discovered", str(ctx.exception))
+
+        review_term = self.seam_b.review_recovery_evidence()
+        self.assertEqual(review_term.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_term.journal_status, CrossRunnerJournalStatus.CORRUPTED)
+
+        # 2. Unsupported / non-canonical stage (e.g. 'LIVE_99_HOSTILE')
+        def non_canonical_stage_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            if b"staging_run_journal" in request.content:
+                cols = [{"name": c} for c in EXPECTED_JOURNAL_QUERY_COLS]
+                ents = create_default_manifest_entities(RUN_ID_A)
+                seal = compute_canonical_inventory_fingerprint(RUN_ID_A, ents)
+                row_bad_stage = [
+                    {"type": "text", "value": RUN_ID_A},
+                    {"type": "text", "value": "worker_01"},
+                    {"type": "integer", "value": 1},
+                    {"type": "text", "value": "LIVE_99_HOSTILE"},  # Non-canonical stage!
+                    {"type": "text", "value": JournalStatus.ACKED.value},
+                    {"type": "text", "value": seal},
+                    {"type": "text", "value": json.dumps([e.model_dump() for e in ents])},
+                    {"type": "text", "value": "2026-11-07T12:00:00Z"},
+                    {"type": "text", "value": "2026-11-07T12:00:00Z"},
+                    {"type": "null"},
+                ]
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "type": "execute",
+                                    "result": {"cols": cols, "rows": [row_bad_stage], "affected_row_count": 0},
+                                },
+                            },
+                            {"type": "ok", "response": {"type": "close"}},
+                        ],
+                    },
+                )
+            return None
+
+        self.transport_b.custom_response_hook = non_canonical_stage_hook
+        # review_recovery_evidence must NOT coerce to LIVE_02; must fail closed to CORRUPTED / UNKNOWN
+        review_stage = self.seam_b.review_recovery_evidence(run_id=RUN_ID_A)
+        self.assertEqual(review_stage.decision, ReviewDecision.UNKNOWN)
+        self.assertEqual(review_stage.journal_status, CrossRunnerJournalStatus.CORRUPTED)
+        self.assertEqual(review_stage.remote_state, "UNKNOWN")
+        self.assertEqual(review_stage.action, "MANUAL_REVIEW_ONLY")
+        self.assertTrue(
+            any("Unsupported or noncanonical journal intent stage" in r for r in review_stage.reasons)
+        )
+        self.transport_b.custom_response_hook = None
+
+    def test_point28_response_byte_and_row_count_ceilings_before_deserialization(self):
+        """P2: Response-byte ceiling and row-count limits are strictly enforced before cell deserialization."""
+        # 1. Response-byte ceiling (> 5 MB)
+        oversized_content = b'{"results": []}' + (b" " * (MAX_HRANA_RESPONSE_BYTES + 1024))
+        def oversized_byte_handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=oversized_content, headers={"Content-Type": "application/json"})
+
+        transport_oversized = httpx.MockTransport(oversized_byte_handler)
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=transport_oversized) as client:
+            with self.assertRaises(TursoClientError) as ctx:
+                client.execute("SELECT 1")
+            self.assertIn("exceeds maximum allowed limit", str(ctx.exception))
+
+        # 2. Row count ceiling enforced before cell deserialization
+        # Construct a response with 10 rows when max_rows is 5,
+        # with an explosive sentinel cell that would raise ValueError if deserialized
+        cols = [{"name": "col1"}]
+        rows = [[{"type": "integer", "value": "EXPLOSIVE_SENTINEL_NEVER_DESERIALIZED"}] for _ in range(10)]
+
+        def large_rows_handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "type": "ok",
+                            "response": {
+                                "type": "execute",
+                                "result": {"cols": cols, "rows": rows, "affected_row_count": 0},
+                            },
+                        },
+                        {"type": "ok", "response": {"type": "close"}},
+                    ]
+                },
+            )
+
+        transport_large = httpx.MockTransport(large_rows_handler)
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=transport_large) as client:
+            with self.assertRaises(TursoClientError) as ctx:
+                client.execute("SELECT col1", max_rows=5)
+            # Must raise row count limit exceeded, NOT cell deserialization error!
+            self.assertIn("Hrana result row count 10 exceeds maximum limit 5.", str(ctx.exception))
+            self.assertNotIn("EXPLOSIVE_SENTINEL_NEVER_DESERIALIZED", str(ctx.exception))
+
+    def test_point29_pre_commit_statement_validation_and_rollback_prevents_unsafe_commit(self):
+        """P1: Statement results are validated BEFORE sending COMMIT; malformed statements abort with ROLLBACK and never dispatch COMMIT."""
+        dispatched_requests: list[dict[str, Any]] = []
+
+        def mock_tx_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_requests.append(body)
+
+            reqs = body.get("requests", [])
+            has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+            has_commit = any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in reqs)
+            has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+
+            if has_begin:
+                # Return superficially ok statement with result={} (missing cols/rows)
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": "test-baton-precommit-1",
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": {}}},  # Malformed: missing cols & rows!
+                        ],
+                    },
+                )
+            elif has_rollback:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "close"}},
+                        ],
+                    },
+                )
+            elif has_commit:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "close"}},
+                        ],
+                    },
+                )
+            return httpx.Response(500, json={"error": "Unexpected request in mock"})
+
+        transport = httpx.MockTransport(mock_tx_handler)
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=transport) as client:
+            with self.assertRaises(TursoClientError) as ctx:
+                client.execute_transaction([("INSERT INTO stories (story_id) VALUES (?)", ["EFSO-TEST"])])
+
+            # Validation error raised before commit
+            self.assertIn("Missing or invalid 'cols' list in execute result.", str(ctx.exception))
+            # Must NOT be an ambiguous commit error because COMMIT was never sent
+            self.assertNotIsInstance(ctx.exception, TursoAmbiguousTransactionError)
+
+        # Confirm that ROLLBACK was dispatched and COMMIT was NEVER dispatched!
+        commit_dispatched = any(
+            any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", []))
+            for p in dispatched_requests
+        )
+        rollback_dispatched = any(
+            any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in p.get("requests", []))
+            for p in dispatched_requests
+        )
+        self.assertFalse(commit_dispatched, "COMMIT must NEVER be dispatched when statement validation fails pre-commit")
+        self.assertTrue(rollback_dispatched, "ROLLBACK must be dispatched via baton when statement validation fails pre-commit")
+
+        # 2. Ambiguity preservation: Post-COMMIT error remains TursoAmbiguousTransactionError (UNKNOWN), never ordinary retryable error
+        dispatched_requests.clear()
+
+        def commit_network_drop_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_requests.append(body)
+            reqs = body.get("requests", [])
+            has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+            has_commit = any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in reqs)
+
+            if has_begin:
+                # Valid statement
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": "test-baton-precommit-2",
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [{"name": "id"}], "rows": []}}},
+                        ],
+                    },
+                )
+            elif has_commit:
+                raise httpx.ConnectError("Network dropped while waiting for COMMIT response")
+            return httpx.Response(500, json={"error": "Unexpected request"})
+
+        transport_drop = httpx.MockTransport(commit_network_drop_handler)
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=transport_drop) as client:
+            with self.assertRaises(TursoAmbiguousTransactionError) as ctx:
+                client.execute_transaction([("SELECT 1", [])])
+            self.assertIn("Ambiguous transaction outcome (UNKNOWN)", str(ctx.exception))
+            self.assertIn("network error during Turso COMMIT", str(ctx.exception))
+
+    def test_point30_pre_commit_validation_unverified_rollback_fails_closed(self):
+        """P1: Unverified or failed rollback during pre-COMMIT statement validation failure raises TursoAmbiguousTransactionError (UNKNOWN/HALT)."""
+        # Scenario A: Rollback network drop
+        dispatched_a: list[dict[str, Any]] = []
+
+        def rollback_network_error_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_a.append(body)
+            reqs = body.get("requests", [])
+            has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+            has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+
+            if has_begin:
+                # Return malformed statement result to trigger validation failure
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": "test-baton-rb-drop",
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": {}}},  # Malformed: missing cols & rows
+                        ],
+                    },
+                )
+            elif has_rollback:
+                raise httpx.ConnectError("Network dropped during ROLLBACK request")
+            return httpx.Response(500, json={"error": "Unexpected request"})
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(rollback_network_error_handler)) as client:
+            with self.assertRaises(TursoAmbiguousTransactionError) as ctx:
+                client.execute_transaction([("SELECT 1", [])])
+            self.assertIn("Ambiguous transaction outcome (UNKNOWN)", str(ctx.exception))
+            self.assertIn("statement validation failed and rollback network request failed (ConnectError)", str(ctx.exception))
+
+        self.assertFalse(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", [])) for p in dispatched_a),
+            "COMMIT must NEVER be dispatched when statement validation fails",
+        )
+
+        # Scenario B: Rollback HTTP 500 error
+        dispatched_b: list[dict[str, Any]] = []
+
+        def rollback_http_error_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_b.append(body)
+            reqs = body.get("requests", [])
+            has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+            has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+
+            if has_begin:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": "test-baton-rb-http500",
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": {}}},
+                        ],
+                    },
+                )
+            elif has_rollback:
+                return httpx.Response(500, text="Internal Server Error")
+            return httpx.Response(500, json={"error": "Unexpected request"})
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(rollback_http_error_handler)) as client:
+            with self.assertRaises(TursoAmbiguousTransactionError) as ctx:
+                client.execute_transaction([("SELECT 1", [])])
+            self.assertIn("Ambiguous transaction outcome (UNKNOWN)", str(ctx.exception))
+            self.assertIn("statement validation failed and rollback returned HTTP status 500", str(ctx.exception))
+
+        self.assertFalse(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", [])) for p in dispatched_b),
+            "COMMIT must NEVER be dispatched when statement validation fails",
+        )
+
+        # Scenario C: Rollback returns execution error / unconfirmed rollback
+        dispatched_c: list[dict[str, Any]] = []
+
+        def rollback_stmt_error_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_c.append(body)
+            reqs = body.get("requests", [])
+            has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+            has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+
+            if has_begin:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": "test-baton-rb-error",
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": {}}},
+                        ],
+                    },
+                )
+            elif has_rollback:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {"type": "error", "error": {"code": "SQLITE_BUSY", "message": "locked"}},
+                            {"type": "ok", "response": {"type": "close"}},
+                        ],
+                    },
+                )
+            return httpx.Response(500, json={"error": "Unexpected request"})
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(rollback_stmt_error_handler)) as client:
+            with self.assertRaises(TursoAmbiguousTransactionError) as ctx:
+                client.execute_transaction([("SELECT 1", [])])
+            self.assertIn("Ambiguous transaction outcome (UNKNOWN)", str(ctx.exception))
+            self.assertIn("statement validation failed and ROLLBACK execution was not confirmed", str(ctx.exception))
+
+        self.assertFalse(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", [])) for p in dispatched_c),
+            "COMMIT must NEVER be dispatched when statement validation fails",
+        )
+
+        # Scenario D: Rollback returns unconfirmed close
+        dispatched_d: list[dict[str, Any]] = []
+
+        def rollback_bad_close_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_d.append(body)
+            reqs = body.get("requests", [])
+            has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+            has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+
+            if has_begin:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": "test-baton-rb-badclose",
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": {}}},
+                        ],
+                    },
+                )
+            elif has_rollback:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "pending"},
+                        ],
+                    },
+                )
+            return httpx.Response(500, json={"error": "Unexpected request"})
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(rollback_bad_close_handler)) as client:
+            with self.assertRaises(TursoAmbiguousTransactionError) as ctx:
+                client.execute_transaction([("SELECT 1", [])])
+            self.assertIn("Ambiguous transaction outcome (UNKNOWN)", str(ctx.exception))
+            self.assertIn("statement validation failed and pipeline close was not confirmed", str(ctx.exception))
+
+        self.assertFalse(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", [])) for p in dispatched_d),
+            "COMMIT must NEVER be dispatched when statement validation fails",
+        )
+
+        # Scenario E (P1-1): First response has null baton with statement validation failure -> fails closed to UNKNOWN
+        dispatched_e: list[dict[str, Any]] = []
+
+        def null_baton_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_e.append(body)
+            return httpx.Response(
+                200,
+                json={
+                    "baton": None,
+                    "results": [
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                        {"type": "ok", "response": {"type": "execute", "result": {}}},  # Malformed: triggers validation failure
+                    ],
+                },
+            )
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(null_baton_handler)) as client:
+            with self.assertRaises(TursoAmbiguousTransactionError) as ctx:
+                client.execute_transaction([("SELECT 1", [])])
+            self.assertIn("Ambiguous transaction outcome (UNKNOWN)", str(ctx.exception))
+            self.assertIn("statement validation failed but server did not return a valid session baton", str(ctx.exception))
+
+        self.assertFalse(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", [])) for p in dispatched_e),
+            "COMMIT must NEVER be dispatched when statement validation fails",
+        )
+        self.assertFalse(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in p.get("requests", [])) for p in dispatched_e),
+            "ROLLBACK cannot be dispatched without a session baton",
+        )
+
+        # Scenario F (P1-1): First response has empty string baton with statement validation failure -> fails closed to UNKNOWN
+        dispatched_f: list[dict[str, Any]] = []
+
+        def empty_baton_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_f.append(body)
+            return httpx.Response(
+                200,
+                json={
+                    "baton": "",
+                    "results": [
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                        {"type": "ok", "response": {"type": "execute", "result": {}}},
+                    ],
+                },
+            )
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(empty_baton_handler)) as client:
+            with self.assertRaises(TursoAmbiguousTransactionError) as ctx:
+                client.execute_transaction([("SELECT 1", [])])
+            self.assertIn("Ambiguous transaction outcome (UNKNOWN)", str(ctx.exception))
+            self.assertIn("statement validation failed but server did not return a valid session baton", str(ctx.exception))
+
+        self.assertFalse(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", [])) for p in dispatched_f),
+            "COMMIT must NEVER be dispatched when statement validation fails",
+        )
+
+        # Scenario G (P1-2): Rollback response execute result missing cols/rows (result={}) -> fails closed to UNKNOWN
+        dispatched_g: list[dict[str, Any]] = []
+
+        def rollback_empty_result_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_g.append(body)
+            reqs = body.get("requests", [])
+            has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+            has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+
+            if has_begin:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": "test-baton-rb-emptyres",
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": {}}},
+                        ],
+                    },
+                )
+            elif has_rollback:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {}}},  # Malformed: missing cols & rows!
+                            {"type": "ok", "response": {"type": "close"}},
+                        ],
+                    },
+                )
+            return httpx.Response(500, json={"error": "Unexpected request"})
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(rollback_empty_result_handler)) as client:
+            with self.assertRaises(TursoAmbiguousTransactionError) as ctx:
+                client.execute_transaction([("SELECT 1", [])])
+            self.assertIn("Ambiguous transaction outcome (UNKNOWN)", str(ctx.exception))
+            self.assertIn("statement validation failed and ROLLBACK execution response was malformed", str(ctx.exception))
+
+        self.assertFalse(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", [])) for p in dispatched_g),
+            "COMMIT must NEVER be dispatched when statement validation fails",
+        )
+
+        # Scenario H (P1-2): Rollback response cardinality > 2 (extra trailing error result) -> fails closed to UNKNOWN
+        dispatched_h: list[dict[str, Any]] = []
+
+        def rollback_extra_result_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_h.append(body)
+            reqs = body.get("requests", [])
+            has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+            has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+
+            if has_begin:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": "test-baton-rb-extrares",
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": {}}},
+                        ],
+                    },
+                )
+            elif has_rollback:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "close"}},
+                            {"type": "error", "error": {"code": "SQLITE_ERROR", "message": "trailing error"}},
+                        ],
+                    },
+                )
+            return httpx.Response(500, json={"error": "Unexpected request"})
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(rollback_extra_result_handler)) as client:
+            with self.assertRaises(TursoAmbiguousTransactionError) as ctx:
+                client.execute_transaction([("SELECT 1", [])])
+            self.assertIn("Ambiguous transaction outcome (UNKNOWN)", str(ctx.exception))
+            self.assertIn("statement validation failed and rollback result list was missing, truncated, or had extra results", str(ctx.exception))
+
+        self.assertFalse(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", [])) for p in dispatched_h),
+            "COMMIT must NEVER be dispatched when statement validation fails",
+        )
+
+        # Scenario J (P1 Review #8): ROLLBACK response returns structurally valid but nonempty columns and rows -> fails closed to UNKNOWN
+        dispatched_j: list[dict[str, Any]] = []
+
+        def rollback_nonempty_result_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_j.append(body)
+            reqs = body.get("requests", [])
+            has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+            has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+
+            if has_begin:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": "test-baton-rb-nonempty",
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": {}}},
+                        ],
+                    },
+                )
+            elif has_rollback:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "type": "execute",
+                                    "result": {
+                                        "cols": [{"name": "foreign"}],
+                                        "rows": [[{"type": "integer", "value": 1}]],
+                                    },
+                                },
+                            },
+                            {"type": "ok", "response": {"type": "close"}},
+                        ],
+                    },
+                )
+            return httpx.Response(500, json={"error": "Unexpected request"})
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(rollback_nonempty_result_handler)) as client:
+            with self.assertRaises(TursoAmbiguousTransactionError) as ctx:
+                client.execute_transaction([("SELECT 1", [])])
+            self.assertIn("Ambiguous transaction outcome (UNKNOWN)", str(ctx.exception))
+            self.assertIn("statement validation failed and ROLLBACK execution returned unexpected columns or rows", str(ctx.exception))
+
+        self.assertFalse(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", [])) for p in dispatched_j),
+            "COMMIT must NEVER be dispatched when statement validation fails",
+        )
+
+        # Scenario K (P1 Review #8): ROLLBACK response returns nonempty columns with empty rows -> fails closed to UNKNOWN
+        dispatched_k: list[dict[str, Any]] = []
+
+        def rollback_cols_only_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_k.append(body)
+            reqs = body.get("requests", [])
+            has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+            has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+
+            if has_begin:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": "test-baton-rb-colsonly",
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": {}}},
+                        ],
+                    },
+                )
+            elif has_rollback:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {
+                                "type": "ok",
+                                "response": {
+                                    "type": "execute",
+                                    "result": {
+                                        "cols": [{"name": "unexpected_col"}],
+                                        "rows": [],
+                                    },
+                                },
+                            },
+                            {"type": "ok", "response": {"type": "close"}},
+                        ],
+                    },
+                )
+            return httpx.Response(500, json={"error": "Unexpected request"})
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(rollback_cols_only_handler)) as client:
+            with self.assertRaises(TursoAmbiguousTransactionError) as ctx:
+                client.execute_transaction([("SELECT 1", [])])
+            self.assertIn("Ambiguous transaction outcome (UNKNOWN)", str(ctx.exception))
+            self.assertIn("statement validation failed and ROLLBACK execution returned unexpected columns or rows", str(ctx.exception))
+
+        self.assertFalse(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", [])) for p in dispatched_k),
+            "COMMIT must NEVER be dispatched when statement validation fails",
+        )
+
+        # Scenario I: Positive control: verified rollback preserves original validation error and never dispatches COMMIT
+        dispatched_i: list[dict[str, Any]] = []
+
+        def rollback_canonical_verified_handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content.decode("utf-8"))
+            dispatched_i.append(body)
+            reqs = body.get("requests", [])
+            has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+            has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+
+            if has_begin:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": "test-baton-rb-verified",
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": {}}},  # Malformed statement triggers validation error
+                        ],
+                    },
+                )
+            elif has_rollback:
+                return httpx.Response(
+                    200,
+                    json={
+                        "baton": None,
+                        "results": [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "close"}},
+                        ],
+                    },
+                )
+            return httpx.Response(500, json={"error": "Unexpected request"})
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(rollback_canonical_verified_handler)) as client:
+            with self.assertRaises(TursoClientError) as ctx:
+                client.execute_transaction([("SELECT 1", [])])
+            self.assertIn("Missing or invalid 'cols' list in execute result.", str(ctx.exception))
+            self.assertNotIsInstance(ctx.exception, TursoAmbiguousTransactionError)
+
+        self.assertFalse(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT" for r in p.get("requests", [])) for p in dispatched_i),
+            "COMMIT must NEVER be dispatched when statement validation fails",
+        )
+        self.assertTrue(
+            any(any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in p.get("requests", [])) for p in dispatched_i),
+            "ROLLBACK must be dispatched via baton when statement validation fails",
+        )
+
+    def test_point31_sanitized_error_reporting_no_untrusted_sentinel_leakage(self):
+        """P2: Untrusted Hrana discriminators, tags, and cell types never leak into exceptions or active tracebacks."""
+        # 1. Pipeline close response type mismatch does not leak untrusted discriminator
+        def close_sentinel_handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [{"name": "x"}], "rows": []}}},
+                        {"type": "ok", "response": {"type": "EXPLOSIVE_CLOSE_SENTINEL_xyz123"}},
+                    ]
+                },
+            )
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(close_sentinel_handler)) as client:
+            with self.assertRaises(TursoClientError) as ctx:
+                client.execute("SELECT 1")
+            self.assertEqual("Pipeline close response type mismatch: expected 'close'.", str(ctx.exception))
+            self.assertNotIn("EXPLOSIVE_CLOSE_SENTINEL_xyz123", str(ctx.exception))
+
+        # 2. Unexpected close outer type does not leak untrusted discriminator
+        def close_outer_sentinel_handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [{"name": "x"}], "rows": []}}},
+                        {"type": "EXPLOSIVE_CLOSE_OUTER_SENTINEL_abc456"},
+                    ]
+                },
+            )
+
+        with TursoHTTPClient(database_url=EXACT_STAGING_DESTINATION, transport=httpx.MockTransport(close_outer_sentinel_handler)) as client:
+            with self.assertRaises(TursoClientError) as ctx:
+                client.execute("SELECT 1")
+            self.assertEqual("Pipeline close failed with unexpected type. Expected 'ok'.", str(ctx.exception))
+            self.assertNotIn("EXPLOSIVE_CLOSE_OUTER_SENTINEL_abc456", str(ctx.exception))
