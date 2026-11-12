@@ -324,6 +324,43 @@ def _validate_transaction_control_ack(data: Any, expected_stmt: str = "COMMIT") 
     return True, "OK"
 
 
+def _is_valid_execute_response(item: Any) -> bool:
+    """Validate that a pipeline result item is a valid Hrana execute response.
+
+    Enforces:
+    - item is a dictionary with outer type == 'ok'.
+    - Inner 'response' is a dictionary with type == 'execute'.
+    - Inner 'result' is a dictionary.
+    """
+    if not isinstance(item, dict) or item.get("type") != "ok":
+        return False
+    resp = item.get("response")
+    if not isinstance(resp, dict) or resp.get("type") != "execute":
+        return False
+    result = resp.get("result")
+    if not isinstance(result, dict):
+        return False
+    return True
+
+
+def _validate_exact_affected_count(result_dict: Any, expected: int) -> bool:
+    """Strictly validate affected_row_count against an expected integer count.
+
+    Rejects:
+    - Non-dict result objects.
+    - Missing 'affected_row_count' field.
+    - Non-int types (e.g. float 1.0, str '1').
+    - Booleans (in Python bool is a subclass of int: isinstance(True, int) is True).
+    - Any int value not strictly equal to expected.
+    """
+    if not isinstance(result_dict, dict) or "affected_row_count" not in result_dict:
+        return False
+    val = result_dict["affected_row_count"]
+    if not isinstance(val, int) or isinstance(val, bool):
+        return False
+    return val == expected
+
+
 def _is_valid_entity_result_metadata(
     tbl: str,
     pk_col: str,
@@ -1235,13 +1272,7 @@ class StagingJournalHranaSeam:
 
         # 3. Check BEGIN outcome
         begin_res = results[0]
-        begin_resp = begin_res.get("response") if isinstance(begin_res, dict) else None
-        begin_resp_type = begin_resp.get("type") if isinstance(begin_resp, dict) else None
-        if (
-            not isinstance(begin_res, dict)
-            or begin_res.get("type") != "ok"
-            or (begin_resp_type is not None and begin_resp_type != "execute")
-        ):
+        if not _is_valid_execute_response(begin_res):
             if baton:
                 rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="BEGIN failed")
                 if not rb_ok:
@@ -1256,13 +1287,7 @@ class StagingJournalHranaSeam:
         # 4. Check each statement outcome and row count
         stmt_results = results[1:]
         for idx, s_res in enumerate(stmt_results):
-            s_resp = s_res.get("response") if isinstance(s_res, dict) else None
-            s_resp_type = s_resp.get("type") if isinstance(s_resp, dict) else None
-            if (
-                not isinstance(s_res, dict)
-                or s_res.get("type") != "ok"
-                or (s_resp_type is not None and s_resp_type != "execute")
-            ):
+            if not _is_valid_execute_response(s_res):
                 err_dict = s_res.get("error", {}) if isinstance(s_res, dict) and isinstance(s_res.get("error"), dict) else {}
                 valid_code, category = _sanitize_hrana_error(err_dict.get("code"))
                 if baton:
@@ -1278,10 +1303,10 @@ class StagingJournalHranaSeam:
 
             resp_obj = s_res.get("response")
             exec_res = resp_obj.get("result") if isinstance(resp_obj, dict) else None
-            actual_affected = exec_res.get("affected_row_count", 0) if isinstance(exec_res, dict) else None
             req_affected = required_affected_counts[idx]
 
-            if req_affected is not None and (actual_affected is None or actual_affected != req_affected):
+            if req_affected is not None and not _validate_exact_affected_count(exec_res, req_affected):
+                raw_affected = exec_res.get("affected_row_count") if isinstance(exec_res, dict) else None
                 rb_ok, rb_code = self._dispatch_verified_rollback(
                     baton=baton,
                     run_id=run_id,
@@ -1290,12 +1315,12 @@ class StagingJournalHranaSeam:
                 if not rb_ok:
                     self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
                     raise AmbiguousRollbackError(
-                        f"Hrana statement {idx} affected {actual_affected} rows (expected {req_affected}), "
+                        f"Hrana statement {idx} affected {raw_affected} rows (expected {req_affected}), "
                         f"and ROLLBACK could not be confirmed ({rb_code}). "
                         "Transaction outcome UNKNOWN; run locally HALTED."
                     ) from None
                 raise FencingConflictError(
-                    f"Hrana statement {idx} affected {actual_affected} rows (expected {req_affected}). "
+                    f"Hrana statement {idx} affected {raw_affected} rows (expected {req_affected}). "
                     "Transaction rolled back fail-closed."
                 )
 
@@ -1761,10 +1786,8 @@ class StagingJournalHranaSeam:
 
         if manifest_seal_hex is not None:
             if not isinstance(manifest_seal_hex, str) or not HEX_SHA256_REGEX.fullmatch(manifest_seal_hex):
-                self._latch_local_halt(run_id, "CLEANUP_OWNERSHIP_VIOLATION")
                 raise ManifestTamperedError("Provided manifest_seal_hex is not a valid 64-char lowercase hex string.") from None
             if manifest_seal_hex != entry.manifest_seal_hex:
-                self._latch_local_halt(run_id, "CLEANUP_OWNERSHIP_VIOLATION")
                 raise ManifestTamperedError("Provided manifest_seal_hex does not match registered seal.") from None
 
         validate_status_transition(entry.status, JournalStatus.CLEANUP_PENDING)
@@ -1967,13 +1990,7 @@ class StagingJournalHranaSeam:
 
         # Check BEGIN
         begin_res = results1[0]
-        begin_resp = begin_res.get("response") if isinstance(begin_res, dict) else None
-        begin_resp_type = begin_resp.get("type") if isinstance(begin_resp, dict) else None
-        if (
-            not isinstance(begin_res, dict)
-            or begin_res.get("type") != "ok"
-            or (begin_resp_type is not None and begin_resp_type != "execute")
-        ):
+        if not _is_valid_execute_response(begin_res):
             rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 1 BEGIN failed")
             if not rb_ok:
                 self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
@@ -2003,9 +2020,7 @@ class StagingJournalHranaSeam:
             self._latch_local_halt(run_id, "CLEANUP_PHASE1_FAILED")
             raise FencingConflictError(f"Cleanup CAS failed ({valid_code}). Transaction rolled back fail-closed.")
 
-        cas_resp_obj = cas_res.get("response") if isinstance(cas_res, dict) else None
-        cas_resp_type = cas_resp_obj.get("type") if isinstance(cas_resp_obj, dict) else None
-        if cas_resp_type is not None and cas_resp_type != "execute":
+        if not _is_valid_execute_response(cas_res):
             rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="cleanup CAS malformed response")
             if not rb_ok:
                 self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
@@ -2016,9 +2031,10 @@ class StagingJournalHranaSeam:
             self._latch_local_halt(run_id, "CLEANUP_PHASE1_MALFORMED")
             raise FencingConflictError("Cleanup CAS response malformed. Transaction rolled back fail-closed.")
 
+        cas_resp_obj = cas_res.get("response") if isinstance(cas_res, dict) else None
         cas_res_dict = cas_resp_obj.get("result") if isinstance(cas_resp_obj, dict) else None
-        affected_cas = cas_res_dict.get("affected_row_count", 0) if isinstance(cas_res_dict, dict) else 0
-        if affected_cas != 1:
+        if not _validate_exact_affected_count(cas_res_dict, 1):
+            raw_affected = cas_res_dict.get("affected_row_count") if isinstance(cas_res_dict, dict) else None
             rb_ok, rb_code = self._dispatch_verified_rollback(
                 baton=baton,
                 run_id=run_id,
@@ -2027,22 +2043,16 @@ class StagingJournalHranaSeam:
             if not rb_ok:
                 self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
                 raise AmbiguousRollbackError(
-                    f"Cleanup CAS affected {affected_cas} rows (expected 1), and ROLLBACK could not be confirmed ({rb_code}). "
+                    f"Cleanup CAS affected {raw_affected} rows (expected 1), and ROLLBACK could not be confirmed ({rb_code}). "
                     "Transaction outcome UNKNOWN; run locally HALTED."
                 ) from None
             raise FencingConflictError(
-                f"Cleanup CAS affected {affected_cas} rows (expected 1). Fencing check failed; transaction rolled back fail-closed."
+                f"Cleanup CAS affected {raw_affected} rows (expected 1). Fencing check failed; transaction rolled back fail-closed."
             )
 
         # Check all DELETE statement outcomes
         for del_idx, del_res in enumerate(results1[2:]):
-            del_resp = del_res.get("response") if isinstance(del_res, dict) else None
-            del_resp_type = del_resp.get("type") if isinstance(del_resp, dict) else None
-            if (
-                not isinstance(del_res, dict)
-                or del_res.get("type") != "ok"
-                or (del_resp_type is not None and del_resp_type != "execute")
-            ):
+            if not _is_valid_execute_response(del_res):
                 err_dict = del_res.get("error", {}) if isinstance(del_res, dict) and isinstance(del_res.get("error"), dict) else {}
                 valid_code, _ = _sanitize_hrana_error(err_dict.get("code"))
                 rb_ok, rb_code = self._dispatch_verified_rollback(
@@ -2119,28 +2129,16 @@ class StagingJournalHranaSeam:
 
         residual_detected: Optional[str] = None
         for idx, audit_res in enumerate(results2):
-            resp_obj = audit_res.get("response") if isinstance(audit_res, dict) else None
-            resp_type = resp_obj.get("type") if isinstance(resp_obj, dict) else None
-            if (
-                not isinstance(audit_res, dict)
-                or audit_res.get("type") != "ok"
-                or (resp_type is not None and resp_type != "execute")
-            ):
+            if not _is_valid_execute_response(audit_res):
                 err_dict = audit_res.get("error", {}) if isinstance(audit_res, dict) and isinstance(audit_res.get("error"), dict) else {}
                 valid_code, _ = _sanitize_hrana_error(err_dict.get("code"))
                 residual_detected = f"Audit query failed for entity index {idx} ({valid_code})"
                 break
 
-            if not isinstance(resp_obj, dict):
-                residual_detected = f"Malformed audit response object for entity index {idx}"
-                break
-
+            resp_obj = audit_res.get("response") if isinstance(audit_res, dict) else None
             result_dict = resp_obj.get("result") if isinstance(resp_obj, dict) else None
-            if not isinstance(result_dict, dict):
-                residual_detected = f"Malformed audit result dict for entity index {idx}"
-                break
 
-            if "rows" not in result_dict or not isinstance(result_dict["rows"], list):
+            if not isinstance(result_dict, dict) or "rows" not in result_dict or not isinstance(result_dict["rows"], list):
                 residual_detected = (
                     f"missing explicit 'rows' array for entity index {idx} "
                     f"table '{sorted_entities[idx]['table']}', pk '{sorted_entities[idx]['pk_value']}'"
@@ -2246,13 +2244,7 @@ class StagingJournalHranaSeam:
             )
 
         for p_idx, p_res in enumerate(results3):
-            p_resp = p_res.get("response") if isinstance(p_res, dict) else None
-            p_resp_type = p_resp.get("type") if isinstance(p_resp, dict) else None
-            if (
-                not isinstance(p_res, dict)
-                or p_res.get("type") != "ok"
-                or (p_resp_type is not None and p_resp_type != "execute")
-            ):
+            if not _is_valid_execute_response(p_res):
                 err_dict = p_res.get("error", {}) if isinstance(p_res, dict) and isinstance(p_res.get("error"), dict) else {}
                 valid_code, _ = _sanitize_hrana_error(err_dict.get("code"))
                 rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context=f"Phase 3 statement {p_idx} failed")
@@ -2271,18 +2263,18 @@ class StagingJournalHranaSeam:
         last_res = results3[-1] if isinstance(results3, list) and results3 else None
         last_resp_obj = last_res.get("response") if isinstance(last_res, dict) else None
         last_res_dict = last_resp_obj.get("result") if isinstance(last_resp_obj, dict) else None
-        affected_journal = last_res_dict.get("affected_row_count", 0) if isinstance(last_res_dict, dict) else None
-        if affected_journal != 1:
+        if not _validate_exact_affected_count(last_res_dict, 1):
+            raw_affected = last_res_dict.get("affected_row_count") if isinstance(last_res_dict, dict) else None
             rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 3 journal UPDATE != 1")
             if not rb_ok:
                 self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
                 raise AmbiguousRollbackError(
-                    f"Journal UPDATE to CLEANED_UP affected {affected_journal} rows (expected 1), and ROLLBACK could not be confirmed ({rb_code}). "
+                    f"Journal UPDATE to CLEANED_UP affected {raw_affected} rows (expected 1), and ROLLBACK could not be confirmed ({rb_code}). "
                     "Transaction outcome UNKNOWN; run locally HALTED."
                 ) from None
             self._latch_local_halt(run_id, "CLEANUP_PHASE3_ROWCOUNT_MISMATCH")
             raise CleanupVerificationError(
-                f"Failed to update journal status to CLEANED_UP: affected {affected_journal} rows (expected 1). "
+                f"Failed to update journal status to CLEANED_UP: affected {raw_affected} rows (expected 1). "
                 "Transaction rolled back; run locally HALTED."
             )
 
