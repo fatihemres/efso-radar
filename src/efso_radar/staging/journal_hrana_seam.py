@@ -331,6 +331,8 @@ def _is_valid_execute_response(item: Any) -> bool:
     - item is a dictionary with outer type == 'ok'.
     - Inner 'response' is a dictionary with type == 'execute'.
     - Inner 'result' is a dictionary.
+    - Mandatory canonical 'cols' is a list of column descriptors (each a dict with non-empty string 'name').
+    - Mandatory canonical 'rows' is a list of row lists/tuples, each having length equal to len(cols).
     """
     if not isinstance(item, dict) or item.get("type") != "ok":
         return False
@@ -340,7 +342,42 @@ def _is_valid_execute_response(item: Any) -> bool:
     result = resp.get("result")
     if not isinstance(result, dict):
         return False
+    cols = result.get("cols")
+    if not isinstance(cols, list):
+        return False
+    for c in cols:
+        if not isinstance(c, dict) or not isinstance(c.get("name"), str) or not c.get("name"):
+            return False
+    rows = result.get("rows")
+    if not isinstance(rows, list):
+        return False
+    cols_len = len(cols)
+    for r in rows:
+        if not isinstance(r, (list, tuple)) or len(r) != cols_len:
+            return False
     return True
+
+
+def _sanitize_rowcount_category(result_dict: Any) -> str:
+    """Return a fixed, bounded categorization string for an unvalidated affected_row_count value.
+
+    Guarantees that untrusted wire values (such as secret sentinels or injection strings)
+    are NEVER interpolated into exception messages or tracebacks.
+    """
+    if not isinstance(result_dict, dict) or "affected_row_count" not in result_dict:
+        return "missing"
+    val = result_dict["affected_row_count"]
+    if isinstance(val, bool):
+        return "boolean"
+    if isinstance(val, int):
+        if -1000 <= val <= 1000:
+            return str(val)
+        return "out-of-range integer"
+    if isinstance(val, float):
+        return "float"
+    if isinstance(val, str):
+        return "string"
+    return "invalid type"
 
 
 def _validate_exact_affected_count(result_dict: Any, expected: int) -> bool:
@@ -370,11 +407,25 @@ def _is_valid_entity_result_metadata(
     """Validate that query result metadata from mock Hrana wire is credible for an allowlisted entity."""
     if tbl not in ALLOWED_TABLE_PK_MAP or pk_col != ALLOWED_TABLE_PK_MAP[tbl]:
         return False
-    cols = getattr(res, "cols", None)
-    if not isinstance(cols, (list, tuple)) or not cols:
+
+    raw_cols = None
+    if isinstance(res, dict):
+        raw_cols = res.get("cols")
+    else:
+        raw_cols = getattr(res, "cols", None)
+
+    if not isinstance(raw_cols, (list, tuple)) or not raw_cols:
         return False
-    if not all(isinstance(c, str) and c for c in cols):
-        return False
+
+    cols: list[str] = []
+    for c in raw_cols:
+        if isinstance(c, str) and c:
+            cols.append(c)
+        elif isinstance(c, dict) and isinstance(c.get("name"), str) and c.get("name"):
+            cols.append(c["name"])
+        else:
+            return False
+
     expected_cols = EXPECTED_ENTITY_QUERY_COLS.get(tbl)
     if expected_cols is None or tuple(cols) != expected_cols:
         return False
@@ -1306,7 +1357,7 @@ class StagingJournalHranaSeam:
             req_affected = required_affected_counts[idx]
 
             if req_affected is not None and not _validate_exact_affected_count(exec_res, req_affected):
-                raw_affected = exec_res.get("affected_row_count") if isinstance(exec_res, dict) else None
+                count_cat = _sanitize_rowcount_category(exec_res)
                 rb_ok, rb_code = self._dispatch_verified_rollback(
                     baton=baton,
                     run_id=run_id,
@@ -1315,12 +1366,12 @@ class StagingJournalHranaSeam:
                 if not rb_ok:
                     self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
                     raise AmbiguousRollbackError(
-                        f"Hrana statement {idx} affected {raw_affected} rows (expected {req_affected}), "
+                        f"Hrana statement {idx} affected {count_cat} rows (expected {req_affected}), "
                         f"and ROLLBACK could not be confirmed ({rb_code}). "
                         "Transaction outcome UNKNOWN; run locally HALTED."
                     ) from None
                 raise FencingConflictError(
-                    f"Hrana statement {idx} affected {raw_affected} rows (expected {req_affected}). "
+                    f"Hrana statement {idx} affected {count_cat} rows (expected {req_affected}). "
                     "Transaction rolled back fail-closed."
                 )
 
@@ -2034,7 +2085,7 @@ class StagingJournalHranaSeam:
         cas_resp_obj = cas_res.get("response") if isinstance(cas_res, dict) else None
         cas_res_dict = cas_resp_obj.get("result") if isinstance(cas_resp_obj, dict) else None
         if not _validate_exact_affected_count(cas_res_dict, 1):
-            raw_affected = cas_res_dict.get("affected_row_count") if isinstance(cas_res_dict, dict) else None
+            count_cat = _sanitize_rowcount_category(cas_res_dict)
             rb_ok, rb_code = self._dispatch_verified_rollback(
                 baton=baton,
                 run_id=run_id,
@@ -2043,11 +2094,11 @@ class StagingJournalHranaSeam:
             if not rb_ok:
                 self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
                 raise AmbiguousRollbackError(
-                    f"Cleanup CAS affected {raw_affected} rows (expected 1), and ROLLBACK could not be confirmed ({rb_code}). "
+                    f"Cleanup CAS affected {count_cat} rows (expected 1), and ROLLBACK could not be confirmed ({rb_code}). "
                     "Transaction outcome UNKNOWN; run locally HALTED."
                 ) from None
             raise FencingConflictError(
-                f"Cleanup CAS affected {raw_affected} rows (expected 1). Fencing check failed; transaction rolled back fail-closed."
+                f"Cleanup CAS affected {count_cat} rows (expected 1). Fencing check failed; transaction rolled back fail-closed."
             )
 
         # Check all DELETE statement outcomes
@@ -2129,27 +2180,37 @@ class StagingJournalHranaSeam:
 
         residual_detected: Optional[str] = None
         for idx, audit_res in enumerate(results2):
-            if not _is_valid_execute_response(audit_res):
-                err_dict = audit_res.get("error", {}) if isinstance(audit_res, dict) and isinstance(audit_res.get("error"), dict) else {}
-                valid_code, _ = _sanitize_hrana_error(err_dict.get("code"))
-                residual_detected = f"Audit query failed for entity index {idx} ({valid_code})"
-                break
-
             resp_obj = audit_res.get("response") if isinstance(audit_res, dict) else None
             result_dict = resp_obj.get("result") if isinstance(resp_obj, dict) else None
 
-            if not isinstance(result_dict, dict) or "rows" not in result_dict or not isinstance(result_dict["rows"], list):
+            if not _is_valid_execute_response(audit_res):
+                if isinstance(result_dict, dict) and ("rows" not in result_dict or not isinstance(result_dict.get("rows"), list)):
+                    residual_detected = (
+                        f"missing explicit 'rows' array for entity index {idx} "
+                        f"table '{sorted_entities[idx]['table']}', pk '{sorted_entities[idx]['pk_value']}'"
+                    )
+                else:
+                    err_dict = audit_res.get("error", {}) if isinstance(audit_res, dict) and isinstance(audit_res.get("error"), dict) else {}
+                    valid_code, _ = _sanitize_hrana_error(err_dict.get("code"))
+                    residual_detected = f"Audit query failed for entity index {idx} ({valid_code})"
+                break
+
+            ent = sorted_entities[idx]
+            tbl = ent["table"]
+            pk_col = ent["pk_column"]
+            exp_attrs = ent.get("expected_attributes", {})
+
+            if not _is_valid_entity_result_metadata(tbl, pk_col, exp_attrs, result_dict):
                 residual_detected = (
-                    f"missing explicit 'rows' array for entity index {idx} "
-                    f"table '{sorted_entities[idx]['table']}', pk '{sorted_entities[idx]['pk_value']}'"
+                    f"Invalid or untrusted column metadata for entity index {idx} "
+                    f"table '{tbl}', pk '{ent['pk_value']}'"
                 )
                 break
 
             rows = result_dict["rows"]
             if len(rows) > 0:
-                ent = sorted_entities[idx]
                 residual_detected = (
-                    f"Residual or foreign row detected for table '{ent['table']}', "
+                    f"Residual or foreign row detected for table '{tbl}', "
                     f"pk '{ent['pk_value']}' (found {len(rows)} rows after cleanup DELETE)"
                 )
                 break
@@ -2264,17 +2325,17 @@ class StagingJournalHranaSeam:
         last_resp_obj = last_res.get("response") if isinstance(last_res, dict) else None
         last_res_dict = last_resp_obj.get("result") if isinstance(last_resp_obj, dict) else None
         if not _validate_exact_affected_count(last_res_dict, 1):
-            raw_affected = last_res_dict.get("affected_row_count") if isinstance(last_res_dict, dict) else None
+            count_cat = _sanitize_rowcount_category(last_res_dict)
             rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 3 journal UPDATE != 1")
             if not rb_ok:
                 self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
                 raise AmbiguousRollbackError(
-                    f"Journal UPDATE to CLEANED_UP affected {raw_affected} rows (expected 1), and ROLLBACK could not be confirmed ({rb_code}). "
+                    f"Journal UPDATE to CLEANED_UP affected {count_cat} rows (expected 1), and ROLLBACK could not be confirmed ({rb_code}). "
                     "Transaction outcome UNKNOWN; run locally HALTED."
                 ) from None
             self._latch_local_halt(run_id, "CLEANUP_PHASE3_ROWCOUNT_MISMATCH")
             raise CleanupVerificationError(
-                f"Failed to update journal status to CLEANED_UP: affected {raw_affected} rows (expected 1). "
+                f"Failed to update journal status to CLEANED_UP: affected {count_cat} rows (expected 1). "
                 "Transaction rolled back; run locally HALTED."
             )
 
