@@ -324,7 +324,7 @@ def _validate_transaction_control_ack(data: Any, expected_stmt: str = "COMMIT") 
     return True, "OK"
 
 
-def _is_valid_execute_response(item: Any) -> bool:
+def _is_valid_execute_response(item: Any, *, require_empty_results: bool = False) -> bool:
     """Validate that a pipeline result item is a valid Hrana execute response.
 
     Enforces:
@@ -333,6 +333,9 @@ def _is_valid_execute_response(item: Any) -> bool:
     - Inner 'result' is a dictionary.
     - Mandatory canonical 'cols' is a list of column descriptors (each a dict with non-empty string 'name').
     - Mandatory canonical 'rows' is a list of row lists/tuples, each having length equal to len(cols).
+    - If require_empty_results is True (enforced for non-returning write/control statements:
+      BEGIN, INSERT, UPDATE, DELETE, CAS, and Phase-3 finalization):
+      both 'cols' and 'rows' must be strictly empty (len(cols) == 0 and len(rows) == 0).
     """
     if not isinstance(item, dict) or item.get("type") != "ok":
         return False
@@ -355,7 +358,14 @@ def _is_valid_execute_response(item: Any) -> bool:
     for r in rows:
         if not isinstance(r, (list, tuple)) or len(r) != cols_len:
             return False
+    if require_empty_results and (len(cols) != 0 or len(rows) != 0):
+        return False
     return True
+
+
+def _is_valid_write_execute_response(item: Any) -> bool:
+    """Validate that a pipeline result item is a valid Hrana execute response for a non-returning write/control statement."""
+    return _is_valid_execute_response(item, require_empty_results=True)
 
 
 def _sanitize_rowcount_category(result_dict: Any) -> str:
@@ -1323,7 +1333,7 @@ class StagingJournalHranaSeam:
 
         # 3. Check BEGIN outcome
         begin_res = results[0]
-        if not _is_valid_execute_response(begin_res):
+        if not _is_valid_write_execute_response(begin_res):
             if baton:
                 rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="BEGIN failed")
                 if not rb_ok:
@@ -1338,7 +1348,7 @@ class StagingJournalHranaSeam:
         # 4. Check each statement outcome and row count
         stmt_results = results[1:]
         for idx, s_res in enumerate(stmt_results):
-            if not _is_valid_execute_response(s_res):
+            if not _is_valid_write_execute_response(s_res):
                 err_dict = s_res.get("error", {}) if isinstance(s_res, dict) and isinstance(s_res.get("error"), dict) else {}
                 valid_code, category = _sanitize_hrana_error(err_dict.get("code"))
                 if baton:
@@ -2041,7 +2051,7 @@ class StagingJournalHranaSeam:
 
         # Check BEGIN
         begin_res = results1[0]
-        if not _is_valid_execute_response(begin_res):
+        if not _is_valid_write_execute_response(begin_res):
             rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="Phase 1 BEGIN failed")
             if not rb_ok:
                 self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
@@ -2071,7 +2081,7 @@ class StagingJournalHranaSeam:
             self._latch_local_halt(run_id, "CLEANUP_PHASE1_FAILED")
             raise FencingConflictError(f"Cleanup CAS failed ({valid_code}). Transaction rolled back fail-closed.")
 
-        if not _is_valid_execute_response(cas_res):
+        if not _is_valid_write_execute_response(cas_res):
             rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context="cleanup CAS malformed response")
             if not rb_ok:
                 self._latch_local_halt(run_id, "AMBIGUOUS_ROLLBACK_UNVERIFIED")
@@ -2103,7 +2113,7 @@ class StagingJournalHranaSeam:
 
         # Check all DELETE statement outcomes
         for del_idx, del_res in enumerate(results1[2:]):
-            if not _is_valid_execute_response(del_res):
+            if not _is_valid_write_execute_response(del_res):
                 err_dict = del_res.get("error", {}) if isinstance(del_res, dict) and isinstance(del_res.get("error"), dict) else {}
                 valid_code, _ = _sanitize_hrana_error(err_dict.get("code"))
                 rb_ok, rb_code = self._dispatch_verified_rollback(
@@ -2305,7 +2315,7 @@ class StagingJournalHranaSeam:
             )
 
         for p_idx, p_res in enumerate(results3):
-            if not _is_valid_execute_response(p_res):
+            if not _is_valid_write_execute_response(p_res):
                 err_dict = p_res.get("error", {}) if isinstance(p_res, dict) and isinstance(p_res.get("error"), dict) else {}
                 valid_code, _ = _sanitize_hrana_error(err_dict.get("code"))
                 rb_ok, rb_code = self._dispatch_verified_rollback(baton=baton, run_id=run_id, context=f"Phase 3 statement {p_idx} failed")

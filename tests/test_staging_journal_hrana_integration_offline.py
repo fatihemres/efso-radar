@@ -6875,20 +6875,30 @@ class TestIssue97WritePathSecurity(_BaseTwoRunnerFixture):
             return None
 
         self.transport_a.custom_response_hook = sentinel_cas_hook
-        with self.assertRaises(FencingConflictError) as ctx:
+        caught_exc: Optional[FencingConflictError] = None
+        active_tb: Optional[str] = None
+        active_frames: list[traceback.FrameSummary] = []
+        try:
             self.seam_a.execute_conditional_cleanup(
                 run_id=sub_run_id,
                 expected_fencing_token=token,
                 manifest_seal_hex=sub_seal,
             )
+        except FencingConflictError as exc:
+            caught_exc = exc
+            active_tb = traceback.format_exc()
+            active_frames = traceback.extract_tb(exc.__traceback__)
 
-        err_msg = str(ctx.exception)
-        tb_str = "".join(traceback.format_exception(type(ctx.exception), ctx.exception, ctx.exception.__traceback__))
+        self.assertIsNotNone(caught_exc, "Expected FencingConflictError to be raised")
+        self.assertGreater(len(active_frames), 0, "Active traceback must contain stack frames")
+        self.assertIsNotNone(active_tb)
+        self.assertIn("execute_conditional_cleanup", active_tb)
+        err_msg = str(caught_exc)
 
         self.assertNotIn(sentinel, err_msg, "Secret sentinel leaked into exception message")
-        self.assertNotIn(sentinel, tb_str, "Secret sentinel leaked into traceback")
+        self.assertNotIn(sentinel, active_tb, "Secret sentinel leaked into active traceback")
         self.assertIn("Cleanup CAS affected string rows (expected 1)", err_msg)
-        self.assertIsNone(ctx.exception.__cause__, "Unexpected __cause__ on FencingConflictError")
+        self.assertIsNone(caught_exc.__cause__, "Unexpected __cause__ on FencingConflictError")
         self.assertEqual(len(commit_dispatched), 0, "Phase 4 COMMIT dispatched on sentinel failure")
 
     def test_p2_malformed_rowcount_sentinel_unverified_rollback(self):
@@ -6951,18 +6961,28 @@ class TestIssue97WritePathSecurity(_BaseTwoRunnerFixture):
             return None
 
         self.transport_a.custom_response_hook = sentinel_cas_unverified_hook
-        with self.assertRaises(AmbiguousRollbackError) as ctx:
+        caught_exc: Optional[AmbiguousRollbackError] = None
+        active_tb: Optional[str] = None
+        active_frames: list[traceback.FrameSummary] = []
+        try:
             self.seam_a.execute_conditional_cleanup(
                 run_id=sub_run_id,
                 expected_fencing_token=token,
                 manifest_seal_hex=sub_seal,
             )
+        except AmbiguousRollbackError as exc:
+            caught_exc = exc
+            active_tb = traceback.format_exc()
+            active_frames = traceback.extract_tb(exc.__traceback__)
 
-        err_msg = str(ctx.exception)
-        tb_str = "".join(traceback.format_exception(type(ctx.exception), ctx.exception, ctx.exception.__traceback__))
+        self.assertIsNotNone(caught_exc, "Expected AmbiguousRollbackError to be raised")
+        self.assertGreater(len(active_frames), 0, "Active traceback must contain stack frames")
+        self.assertIsNotNone(active_tb)
+        self.assertIn("execute_conditional_cleanup", active_tb)
+        err_msg = str(caught_exc)
 
         self.assertNotIn(sentinel, err_msg, "Secret sentinel leaked into AmbiguousRollbackError message")
-        self.assertNotIn(sentinel, tb_str, "Secret sentinel leaked into AmbiguousRollbackError traceback")
+        self.assertNotIn(sentinel, active_tb, "Secret sentinel leaked into AmbiguousRollbackError active traceback")
         self.assertIn("Cleanup CAS affected string rows (expected 1)", err_msg)
         self.assertIn("ROLLBACK could not be confirmed", err_msg)
 
@@ -6973,3 +6993,330 @@ class TestIssue97WritePathSecurity(_BaseTwoRunnerFixture):
         self.assertNotIn(sentinel, marker_text, "Secret sentinel leaked into disk HALT marker")
 
         self.assertEqual(len(commit_dispatched), 0, "Phase 4 COMMIT dispatched on unverified rollback")
+
+    def test_p1_non_returning_write_ack_select_like_cols_or_rows_rejects_with_zero_commit(self):
+        """Non-returning write acknowledgments (BEGIN, CAS, DELETE, Phase-3 prep) returning SELECT-like cols/rows fail closed with 0 COMMIT."""
+        scenarios = [
+            ("begin_select_like_cols", "begin", {"cols": [{"name": "fake"}], "rows": []}, TursoClientError, "Failed to begin cleanup transaction"),
+            ("begin_select_like_cols_and_rows", "begin", {"cols": [{"name": "fake"}], "rows": [[{"type": "text", "value": "x"}]]}, TursoClientError, "Failed to begin cleanup transaction"),
+            ("cas_select_like_cols", "cas", {"cols": [{"name": "fencing_token"}], "rows": [], "affected_row_count": 1}, FencingConflictError, "Cleanup CAS response malformed"),
+            ("cas_select_like_cols_and_rows", "cas", {"cols": [{"name": "fencing_token"}], "rows": [[{"type": "integer", "value": "1"}]], "affected_row_count": 1}, FencingConflictError, "Cleanup CAS response malformed"),
+            ("delete_select_like_cols", "delete", {"cols": [{"name": "id"}], "rows": [], "affected_row_count": 1}, CleanupVerificationError, "DELETE statement"),
+            ("delete_select_like_cols_and_rows", "delete", {"cols": [{"name": "id"}], "rows": [[{"type": "text", "value": "x"}]]}, CleanupVerificationError, "DELETE statement"),
+            ("phase3_prep_select_like_cols", "phase3", {"cols": [{"name": "status"}], "rows": [], "affected_row_count": 1}, CleanupVerificationError, "Cleanup finalization statement"),
+            ("phase3_prep_select_like_cols_and_rows", "phase3", {"cols": [{"name": "status"}], "rows": [[{"type": "text", "value": "x"}]]}, CleanupVerificationError, "Cleanup finalization statement"),
+        ]
+
+        for i, (scen_id, target_stmt, spoofed_res, expected_exc, err_match) in enumerate(scenarios, start=1):
+            sub_run_id = f"run_20261107T130600Z_{i:012x}"
+            sub_entities = create_default_manifest_entities(sub_run_id)
+            sub_seal = compute_canonical_inventory_fingerprint(sub_run_id, sub_entities)
+
+            self.transport_a.custom_response_hook = None
+            self.conn_a.rollback()
+            self.transport_a.active_batons.clear()
+            self.transport_a.in_transaction.clear()
+            self.conn_a.execute("DELETE FROM staging_run_journal")
+            self.conn_a.execute("DELETE FROM run_locks")
+            self.conn_a.commit()
+
+            self.seam_a.register_intent(
+                run_id=sub_run_id,
+                manifest_seal_hex=sub_seal,
+                target_inventory=sub_entities,
+            )
+            mutations = build_live02_synthetic_mutations(sub_run_id)
+            token = self.seam_a.execute_atomic_stage_mutation(
+                run_id=sub_run_id,
+                expected_fencing_token=1,
+                stage="LIVE-02",
+                mutation_statements=mutations,
+                manifest_seal_hex=sub_seal,
+            )
+
+            commit_dispatched: list[str] = []
+
+            def select_like_hook(request: httpx.Request) -> Optional[httpx.Response]:
+                try:
+                    body = json.loads(request.content.decode("utf-8"))
+                except Exception:
+                    return None
+                reqs = body.get("requests", [])
+                for r in reqs:
+                    if r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT":
+                        commit_dispatched.append("COMMIT")
+
+                has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+                if has_rollback:
+                    return httpx.Response(
+                        200,
+                        json={
+                            "baton": body.get("baton"),
+                            "results": [
+                                {
+                                    "type": "ok",
+                                    "response": {
+                                        "type": "execute",
+                                        "result": {"cols": [], "rows": []},
+                                    },
+                                }
+                            ],
+                        },
+                        request=request,
+                    )
+
+                is_phase1 = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+                if is_phase1:
+                    if target_stmt == "begin":
+                        results = [
+                            {"type": "ok", "response": {"type": "execute", "result": spoofed_res}},
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": [], "affected_row_count": 1}}},
+                            *[{"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": [], "affected_row_count": 1}}} for _ in reqs[2:]],
+                        ]
+                    elif target_stmt == "cas":
+                        results = [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": spoofed_res}},
+                            *[{"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": [], "affected_row_count": 1}}} for _ in reqs[2:]],
+                        ]
+                    elif target_stmt == "delete":
+                        results = [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": [], "affected_row_count": 1}}},
+                            {"type": "ok", "response": {"type": "execute", "result": spoofed_res}},
+                            *[{"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": [], "affected_row_count": 1}}} for _ in reqs[3:]],
+                        ]
+                    else:
+                        results = [
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                            {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": [], "affected_row_count": 1}}},
+                            *[{"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": [], "affected_row_count": 1}}} for _ in reqs[2:]],
+                        ]
+                    return httpx.Response(
+                        200,
+                        json={"baton": body.get("baton", "b_sel_like"), "results": results},
+                        request=request,
+                    )
+
+                is_phase2 = any("SELECT" in r.get("stmt", {}).get("sql", "").upper() for r in reqs)
+                if is_phase2:
+                    results = []
+                    for r in reqs:
+                        sql = r.get("stmt", {}).get("sql", "")
+                        for tbl, exp_cols in EXPECTED_ENTITY_QUERY_COLS.items():
+                            if f"FROM {tbl}" in sql:
+                                results.append({
+                                    "type": "ok",
+                                    "response": {
+                                        "type": "execute",
+                                        "result": {
+                                            "cols": [{"name": c} for c in exp_cols],
+                                            "rows": [],
+                                        },
+                                    },
+                                })
+                                break
+                    return httpx.Response(
+                        200,
+                        json={"baton": body.get("baton", "b_audit_ok"), "results": results},
+                        request=request,
+                    )
+
+                is_phase3 = any("CLEANED_UP" in str(r.get("stmt", {}).get("args", [])) or "status = ?" in r.get("stmt", {}).get("sql", "") for r in reqs)
+                if is_phase3 and target_stmt == "phase3":
+                    results = [
+                        {"type": "ok", "response": {"type": "execute", "result": spoofed_res}},
+                        {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": [], "affected_row_count": 1}}},
+                    ][:len(reqs)]
+                    return httpx.Response(
+                        200,
+                        json={"baton": body.get("baton", "b_p3_spoofed"), "results": results},
+                        request=request,
+                    )
+                return None
+
+            self.transport_a.custom_response_hook = select_like_hook
+            with self.subTest(scen_id=scen_id):
+                with self.assertRaises(expected_exc) as ctx:
+                    self.seam_a.execute_conditional_cleanup(
+                        run_id=sub_run_id,
+                        expected_fencing_token=token,
+                        manifest_seal_hex=sub_seal,
+                    )
+                self.assertIn(err_match, str(ctx.exception))
+                self.assertTrue(self.seam_a.is_halted(sub_run_id))
+                self.assertEqual(len(commit_dispatched), 0, f"COMMIT dispatched in {scen_id}")
+
+    def test_p1_non_returning_write_ack_select_like_unverified_rollback_fails_to_ambiguous(self):
+        """SELECT-like response on write statement with failed rollback raises AmbiguousRollbackError and latches durable HALT."""
+        sub_run_id = "run_20261107T130700Z_000000000001"
+        sub_entities = create_default_manifest_entities(sub_run_id)
+        sub_seal = compute_canonical_inventory_fingerprint(sub_run_id, sub_entities)
+
+        self.transport_a.custom_response_hook = None
+        self.conn_a.rollback()
+        self.transport_a.active_batons.clear()
+        self.transport_a.in_transaction.clear()
+        self.conn_a.execute("DELETE FROM staging_run_journal")
+        self.conn_a.execute("DELETE FROM run_locks")
+        self.conn_a.commit()
+
+        self.seam_a.register_intent(
+            run_id=sub_run_id,
+            manifest_seal_hex=sub_seal,
+            target_inventory=sub_entities,
+        )
+        mutations = build_live02_synthetic_mutations(sub_run_id)
+        token = self.seam_a.execute_atomic_stage_mutation(
+            run_id=sub_run_id,
+            expected_fencing_token=1,
+            stage="LIVE-02",
+            mutation_statements=mutations,
+            manifest_seal_hex=sub_seal,
+        )
+
+        commit_dispatched: list[str] = []
+
+        def unv_rollback_hook(request: httpx.Request) -> Optional[httpx.Response]:
+            try:
+                body = json.loads(request.content.decode("utf-8"))
+            except Exception:
+                return None
+            reqs = body.get("requests", [])
+            for r in reqs:
+                if r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT":
+                    commit_dispatched.append("COMMIT")
+
+            has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+            if has_rollback:
+                return httpx.Response(503, json={"error": "Service Unavailable on ROLLBACK"}, request=request)
+
+            has_delete = any("DELETE FROM" in r.get("stmt", {}).get("sql", "").upper() for r in reqs)
+            if has_delete:
+                results = [
+                    {"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": []}}},
+                    {"type": "ok", "response": {"type": "execute", "result": {"cols": [{"name": "fencing_token"}], "rows": [], "affected_row_count": 1}}},
+                    *[{"type": "ok", "response": {"type": "execute", "result": {"cols": [], "rows": [], "affected_row_count": 1}}} for _ in reqs[2:]],
+                ]
+                return httpx.Response(
+                    200,
+                    json={"baton": body.get("baton", "b_unv_sel"), "results": results},
+                    request=request,
+                )
+            return None
+
+        self.transport_a.custom_response_hook = unv_rollback_hook
+        with self.assertRaises(AmbiguousRollbackError) as ctx:
+            self.seam_a.execute_conditional_cleanup(
+                run_id=sub_run_id,
+                expected_fencing_token=token,
+                manifest_seal_hex=sub_seal,
+            )
+
+        err_msg = str(ctx.exception)
+        self.assertIn("ROLLBACK could not be confirmed", err_msg)
+        self.assertTrue(self.seam_a.is_halted(sub_run_id))
+        marker_file = _halt_marker_path(sub_run_id, self.marker_dir_a)
+        self.assertTrue(marker_file.exists(), "Persistent HALT marker file must exist")
+        self.assertEqual(len(commit_dispatched), 0, "Phase 4 COMMIT dispatched on unverified rollback")
+
+    def test_p1_stage_mutation_write_ack_select_like_cols_or_rows_rejects_with_zero_commit(self):
+        """In execute_atomic_stage_mutation, SELECT-like write responses fail closed with verified rollback and 0 COMMIT."""
+        scenarios = [
+            ("cas_statement_0_select_like", 0, FencingConflictError, "Stage mutation CAS failed"),
+            ("mutation_statement_1_select_like", 1, JournalError, "Statement 1 failed in Hrana transaction"),
+        ]
+
+        for i, (scen_id, fail_stmt_idx, expected_exc, err_match) in enumerate(scenarios, start=1):
+            sub_run_id = f"run_20261107T130800Z_{i:012x}"
+            sub_entities = create_default_manifest_entities(sub_run_id)
+            sub_seal = compute_canonical_inventory_fingerprint(sub_run_id, sub_entities)
+
+            self.transport_a.custom_response_hook = None
+            self.conn_a.rollback()
+            self.transport_a.active_batons.clear()
+            self.transport_a.in_transaction.clear()
+            self.conn_a.execute("DELETE FROM staging_run_journal")
+            self.conn_a.execute("DELETE FROM run_locks")
+            self.conn_a.commit()
+
+            self.seam_a.register_intent(
+                run_id=sub_run_id,
+                manifest_seal_hex=sub_seal,
+                target_inventory=sub_entities,
+            )
+            mutations = build_live02_synthetic_mutations(sub_run_id)
+
+            commit_dispatched: list[str] = []
+
+            def mutation_select_like_hook(request: httpx.Request) -> Optional[httpx.Response]:
+                try:
+                    body = json.loads(request.content.decode("utf-8"))
+                except Exception:
+                    return None
+                reqs = body.get("requests", [])
+                for r in reqs:
+                    if r.get("stmt", {}).get("sql", "").strip().upper() == "COMMIT":
+                        commit_dispatched.append("COMMIT")
+
+                has_rollback = any(r.get("stmt", {}).get("sql", "").strip().upper() == "ROLLBACK" for r in reqs)
+                if has_rollback:
+                    return httpx.Response(
+                        200,
+                        json={
+                            "baton": body.get("baton"),
+                            "results": [
+                                {
+                                    "type": "ok",
+                                    "response": {
+                                        "type": "execute",
+                                        "result": {"cols": [], "rows": []},
+                                    },
+                                }
+                            ],
+                        },
+                        request=request,
+                    )
+
+                has_begin = any(r.get("stmt", {}).get("sql", "").strip().upper() == "BEGIN" for r in reqs)
+                if has_begin:
+                    target_idx = 1 + fail_stmt_idx
+                    results = []
+                    for idx, _ in enumerate(reqs):
+                        if idx == target_idx:
+                            results.append({
+                                "type": "ok",
+                                "response": {
+                                    "type": "execute",
+                                    "result": {"cols": [{"name": "fake"}], "rows": [], "affected_row_count": 1},
+                                },
+                            })
+                        else:
+                            results.append({
+                                "type": "ok",
+                                "response": {
+                                    "type": "execute",
+                                    "result": {"cols": [], "rows": [], "affected_row_count": 1},
+                                },
+                            })
+                    return httpx.Response(
+                        200,
+                        json={"baton": body.get("baton", "b_mut_sel"), "results": results},
+                        request=request,
+                    )
+                return None
+
+            self.transport_a.custom_response_hook = mutation_select_like_hook
+            with self.subTest(scen_id=scen_id):
+                with self.assertRaises(expected_exc) as ctx:
+                    self.seam_a.execute_atomic_stage_mutation(
+                        run_id=sub_run_id,
+                        expected_fencing_token=1,
+                        stage="LIVE-02",
+                        mutation_statements=mutations,
+                        manifest_seal_hex=sub_seal,
+                    )
+
+                self.assertIn(err_match, str(ctx.exception))
+                self.assertTrue(self.seam_a.is_halted(sub_run_id))
+                self.assertEqual(len(commit_dispatched), 0, f"COMMIT dispatched in {scen_id}")
