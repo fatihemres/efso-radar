@@ -672,6 +672,16 @@ class TestAdversarialSchemaPhaseTampering(unittest.TestCase):
             self.assertIn(PhaseGateReasonCode.UNEXPECTED_VIEW_OBJECT, cl.reason_codes)
             self.assertIn(PhaseGateReasonCode.CANDIDATE_JOURNAL_SCHEMA_INVALID, cl.reason_codes)
 
+        # Virtual table impersonating staging_run_journal
+        with closing(_make_canonical_v6_conn()) as conn:
+            conn.execute("CREATE VIRTUAL TABLE staging_run_journal USING fts5(run_id, owner_id)")
+            cl = classify_offline_schema_phase(conn)
+            self.assertEqual(cl.phase, SchemaPhase.DENY)
+            self.assertTrue(cl.candidate_journal_present)
+            self.assertFalse(cl.candidate_journal_valid)
+            self.assertIn(PhaseGateReasonCode.UNEXPECTED_VIRTUAL_TABLE, cl.reason_codes)
+            self.assertIn(PhaseGateReasonCode.CANDIDATE_JOURNAL_SCHEMA_INVALID, cl.reason_codes)
+
         # Case-mismatched table "STAGING_RUN_JOURNAL"
         with closing(_make_canonical_v6_conn()) as conn:
             conn.execute('CREATE TABLE "STAGING_RUN_JOURNAL" (run_id TEXT PRIMARY KEY)')
@@ -896,6 +906,18 @@ class TestReadOnlyIsolationAndInertHandoff(unittest.TestCase):
         self.assertFalse(handoff.non_mutating_verified)
         self.assertIn(PhaseGateReasonCode.INSPECTION_READ_ERROR, handoff.reason_codes)
 
+    def test_custom_dict_row_factory_on_candidate_journal_fails_closed_to_unknown(self):
+        def dict_factory(cursor: sqlite3.Cursor, row: tuple[Any, ...]) -> dict[str, Any]:
+            return {col[0]: row[idx] for idx, col in enumerate(cursor.description or ())}
+
+        with closing(_make_canonical_v6_conn()) as conn:
+            apply_candidate_schema_v7(conn)
+            conn.row_factory = dict_factory
+            cl = classify_offline_schema_phase(conn)
+            self.assertEqual(cl.phase, SchemaPhase.UNKNOWN)
+            self.assertIn(PhaseGateReasonCode.INSPECTION_READ_ERROR, cl.reason_codes)
+            self.assertIs(conn.row_factory, dict_factory)
+
     def test_sentinel_never_leaks_from_hostile_ddl_names_or_migrations(self):
         sentinel = "SECRET_SENTINEL_HOSTILE_DDL_99"
         with closing(_make_canonical_v6_conn()) as conn:
@@ -937,6 +959,16 @@ class TestReadOnlyIsolationAndInertHandoff(unittest.TestCase):
                 token="forbid",
             )
 
+        with self.assertRaises(ValidationError):
+            MockOperatorHandoff(
+                **{**handoff.model_dump(), "notes": ("LIVE_GO_APPROVED",)},
+            )
+
+        with self.assertRaises(ValidationError):
+            MockOperatorHandoff(
+                **{**handoff.model_dump(), "schema_fingerprint_sha256": "not-a-sha256"},
+            )
+
         # Missing/None classification -> UNKNOWN
         unknown_handoff = build_mock_operator_handoff(None)
         self.assertEqual(unknown_handoff.phase, SchemaPhase.UNKNOWN)
@@ -958,6 +990,21 @@ class TestReadOnlyIsolationAndInertHandoff(unittest.TestCase):
             non_mutating_verified=True,
             reason_codes=(),
         )
+        forged_non_hex_classification = SchemaPhaseClassification.model_construct(
+            phase=SchemaPhase.V6_BASELINE_OFFLINE,
+            observed_schema_version=6,
+            observed_v6_tables_matched=15,
+            observed_v6_columns_matched=129,
+            observed_v6_explicit_indexes_matched=15,
+            candidate_journal_present=False,
+            candidate_journal_valid=False,
+            schema_fingerprint_before="not-a-sha256",
+            schema_fingerprint_after="not-a-sha256",
+            content_fingerprint_before="b" * 64,
+            content_fingerprint_after="b" * 64,
+            non_mutating_verified=True,
+            reason_codes=(),
+        )
         remote_dict = {"phase": "V6_BASELINE_OFFLINE", "remote_state": "CLEAN", "live_authorized": True}
         preflight_ok = PreflightReport(success=True, schema_version=6, tables_checked=15, columns_checked=129)
         live01_ok = Live01Report(
@@ -969,7 +1016,13 @@ class TestReadOnlyIsolationAndInertHandoff(unittest.TestCase):
             columns_checked=129,
             collision_checks=5,
         )
-        for untrusted in (forged_classification, remote_dict, preflight_ok, live01_ok):
+        for untrusted in (
+            forged_classification,
+            forged_non_hex_classification,
+            remote_dict,
+            preflight_ok,
+            live01_ok,
+        ):
             with self.subTest(untrusted_type=type(untrusted).__name__):
                 denied = build_mock_operator_handoff(untrusted)  # type: ignore[arg-type]
                 self.assertEqual(denied.phase, SchemaPhase.DENY)

@@ -45,6 +45,7 @@ _FORBIDDEN_V6_DDL_CLAUSES = re.compile(
     re.IGNORECASE,
 )
 _AUTOINDEX_NAME_RE = re.compile(r"\Asqlite_autoindex_[a-z0-9_]+_[0-9]+\Z")
+_HEX_SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 _CANDIDATE_JOURNAL_TABLE = "staging_run_journal"
 
 
@@ -163,10 +164,19 @@ class SchemaPhaseClassification(_StrictFrozenModel):
 
     @model_validator(mode="after")
     def _validate_coherence(self) -> SchemaPhaseClassification:
+        for fp in (
+            self.schema_fingerprint_before,
+            self.schema_fingerprint_after,
+            self.content_fingerprint_before,
+            self.content_fingerprint_after,
+        ):
+            if fp != "" and not _HEX_SHA256_RE.match(fp):
+                raise ValueError("Fingerprints must be empty or lowercase 64-char hex SHA-256 digests.")
+
         expected_non_mutating = (
-            bool(self.schema_fingerprint_before)
+            bool(_HEX_SHA256_RE.match(self.schema_fingerprint_before))
             and self.schema_fingerprint_before == self.schema_fingerprint_after
-            and bool(self.content_fingerprint_before)
+            and bool(_HEX_SHA256_RE.match(self.content_fingerprint_before))
             and self.content_fingerprint_before == self.content_fingerprint_after
         )
         if self.non_mutating_verified != expected_non_mutating:
@@ -224,6 +234,9 @@ class MockOperatorHandoff(_StrictFrozenModel):
 
     @model_validator(mode="after")
     def _validate_handoff_coherence(self) -> MockOperatorHandoff:
+        if self.schema_fingerprint_sha256 != "" and not _HEX_SHA256_RE.match(self.schema_fingerprint_sha256):
+            raise ValueError("schema_fingerprint_sha256 must be empty or a lowercase 64-char hex SHA-256 digest.")
+
         if self.phase == SchemaPhase.V6_BASELINE_OFFLINE:
             if (
                 self.mock_test_eligibility != MockTestEligibility.LEGACY_V6_MOCK_LIVE01_AND_RUNNER_ONLY
@@ -232,8 +245,9 @@ class MockOperatorHandoff(_StrictFrozenModel):
                 or self.manual_next_gate != ManualNextGate.SEPARATE_PO_B2_COST_AND_B3_LIVE_READ_GO_REQUIRED
                 or self.observed_schema_version != CURRENT_SCHEMA_VERSION
                 or not self.non_mutating_verified
-                or not self.schema_fingerprint_sha256
+                or not _HEX_SHA256_RE.match(self.schema_fingerprint_sha256)
                 or len(self.reason_codes) != 0
+                or self.notes != _NOTES_V6_BASELINE
             ):
                 raise ValueError("Incoherent V6_BASELINE_OFFLINE handoff.")
         elif self.phase == SchemaPhase.V6_WITH_CANDIDATE_JOURNAL_OFFLINE:
@@ -244,8 +258,9 @@ class MockOperatorHandoff(_StrictFrozenModel):
                 or self.manual_next_gate != ManualNextGate.SEPARATE_PO_REVIEW_AND_FUTURE_B4_MIGRATION_GO_REQUIRED
                 or self.observed_schema_version != CURRENT_SCHEMA_VERSION
                 or not self.non_mutating_verified
-                or not self.schema_fingerprint_sha256
+                or not _HEX_SHA256_RE.match(self.schema_fingerprint_sha256)
                 or len(self.reason_codes) != 0
+                or self.notes != _NOTES_V6_WITH_CANDIDATE_JOURNAL
             ):
                 raise ValueError("Incoherent V6_WITH_CANDIDATE_JOURNAL_OFFLINE handoff.")
         elif self.phase == SchemaPhase.DENY:
@@ -255,6 +270,7 @@ class MockOperatorHandoff(_StrictFrozenModel):
                 or self.eligible_for_mock_journal_seam
                 or self.manual_next_gate != ManualNextGate.STOP_MANUAL_SCHEMA_INVESTIGATION_REQUIRED
                 or len(self.reason_codes) < 1
+                or self.notes != _NOTES_DENY
             ):
                 raise ValueError("Incoherent DENY handoff.")
         elif self.phase == SchemaPhase.UNKNOWN:
@@ -264,6 +280,7 @@ class MockOperatorHandoff(_StrictFrozenModel):
                 or self.eligible_for_mock_journal_seam
                 or self.manual_next_gate != ManualNextGate.STOP_MANUAL_EVIDENCE_VERIFICATION_REQUIRED
                 or len(self.reason_codes) < 1
+                or self.notes != _NOTES_UNKNOWN
             ):
                 raise ValueError("Incoherent UNKNOWN handoff.")
         return self
@@ -545,7 +562,7 @@ def _assert_hermetic_fixture_connection(conn: Any) -> tuple[bool, bool]:
                 or not resolved.is_relative_to(temp_dir)
                 or resolved == repo_data_dir
                 or resolved.is_relative_to(repo_data_dir)
-                or (resolved.name == "radar.db" and "data" in resolved.parts)
+                or (resolved.name.lower() == "radar.db" and any(part.lower() == "data" for part in resolved.parts))
             ):
                 raise PermissionError(
                     "HERMETIC_FIXTURE_ISOLATION_VIOLATION: SQLite connection targets a non-temporary or operational database."
@@ -571,6 +588,7 @@ def _compute_fingerprints(
         {"main": main_master, "temp": temp_master},
         sort_keys=True,
         separators=(",", ":"),
+        default=str,
     ).encode("utf-8")
     schema_fp = hashlib.sha256(schema_payload).hexdigest()
 
@@ -732,10 +750,17 @@ def classify_offline_schema_phase(
                     add_reason(PhaseGateReasonCode.CANDIDATE_JOURNAL_SCHEMA_INVALID)
             elif t_str == "table":
                 main_tables[name_str] = sql_str
+                is_virtual = sql_str is not None and sql_str.strip().upper().startswith("CREATE VIRTUAL TABLE")
+                if is_virtual:
+                    add_reason(PhaseGateReasonCode.UNEXPECTED_VIRTUAL_TABLE)
                 if name_str == _CANDIDATE_JOURNAL_TABLE:
                     candidate_journal_present = True
+                    if is_virtual:
+                        journal_has_invalid_artifact = True
+                        add_reason(PhaseGateReasonCode.CANDIDATE_JOURNAL_SCHEMA_INVALID)
                 elif name_str not in profile.tables:
-                    add_reason(PhaseGateReasonCode.UNEXPECTED_TABLE_OBJECT)
+                    if not is_virtual:
+                        add_reason(PhaseGateReasonCode.UNEXPECTED_TABLE_OBJECT)
                     if name_str.lower() == _CANDIDATE_JOURNAL_TABLE:
                         candidate_journal_present = True
                         journal_has_invalid_artifact = True
@@ -981,12 +1006,21 @@ def classify_offline_schema_phase(
             candidate_journal_present = True
             if not allow_candidate_journal:
                 add_reason(PhaseGateReasonCode.UNEXPECTED_JOURNAL_PRESENT)
-            journal_report = verify_staging_journal_schema(conn, raise_on_error=False)
-            if journal_report.is_valid and not journal_has_invalid_artifact:
-                candidate_journal_valid = True
-            else:
+            try:
+                journal_report = verify_staging_journal_schema(conn, raise_on_error=False)
+            except PermissionError:
+                raise PermissionError(
+                    "HERMETIC_FIXTURE_ISOLATION_VIOLATION: SQLite connection failed hermetic fixture isolation."
+                ) from None
+            except (TypeError, ValueError, KeyError, IndexError):
                 candidate_journal_valid = False
-                add_reason(PhaseGateReasonCode.CANDIDATE_JOURNAL_SCHEMA_INVALID)
+                add_reason(PhaseGateReasonCode.INSPECTION_READ_ERROR)
+            else:
+                if journal_report.is_valid and not journal_has_invalid_artifact:
+                    candidate_journal_valid = True
+                else:
+                    candidate_journal_valid = False
+                    add_reason(PhaseGateReasonCode.CANDIDATE_JOURNAL_SCHEMA_INVALID)
         elif candidate_journal_present:
             if not allow_candidate_journal:
                 add_reason(PhaseGateReasonCode.UNEXPECTED_JOURNAL_PRESENT)
@@ -1087,7 +1121,7 @@ def build_mock_operator_handoff(
 
     try:
         validated = SchemaPhaseClassification.model_validate(classification.model_dump())
-    except ValidationError:
+    except (ValidationError, TypeError, ValueError):
         return MockOperatorHandoff(
             phase=SchemaPhase.DENY,
             mock_test_eligibility=MockTestEligibility.NONE_DENIED,
