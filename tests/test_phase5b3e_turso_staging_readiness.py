@@ -753,15 +753,37 @@ class TestTursoStagingReadiness(unittest.TestCase):
     # -------------------------------------------------------------------------
 
     def test_20_operational_database_and_env_untouched(self) -> None:
-        """Requirement 20: Operational database data/radar.db and .env remain untouched."""
-        prod_path = Path("data/radar.db")
-        if prod_path.exists():
-            sqlite_repo = SqliteStateRepository(prod_path)
-            with self.assertRaises(PermissionError):
-                CloudPreflightValidator(sqlite_repo, allow_operational_db=False)
+        """Requirement 20: Forbidden operational database paths fail closed without opening or initializing DB."""
+        synthetic_forbidden = self.tmp_path / "data" / "radar.db"
+        self.assertFalse(synthetic_forbidden.exists())
 
-            with self.assertRaises(PermissionError):
-                execute_read_query(sqlite_repo, "SELECT 1")
+        def _uninitialized_repo(db_path: Path) -> SqliteStateRepository:
+            repo = SqliteStateRepository.__new__(SqliteStateRepository)
+            repo.db_path = db_path
+            repo._connection = MagicMock(
+                side_effect=AssertionError("Operational SQLite database must NEVER be opened")
+            )
+            return repo
+
+        with patch(
+            "sqlite3.connect",
+            side_effect=AssertionError("sqlite3.connect must NEVER be called for operational database paths"),
+        ) as mock_connect:
+            for forbidden_path in (Path("data/radar.db"), synthetic_forbidden):
+                repo = _uninitialized_repo(forbidden_path)
+                with self.assertRaises(PermissionError) as validator_ctx:
+                    CloudPreflightValidator(repo, allow_operational_db=False)
+                self.assertIn("operational database data/radar.db", str(validator_ctx.exception))
+
+                with self.assertRaises(PermissionError) as query_ctx:
+                    execute_read_query(repo, "SELECT 1")
+                self.assertIn("operational database data/radar.db", str(query_ctx.exception))
+
+                repo._connection.assert_not_called()
+
+            mock_connect.assert_not_called()
+
+        self.assertFalse(synthetic_forbidden.exists())
 
     # -------------------------------------------------------------------------
     # 10. PR #10 Final Hardening: Injected Client Safety & Hrana Error Redaction

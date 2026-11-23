@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import sqlite3
 import tarfile
 import tempfile
@@ -105,6 +106,7 @@ class TestPhase5B3BCloudSafetyContracts(unittest.TestCase):
         """Modular orchestrator errors must propagate and fail closed without falling back to legacy runner."""
         failing_settings = Settings(
             sqlite_db_path=self.db_path,
+            legacy_state_json_path=self.tmp_path / "nonexistent_state.json",
             telegram_delivery_enabled=False,
             ai_evaluation_enabled=False,
         )
@@ -135,11 +137,58 @@ class TestPhase5B3BCloudSafetyContracts(unittest.TestCase):
             )
         self.assertIn("Partial Turso configuration detected", str(ctx.exception))
 
-        # 3. Execution with cloud mode and missing credentials raises Exception without touching SQLite
-        with patch.dict("os.environ", {"EFSO_STORAGE_MODE": "turso", "TURSO_DATABASE_URL": "", "TURSO_AUTH_TOKEN": ""}):
-            with self.assertRaises(Exception) as ctx:
-                radar.run(dry_run=False)
-            self.assertTrue(any(x in str(ctx.exception).lower() for x in ["cloud storage mode", "incomplete", "validation"]))
+        # 3. Execution with cloud mode / partial credentials in an isolated temp CWD (zero .env access)
+        original_cwd = Path.cwd()
+        original_env = dict(os.environ)
+        with tempfile.TemporaryDirectory(prefix="efso_t1a_env_iso_") as isolated_dir:
+            try:
+                os.chdir(isolated_dir)
+                self.assertFalse(Path(".env").exists())
+
+                with (
+                    patch(
+                        "efso_radar.orchestrator.RadarOrchestrator",
+                        side_effect=AssertionError("Must fail closed before orchestrator construction"),
+                    ) as mock_orch,
+                    patch(
+                        "efso_radar.repositories.sqlite.SqliteStateRepository",
+                        side_effect=AssertionError("Must fail closed before SQLite repository fallback"),
+                    ) as mock_sqlite,
+                    patch(
+                        "efso_radar.repositories.turso.TursoStateRepository",
+                        side_effect=AssertionError("Must fail closed before Turso network repository construction"),
+                    ) as mock_turso,
+                ):
+                    with patch.dict(
+                        os.environ,
+                        {"EFSO_STORAGE_MODE": "turso", "TURSO_DATABASE_URL": "", "TURSO_AUTH_TOKEN": ""},
+                        clear=True,
+                    ):
+                        with self.assertRaises(ValueError) as ctx_turso:
+                            radar.run(dry_run=False)
+                        self.assertIn("Cloud storage mode enabled", str(ctx_turso.exception))
+
+                    with patch.dict(
+                        os.environ,
+                        {
+                            "EFSO_STORAGE_MODE": "auto",
+                            "TURSO_DATABASE_URL": "libsql://synthetic-only.turso.io",
+                            "TURSO_AUTH_TOKEN": "",
+                        },
+                        clear=True,
+                    ):
+                        with self.assertRaises(ValueError) as ctx_partial:
+                            radar.run(dry_run=False)
+                        self.assertIn("Partial Turso configuration detected", str(ctx_partial.exception))
+
+                    mock_orch.assert_not_called()
+                    mock_sqlite.assert_not_called()
+                    mock_turso.assert_not_called()
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(Path.cwd(), original_cwd)
+        self.assertEqual(dict(os.environ), original_env)
 
     # --- 2. Atomic Concurrency Control (Run Locks) ---
     def test_05_atomic_concurrency_lock_mutual_exclusion(self):
