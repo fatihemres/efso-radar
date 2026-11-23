@@ -770,7 +770,8 @@ class TestReadOnlyIsolationAndInertHandoff(unittest.TestCase):
         conn.set_authorizer(read_only_authorizer)
         try:
             classification = classify_offline_schema_phase(conn)
-            handoff = build_mock_operator_handoff(classification)
+            handoff = build_mock_operator_handoff(classification, conn=conn)
+            gate_handoff = evaluate_offline_schema_phase_gate(conn)
         finally:
             conn.set_authorizer(None)
             conn.set_trace_callback(None)
@@ -778,6 +779,7 @@ class TestReadOnlyIsolationAndInertHandoff(unittest.TestCase):
         self.assertEqual(auth_denials, [], f"Authorizer caught non-read-only operations: {auth_denials}")
         self.assertEqual(classification.phase, expected_phase)
         self.assertEqual(handoff.phase, expected_phase)
+        self.assertEqual(gate_handoff, handoff)
         self.assertTrue(classification.non_mutating_verified)
         self.assertEqual(
             classification.schema_fingerprint_before,
@@ -930,7 +932,7 @@ class TestReadOnlyIsolationAndInertHandoff(unittest.TestCase):
                 (f"v6 {sentinel}",),
             )
             cl = classify_offline_schema_phase(conn)
-            handoff = build_mock_operator_handoff(cl)
+            handoff = build_mock_operator_handoff(cl, conn=conn)
 
         self.assertEqual(handoff.phase, SchemaPhase.DENY)
         self.assertNotIn(sentinel, cl.model_dump_json())
@@ -1032,6 +1034,125 @@ class TestReadOnlyIsolationAndInertHandoff(unittest.TestCase):
                     PhaseGateReasonCode.UNTRUSTED_OR_REMOTE_CLAIMED_EVIDENCE,
                     denied.reason_codes,
                 )
+
+    def test_coherent_forged_classification_rejected_and_real_fixtures_bound(self):
+        # Public export boundary distinguishes trusted public API from internal formatter
+        self.assertNotIn("_format_mock_operator_handoff", schema_phase_gate.__all__)
+        for public_sym in (
+            "classify_offline_schema_phase",
+            "build_mock_operator_handoff",
+            "evaluate_offline_schema_phase_gate",
+        ):
+            self.assertIn(public_sym, schema_phase_gate.__all__)
+
+        # Normally constructed, Pydantic-valid, internally coherent forged classifications (NO model_construct)
+        coherent_forged_v6 = SchemaPhaseClassification(
+            phase=SchemaPhase.V6_BASELINE_OFFLINE,
+            observed_schema_version=6,
+            observed_v6_tables_matched=15,
+            observed_v6_columns_matched=129,
+            observed_v6_explicit_indexes_matched=15,
+            candidate_journal_present=False,
+            candidate_journal_valid=False,
+            schema_fingerprint_before="a" * 64,
+            schema_fingerprint_after="a" * 64,
+            content_fingerprint_before="b" * 64,
+            content_fingerprint_after="b" * 64,
+            non_mutating_verified=True,
+            reason_codes=(),
+        )
+        coherent_forged_candidate = SchemaPhaseClassification(
+            phase=SchemaPhase.V6_WITH_CANDIDATE_JOURNAL_OFFLINE,
+            observed_schema_version=6,
+            observed_v6_tables_matched=15,
+            observed_v6_columns_matched=129,
+            observed_v6_explicit_indexes_matched=15,
+            candidate_journal_present=True,
+            candidate_journal_valid=True,
+            schema_fingerprint_before="c" * 64,
+            schema_fingerprint_after="c" * 64,
+            content_fingerprint_before="d" * 64,
+            content_fingerprint_after="d" * 64,
+            non_mutating_verified=True,
+            reason_codes=(),
+        )
+
+        with (
+            closing(_make_canonical_v6_conn()) as v6_conn,
+            closing(_make_canonical_v6_conn()) as cand_conn,
+            closing(_make_canonical_v6_conn()) as tampered_conn,
+        ):
+            apply_candidate_schema_v7(cand_conn)
+            tampered_conn.execute("CREATE TABLE rogue_extra (id TEXT PRIMARY KEY)")
+
+            # 1. Coherent forged classifications fail closed without conn, against tampered conn, and against real v6 conn
+            for label, forged, bound_conn in (
+                ("forged_v6_no_conn", coherent_forged_v6, None),
+                ("forged_candidate_no_conn", coherent_forged_candidate, None),
+                ("forged_v6_tampered_conn", coherent_forged_v6, tampered_conn),
+                ("forged_candidate_tampered_conn", coherent_forged_candidate, tampered_conn),
+                ("forged_v6_mismatched_real_v6_conn", coherent_forged_v6, v6_conn),
+                ("forged_candidate_mismatched_real_cand_conn", coherent_forged_candidate, cand_conn),
+            ):
+                with self.subTest(case=label):
+                    denied = build_mock_operator_handoff(forged, conn=bound_conn)
+                    self.assertEqual(denied.phase, SchemaPhase.DENY)
+                    self.assertEqual(denied.mock_test_eligibility, MockTestEligibility.NONE_DENIED)
+                    self.assertFalse(denied.eligible_for_mock_v6_live01)
+                    self.assertFalse(denied.eligible_for_mock_journal_seam)
+                    self.assertEqual(denied.remote_state, "UNKNOWN")
+                    self.assertIn(
+                        PhaseGateReasonCode.UNTRUSTED_OR_REMOTE_CLAIMED_EVIDENCE,
+                        denied.reason_codes,
+                    )
+
+            # 2. Even a real classification cannot grant positive eligibility without live fixture binding
+            real_v6_cl = classify_offline_schema_phase(v6_conn)
+            real_cand_cl = classify_offline_schema_phase(cand_conn)
+            for label, real_cl in (("real_v6_detached", real_v6_cl), ("real_cand_detached", real_cand_cl)):
+                with self.subTest(case=label):
+                    denied = build_mock_operator_handoff(real_cl)
+                    self.assertEqual(denied.phase, SchemaPhase.DENY)
+                    self.assertFalse(denied.eligible_for_mock_v6_live01)
+                    self.assertFalse(denied.eligible_for_mock_journal_seam)
+                    self.assertIn(
+                        PhaseGateReasonCode.UNTRUSTED_OR_REMOTE_CLAIMED_EVIDENCE,
+                        denied.reason_codes,
+                    )
+
+            # 3. Non-SQLite connection passed to build_mock_operator_handoff raises PermissionError
+            with self.assertRaisesRegex(PermissionError, "HERMETIC_FIXTURE_CONNECTION_REQUIRED"):
+                build_mock_operator_handoff(real_v6_cl, conn=httpx.HTTPTransport(retries=0))  # type: ignore[arg-type]
+
+            # 4. Positive actual-fixture results for both v6-only and candidate-journal fixtures
+            v6_handoff_gate = evaluate_offline_schema_phase_gate(v6_conn)
+            v6_handoff_bound = build_mock_operator_handoff(real_v6_cl, conn=v6_conn)
+            self.assertEqual(v6_handoff_gate, v6_handoff_bound)
+            self.assertEqual(v6_handoff_gate.phase, SchemaPhase.V6_BASELINE_OFFLINE)
+            self.assertTrue(v6_handoff_gate.eligible_for_mock_v6_live01)
+            self.assertFalse(v6_handoff_gate.eligible_for_mock_journal_seam)
+            self.assertEqual(v6_handoff_gate.remote_state, "UNKNOWN")
+            self.assertEqual(v6_handoff_gate.authorization_scope, "NONE_OFFLINE_MOCK_ONLY")
+
+            cand_handoff_gate = evaluate_offline_schema_phase_gate(cand_conn)
+            cand_handoff_bound = build_mock_operator_handoff(real_cand_cl, conn=cand_conn)
+            self.assertEqual(cand_handoff_gate, cand_handoff_bound)
+            self.assertEqual(cand_handoff_gate.phase, SchemaPhase.V6_WITH_CANDIDATE_JOURNAL_OFFLINE)
+            self.assertFalse(cand_handoff_gate.eligible_for_mock_v6_live01)
+            self.assertTrue(cand_handoff_gate.eligible_for_mock_journal_seam)
+            self.assertEqual(cand_handoff_gate.remote_state, "UNKNOWN")
+            self.assertEqual(cand_handoff_gate.schema_v7_adoption_status, "NOT_APPROVED_NOT_MIGRATED")
+
+            # 5. Stale pre-mutation classification replay fails closed when fixture mutates
+            v6_conn.execute("CREATE TABLE post_inspection_drift (id TEXT PRIMARY KEY)")
+            stale_denied = build_mock_operator_handoff(real_v6_cl, conn=v6_conn)
+            self.assertEqual(stale_denied.phase, SchemaPhase.DENY)
+            self.assertFalse(stale_denied.eligible_for_mock_v6_live01)
+            self.assertFalse(stale_denied.eligible_for_mock_journal_seam)
+            self.assertIn(
+                PhaseGateReasonCode.UNTRUSTED_OR_REMOTE_CLAIMED_EVIDENCE,
+                stale_denied.reason_codes,
+            )
 
     def test_module_imports_and_operational_schema_version_unchanged(self):
         self.assertEqual(CURRENT_SCHEMA_VERSION, 6)

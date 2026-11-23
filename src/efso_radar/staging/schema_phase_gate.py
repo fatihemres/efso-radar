@@ -3,7 +3,11 @@
 GOVERNANCE AND SAFETY BOUNDARY:
 - Operates ONLY against in-memory (:memory:) or OS-temp sqlite3.Connection fixtures.
 - Zero network imports, zero HTTP clients, zero Turso/cloud connections, zero credentials.
-- Zero schema mutations, zero DDL/DML, zero operational schema_migrations/CURRENT_SCHEMA_VERSION bump.
+- Zero DDL/DML on the inspected connection, zero operational/provider DDL, and zero
+  schema_migrations/CURRENT_SCHEMA_VERSION bump (only initializes a private ephemeral
+  :memory: reference fixture once to derive canonical Schema v6 metadata).
+- Positive mock eligibility is produced ONLY by inspecting an exact hermetic
+  sqlite3.Connection; caller-constructed Pydantic classifications never authenticate provenance.
 - Never applies candidate Schema v7 DDL or confers live authorization; remote_state is always UNKNOWN.
 """
 from __future__ import annotations
@@ -47,6 +51,18 @@ _FORBIDDEN_V6_DDL_CLAUSES = re.compile(
 _AUTOINDEX_NAME_RE = re.compile(r"\Asqlite_autoindex_[a-z0-9_]+_[0-9]+\Z")
 _HEX_SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 _CANDIDATE_JOURNAL_TABLE = "staging_run_journal"
+
+__all__ = (
+    "ManualNextGate",
+    "MockOperatorHandoff",
+    "MockTestEligibility",
+    "PhaseGateReasonCode",
+    "SchemaPhase",
+    "SchemaPhaseClassification",
+    "build_mock_operator_handoff",
+    "classify_offline_schema_phase",
+    "evaluate_offline_schema_phase_gate",
+)
 
 
 class _StrictFrozenModel(BaseModel):
@@ -141,7 +157,44 @@ _NOTES_UNKNOWN: tuple[str, ...] = (
 )
 
 
+_HANDOFF_PHASE_SPEC: dict[
+    SchemaPhase,
+    tuple[MockTestEligibility, bool, bool, ManualNextGate, tuple[str, ...]],
+] = {
+    SchemaPhase.V6_BASELINE_OFFLINE: (
+        MockTestEligibility.LEGACY_V6_MOCK_LIVE01_AND_RUNNER_ONLY,
+        True,
+        False,
+        ManualNextGate.SEPARATE_PO_B2_COST_AND_B3_LIVE_READ_GO_REQUIRED,
+        _NOTES_V6_BASELINE,
+    ),
+    SchemaPhase.V6_WITH_CANDIDATE_JOURNAL_OFFLINE: (
+        MockTestEligibility.CANDIDATE_JOURNAL_MOCK_SEAM_ONLY,
+        False,
+        True,
+        ManualNextGate.SEPARATE_PO_REVIEW_AND_FUTURE_B4_MIGRATION_GO_REQUIRED,
+        _NOTES_V6_WITH_CANDIDATE_JOURNAL,
+    ),
+    SchemaPhase.DENY: (
+        MockTestEligibility.NONE_DENIED,
+        False,
+        False,
+        ManualNextGate.STOP_MANUAL_SCHEMA_INVESTIGATION_REQUIRED,
+        _NOTES_DENY,
+    ),
+    SchemaPhase.UNKNOWN: (
+        MockTestEligibility.NONE_UNKNOWN,
+        False,
+        False,
+        ManualNextGate.STOP_MANUAL_EVIDENCE_VERIFICATION_REQUIRED,
+        _NOTES_UNKNOWN,
+    ),
+}
+
+
 class SchemaPhaseClassification(_StrictFrozenModel):
+    """Structured offline fixture classification (field coherence only; not provenance authentication)."""
+
     phase: SchemaPhase
     evidence_provenance: Literal["OFFLINE_FIXTURE_ONLY"] = "OFFLINE_FIXTURE_ONLY"
     operational_schema_version_contract: Literal[6] = 6
@@ -184,36 +237,30 @@ class SchemaPhaseClassification(_StrictFrozenModel):
         if self.candidate_journal_valid and not self.candidate_journal_present:
             raise ValueError("candidate_journal_valid cannot be True without candidate_journal_present.")
 
-        if self.phase == SchemaPhase.V6_BASELINE_OFFLINE:
+        if self.phase in (
+            SchemaPhase.V6_BASELINE_OFFLINE,
+            SchemaPhase.V6_WITH_CANDIDATE_JOURNAL_OFFLINE,
+        ):
+            want_journal = self.phase == SchemaPhase.V6_WITH_CANDIDATE_JOURNAL_OFFLINE
             if (
                 self.observed_schema_version != CURRENT_SCHEMA_VERSION
                 or self.observed_v6_tables_matched != self.expected_v6_table_count
                 or self.observed_v6_columns_matched != self.expected_v6_column_count
                 or self.observed_v6_explicit_indexes_matched != self.expected_v6_explicit_index_count
-                or self.candidate_journal_present
-                or self.candidate_journal_valid
+                or self.candidate_journal_present is not want_journal
+                or self.candidate_journal_valid is not want_journal
                 or not self.non_mutating_verified
                 or len(self.reason_codes) != 0
             ):
-                raise ValueError("Incoherent V6_BASELINE_OFFLINE classification.")
-        elif self.phase == SchemaPhase.V6_WITH_CANDIDATE_JOURNAL_OFFLINE:
-            if (
-                self.observed_schema_version != CURRENT_SCHEMA_VERSION
-                or self.observed_v6_tables_matched != self.expected_v6_table_count
-                or self.observed_v6_columns_matched != self.expected_v6_column_count
-                or self.observed_v6_explicit_indexes_matched != self.expected_v6_explicit_index_count
-                or not self.candidate_journal_present
-                or not self.candidate_journal_valid
-                or not self.non_mutating_verified
-                or len(self.reason_codes) != 0
-            ):
-                raise ValueError("Incoherent V6_WITH_CANDIDATE_JOURNAL_OFFLINE classification.")
+                raise ValueError(f"Incoherent {self.phase.value} classification.")
         elif len(self.reason_codes) < 1:
             raise ValueError("DENY and UNKNOWN classifications require at least one reason code.")
         return self
 
 
 class MockOperatorHandoff(_StrictFrozenModel):
+    """Inert, non-authorizing mock operator handoff (remote_state is always UNKNOWN)."""
+
     phase: SchemaPhase
     evidence_provenance: Literal["OFFLINE_FIXTURE_ONLY"] = "OFFLINE_FIXTURE_ONLY"
     authorization_scope: Literal["NONE_OFFLINE_MOCK_ONLY"] = "NONE_OFFLINE_MOCK_ONLY"
@@ -237,52 +284,29 @@ class MockOperatorHandoff(_StrictFrozenModel):
         if self.schema_fingerprint_sha256 != "" and not _HEX_SHA256_RE.match(self.schema_fingerprint_sha256):
             raise ValueError("schema_fingerprint_sha256 must be empty or a lowercase 64-char hex SHA-256 digest.")
 
-        if self.phase == SchemaPhase.V6_BASELINE_OFFLINE:
+        exp_elig, exp_v6, exp_journal, exp_gate, exp_notes = _HANDOFF_PHASE_SPEC[self.phase]
+        if (
+            self.mock_test_eligibility != exp_elig
+            or self.eligible_for_mock_v6_live01 is not exp_v6
+            or self.eligible_for_mock_journal_seam is not exp_journal
+            or self.manual_next_gate != exp_gate
+            or self.notes != exp_notes
+        ):
+            raise ValueError(f"Incoherent {self.phase.value} handoff.")
+
+        if self.phase in (
+            SchemaPhase.V6_BASELINE_OFFLINE,
+            SchemaPhase.V6_WITH_CANDIDATE_JOURNAL_OFFLINE,
+        ):
             if (
-                self.mock_test_eligibility != MockTestEligibility.LEGACY_V6_MOCK_LIVE01_AND_RUNNER_ONLY
-                or not self.eligible_for_mock_v6_live01
-                or self.eligible_for_mock_journal_seam
-                or self.manual_next_gate != ManualNextGate.SEPARATE_PO_B2_COST_AND_B3_LIVE_READ_GO_REQUIRED
-                or self.observed_schema_version != CURRENT_SCHEMA_VERSION
+                self.observed_schema_version != CURRENT_SCHEMA_VERSION
                 or not self.non_mutating_verified
                 or not _HEX_SHA256_RE.match(self.schema_fingerprint_sha256)
                 or len(self.reason_codes) != 0
-                or self.notes != _NOTES_V6_BASELINE
             ):
-                raise ValueError("Incoherent V6_BASELINE_OFFLINE handoff.")
-        elif self.phase == SchemaPhase.V6_WITH_CANDIDATE_JOURNAL_OFFLINE:
-            if (
-                self.mock_test_eligibility != MockTestEligibility.CANDIDATE_JOURNAL_MOCK_SEAM_ONLY
-                or self.eligible_for_mock_v6_live01
-                or not self.eligible_for_mock_journal_seam
-                or self.manual_next_gate != ManualNextGate.SEPARATE_PO_REVIEW_AND_FUTURE_B4_MIGRATION_GO_REQUIRED
-                or self.observed_schema_version != CURRENT_SCHEMA_VERSION
-                or not self.non_mutating_verified
-                or not _HEX_SHA256_RE.match(self.schema_fingerprint_sha256)
-                or len(self.reason_codes) != 0
-                or self.notes != _NOTES_V6_WITH_CANDIDATE_JOURNAL
-            ):
-                raise ValueError("Incoherent V6_WITH_CANDIDATE_JOURNAL_OFFLINE handoff.")
-        elif self.phase == SchemaPhase.DENY:
-            if (
-                self.mock_test_eligibility != MockTestEligibility.NONE_DENIED
-                or self.eligible_for_mock_v6_live01
-                or self.eligible_for_mock_journal_seam
-                or self.manual_next_gate != ManualNextGate.STOP_MANUAL_SCHEMA_INVESTIGATION_REQUIRED
-                or len(self.reason_codes) < 1
-                or self.notes != _NOTES_DENY
-            ):
-                raise ValueError("Incoherent DENY handoff.")
-        elif self.phase == SchemaPhase.UNKNOWN:
-            if (
-                self.mock_test_eligibility != MockTestEligibility.NONE_UNKNOWN
-                or self.eligible_for_mock_v6_live01
-                or self.eligible_for_mock_journal_seam
-                or self.manual_next_gate != ManualNextGate.STOP_MANUAL_EVIDENCE_VERIFICATION_REQUIRED
-                or len(self.reason_codes) < 1
-                or self.notes != _NOTES_UNKNOWN
-            ):
-                raise ValueError("Incoherent UNKNOWN handoff.")
+                raise ValueError(f"Incoherent {self.phase.value} handoff.")
+        elif len(self.reason_codes) < 1:
+            raise ValueError(f"Incoherent {self.phase.value} handoff.")
         return self
 
     def summary(self) -> str:
@@ -377,9 +401,70 @@ def _extract_index_keys(
     return tuple(key_rows)
 
 
+def _read_table_columns(
+    conn: sqlite3.Connection,
+    tbl: str,
+) -> tuple[tuple[int, str, str, int, Optional[str], int, int], ...]:
+    """Read normalized PRAGMA main.table_xinfo tuples for an allowlisted table."""
+    return tuple(
+        (
+            int(r[0]),
+            str(r[1]),
+            str(r[2] or "").upper(),
+            int(r[3]),
+            None if r[4] is None else str(r[4]),
+            int(r[5]),
+            int(r[6]),
+        )
+        for r in _run_query(conn, f'PRAGMA main.table_xinfo("{tbl}")')
+    )
+
+
+def _read_foreign_keys(
+    conn: sqlite3.Connection,
+    tbl: str,
+) -> tuple[tuple[str, str, str, str, str, str], ...]:
+    """Read sorted normalized PRAGMA main.foreign_key_list tuples for an allowlisted table."""
+    return tuple(
+        sorted(
+            (
+                str(r[2]),
+                str(r[3]),
+                str(r[4]),
+                str(r[5]).upper(),
+                str(r[6]).upper(),
+                str(r[7]).upper(),
+            )
+            for r in _run_query(conn, f'PRAGMA main.foreign_key_list("{tbl}")')
+        )
+    )
+
+
+def _unknown_read_error_classification(
+    schema_fp_before: str = "",
+    content_fp_before: str = "",
+) -> SchemaPhaseClassification:
+    """Return a fail-closed UNKNOWN classification for SQLite read/inspection errors."""
+    return SchemaPhaseClassification(
+        phase=SchemaPhase.UNKNOWN,
+        observed_schema_version=None,
+        observed_v6_tables_matched=0,
+        observed_v6_columns_matched=0,
+        observed_v6_explicit_indexes_matched=0,
+        candidate_journal_present=False,
+        candidate_journal_valid=False,
+        schema_fingerprint_before=schema_fp_before,
+        schema_fingerprint_after="",
+        content_fingerprint_before=content_fp_before,
+        content_fingerprint_after="",
+        non_mutating_verified=False,
+        reason_codes=(PhaseGateReasonCode.INSPECTION_READ_ERROR,),
+    )
+
+
 @lru_cache(maxsize=1)
 def _build_canonical_v6_profile() -> _CanonicalV6Profile:
-    """Build canonical Schema v6 structural metadata from repositories.schema and preflight contracts."""
+    """Derive canonical Schema v6 structural metadata using a private ephemeral :memory: reference fixture."""
     if CURRENT_SCHEMA_VERSION != 6:
         raise RuntimeError(f"Expected operational CURRENT_SCHEMA_VERSION=6, got {CURRENT_SCHEMA_VERSION}.")
     if len(EXPECTED_JOURNAL_COLUMNS) != 10:
@@ -428,19 +513,7 @@ def _build_canonical_v6_profile() -> _CanonicalV6Profile:
             all_names_lower.add(tbl.lower())
             table_ddls[tbl] = _normalize_ddl(table_sqls[tbl])
 
-            xinfo_rows = _run_query(conn, f'PRAGMA main.table_xinfo("{tbl}")')
-            cols_norm = tuple(
-                (
-                    int(r[0]),
-                    str(r[1]),
-                    str(r[2] or "").upper(),
-                    int(r[3]),
-                    None if r[4] is None else str(r[4]),
-                    int(r[5]),
-                    int(r[6]),
-                )
-                for r in xinfo_rows
-            )
+            cols_norm = _read_table_columns(conn, tbl)
             if [c[1] for c in cols_norm] != SCHEMA_V6_TABLES[tbl]:
                 raise RuntimeError(f"Column contract mismatch with preflight SCHEMA_V6_TABLES for {tbl}.")
             expected_types = SCHEMA_V6_COLUMN_TYPES.get(tbl, {})
@@ -453,20 +526,7 @@ def _build_canonical_v6_profile() -> _CanonicalV6Profile:
             table_columns[tbl] = cols_norm
             total_cols += len(cols_norm)
 
-            fk_rows = _run_query(conn, f'PRAGMA main.foreign_key_list("{tbl}")')
-            foreign_keys[tbl] = tuple(
-                sorted(
-                    (
-                        str(r[2]),
-                        str(r[3]),
-                        str(r[4]),
-                        str(r[5]).upper(),
-                        str(r[6]).upper(),
-                        str(r[7]).upper(),
-                    )
-                    for r in fk_rows
-                )
-            )
+            foreign_keys[tbl] = _read_foreign_keys(conn, tbl)
 
             idx_rows = _run_query(conn, f'PRAGMA main.index_list("{tbl}")')
             tbl_explicit: dict[str, _CanonicalIndexSpec] = {}
@@ -649,21 +709,7 @@ def classify_offline_schema_phase(
     allowlisted_for_fp = profile.tables | frozenset({_CANDIDATE_JOURNAL_TABLE})
 
     if not db_list_ok:
-        return SchemaPhaseClassification(
-            phase=SchemaPhase.UNKNOWN,
-            observed_schema_version=None,
-            observed_v6_tables_matched=0,
-            observed_v6_columns_matched=0,
-            observed_v6_explicit_indexes_matched=0,
-            candidate_journal_present=False,
-            candidate_journal_valid=False,
-            schema_fingerprint_before="",
-            schema_fingerprint_after="",
-            content_fingerprint_before="",
-            content_fingerprint_after="",
-            non_mutating_verified=False,
-            reason_codes=(PhaseGateReasonCode.INSPECTION_READ_ERROR,),
-        )
+        return _unknown_read_error_classification()
 
     reason_codes: list[PhaseGateReasonCode] = []
 
@@ -674,21 +720,7 @@ def classify_offline_schema_phase(
     try:
         schema_fp_before, content_fp_before = _compute_fingerprints(conn, allowlisted_for_fp)
     except sqlite3.Error:
-        return SchemaPhaseClassification(
-            phase=SchemaPhase.UNKNOWN,
-            observed_schema_version=None,
-            observed_v6_tables_matched=0,
-            observed_v6_columns_matched=0,
-            observed_v6_explicit_indexes_matched=0,
-            candidate_journal_present=False,
-            candidate_journal_valid=False,
-            schema_fingerprint_before="",
-            schema_fingerprint_after="",
-            content_fingerprint_before="",
-            content_fingerprint_after="",
-            non_mutating_verified=False,
-            reason_codes=(PhaseGateReasonCode.INSPECTION_READ_ERROR,),
-        )
+        return _unknown_read_error_classification()
 
     observed_schema_version: Optional[int] = None
     observed_v6_tables_matched = 0
@@ -793,20 +825,8 @@ def classify_offline_schema_phase(
                 table_valid = False
 
             # 3a. Column inspection via PRAGMA main.table_xinfo
-            xinfo_rows = _run_query(conn, f'PRAGMA main.table_xinfo("{tbl}")')
             expected_cols = profile.table_columns[tbl]
-            actual_norm_cols = [
-                (
-                    int(r[0]),
-                    str(r[1]),
-                    str(r[2] or "").upper(),
-                    int(r[3]),
-                    None if r[4] is None else str(r[4]),
-                    int(r[5]),
-                    int(r[6]),
-                )
-                for r in xinfo_rows
-            ]
+            actual_norm_cols = _read_table_columns(conn, tbl)
 
             cols_exact = True
             if len(actual_norm_cols) != len(expected_cols):
@@ -833,21 +853,7 @@ def classify_offline_schema_phase(
                 sm_structurally_valid = True
 
             # 3b. Foreign key inspection
-            fk_rows = _run_query(conn, f'PRAGMA main.foreign_key_list("{tbl}")')
-            actual_fks = tuple(
-                sorted(
-                    (
-                        str(r[2]),
-                        str(r[3]),
-                        str(r[4]),
-                        str(r[5]).upper(),
-                        str(r[6]).upper(),
-                        str(r[7]).upper(),
-                    )
-                    for r in fk_rows
-                )
-            )
-            if actual_fks != profile.foreign_keys[tbl]:
+            if _read_foreign_keys(conn, tbl) != profile.foreign_keys[tbl]:
                 add_reason(PhaseGateReasonCode.V6_FOREIGN_KEY_MISMATCH)
                 table_valid = False
 
@@ -1070,125 +1076,103 @@ def classify_offline_schema_phase(
             reason_codes=tuple(reason_codes),
         )
     except sqlite3.Error:
-        return SchemaPhaseClassification(
-            phase=SchemaPhase.UNKNOWN,
-            observed_schema_version=None,
-            observed_v6_tables_matched=0,
-            observed_v6_columns_matched=0,
-            observed_v6_explicit_indexes_matched=0,
-            candidate_journal_present=False,
-            candidate_journal_valid=False,
-            schema_fingerprint_before=schema_fp_before,
-            schema_fingerprint_after="",
-            content_fingerprint_before=content_fp_before,
-            content_fingerprint_after="",
-            non_mutating_verified=False,
-            reason_codes=(PhaseGateReasonCode.INSPECTION_READ_ERROR,),
+        return _unknown_read_error_classification(
+            schema_fp_before=schema_fp_before,
+            content_fp_before=content_fp_before,
         )
+
+
+def _format_mock_operator_handoff(
+    classification: SchemaPhaseClassification,
+) -> MockOperatorHandoff:
+    """Internal pure formatter — NOT a trust or authorization boundary.
+
+    Does NOT authenticate database inspection provenance. Callers must only invoke
+    this immediately after classify_offline_schema_phase(conn, ...) on a verified
+    hermetic SQLite connection within the same call.
+    """
+    elig, elig_v6, elig_journal, next_gate, notes = _HANDOFF_PHASE_SPEC[classification.phase]
+    return MockOperatorHandoff(
+        phase=classification.phase,
+        mock_test_eligibility=elig,
+        eligible_for_mock_v6_live01=elig_v6,
+        eligible_for_mock_journal_seam=elig_journal,
+        manual_next_gate=next_gate,
+        observed_schema_version=classification.observed_schema_version,
+        schema_fingerprint_sha256=classification.schema_fingerprint_after,
+        non_mutating_verified=classification.non_mutating_verified,
+        reason_codes=classification.reason_codes,
+        notes=notes,
+    )
+
+
+def _fail_closed_handoff(
+    phase: SchemaPhase,
+    reason: PhaseGateReasonCode,
+) -> MockOperatorHandoff:
+    elig, elig_v6, elig_journal, next_gate, notes = _HANDOFF_PHASE_SPEC[phase]
+    return MockOperatorHandoff(
+        phase=phase,
+        mock_test_eligibility=elig,
+        eligible_for_mock_v6_live01=elig_v6,
+        eligible_for_mock_journal_seam=elig_journal,
+        manual_next_gate=next_gate,
+        observed_schema_version=None,
+        schema_fingerprint_sha256="",
+        non_mutating_verified=False,
+        reason_codes=(reason,),
+        notes=notes,
+    )
 
 
 def build_mock_operator_handoff(
-    classification: Optional[SchemaPhaseClassification],
+    classification: Optional[SchemaPhaseClassification] = None,
+    *,
+    conn: Optional[sqlite3.Connection] = None,
+    allow_candidate_journal: bool = True,
 ) -> MockOperatorHandoff:
-    """Construct an inert mock-only operator handoff from a local classification."""
-    if classification is None:
-        return MockOperatorHandoff(
-            phase=SchemaPhase.UNKNOWN,
-            mock_test_eligibility=MockTestEligibility.NONE_UNKNOWN,
-            eligible_for_mock_v6_live01=False,
-            eligible_for_mock_journal_seam=False,
-            manual_next_gate=ManualNextGate.STOP_MANUAL_EVIDENCE_VERIFICATION_REQUIRED,
-            observed_schema_version=None,
-            schema_fingerprint_sha256="",
-            non_mutating_verified=False,
-            reason_codes=(PhaseGateReasonCode.UNOBSERVED_OR_MISSING_EVIDENCE,),
-            notes=_NOTES_UNKNOWN,
+    """Construct an inert mock-only operator handoff bound to an actual fixture inspection.
+
+    Positive mock eligibility is NEVER granted from caller-declared classification
+    fields alone. A hermetically scoped sqlite3.Connection must be inspected via
+    classify_offline_schema_phase(); any missing connection, forged classification,
+    or discrepancy against live fixture inspection fails closed (UNKNOWN / DENY).
+    """
+    if conn is None:
+        if classification is None:
+            return _fail_closed_handoff(
+                SchemaPhase.UNKNOWN,
+                PhaseGateReasonCode.UNOBSERVED_OR_MISSING_EVIDENCE,
+            )
+        return _fail_closed_handoff(
+            SchemaPhase.DENY,
+            PhaseGateReasonCode.UNTRUSTED_OR_REMOTE_CLAIMED_EVIDENCE,
         )
 
-    if type(classification) is not SchemaPhaseClassification:
-        return MockOperatorHandoff(
-            phase=SchemaPhase.DENY,
-            mock_test_eligibility=MockTestEligibility.NONE_DENIED,
-            eligible_for_mock_v6_live01=False,
-            eligible_for_mock_journal_seam=False,
-            manual_next_gate=ManualNextGate.STOP_MANUAL_SCHEMA_INVESTIGATION_REQUIRED,
-            observed_schema_version=None,
-            schema_fingerprint_sha256="",
-            non_mutating_verified=False,
-            reason_codes=(PhaseGateReasonCode.UNTRUSTED_OR_REMOTE_CLAIMED_EVIDENCE,),
-            notes=_NOTES_DENY,
-        )
-
-    try:
-        validated = SchemaPhaseClassification.model_validate(classification.model_dump())
-    except (ValidationError, TypeError, ValueError):
-        return MockOperatorHandoff(
-            phase=SchemaPhase.DENY,
-            mock_test_eligibility=MockTestEligibility.NONE_DENIED,
-            eligible_for_mock_v6_live01=False,
-            eligible_for_mock_journal_seam=False,
-            manual_next_gate=ManualNextGate.STOP_MANUAL_SCHEMA_INVESTIGATION_REQUIRED,
-            observed_schema_version=None,
-            schema_fingerprint_sha256="",
-            non_mutating_verified=False,
-            reason_codes=(PhaseGateReasonCode.UNTRUSTED_OR_REMOTE_CLAIMED_EVIDENCE,),
-            notes=_NOTES_DENY,
-        )
-
-    if validated.phase == SchemaPhase.V6_BASELINE_OFFLINE:
-        return MockOperatorHandoff(
-            phase=SchemaPhase.V6_BASELINE_OFFLINE,
-            mock_test_eligibility=MockTestEligibility.LEGACY_V6_MOCK_LIVE01_AND_RUNNER_ONLY,
-            eligible_for_mock_v6_live01=True,
-            eligible_for_mock_journal_seam=False,
-            manual_next_gate=ManualNextGate.SEPARATE_PO_B2_COST_AND_B3_LIVE_READ_GO_REQUIRED,
-            observed_schema_version=validated.observed_schema_version,
-            schema_fingerprint_sha256=validated.schema_fingerprint_after,
-            non_mutating_verified=validated.non_mutating_verified,
-            reason_codes=(),
-            notes=_NOTES_V6_BASELINE,
-        )
-
-    if validated.phase == SchemaPhase.V6_WITH_CANDIDATE_JOURNAL_OFFLINE:
-        return MockOperatorHandoff(
-            phase=SchemaPhase.V6_WITH_CANDIDATE_JOURNAL_OFFLINE,
-            mock_test_eligibility=MockTestEligibility.CANDIDATE_JOURNAL_MOCK_SEAM_ONLY,
-            eligible_for_mock_v6_live01=False,
-            eligible_for_mock_journal_seam=True,
-            manual_next_gate=ManualNextGate.SEPARATE_PO_REVIEW_AND_FUTURE_B4_MIGRATION_GO_REQUIRED,
-            observed_schema_version=validated.observed_schema_version,
-            schema_fingerprint_sha256=validated.schema_fingerprint_after,
-            non_mutating_verified=validated.non_mutating_verified,
-            reason_codes=(),
-            notes=_NOTES_V6_WITH_CANDIDATE_JOURNAL,
-        )
-
-    if validated.phase == SchemaPhase.DENY:
-        return MockOperatorHandoff(
-            phase=SchemaPhase.DENY,
-            mock_test_eligibility=MockTestEligibility.NONE_DENIED,
-            eligible_for_mock_v6_live01=False,
-            eligible_for_mock_journal_seam=False,
-            manual_next_gate=ManualNextGate.STOP_MANUAL_SCHEMA_INVESTIGATION_REQUIRED,
-            observed_schema_version=validated.observed_schema_version,
-            schema_fingerprint_sha256=validated.schema_fingerprint_after,
-            non_mutating_verified=validated.non_mutating_verified,
-            reason_codes=validated.reason_codes,
-            notes=_NOTES_DENY,
-        )
-
-    return MockOperatorHandoff(
-        phase=SchemaPhase.UNKNOWN,
-        mock_test_eligibility=MockTestEligibility.NONE_UNKNOWN,
-        eligible_for_mock_v6_live01=False,
-        eligible_for_mock_journal_seam=False,
-        manual_next_gate=ManualNextGate.STOP_MANUAL_EVIDENCE_VERIFICATION_REQUIRED,
-        observed_schema_version=validated.observed_schema_version,
-        schema_fingerprint_sha256=validated.schema_fingerprint_after,
-        non_mutating_verified=validated.non_mutating_verified,
-        reason_codes=validated.reason_codes,
-        notes=_NOTES_UNKNOWN,
+    inspected = classify_offline_schema_phase(
+        conn,
+        allow_candidate_journal=allow_candidate_journal,
     )
+    if classification is not None:
+        if type(classification) is not SchemaPhaseClassification:
+            return _fail_closed_handoff(
+                SchemaPhase.DENY,
+                PhaseGateReasonCode.UNTRUSTED_OR_REMOTE_CLAIMED_EVIDENCE,
+            )
+        try:
+            validated = SchemaPhaseClassification.model_validate(classification.model_dump())
+        except (ValidationError, TypeError, ValueError):
+            return _fail_closed_handoff(
+                SchemaPhase.DENY,
+                PhaseGateReasonCode.UNTRUSTED_OR_REMOTE_CLAIMED_EVIDENCE,
+            )
+        if validated != inspected:
+            return _fail_closed_handoff(
+                SchemaPhase.DENY,
+                PhaseGateReasonCode.UNTRUSTED_OR_REMOTE_CLAIMED_EVIDENCE,
+            )
+
+    return _format_mock_operator_handoff(inspected)
 
 
 def evaluate_offline_schema_phase_gate(
@@ -1196,9 +1180,9 @@ def evaluate_offline_schema_phase_gate(
     *,
     allow_candidate_journal: bool = True,
 ) -> MockOperatorHandoff:
-    """Classify a hermetic offline SQLite fixture and return an inert mock operator handoff."""
+    """Primary trusted entrypoint: inspect a hermetic SQLite fixture and return an inert handoff."""
     classification = classify_offline_schema_phase(
         conn,
         allow_candidate_journal=allow_candidate_journal,
     )
-    return build_mock_operator_handoff(classification)
+    return _format_mock_operator_handoff(classification)
