@@ -34,9 +34,7 @@ from efso_radar.ai.schemas import (
     DiagnosticEvaluationBatch,
 )
 from efso_radar.ai.calibration import (
-    DEFAULT_FILLED_CALIBRATION_CSV,
     HybridNotificationPlanner,
-    load_and_verify_calibration_csv,
 )
 from efso_radar.config import Settings
 from efso_radar.domain import (
@@ -52,6 +50,13 @@ from efso_radar.domain import (
     VerificationStatus,
 )
 from efso_radar.repositories.sqlite import SqliteStateRepository
+
+
+HISTORICAL_DATA_SKIP_REASON = (
+    "Historical authentic calibration CSV and second-canary report in operational data/ are "
+    "intentionally excluded from hermetic offline tests (Issue #104 / T1B); see labeled "
+    "synthetic counterparts in TestPhase3C2DContract."
+)
 
 
 class TestPhase3C2DContract(unittest.TestCase):
@@ -70,6 +75,8 @@ class TestPhase3C2DContract(unittest.TestCase):
         self.budget_guard = ExperimentBudgetGuard(
             ledger_path=self.tmp_path / "test_ledger.json",
             budget_ceiling_usd=0.05,
+            canary1_db_path=self.tmp_path / "no_canary1.db",
+            canary2_db_path=self.tmp_path / "no_canary2.db",
         )
         self.runner = BlindShadowEvaluationRunner(
             settings=self.settings,
@@ -277,10 +284,17 @@ class TestPhase3C2DContract(unittest.TestCase):
             max_shadow_eval_budget_usd=0.001,  # $0.001 ceiling vs ~$0.004 batch worst-case cost
             gemini_api_key="mock-key",
         )
+        tight_guard = ExperimentBudgetGuard(
+            ledger_path=self.tmp_path / "tight_ledger.json",
+            budget_ceiling_usd=0.001,
+            canary1_db_path=self.tmp_path / "no_canary1.db",
+            canary2_db_path=self.tmp_path / "no_canary2.db",
+        )
         tight_runner = BlindShadowEvaluationRunner(
             settings=tight_settings,
             repository=self.repo,
             batch_size=8,
+            budget_guard=tight_guard,
         )
         mock_client = MagicMock()
 
@@ -445,213 +459,174 @@ class TestPhase3C2DContract(unittest.TestCase):
         self.assertIn("Doğrulama bekletmesinde", hold_asm.uncertainties_tr)
         self.assertFalse(hold_asm.is_publishable)
 
-    @unittest.skipUnless(
-        Path(DEFAULT_FILLED_CALIBRATION_CSV).exists() and Path("data/canary2_gemini_eval_report.json").exists(),
-        "Requires authentic calibration CSV and second canary evaluation report in data/",
-    )
+    @unittest.skip(HISTORICAL_DATA_SKIP_REASON)
     def test_offline_production_projection_using_real_saved_second_canary_decisions(self):
         """
         Exercise offline production projection strictly from saved genuine second-canary model decisions.
 
-        Verifies:
-        1. Full data-provenance audit: CSV SHA-256, exact article ID derivation, exact publisher,
-           source URL, and headline match. The test fails if stored IDs are mismatched, duplicated,
-           missing, or mapped to the wrong source records.
-        2. Strict blind article isolation: owner_decision and owner_notes are never present in blind articles.
-        3. Three eligible DIGEST items survive: CALIB-01 (75), CALIB-05 (82), CALIB-08 (70).
-        4. Three RESERVE items remain outside primary notifications: CALIB-02 (68), CALIB-04 (65), CALIB-07 (60).
-        5. Two IGNORE items remain suppressed: CALIB-03 (10), CALIB-06 (25).
-        6. Complete production path: diagnostic decision -> assessment -> notification planner ->
-           formatted digest -> persisted outbox in StateRepository.
-        7. Outbox integrity: exactly 3 queued notifications in score order CALIB-05 (82) > CALIB-01 (75) > CALIB-08 (70).
-        8. Strictly zero Telegram network calls are dispatched.
+        Historical authentic-data provenance test preserved without touching operational data/.
         """
-        import hashlib
-        from efso_radar.ai.calibration import (
-            HybridNotificationPlanner,
-            load_and_verify_calibration_csv,
-            DEFAULT_FILLED_CALIBRATION_CSV,
-        )
+        raise AssertionError("Skipped unconditionally under Issue #104 / T1B")
+
+    def test_offline_production_projection_end_to_end_synthetic(self):
+        """Synthetic end-to-end projection: decisions -> assessments -> planner -> temp SQLite outbox."""
         from efso_radar.domain import DeliveryStatus, NotificationRecord, Story
 
-        # 1. Authoritative CSV verification & Provenance check
-        csv_path = Path(DEFAULT_FILLED_CALIBRATION_CSV)
-        self.assertTrue(csv_path.exists(), "Authoritative CSV must exist")
-        csv_bytes = csv_path.read_bytes()
-        calculated_sha = hashlib.sha256(csv_bytes).hexdigest().lower()
-        expected_sha = "108799c19f513327cb04872cec5dbcfb97107f2bd8bf2353acf28e3111ab2305".lower()
-        self.assertEqual(calculated_sha, expected_sha, "Calibration CSV SHA-256 must match authoritative hash exactly")
-
-        # Load first 8 items from CSV
-        calib_items = load_and_verify_calibration_csv(csv_path)[:8]
-        self.assertEqual(len(calib_items), 8)
-
-        # Programmatically verify expected canonical metadata for each of the 8 items
-        expected_provenance = {
-            "CALIB-01": {"headline": "Bulgaristan'daki köyünü ziyaret etti", "pub": "Habertürk Magazin"},
-            "CALIB-02": {"headline": "Aşıkların Ayvalık tatili", "pub": "Habertürk Magazin"},
-            "CALIB-03": {"headline": "14. Kattan Düşerek Hayatını Kaybeden Sezen Taş'ın Geçmişine Dair Dikkat Çeken Detay!", "pub": "Onedio Magazin"},
-            "CALIB-04": {"headline": "Kelly Clarkson Claims NYC Store Gave Her Pretty Woman Treatment", "pub": "E! News"},
-            "CALIB-05": {"headline": "Sıla'nın 101 Yaşındaki Anneannesi İlk Kez Görüntülendi: Zarafetiyle Göz Kamaştırdı!", "pub": "Onedio Magazin"},
-            "CALIB-06": {"headline": "\u2018Wildwood\u2019 Director Travis Knight Reflects on Animated Feature\u2019s 16-Year Journey at London Premiere: \u2018When We Started This, Barack Obama Was a Fresh-Faced President\u2019", "pub": "Variety"},
-            "CALIB-07": {"headline": "İkinci çocuğunu dünyaya getirdi", "pub": "Habertürk Magazin"},
-            "CALIB-08": {"headline": "Aksiyon yıldızlarını aratmadı", "pub": "Hürriyet Kelebek"},
-        }
-
-        for it in calib_items:
-            self.assertIn(it.review_id, expected_provenance)
-            exp = expected_provenance[it.review_id]
-            self.assertEqual(it.headline, exp["headline"], f"Headline mismatch for {it.review_id}")
-            self.assertEqual(it.publisher, exp["pub"], f"Publisher mismatch for {it.review_id}")
-
-        # Verify blind article conversion excludes all owner notes and labels
-        blind_articles = BlindShadowEvaluationRunner.to_blind_articles(calib_items)
+        syn_articles = [
+            Article.create(
+                f"Sentetik Sanatçı Haber {i}",
+                f"https://synthetic.example.invalid/canary-syn-{i}",
+                "Habertürk Magazin" if i % 2 else "Variety",
+                self.now,
+                snippet=f"Sentetik haber detayı {i}.",
+            )
+            for i in range(1, 9)
+        ]
+        blind_articles = BlindShadowEvaluationRunner.to_blind_articles(syn_articles)
         for ba in blind_articles:
-            self.assertEqual(ba.raw_metadata, {}, "Blind articles must have empty raw_metadata")
-            self.assertNotIn("owner_decision", str(ba))
-            self.assertNotIn("owner_notes", str(ba))
+            self.assertEqual(ba.raw_metadata, {})
 
-        art_map_by_id = {a.id: a for a in blind_articles}
-        calib_by_id = {a.id: it for a, it in zip(blind_articles, calib_items)}
+        decisions = [
+            DiagnosticArticleDecision(
+                article_id=blind_articles[0].id,
+                score=75,
+                disposition="DIGEST",
+                kind="NEW",
+                urgency="NORMAL",
+                rationale_tr="Sentetik birinci DIGEST adayı.",
+                headline_tr="Sentetik Başlık 1",
+                verification_status="REPUTABLE_REPORTING",
+            ),
+            DiagnosticArticleDecision(
+                article_id=blind_articles[1].id,
+                score=68,
+                disposition="RESERVE",
+                kind="NEW",
+                urgency="NORMAL",
+                rationale_tr="Sentetik RESERVE adayı.",
+                headline_tr="Sentetik Reserve 2",
+                verification_status="REPUTABLE_REPORTING",
+            ),
+            DiagnosticArticleDecision(
+                article_id=blind_articles[2].id,
+                score=10,
+                disposition="IGNORE",
+                kind="NEW",
+                urgency="NORMAL",
+                rationale_tr="Sentetik IGNORE adayı.",
+                headline_tr="",
+                verification_status="REPUTABLE_REPORTING",
+            ),
+            DiagnosticArticleDecision(
+                article_id=blind_articles[3].id,
+                score=65,
+                disposition="RESERVE",
+                kind="NEW",
+                urgency="NORMAL",
+                rationale_tr="Sentetik ikinci RESERVE adayı.",
+                headline_tr="Sentetik Reserve 4",
+                verification_status="REPUTABLE_REPORTING",
+            ),
+            DiagnosticArticleDecision(
+                article_id=blind_articles[4].id,
+                score=82,
+                disposition="DIGEST",
+                kind="NEW",
+                urgency="NORMAL",
+                rationale_tr="Sentetik en yüksek skorlu DIGEST adayı.",
+                headline_tr="Sentetik Başlık 5",
+                verification_status="FIRST_PARTY_STATEMENT",
+            ),
+            DiagnosticArticleDecision(
+                article_id=blind_articles[5].id,
+                score=25,
+                disposition="IGNORE",
+                kind="NEW",
+                urgency="NORMAL",
+                rationale_tr="Sentetik ikinci IGNORE adayı.",
+                headline_tr="",
+                verification_status="REPUTABLE_REPORTING",
+            ),
+            DiagnosticArticleDecision(
+                article_id=blind_articles[6].id,
+                score=60,
+                disposition="RESERVE",
+                kind="NEW",
+                urgency="NORMAL",
+                rationale_tr="Sentetik üçüncü RESERVE adayı.",
+                headline_tr="Sentetik Reserve 7",
+                verification_status="REPUTABLE_REPORTING",
+            ),
+            DiagnosticArticleDecision(
+                article_id=blind_articles[7].id,
+                score=70,
+                disposition="DIGEST",
+                kind="NEW",
+                urgency="NORMAL",
+                rationale_tr="Sentetik üçüncü DIGEST adayı.",
+                headline_tr="Sentetik Başlık 8",
+                verification_status="REPUTABLE_REPORTING",
+            ),
+        ]
 
-        # 2. Inspect real saved canary2 evidence
-        canary_report_path = Path("data/canary2_gemini_eval_report.json")
-        self.assertTrue(canary_report_path.exists(), "Saved genuine second canary report must exist")
-
-        with open(canary_report_path, "r", encoding="utf-8") as f:
-            canary_data = json.load(f)
-
-        raw_decisions = canary_data["evidence"]["raw_structured_model_predictions"][0]["decisions"]
-        self.assertEqual(len(raw_decisions), 8, "Canary report must contain exactly 8 raw decisions")
-
-        # Provenance check on raw decisions: must match candidate article IDs exactly without omissions or duplicates
-        dec_article_ids = [d["article_id"] for d in raw_decisions]
-        self.assertEqual(len(set(dec_article_ids)), 8, "Model decisions must not contain duplicate article IDs")
-        for aid in dec_article_ids:
-            self.assertIn(aid, art_map_by_id, f"Decision references unknown article_id: {aid}")
-
-        diagnostic_decisions = [DiagnosticArticleDecision(**d) for d in raw_decisions]
-
-        # 3. Execute production projection
         projected = project_diagnostic_decisions_to_assessments(
-            decisions=diagnostic_decisions,
+            decisions=decisions,
             candidates=blind_articles,
             include_manual_holds=True,
         )
-
-        publishable_assessments = [asm for asm in projected if asm.is_publishable]
-        hold_assessments = [asm for asm in projected if not asm.is_publishable]
-
-        # Exact count and CALIB IDs of publishable DIGEST items
-        self.assertEqual(len(publishable_assessments), 3)
-        self.assertEqual(len(hold_assessments), 0)
-
-        pub_calib_ids = {calib_by_id[asm.article_ids[0]].review_id for asm in publishable_assessments}
-        expected_pub_ids = {"CALIB-01", "CALIB-05", "CALIB-08"}
-        self.assertEqual(pub_calib_ids, expected_pub_ids)
-
-        # CALIB-01 (Çağatay Ulusoy) survived with score 75
-        c01_asm = next(asm for asm in publishable_assessments if calib_by_id[asm.article_ids[0]].review_id == "CALIB-01")
-        self.assertEqual(c01_asm.score, 75)
-        self.assertEqual(c01_asm.disposition, EditorialDisposition.DIGEST)
-        self.assertIn("Çağatay Ulusoy", c01_asm.headline_tr)
-
-        # CALIB-05 (Sıla) survived with score 82
-        c05_asm = next(asm for asm in publishable_assessments if calib_by_id[asm.article_ids[0]].review_id == "CALIB-05")
-        self.assertEqual(c05_asm.score, 82)
-        self.assertEqual(c05_asm.disposition, EditorialDisposition.DIGEST)
-        self.assertIn("Sıla", c05_asm.headline_tr)
-
-        # CALIB-08 (Doğukan Güngör) survived with score 70
-        c08_asm = next(asm for asm in publishable_assessments if calib_by_id[asm.article_ids[0]].review_id == "CALIB-08")
-        self.assertEqual(c08_asm.score, 70)
-        self.assertEqual(c08_asm.disposition, EditorialDisposition.DIGEST)
-        self.assertIn("Doğukan Güngör", c08_asm.headline_tr)
-
-        # RESERVE items (CALIB-02, CALIB-04, CALIB-07) are NOT in publishable queue
-        reserve_calib_ids = {"CALIB-02", "CALIB-04", "CALIB-07"}
-        for r_id in reserve_calib_ids:
-            self.assertNotIn(r_id, pub_calib_ids)
-
-        # IGNORE items (CALIB-03, CALIB-06) are NOT in publishable queue
-        ignore_calib_ids = {"CALIB-03", "CALIB-06"}
-        for i_id in ignore_calib_ids:
-            self.assertNotIn(i_id, pub_calib_ids)
-
-        # 4. Hybrid Notification Planning
-        planner = HybridNotificationPlanner(self.settings)
-        plan = planner.plan_dispatch(
-            assessments=publishable_assessments,
-            messages_sent_today=0,
-            is_digest_due=True,
+        publishable = [asm for asm in projected if asm.is_publishable]
+        self.assertEqual(len(publishable), 3)
+        self.assertEqual(
+            {asm.article_ids[0] for asm in publishable},
+            {blind_articles[0].id, blind_articles[4].id, blind_articles[7].id},
         )
 
+        planner = HybridNotificationPlanner(self.settings)
+        plan = planner.plan_dispatch(publishable, messages_sent_today=0, is_digest_due=True)
         self.assertEqual(len(plan.digest_batch), 3)
         self.assertEqual(len(plan.immediate_breaking_alerts), 0)
-        self.assertEqual(len(plan.held_for_verification), 0)
-        self.assertEqual(len(plan.suppressed), 0)
-
-        # Check score ranking priority: CALIB-05 (82) > CALIB-01 (75) > CALIB-08 (70)
-        ordered_ranked_ids = [calib_by_id[asm.article_ids[0]].review_id for asm in plan.digest_batch]
-        self.assertEqual(ordered_ranked_ids, ["CALIB-05", "CALIB-01", "CALIB-08"])
-
-        # Verify digest formatting text exists without sending any network request
+        self.assertEqual(
+            [asm.score for asm in plan.digest_batch],
+            [82, 75, 70],
+        )
         self.assertIsNotNone(plan.formatted_digest_message)
-        self.assertIn("EDİTORYAL ÖZET", plan.formatted_digest_message)
         self.assertEqual(plan.telegram_messages_to_send_now, 1)
 
-        # 5. Complete Production Path: Persist to Outbox in StateRepository
-        with tempfile.TemporaryDirectory() as tmp_repo_dir:
-            temp_db = Path(tmp_repo_dir) / "test_outbox.db"
-            repo = SqliteStateRepository(temp_db)
-            ref_now = calib_items[0].discovered_at
-
-            for idx, asm in enumerate(plan.digest_batch):
-                it = calib_by_id[asm.article_ids[0]]
-                notif_id = f"DIGEST-Q-{it.review_id}"
-                story_id = f"EFSO-{it.review_id}"
-                notif_rec = NotificationRecord(
+        outbox_repo = SqliteStateRepository(self.tmp_path / "synthetic_outbox.db")
+        for idx, asm in enumerate(plan.digest_batch, 1):
+            notif_id = f"DIGEST-SYN-{idx}"
+            story_id = f"EFSO-SYN-{idx}"
+            outbox_repo.record_notification(
+                NotificationRecord(
                     notification_id=notif_id,
                     story_id=story_id,
                     update_id=None,
                     kind=asm.kind,
                     channel="TELEGRAM_DIGEST",
-                    sent_at=ref_now,
+                    sent_at=self.now,
                     status=DeliveryStatus.QUEUED_FOR_DIGEST,
                     message_text=asm.headline_tr,
                     headline_tr=asm.headline_tr,
                     score=asm.score,
                 )
-                repo.record_notification(notif_rec)
-                repo.record_editorial_assessment(asm, story_id)
-                repo.record_new_story(
-                    Story(
-                        story_id=story_id,
-                        headline_tr=asm.headline_tr,
-                        category=asm.category,
-                        first_seen_at=ref_now,
-                        last_updated_at=ref_now,
-                        article_ids=asm.article_ids,
-                    ),
-                    asm,
-                )
+            )
+            outbox_repo.record_editorial_assessment(asm, story_id)
+            outbox_repo.record_new_story(
+                Story(
+                    story_id=story_id,
+                    headline_tr=asm.headline_tr,
+                    category=asm.category,
+                    first_seen_at=self.now,
+                    last_updated_at=self.now,
+                    article_ids=asm.article_ids,
+                ),
+                asm,
+            )
 
-            # Query outbox
-            queued_outbox = repo.get_queued_digest_notifications(max_age_hours=None)
-            self.assertEqual(len(queued_outbox), 3, "Exactly 3 DIGEST notifications must be in the outbox")
-
-            # Outbox order must follow score descending: CALIB-05 (82) > CALIB-01 (75) > CALIB-08 (70)
-            self.assertEqual(queued_outbox[0].notification_id, "DIGEST-Q-CALIB-05")
-            self.assertEqual(queued_outbox[0].score, 82)
-            self.assertEqual(queued_outbox[1].notification_id, "DIGEST-Q-CALIB-01")
-            self.assertEqual(queued_outbox[1].score, 75)
-            self.assertEqual(queued_outbox[2].notification_id, "DIGEST-Q-CALIB-08")
-            self.assertEqual(queued_outbox[2].score, 70)
-
-            # Confirm RESERVE and IGNORE records never entered the notifications outbox table
-            all_notif_ids = [n.notification_id for n in queued_outbox]
-            for non_pub in ("CALIB-02", "CALIB-03", "CALIB-04", "CALIB-06", "CALIB-07"):
-                self.assertNotIn(f"DIGEST-Q-{non_pub}", all_notif_ids)
+        queued = outbox_repo.get_queued_digest_notifications(max_age_hours=None)
+        self.assertEqual(len(queued), 3)
+        self.assertEqual([n.score for n in queued], [82, 75, 70])
+        self.assertEqual([n.notification_id for n in queued], ["DIGEST-SYN-1", "DIGEST-SYN-2", "DIGEST-SYN-3"])
 
     def test_precedence_invariants_and_conflict_handling(self):
         """Urgency must never override verification, duplication, or editorial disposition."""
@@ -875,67 +850,60 @@ class TestPhase3C2DContract(unittest.TestCase):
             self.assertEqual(len(sensitive_outbox), 1)
             self.assertEqual(sensitive_outbox[0].status, DeliveryStatus.HELD_FOR_SENSITIVE_REVIEW)
 
-    @unittest.skipUnless(
-        Path(DEFAULT_FILLED_CALIBRATION_CSV).exists(),
-        "Requires authentic calibration CSV dataset in data/",
-    )
-    @patch("efso_radar.ai.phase3c2b_eval.require_verified_free_tier", new=lambda: None)
+    @unittest.skip(HISTORICAL_DATA_SKIP_REASON)
     def test_sensitive_review_calib_11_regression_case(self):
         """CALIB-11 regression test: Cindy Crawford / Presley Gerber death story must route to SENSITIVE_REVIEW."""
-        calib_items = load_and_verify_calibration_csv(DEFAULT_FILLED_CALIBRATION_CSV)
-        c11 = next((item for item in calib_items if item.review_id == "CALIB-11"), None)
-        self.assertIsNotNone(c11, "CALIB-11 must be present in the authoritative calibration dataset")
+        raise AssertionError("Skipped unconditionally under Issue #104 / T1B")
 
-        # Provenance verification of CALIB-11
-        self.assertEqual(c11.headline, "Acılı anne babanın ilk görüntüsü")
-        self.assertEqual(c11.publisher, "Habertürk Magazin")
-        self.assertEqual(c11.owner_decision, OwnerFeedbackRating.APPROVE)
-        self.assertIn("Cindy Crawford", c11.factual_summary)
-        self.assertIn("Presley Gerber", c11.factual_summary)
-        self.assertIn("vefat", c11.factual_summary.lower())
-
-        # Test offline predictor routing on blind article
-        blind_art = c11.to_blind_article()
-        batch_res = _offline_blind_diagnostic_predictor([blind_art], [], self.now)
+    @patch("efso_radar.ai.phase3c2b_eval.require_verified_free_tier", new=lambda: None)
+    def test_sensitive_review_metric_accounting_synthetic(self):
+        """Synthetic regression: SENSITIVE_REVIEW metrics report separately from DIGEST and positive_predicted_relevant."""
+        art = Article.create(
+            "Sentetik Acılı Aile İlk Görüntüsü",
+            "https://synthetic.example.invalid/sensitive-bereavement",
+            "Habertürk Magazin",
+            self.now,
+            snippet="Sentetik vefat ve taziye haberi: aile yakınlarının vefat sonrası görüntüleri.",
+        )
+        batch_res = _offline_blind_diagnostic_predictor([art], [], self.now)
         self.assertEqual(len(batch_res.decisions), 1)
         dec = batch_res.decisions[0]
-        self.assertEqual(dec.article_id, blind_art.id)
-        self.assertEqual(dec.disposition, "SENSITIVE_REVIEW", "CALIB-11 must be classified as SENSITIVE_REVIEW")
+        self.assertEqual(dec.disposition, "SENSITIVE_REVIEW")
 
-        # Test production projection
-        asms = project_diagnostic_decisions_to_assessments([dec], [blind_art])
-        self.assertEqual(len(asms), 1)
-        asm = asms[0]
-        self.assertFalse(asm.is_publishable, "CALIB-11 must NOT be publishable without owner review")
-        self.assertEqual(asm.disposition, EditorialDisposition.SENSITIVE_REVIEW)
-        self.assertIn("[NOT_PUBLISHABLE - SENSITIVE EDITORIAL REVIEW REQUIRED]", asm.uncertainties_tr)
-
-        # Test notification planner isolation
-        planner = HybridNotificationPlanner(self.settings)
-        plan = planner.plan_dispatch([asm], messages_sent_today=0, is_digest_due=True)
-        self.assertEqual(len(plan.immediate_breaking_alerts), 0)
-        self.assertEqual(len(plan.digest_batch), 0)
-        self.assertEqual(len(plan.held_for_sensitive_review), 1)
-
-        # Test evaluation metric accounting: reported separately from DIGEST and IGNORE, not automatically published
-        pred_record = self.runner.run_live_gemini_evaluation(
-            items=[c11],
-            mock_client=MagicMock(models=MagicMock(generate_content=MagicMock(return_value=MagicMock(
-                text=json.dumps({
-                    "decisions": [dec.model_dump()],
-                    "run_editorial_summary_tr": "Özet.",
-                }),
-                candidates=[MagicMock(finish_reason="STOP")],
-                usage_metadata=MagicMock(prompt_token_count=100, candidates_token_count=50, total_token_count=150),
-            )))),
+        preds, metrics, _ = self.runner.run_live_gemini_evaluation(
+            items=[art],
+            mock_client=MagicMock(
+                models=MagicMock(
+                    generate_content=MagicMock(
+                        return_value=MagicMock(
+                            text=json.dumps(
+                                {
+                                    "decisions": [dec.model_dump()],
+                                    "run_editorial_summary_tr": "Sentetik özet.",
+                                }
+                            ),
+                            candidates=[MagicMock(finish_reason="STOP")],
+                            usage_metadata=MagicMock(
+                                prompt_token_count=100,
+                                candidates_token_count=50,
+                                total_token_count=150,
+                            ),
+                        )
+                    )
+                )
+            ),
             dry_run=False,
             schema_mode="DIAGNOSTIC",
         )
-        preds, metrics, report = pred_record
+        self.assertEqual(len(preds), 1)
         self.assertEqual(metrics.sensitive_review_count, 1)
         self.assertEqual(metrics.digest_count, 0)
         self.assertEqual(metrics.ignore_count, 0)
-        self.assertEqual(metrics.positive_predicted_relevant, 0, "SENSITIVE_REVIEW must not be counted as automatically published")
+        self.assertEqual(
+            metrics.positive_predicted_relevant,
+            0,
+            "SENSITIVE_REVIEW must not be counted as automatically published",
+        )
 
     def test_sensitive_review_bereavement_regression_case_portable(self):
         """Portable regression test: death/bereavement story must route to SENSITIVE_REVIEW and fail closed."""
@@ -1122,6 +1090,16 @@ class TestPhase3C2DContract(unittest.TestCase):
         self.assertEqual(len(plan.held_for_sensitive_review), 2)  # State B + State C
         self.assertEqual(len(plan.digest_batch), 1)  # Normal story D only!
         self.assertEqual(plan.digest_batch[0].article_ids[0], art_d.id)
+
+    def test_historical_phase3c2d_tests_skip_unconditionally(self):
+        """Historical authentic-data tests must skip unconditionally without accessing data/."""
+        for method_name in (
+            "test_offline_production_projection_using_real_saved_second_canary_decisions",
+            "test_sensitive_review_calib_11_regression_case",
+        ):
+            method = getattr(self, method_name)
+            self.assertTrue(getattr(method, "__unittest_skip__", False), f"{method_name} must skip")
+            self.assertEqual(getattr(method, "__unittest_skip_why__", ""), HISTORICAL_DATA_SKIP_REASON)
 
 
 if __name__ == "__main__":

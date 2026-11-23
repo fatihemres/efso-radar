@@ -12,15 +12,16 @@ Verifies:
 """
 from __future__ import annotations
 
+import csv
+import json
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-
+from efso_radar.ai.calibration import REQUIRED_CSV_COLUMNS
 from efso_radar.ai.client import (
     detect_sensitive_tragedy_content,
-    project_diagnostic_decisions_to_assessments,
 )
 from efso_radar.ai.cost import ExperimentBudgetGuard
 from efso_radar.ai.schemas import DiagnosticArticleDecision
@@ -43,11 +44,19 @@ from scripts.preview_editorial_digest import (
     load_genuine_project_decisions,
 )
 
+HISTORICAL_DATA_SKIP_REASON = (
+    "Historical authentic Phase 4B calibration/eval/ledger files in operational data/ are "
+    "intentionally excluded from hermetic offline tests (Issue #104 / T1B); see labeled "
+    "synthetic counterparts in TestPhase4BDigestPreview."
+)
+
 
 class TestPhase4BDigestPreview(unittest.TestCase):
     """Test suite for Phase 4B Editorial Digest Preview."""
 
     def setUp(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self.tmpdir.name)
         self.now = datetime(2026, 10, 18, 19, 45, tzinfo=timezone.utc)
         self.art_cagatay_1 = Article(
             id="cagatay_haberturk",
@@ -158,6 +167,9 @@ class TestPhase4BDigestPreview(unittest.TestCase):
             disposition=EditorialDisposition.DIGEST,
         )
 
+    def tearDown(self) -> None:
+        self.tmpdir.cleanup()
+
     def test_deduplicate_assessments_drops_lower_scoring_duplicate(self) -> None:
         """Deduplication drops the lower-scoring duplicate and keeps the higher-scoring primary story."""
         input_items = [self.assess_cagatay_low, self.assess_cagatay_high, self.assess_eda]
@@ -203,42 +215,10 @@ class TestPhase4BDigestPreview(unittest.TestCase):
         self.assertNotIn("Çağatay Ulusoy köklerine döndü", rendered)
         self.assertIn("Instagram'da otomatik paylaşım yapılmaz.", rendered)
 
-    @unittest.skipUnless(
-        (REPO_ROOT / "data" / "Efso_Radar_Kalibrasyon_Doldurulmus.csv").exists(),
-        "Requires authentic calibration CSV and genuine project data in data/",
-    )
+    @unittest.skip(HISTORICAL_DATA_SKIP_REASON)
     def test_build_editorial_digest_preview_with_genuine_project_data(self) -> None:
         """Integration test: build_editorial_digest_preview correctly loads genuine saved records."""
-        preview = build_editorial_digest_preview(limit=5, preview_timestamp=self.now)
-
-        self.assertEqual(len(preview["selected_top"]), 5)
-        self.assertGreaterEqual(len(preview["reserve_backlog"]), 10)
-        self.assertGreaterEqual(len(preview["duplicate_drops"]), 1)
-
-        # Check ranking: scores must be monotonically non-increasing
-        scores = [a.score for a in preview["selected_top"]]
-        self.assertEqual(scores, sorted(scores, reverse=True))
-
-        # Check that top scores are genuinely 85, 85, 82, 82, 82
-        self.assertEqual(scores, [85, 85, 82, 82, 82])
-
-        # Verify no sensitive stories leaked into DIGEST
-        for a in preview["selected_top"]:
-            self.assertEqual(a.disposition, EditorialDisposition.DIGEST)
-            self.assertTrue(a.is_publishable)
-            self.assertFalse(detect_sensitive_tragedy_content(a.headline_tr, a.why_efso_tr))
-
-        # Verify Çağatay Ulusoy duplicate is in duplicate_drops
-        dup_headlines = [item.headline_tr for item, _ in preview["duplicate_drops"]]
-        self.assertTrue(any("Çağatay Ulusoy" in h for h in dup_headlines))
-
-        # Verify HTML content
-        html_msg = preview["telegram_html"]
-        self.assertIn("EDİTORYAL BÜLTEN", html_msg)
-        self.assertIn("[DEMO / KALİBRASYON]", html_msg)
-        self.assertIn("5 haber önerisi", html_msg)
-        self.assertIn("<a href=", html_msg)
-        self.assertIn("Instagram'da otomatik paylaşım yapılmaz.", html_msg)
+        raise AssertionError("Skipped unconditionally under Issue #104 / T1B")
 
     def test_deduplicate_merges_sources_for_true_duplicates(self) -> None:
         """True duplicates merge their supporting articles and source URLs into the primary representative."""
@@ -305,65 +285,69 @@ class TestPhase4BDigestPreview(unittest.TestCase):
         self.assertEqual(len(dropped), 1)
         self.assertEqual(dropped[0][0].headline_tr, self.assess_cagatay_low.headline_tr)
 
-    @unittest.skipUnless(
-        (REPO_ROOT / "data" / "experiment_budget_ledger.json").exists(),
-        "Requires authentic experiment budget ledger in data/",
-    )
+    @unittest.skip(HISTORICAL_DATA_SKIP_REASON)
     def test_budget_ledger_reporting_matches_ledger_file(self) -> None:
         """Budget reporting in preview dynamically reads actual ledger evidence."""
-        preview = build_editorial_digest_preview(limit=5)
-        budget = preview.get("budget_info")
-
-        self.assertIsNotNone(budget)
-        self.assertEqual(budget["budget_ceiling_usd"], 0.05)
-        guard = ExperimentBudgetGuard(ledger_path=REPO_ROOT / "data" / "experiment_budget_ledger.json")
-        self.assertAlmostEqual(budget["total_consumed_usd"], guard.get_total_consumed_usd(), places=6)
-        self.assertAlmostEqual(budget["remaining_allowance_usd"], guard.get_remaining_allowance_usd(), places=6)
-        self.assertAlmostEqual(budget["prior_canaries_usd"], guard.get_prior_canaries_cost_usd(), places=6)
+        raise AssertionError("Skipped unconditionally under Issue #104 / T1B")
 
     def test_url_checks_separate_structural_and_remote(self) -> None:
         """URL validation reports separate structural verification from remote network verification."""
-        if (REPO_ROOT / "data" / "Efso_Radar_Kalibrasyon_Doldurulmus.csv").exists():
-            preview = build_editorial_digest_preview(limit=5)
-            min_checks = 5
-        else:
-            syn_decisions = [
-                DiagnosticArticleDecision(
-                    article_id=self.art_eda.id,
-                    score=85,
-                    disposition="DIGEST",
-                    kind="NEW",
-                    urgency="NORMAL",
-                    rationale_tr="Eda Ece açıklaması",
-                    headline_tr=self.art_eda.title,
-                    verification_status="FIRST_PARTY_STATEMENT",
-                ),
-                DiagnosticArticleDecision(
-                    article_id=self.art_sila.id,
-                    score=82,
-                    disposition="DIGEST",
-                    kind="NEW",
-                    urgency="NORMAL",
-                    rationale_tr="Sıla paylaşımı",
-                    headline_tr=self.art_sila.title,
-                    verification_status="FIRST_PARTY_STATEMENT",
-                ),
-            ]
-            preview = build_editorial_digest_preview(
-                limit=2,
-                decisions=syn_decisions,
-                articles=[self.art_eda, self.art_sila],
-            )
-            min_checks = 2
+        bad_url_art = Article(
+            id="bad_url_art",
+            source="Sentetik Kaynak",
+            market=Market.TR,
+            title="Sentetik Geçersiz URL Haberi",
+            url="ftp://invalid-no-dot/story",
+            published_at=self.now,
+            discovered_at=self.now,
+            snippet="Sentetik test haberi.",
+        )
+        syn_decisions = [
+            DiagnosticArticleDecision(
+                article_id=self.art_eda.id,
+                score=85,
+                disposition="DIGEST",
+                kind="NEW",
+                urgency="NORMAL",
+                rationale_tr="Eda Ece açıklaması",
+                headline_tr=self.art_eda.title,
+                verification_status="FIRST_PARTY_STATEMENT",
+            ),
+            DiagnosticArticleDecision(
+                article_id=self.art_sila.id,
+                score=82,
+                disposition="DIGEST",
+                kind="NEW",
+                urgency="NORMAL",
+                rationale_tr="Sıla paylaşımı",
+                headline_tr=self.art_sila.title,
+                verification_status="FIRST_PARTY_STATEMENT",
+            ),
+            DiagnosticArticleDecision(
+                article_id=bad_url_art.id,
+                score=80,
+                disposition="DIGEST",
+                kind="NEW",
+                urgency="NORMAL",
+                rationale_tr="Geçersiz URL sentetik kontrolü",
+                headline_tr=bad_url_art.title,
+                verification_status="REPUTABLE_REPORTING",
+            ),
+        ]
+        preview = build_editorial_digest_preview(
+            limit=3,
+            repo_root=self.tmp_path,
+            decisions=syn_decisions,
+            articles=[self.art_eda, self.art_sila, bad_url_art],
+        )
 
         url_checks = preview.get("url_checks", [])
-
-        self.assertGreaterEqual(len(url_checks), min_checks)
+        self.assertEqual(len(url_checks), 3)
+        by_id = {c["article_id"]: c for c in url_checks}
+        self.assertTrue(by_id[self.art_eda.id]["structural_valid"])
+        self.assertTrue(by_id[self.art_sila.id]["structural_valid"])
+        self.assertFalse(by_id[bad_url_art.id]["structural_valid"])
         for check in url_checks:
-            # Structural validation passes 100%
-            self.assertTrue(check["structural_valid"])
-            self.assertTrue(check["url"].startswith("http://") or check["url"].startswith("https://"))
-            # Remote check is strictly False (offline isolation)
             self.assertFalse(check["remote_checked"])
 
     def test_build_editorial_digest_preview_hermetic(self) -> None:
@@ -404,6 +388,7 @@ class TestPhase4BDigestPreview(unittest.TestCase):
         preview = build_editorial_digest_preview(
             limit=2,
             preview_timestamp=self.now,
+            repo_root=self.tmp_path,
             decisions=syn_decisions,
             articles=articles,
         )
@@ -414,6 +399,212 @@ class TestPhase4BDigestPreview(unittest.TestCase):
         self.assertEqual(len(preview["duplicate_drops"]), 1)
         self.assertIn("EDİTORYAL BÜLTEN", preview["telegram_html"])
         self.assertIn("2 haber önerisi", preview["telegram_html"])
+
+    def test_build_editorial_digest_preview_loader_and_triage_synthetic(self) -> None:
+        """Synthetic regression: loader + preview pipeline isolates sensitive/hold/reserve/duplicate items in temp dir."""
+        syn_data_dir = self.tmp_path / "data"
+        syn_data_dir.mkdir(parents=True, exist_ok=True)
+        syn_csv = syn_data_dir / "Efso_Radar_Kalibrasyon_Doldurulmus.csv"
+
+        rows_spec = {
+            1: ("Çağatay Ulusoy köyünü ziyaret etti", "Habertürk Magazin", "https://synthetic.example.invalid/1", "Bulgaristan'daki köyünü ziyaret etti."),
+            2: ("Çağatay Ulusoy baba ocağında görüntülendi", "Sabah", "https://synthetic.example.invalid/2", "Bulgaristan'daki köyünde ailesiyle buluştu."),
+            3: ("Sentetik Sanatçı Vefat Etti: Cenaze Töreni Yarın", "Habertürk Magazin", "https://synthetic.example.invalid/3", "Ünlü sanatçının vefatı sonrası cenaze programı açıklandı."),
+            4: ("Sentetik Oyuncu Yeni Dizi Anlaşması İddiası", "Variety", "https://synthetic.example.invalid/4", "Kulis iddialarına göre yeni dizi anlaşması gündemde."),
+            5: ("Eda Ece Yeni Sezon Kurallarını Açıkladı", "Habertürk Magazin", "https://synthetic.example.invalid/5", "Ünlü oyuncu yeni sezon proje tercihlerini anlattı."),
+            6: ("Sıla Konser Turnesi Tarihlerini Paylaştı", "Onedio Magazin", "https://synthetic.example.invalid/6", "Şarkıcı Sıla yaz konser takvimini duyurdu."),
+            7: ("Sentetik Reserve Magazin Gelişmesi", "Posta", "https://synthetic.example.invalid/7", "Yedek tampon listede yer alan sentetik magazin haberi."),
+        }
+
+        with open(syn_csv, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(REQUIRED_CSV_COLUMNS))
+            writer.writeheader()
+            for i in range(1, 51):
+                headline, pub, url, summary = rows_spec.get(
+                    i,
+                    (
+                        f"Sentetik Magazin Başlığı {i}",
+                        "Habertürk Magazin" if i % 2 == 0 else "Variety",
+                        f"https://synthetic.example.invalid/item-{i}",
+                        f"Sentetik haber özeti {i}.",
+                    ),
+                )
+                writer.writerow(
+                    {
+                        "review_id": f"CALIB-{i:02d}",
+                        "headline": headline,
+                        "publisher": pub,
+                        "source_url": url,
+                        "published_at": "2026-10-18 12:00:00+00:00",
+                        "discovered_at": "2026-10-18 15:00:00+00:00",
+                        "category": "MAGAZIN_TR",
+                        "factual_summary": summary,
+                        "supporting_sources": pub,
+                        "verification_uncertainty_notes": "Sentetik test fikstürü.",
+                        "discovery_priority": str(round(12.0 - i * 0.1, 2)),
+                        "enters_ai_cutoff_yn": "Y" if i <= 32 else "N",
+                        "owner_decision": "APPROVE",
+                        "owner_notes": "",
+                    }
+                )
+
+        # Load synthetic articles via loader helper to obtain matching article IDs
+        _, loaded_articles = load_genuine_project_decisions(repo_root=self.tmp_path)
+        self.assertEqual(len(loaded_articles), 50)
+        by_idx = {idx + 1: art for idx, art in enumerate(loaded_articles)}
+
+        syn_eval_path = syn_data_dir / "canary2_gemini_eval_report.json"
+        syn_decisions = [
+            {
+                "article_id": by_idx[5].id,
+                "score": 88,
+                "disposition": "DIGEST",
+                "kind": "NEW",
+                "urgency": "NORMAL",
+                "rationale_tr": "Sentetik yüksek öncelikli haber.",
+                "headline_tr": by_idx[5].title,
+                "verification_status": "FIRST_PARTY_STATEMENT",
+            },
+            {
+                "article_id": by_idx[6].id,
+                "score": 84,
+                "disposition": "DIGEST",
+                "kind": "NEW",
+                "urgency": "NORMAL",
+                "rationale_tr": "Sentetik ikinci DIGEST haberi.",
+                "headline_tr": by_idx[6].title,
+                "verification_status": "REPUTABLE_REPORTING",
+            },
+            {
+                "article_id": by_idx[1].id,
+                "score": 75,
+                "disposition": "DIGEST",
+                "kind": "NEW",
+                "urgency": "NORMAL",
+                "rationale_tr": "Mükerrer düşük skorlu aday.",
+                "headline_tr": by_idx[1].title,
+                "verification_status": "REPUTABLE_REPORTING",
+            },
+            {
+                "article_id": by_idx[2].id,
+                "score": 79,
+                "disposition": "DIGEST",
+                "kind": "NEW",
+                "urgency": "NORMAL",
+                "rationale_tr": "Mükerrer yüksek skorlu aday.",
+                "headline_tr": by_idx[2].title,
+                "verification_status": "REPUTABLE_REPORTING",
+            },
+            {
+                "article_id": by_idx[3].id,
+                "score": 90,
+                "disposition": "DIGEST",  # Deliberate mislabel to test independent sensitivity veto
+                "kind": "NEW",
+                "urgency": "BREAKING",
+                "rationale_tr": "Hassas vefat içeriği testi.",
+                "headline_tr": by_idx[3].title,
+                "verification_status": "OFFICIAL_CONFIRMATION",
+            },
+            {
+                "article_id": by_idx[4].id,
+                "score": 80,
+                "disposition": "DIGEST",
+                "kind": "NEW",
+                "urgency": "NORMAL",
+                "rationale_tr": "Teyitsiz iddia testi.",
+                "headline_tr": by_idx[4].title,
+                "verification_status": "UNVERIFIED_RUMOR",
+            },
+            {
+                "article_id": by_idx[7].id,
+                "score": 68,
+                "disposition": "RESERVE",
+                "kind": "NEW",
+                "urgency": "NORMAL",
+                "rationale_tr": "Yedek tampon haber.",
+                "headline_tr": by_idx[7].title,
+                "verification_status": "REPUTABLE_REPORTING",
+            },
+        ]
+        syn_eval_path.write_text(
+            json.dumps({"evidence": {"raw_structured_model_predictions": [{"decisions": syn_decisions}]}}),
+            encoding="utf-8",
+        )
+
+        preview = build_editorial_digest_preview(
+            limit=2,
+            preview_timestamp=self.now,
+            repo_root=self.tmp_path,
+        )
+
+        self.assertEqual(preview["total_decisions_evaluated"], 7)
+        self.assertEqual(len(preview["selected_top"]), 2)
+        self.assertEqual([a.score for a in preview["selected_top"]], [88, 84])
+        self.assertEqual(len(preview["reserve_backlog"]), 1)
+        self.assertEqual(len(preview["duplicate_drops"]), 1)
+        self.assertEqual(len(preview["sensitive_intercepted"]), 1)
+        self.assertEqual(len(preview["hold_unverified"]), 1)
+        self.assertEqual(preview["reserve_decisions_count"], 1)
+
+        for selected in preview["selected_top"]:
+            self.assertFalse(detect_sensitive_tragedy_content(selected.headline_tr, selected.why_efso_tr))
+        self.assertIn("EDİTORYAL BÜLTEN", preview["telegram_html"])
+        self.assertIn("[DEMO / KALİBRASYON]", preview["telegram_html"])
+        self.assertIn("2 haber önerisi", preview["telegram_html"])
+        self.assertIn("Instagram'da otomatik paylaşım yapılmaz.", preview["telegram_html"])
+
+    def test_budget_ledger_reporting_synthetic_temp_ledger(self) -> None:
+        """Synthetic regression: build_editorial_digest_preview reads temp synthetic ledger without touching data/."""
+        syn_data_dir = self.tmp_path / "data"
+        syn_data_dir.mkdir(parents=True, exist_ok=True)
+        syn_ledger = syn_data_dir / "experiment_budget_ledger.json"
+
+        guard = ExperimentBudgetGuard(
+            ledger_path=syn_ledger,
+            budget_ceiling_usd=0.05,
+            canary1_db_path=self.tmp_path / "no_c1.db",
+            canary2_db_path=self.tmp_path / "no_c2.db",
+        )
+        guard.reserve_batch("syn_batch_1", [self.art_eda.id], 0.003)
+        guard.reconcile_batch("syn_batch_1", actual_cost_usd=0.0025, input_tokens=900, output_tokens=200)
+
+        syn_decisions = [
+            DiagnosticArticleDecision(
+                article_id=self.art_eda.id,
+                score=85,
+                disposition="DIGEST",
+                kind="NEW",
+                urgency="NORMAL",
+                rationale_tr="Sentetik karar.",
+                headline_tr=self.art_eda.title,
+                verification_status="FIRST_PARTY_STATEMENT",
+            )
+        ]
+        preview = build_editorial_digest_preview(
+            limit=2,
+            repo_root=self.tmp_path,
+            decisions=syn_decisions,
+            articles=[self.art_eda],
+        )
+
+        budget = preview.get("budget_info")
+        self.assertIsNotNone(budget)
+        self.assertEqual(budget["budget_ceiling_usd"], 0.0)
+        self.assertAlmostEqual(budget["total_consumed_usd"], guard.get_total_consumed_usd(), places=6)
+        # Verify the synthetic batch cost (0.0025) was loaded dynamically from the temp ledger.
+        self.assertAlmostEqual(budget["total_consumed_usd"], 0.0025, places=6)
+        self.assertAlmostEqual(budget["prior_canaries_usd"], 0.0, places=6)
+        self.assertEqual(budget["batches_count"], 1)
+
+    def test_historical_phase4b_tests_skip_unconditionally(self) -> None:
+        """Historical authentic-data Phase 4B tests must skip unconditionally without accessing data/."""
+        for method_name in (
+            "test_build_editorial_digest_preview_with_genuine_project_data",
+            "test_budget_ledger_reporting_matches_ledger_file",
+        ):
+            method = getattr(self, method_name)
+            self.assertTrue(getattr(method, "__unittest_skip__", False), f"{method_name} must skip")
+            self.assertEqual(getattr(method, "__unittest_skip_why__", ""), HISTORICAL_DATA_SKIP_REASON)
 
 
 if __name__ == "__main__":
