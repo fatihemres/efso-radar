@@ -13,182 +13,58 @@ Verifies:
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from efso_radar.ai.client import (
     detect_sensitive_tragedy_content,
     project_diagnostic_decisions_to_assessments,
 )
 from efso_radar.ai.cost import ExperimentBudgetGuard
-from efso_radar.ai.schemas import DiagnosticArticleDecision, DiagnosticEvaluationBatch
-from efso_radar.domain import EditorialDisposition
+from efso_radar.ai.schemas import DiagnosticArticleDecision
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+HISTORICAL_DATA_SKIP_REASON = (
+    "Historical authentic Phase 4D evidence in operational data/ is intentionally "
+    "excluded from hermetic offline tests (Issue #102 / T1A); see "
+    "TestPhase4DPortableContract for labeled synthetic regression coverage."
+)
 
 
 class TestPhase4DLiveGemini(unittest.TestCase):
-    """Test suite for Phase 4D live Gemini evaluation contract and safety gates (authentic evidence)."""
+    """Historical Phase 4D authentic-evidence tests (unconditionally skipped without touching data/)."""
 
-    def setUp(self) -> None:
-        self.rss_evidence_path = REPO_ROOT / "data" / "trial_live_rss_evidence.json"
-        self.gemini_evidence_path = REPO_ROOT / "data" / "trial_live_gemini_evidence.json"
-        self.budget_ledger_path = REPO_ROOT / "data" / "experiment_budget_ledger.json"
-
-    @unittest.skipUnless(
-        (REPO_ROOT / "data" / "trial_live_rss_evidence.json").exists(),
-        "Requires authentic Phase 4D RSS trial evidence in data/",
-    )
+    @unittest.skip(HISTORICAL_DATA_SKIP_REASON)
     def test_rss_evidence_integrity(self) -> None:
         """Verify authentic saved RSS evidence has 12 items and correct fields."""
-        self.assertTrue(self.rss_evidence_path.exists())
-        with open(self.rss_evidence_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        raise AssertionError("Skipped unconditionally under Issue #102 / T1A")
 
-        self.assertEqual(data.get("source_id"), "haberturk_magazin")
-        self.assertEqual(data.get("accepted_items_count"), 12)
-        self.assertEqual(len(data.get("articles", [])), 12)
-
-    @unittest.skipUnless(
-        (REPO_ROOT / "data" / "trial_live_rss_evidence.json").exists(),
-        "Requires authentic Phase 4D RSS trial evidence in data/",
-    )
+    @unittest.skip(HISTORICAL_DATA_SKIP_REASON)
     def test_sensitive_tragedy_isolation_in_rss(self) -> None:
         """Verify exactly 3 sensitive tragedy/bereavement stories are flagged and isolated."""
-        with open(self.rss_evidence_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        raise AssertionError("Skipped unconditionally under Issue #102 / T1A")
 
-        articles = data["articles"]
-        sensitive = [a for a in articles if a.get("is_sensitive_tragedy")]
-        self.assertEqual(len(sensitive), 3)
-
-        titles = [a["title"] for a in sensitive]
-        self.assertTrue(any("Soner Olgun" in t for t in titles))
-        self.assertTrue(any("Süleyman Saim Tekcan" in t for t in titles))
-        self.assertTrue(any("Can Bonomo" in t for t in titles))
-
-        # Check triggers
-        for a in sensitive:
-            is_sens = detect_sensitive_tragedy_content(a["title"], a.get("snippet", ""))
-            self.assertTrue(is_sens, f"Article '{a['title']}' must trigger sensitivity detector.")
-
-    @unittest.skipUnless(
-        (REPO_ROOT / "data" / "trial_live_rss_evidence.json").exists(),
-        "Requires authentic Phase 4D RSS trial evidence in data/",
-    )
+    @unittest.skip(HISTORICAL_DATA_SKIP_REASON)
     def test_ordinary_health_news_not_classified_as_tragedy(self) -> None:
         """Verify ordinary injury/health entertainment reporting is NOT classified as tragedy."""
-        with open(self.rss_evidence_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        raise AssertionError("Skipped unconditionally under Issue #102 / T1A")
 
-        gisele_art = next(a for a in data["articles"] if "sakatlandı" in a["title"].lower())
-        is_sens = detect_sensitive_tragedy_content(gisele_art["title"], gisele_art.get("snippet", ""))
-        self.assertFalse(is_sens, "Gisele Bündchen crutches story must not be treated as tragedy.")
-
-    @unittest.skipUnless(
-        (REPO_ROOT / "data" / "experiment_budget_ledger.json").exists(),
-        "Requires authentic Phase 4D experiment budget ledger in data/",
-    )
+    @unittest.skip(HISTORICAL_DATA_SKIP_REASON)
     def test_durable_budget_ledger_consistency(self) -> None:
         """Verify durable budget ledger tracks cumulative consumption correctly."""
-        self.assertTrue(self.budget_ledger_path.exists())
-        guard = ExperimentBudgetGuard(
-            ledger_path=self.budget_ledger_path,
-            budget_ceiling_usd=0.050000,
-            canary1_db_path=REPO_ROOT / "data" / "canary_radar.db",
-            canary2_db_path=REPO_ROOT / "data" / "canary2_radar.db",
-        )
+        raise AssertionError("Skipped unconditionally under Issue #102 / T1A")
 
-        prior_cost = guard.get_prior_canaries_cost_usd()
-        self.assertAlmostEqual(prior_cost, 0.005184, places=5)
-
-        total_consumed = guard.get_total_consumed_usd()
-        remaining_allowance = guard.get_remaining_allowance_usd()
-
-        # Cumulative consumption must be strictly within ceiling
-        self.assertLessEqual(total_consumed, 0.050000)
-        self.assertAlmostEqual(total_consumed + remaining_allowance, 0.050000, places=5)
-
-        # 8 batches total (7 from Phase 3C-3 + 1 from Phase 4D)
-        completed_batches = [
-            b for b in guard.data.get("batches", {}).values()
-            if b.get("status") == "COMPLETED"
-        ]
-        self.assertEqual(len(completed_batches), 8)
-
-    @unittest.skipUnless(
-        (REPO_ROOT / "data" / "trial_live_gemini_evidence.json").exists(),
-        "Requires authentic Phase 4D live Gemini evidence in data/",
-    )
+    @unittest.skip(HISTORICAL_DATA_SKIP_REASON)
     def test_phase4d_gemini_evidence_and_decisions(self) -> None:
         """Verify Phase 4D live Gemini evidence integrity, decisions, and token tracking."""
-        self.assertTrue(self.gemini_evidence_path.exists())
-        with open(self.gemini_evidence_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        raise AssertionError("Skipped unconditionally under Issue #102 / T1A")
 
-        self.assertEqual(data.get("model_name"), "gemini-3.5-flash-lite")
-        self.assertTrue(data.get("is_live"))
-        self.assertEqual(len(data.get("selected_candidates", [])), 6)
-        self.assertEqual(len(data.get("sensitive_excluded_articles", [])), 3)
-
-        # Verify token counts are genuine numbers from API
-        self.assertGreater(data.get("input_tokens", 0), 2000)
-        self.assertGreater(data.get("output_tokens", 0), 800)
-        self.assertGreater(data.get("actual_cost_usd", 0.0), 0.0020)
-
-        # Verify decisions
-        decisions = data.get("diagnostic_decisions", [])
-        self.assertEqual(len(decisions), 6)
-
-        dispositions = [d["disposition"] for d in decisions]
-        self.assertEqual(dispositions.count("DIGEST"), 4)
-        self.assertEqual(dispositions.count("RESERVE"), 1)
-        self.assertEqual(dispositions.count("IGNORE"), 1)
-
-        # Verify published count matches DIGEST count
-        self.assertEqual(data.get("publishable_digest_count"), 4)
-
-        # Verify Telegram preview HTML contains the 4 approved headlines and original links
-        preview_html = data.get("telegram_digest_preview_html", "")
-        self.assertIn("Şükrü Özyıldız", preview_html)
-        self.assertIn("Nicolas Cage", preview_html)
-        self.assertIn("Elizabeth Hurley", preview_html)
-        self.assertIn("Gisele Bündchen", preview_html)
-        self.assertNotIn("Soner Olgun", preview_html)
-        self.assertNotIn("Süleyman Saim", preview_html)
-        self.assertNotIn("Can Bonomo", preview_html)
-
-    @unittest.skipUnless(
-        (REPO_ROOT / "data" / "trial_live_rss_evidence.json").exists()
-        and (REPO_ROOT / "data" / "trial_live_gemini_evidence.json").exists(),
-        "Requires authentic Phase 4D live RSS and Gemini evidence in data/",
-    )
+    @unittest.skip(HISTORICAL_DATA_SKIP_REASON)
     def test_phase4d_final_editorial_review_override(self) -> None:
         """Verify final editorial review: Hurley overridden to HOLD, 3 final publishable items."""
-        from scripts.review_phase4d_digest import run_editorial_review
-
-        review = run_editorial_review()
-        self.assertEqual(review["final_publishable_digest_count"], 3)
-        self.assertEqual(len(review["editorial_overrides"]), 1)
-
-        override = review["editorial_overrides"][0]
-        self.assertEqual(override["celebrity"], "Elizabeth Hurley & Billy Ray Cyrus")
-        self.assertEqual(override["editorial_action"], "OVERRIDE_TO_HOLD_FOR_VERIFICATION")
-        self.assertEqual(override["override_details"]["to_disposition"], "HOLD_FOR_VERIFICATION")
-        self.assertFalse(override["override_details"]["is_publishable"])
-
-        # Final Telegram HTML
-        final_html = review["final_telegram_html"]
-        self.assertIn("3 haber önerisi", final_html)
-        self.assertIn("Şükrü Özyıldız", final_html)
-        self.assertIn("True Detective", final_html)
-        self.assertIn("5. Sezon", final_html)
-        self.assertIn("Gisele Bündchen", final_html)
-        # Hurley must NOT be in final HTML
-        self.assertNotIn("Elizabeth Hurley", final_html)
-        self.assertNotIn("Billy Ray Cyrus", final_html)
-        # Message length under 4096
-        self.assertLess(len(final_html), 4000)
+        raise AssertionError("Skipped unconditionally under Issue #102 / T1A")
 
 
 class TestPhase4DPortableContract(unittest.TestCase):
@@ -287,7 +163,6 @@ class TestPhase4DPortableContract(unittest.TestCase):
 
     def test_durable_budget_guard_portable(self) -> None:
         """Verify ExperimentBudgetGuard tracks reservations, completions, and ceilings portably."""
-        import tempfile
         with tempfile.TemporaryDirectory() as tmp_dir:
             ledger_file = Path(tmp_dir) / "test_budget_ledger.json"
             guard = ExperimentBudgetGuard(
@@ -312,6 +187,188 @@ class TestPhase4DPortableContract(unittest.TestCase):
             )
             self.assertAlmostEqual(guard.get_total_consumed_usd(), 0.001500, places=6)
             self.assertAlmostEqual(guard.get_remaining_allowance_usd(), 0.008500, places=6)
+
+    def test_editorial_review_script_isolated_synthetic_fixture(self) -> None:
+        """Verify run_editorial_review() in strict temp isolation using explicitly labeled synthetic fixtures."""
+        import scripts.review_phase4d_digest as review_mod
+
+        orig_delivery_env = os.environ.get("TELEGRAM_DELIVERY_ENABLED")
+
+        with tempfile.TemporaryDirectory(prefix="efso_t1a_phase4d_") as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            synthetic_rss_path = tmp_path / "synthetic_rss_evidence.json"
+            synthetic_gemini_path = tmp_path / "synthetic_gemini_evidence.json"
+            synthetic_review_out = tmp_path / "synthetic_review_evidence.json"
+            synthetic_budget_path = tmp_path / "synthetic_budget_ledger.json"
+
+            synthetic_rss_payload = {
+                "synthetic_fixture": True,
+                "articles": [
+                    {
+                        "article_id": "c12aebfb09cea9753d28a1cb",
+                        "title": "[SYNTHETIC] Şükrü Özyıldız kardeşinin düğününden kareler paylaştı",
+                        "url": "https://synthetic.example.invalid/news/sukru",
+                        "publisher": "Synthetic Test Source",
+                        "published_at_utc": "2026-10-18T12:00:00+00:00",
+                        "snippet": "Sentetik test haberi: aile düğünü paylaşımı.",
+                    },
+                    {
+                        "article_id": "bc038ac2e6c763dfd15c913f",
+                        "title": "[SYNTHETIC] True Detective 5. Sezon için Nicolas Cage ve Antonio Banderas buluşuyor",
+                        "url": "https://synthetic.example.invalid/news/true-detective-s5",
+                        "publisher": "Synthetic Test Source",
+                        "published_at_utc": "2026-10-18T12:05:00+00:00",
+                        "snippet": "Sentetik test haberi: oyuncu kadrosu duyurusu.",
+                    },
+                    {
+                        "article_id": "e96f2f49484d35370b64cec5",
+                        "title": "[SYNTHETIC] Elizabeth Hurley ve Billy Ray Cyrus hakkında nişan iddiası",
+                        "url": "https://synthetic.example.invalid/news/hurley-rumor",
+                        "publisher": "Synthetic Test Source",
+                        "published_at_utc": "2026-10-18T12:10:00+00:00",
+                        "snippet": "Sentetik test haberi: yabancı basında doğrulama bekleyen söylenti.",
+                    },
+                    {
+                        "article_id": "8262e6a3c4f2f3abf2534c98",
+                        "title": "[SYNTHETIC] Gisele Bündchen koltuk değnekleriyle görüntülendi",
+                        "url": "https://synthetic.example.invalid/news/gisele",
+                        "publisher": "Synthetic Test Source",
+                        "published_at_utc": "2026-10-18T12:15:00+00:00",
+                        "snippet": "Sentetik test haberi: ortopedik bot ile görüntülendi.",
+                    },
+                ],
+            }
+            synthetic_gemini_payload = {
+                "synthetic_fixture": True,
+                "diagnostic_decisions": [
+                    {
+                        "article_id": "c12aebfb09cea9753d28a1cb",
+                        "disposition": "DIGEST",
+                        "score": 85,
+                        "headline_tr": "Synthetic Şükrü Özyıldız Başlığı",
+                        "verification_status": "FIRST_PARTY_STATEMENT",
+                        "rationale_tr": "Sentetik özet: kardeşinin düğün karelerini paylaştı.",
+                    },
+                    {
+                        "article_id": "bc038ac2e6c763dfd15c913f",
+                        "disposition": "DIGEST",
+                        "score": 88,
+                        "headline_tr": "Synthetic True Detective Başlığı",
+                        "verification_status": "REPUTABLE_REPORTING",
+                        "rationale_tr": "Sentetik özet: 5. sezon kadrosu duyuruldu.",
+                    },
+                    {
+                        "article_id": "e96f2f49484d35370b64cec5",
+                        "disposition": "DIGEST",
+                        "score": 82,
+                        "headline_tr": "Synthetic Hurley İddiası",
+                        "verification_status": "FIRST_PARTY_STATEMENT",
+                        "rationale_tr": "Sentetik özet: teyitsiz nişan söylentisi.",
+                    },
+                    {
+                        "article_id": "8262e6a3c4f2f3abf2534c98",
+                        "disposition": "DIGEST",
+                        "score": 80,
+                        "headline_tr": "Synthetic Gisele Bündchen Başlığı",
+                        "verification_status": "REPUTABLE_REPORTING",
+                        "rationale_tr": "Sentetik özet: koltuk değnekleriyle görüntülendi.",
+                    },
+                ],
+            }
+            synthetic_budget_payload = {
+                "synthetic_fixture": True,
+                "experiment_id": "synthetic_t1a_phase4d_fixture",
+                "budget_ceiling_usd": 0.05,
+                "prior_canaries": [
+                    {"canary_id": "synthetic_c1", "cost_usd": 0.001027},
+                    {"canary_id": "synthetic_c2", "cost_usd": 0.004157},
+                ],
+                "batches": {
+                    "synthetic_batch_01": {
+                        "status": "COMPLETED",
+                        "actual_cost_usd": 0.028662,
+                    }
+                },
+            }
+
+            synthetic_rss_path.write_text(json.dumps(synthetic_rss_payload, ensure_ascii=False), encoding="utf-8")
+            synthetic_gemini_path.write_text(json.dumps(synthetic_gemini_payload, ensure_ascii=False), encoding="utf-8")
+            synthetic_budget_path.write_text(json.dumps(synthetic_budget_payload, ensure_ascii=False), encoding="utf-8")
+
+            def _synthetic_budget_guard(*, ledger_path: Path) -> ExperimentBudgetGuard:
+                return ExperimentBudgetGuard(
+                    ledger_path=ledger_path,
+                    budget_ceiling_usd=0.050000,
+                    canary1_db_path=tmp_path / "synthetic_canary1.db",
+                    canary2_db_path=tmp_path / "synthetic_canary2.db",
+                )
+
+            with (
+                patch.object(review_mod, "RSS_EVIDENCE_PATH", synthetic_rss_path),
+                patch.object(review_mod, "GEMINI_EVIDENCE_PATH", synthetic_gemini_path),
+                patch.object(review_mod, "REVIEW_EVIDENCE_PATH", synthetic_review_out),
+                patch.object(review_mod, "BUDGET_LEDGER_PATH", synthetic_budget_path),
+                patch.object(review_mod, "ExperimentBudgetGuard", side_effect=_synthetic_budget_guard),
+                patch.dict(os.environ, {"TELEGRAM_DELIVERY_ENABLED": "sentinel_before_review"}, clear=False),
+            ):
+                review = review_mod.run_editorial_review()
+                self.assertEqual(os.environ.get("TELEGRAM_DELIVERY_ENABLED"), "false")
+
+            # Process environment is cleanly restored upon leaving test context
+            self.assertEqual(os.environ.get("TELEGRAM_DELIVERY_ENABLED"), orig_delivery_env)
+
+            # Assertions run against isolated synthetic output only
+            self.assertTrue(synthetic_review_out.exists())
+            self.assertEqual(review["final_publishable_digest_count"], 3)
+            self.assertEqual(len(review["editorial_overrides"]), 1)
+
+            override = review["editorial_overrides"][0]
+            self.assertEqual(override["celebrity"], "Elizabeth Hurley & Billy Ray Cyrus")
+            self.assertEqual(override["editorial_action"], "OVERRIDE_TO_HOLD_FOR_VERIFICATION")
+            self.assertEqual(override["override_details"]["to_disposition"], "HOLD_FOR_VERIFICATION")
+            self.assertFalse(override["override_details"]["is_publishable"])
+
+            final_html = review["final_telegram_html"]
+            self.assertIn("3 haber önerisi", final_html)
+            self.assertIn("Şükrü Özyıldız", final_html)
+            self.assertIn("True Detective", final_html)
+            self.assertIn("5. Sezon", final_html)
+            self.assertIn("Gisele Bündchen", final_html)
+            self.assertNotIn("Elizabeth Hurley", final_html)
+            self.assertNotIn("Billy Ray Cyrus", final_html)
+            self.assertLess(len(final_html), 4000)
+
+            # Exception-path negative control also restores TELEGRAM_DELIVERY_ENABLED
+            with (
+                patch.object(review_mod, "RSS_EVIDENCE_PATH", tmp_path / "missing_rss_evidence.json"),
+                patch.object(review_mod, "GEMINI_EVIDENCE_PATH", synthetic_gemini_path),
+                patch.object(review_mod, "REVIEW_EVIDENCE_PATH", synthetic_review_out),
+                patch.object(review_mod, "BUDGET_LEDGER_PATH", synthetic_budget_path),
+                patch.object(review_mod, "ExperimentBudgetGuard", side_effect=_synthetic_budget_guard),
+                patch.dict(os.environ, {"TELEGRAM_DELIVERY_ENABLED": "sentinel_exception_path"}, clear=False),
+            ):
+                with self.assertRaises(FileNotFoundError):
+                    review_mod.run_editorial_review()
+
+            self.assertEqual(os.environ.get("TELEGRAM_DELIVERY_ENABLED"), orig_delivery_env)
+
+    def test_historical_authentic_evidence_suite_skips_unconditionally_without_data_access(self) -> None:
+        """Verify all historical authentic-evidence tests skip unconditionally without checking data/."""
+        expected_skipped = (
+            "test_rss_evidence_integrity",
+            "test_sensitive_tragedy_isolation_in_rss",
+            "test_ordinary_health_news_not_classified_as_tragedy",
+            "test_durable_budget_ledger_consistency",
+            "test_phase4d_gemini_evidence_and_decisions",
+            "test_phase4d_final_editorial_review_override",
+        )
+        for method_name in expected_skipped:
+            method = getattr(TestPhase4DLiveGemini, method_name)
+            self.assertTrue(
+                getattr(method, "__unittest_skip__", False),
+                f"{method_name} must remain unconditionally skipped without reading data/",
+            )
+            self.assertEqual(getattr(method, "__unittest_skip_why__", ""), HISTORICAL_DATA_SKIP_REASON)
 
 
 if __name__ == "__main__":
