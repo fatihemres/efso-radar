@@ -7,6 +7,7 @@ import os
 import shutil
 import socket
 import sqlite3
+import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -23,6 +24,8 @@ if conftest is None:
 REPO_ROOT = conftest.REPO_ROOT
 RESIDUAL_LIMITATIONS = conftest.RESIDUAL_LIMITATIONS
 HermeticGuardrailError = conftest.HermeticGuardrailError
+_resolve_dir_fd = conftest._resolve_dir_fd
+check_not_operational_path = conftest.check_not_operational_path
 hermetic_guardrails_context = conftest.hermetic_guardrails_context
 
 
@@ -208,3 +211,210 @@ def test_residual_limitations_are_explicitly_documented() -> None:
     assert "subprocess" in joined
     assert "file descriptors" in joined
     assert "stat()" in joined or "exists()" in joined
+
+
+def test_positive_temp_directory_cleanup_with_operational_like_basenames() -> None:
+    """Temp cleanup (TemporaryDirectory & shutil.rmtree) succeeds with operational-like basenames on Linux & Windows."""
+    orig_cwd = os.getcwd()
+    os.chdir(REPO_ROOT)
+
+    tmpdir = tempfile.TemporaryDirectory(prefix="efso_t1b_cleanup_")
+    tmp_root = Path(tmpdir.name)
+    for filename in (
+        "test_phase3c2d.db",
+        "shared_mock_staging.db",
+        "radar.db-wal",
+        "efso_radar_staging_manifest_run_20261123T000000Z_abcdef123456.json",
+        ".env",
+    ):
+        (tmp_root / filename).write_text("synthetic\n", encoding="utf-8")
+
+    (tmp_root / "data").mkdir()
+    (tmp_root / "data" / "state.json").write_text("{}", encoding="utf-8")
+    (tmp_root / "backups").mkdir()
+    (tmp_root / "backups" / "archive.enc").write_bytes(b"enc")
+    repo = SqliteStateRepository(tmp_root / "repo.db")
+    with repo._connection() as conn:
+        assert conn.execute("SELECT 1").fetchone()[0] == 1
+
+    # Cleanup runs shutil.rmtree (using dir_fd on Linux) while CWD == REPO_ROOT.
+    tmpdir.cleanup()
+    assert not tmp_root.exists()
+
+    # Verify explicit shutil.rmtree with nested data/ and operational-like basenames too.
+    explicit_dir = Path(tempfile.mkdtemp(prefix="efso_t1b_rmtree_"))
+    (explicit_dir / "data").mkdir()
+    (explicit_dir / "data" / "radar.db").write_bytes(b"sqlite")
+    (explicit_dir / "test_phase3c2d.db").write_bytes(b"sqlite")
+    shutil.rmtree(explicit_dir)
+    assert not explicit_dir.exists()
+    assert os.path.normcase(os.getcwd()) == os.path.normcase(str(REPO_ROOT)) or os.getcwd() == orig_cwd
+
+
+def test_unknown_or_unsupported_dir_fd_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unknown, negative, boolean, deleted, pipe, or unresolvable dir_fd values fail closed."""
+    for bad_fd in (-1, 999999, True):
+        with pytest.raises(HermeticGuardrailError):
+            check_not_operational_path("safe.txt", "os.unlink", dir_fd=bad_fd)
+
+    with pytest.raises(HermeticGuardrailError):
+        os.open("safe.txt", os.O_RDONLY, dir_fd=999999)
+    with pytest.raises(HermeticGuardrailError):
+        os.unlink("safe.txt", dir_fd=999999)
+    with pytest.raises(HermeticGuardrailError):
+        os.remove("safe.txt", dir_fd=999999)
+    with pytest.raises(HermeticGuardrailError):
+        os.rmdir("safe_dir", dir_fd=999999)
+    with pytest.raises(HermeticGuardrailError):
+        os.rename("a.txt", "b.txt", src_dir_fd=999999)
+    with pytest.raises(HermeticGuardrailError):
+        os.replace("a.txt", "b.txt", dst_dir_fd=999999)
+    with pytest.raises(HermeticGuardrailError):
+        shutil.rmtree("safe_dir", dir_fd=999999)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(os, "readlink", lambda _p: "/tmp/deleted_dir (deleted)")
+        with pytest.raises(HermeticGuardrailError):
+            _resolve_dir_fd(999999, "os.unlink")
+
+        mp.setattr(os, "readlink", lambda _p: "pipe:[12345]")
+        with pytest.raises(HermeticGuardrailError):
+            _resolve_dir_fd(999999, "os.unlink")
+
+        def _raise_oserror(_p: str) -> str:
+            raise OSError("procfs unavailable")
+
+        mp.setattr(os, "readlink", _raise_oserror)
+        with pytest.raises(HermeticGuardrailError):
+            _resolve_dir_fd(999999, "os.open")
+
+
+def test_fd_relative_policy_with_synthetic_standin_repo_cross_platform(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cross-platform policy test using a synthetic stand-in repo and mocked fd resolution."""
+    fake_repo = tmp_path / "synthetic_repo"
+    fake_data = fake_repo / "data"
+    fake_backups = fake_repo / "backups"
+    fake_tests = fake_repo / "tests"
+    safe_scratch = tmp_path / "safe_scratch"
+    for d in (fake_data, fake_backups, fake_tests, safe_scratch):
+        d.mkdir(parents=True)
+
+    (fake_data / "state.json").write_text('{"synthetic": true}', encoding="utf-8")
+    (fake_repo / ".env").write_text("SYNTHETIC_SECRET=1\n", encoding="utf-8")
+    (fake_backups / "b.enc").write_bytes(b"synthetic")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(conftest, "REPO_ROOT", fake_repo)
+        # Stand-in fd=100 resolves to synthetic data/ -> operational paths blocked fail-closed.
+        mp.setattr(
+            conftest,
+            "_resolve_dir_fd",
+            lambda fd, _op: str(fake_data) if fd == 100 else str(safe_scratch),
+        )
+
+        with pytest.raises(HermeticGuardrailError):
+            check_not_operational_path("state.json", "os.unlink", dir_fd=100, block_repo_root=True)
+        with pytest.raises(HermeticGuardrailError):
+            check_not_operational_path("state.json", "os.open", dir_fd=100)
+        with pytest.raises(HermeticGuardrailError):
+            check_not_operational_path("../.env", "os.remove", dir_fd=100, block_repo_root=True)
+        with pytest.raises(HermeticGuardrailError):
+            check_not_operational_path("../backups/b.enc", "os.replace(dst)", dir_fd=100, block_repo_root=True)
+        with pytest.raises(HermeticGuardrailError):
+            shutil.rmtree(fake_repo)
+        with pytest.raises(HermeticGuardrailError):
+            os.rmdir(fake_repo)
+
+        # Stand-in fd=200 resolves to safe_scratch -> permitted even for .db / data basenames.
+        check_not_operational_path("test.db", "os.unlink", dir_fd=200, block_repo_root=True)
+        check_not_operational_path("data", "os.open", dir_fd=200)
+
+
+@pytest.mark.skipif(
+    os.unlink not in os.supports_dir_fd or os.open not in os.supports_dir_fd,
+    reason="Host OS does not support dir_fd on os.open/os.unlink",
+)
+def test_posix_real_dir_fd_positive_and_negative_controls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real POSIX dir_fd positive temp ops and negative synthetic stand-in repo ops."""
+    fake_repo = tmp_path / "synthetic_repo_posix"
+    fake_data = fake_repo / "data"
+    fake_tests = fake_repo / "tests"
+    safe_dir = tmp_path / "safe_scratch"
+    safe_empty_sub = safe_dir / "sub_empty"
+    for d in (fake_data, fake_tests, safe_dir, safe_empty_sub):
+        d.mkdir(parents=True)
+
+    state_file = fake_data / "state.json"
+    db_file = fake_data / "radar.db"
+    env_file = fake_repo / ".env"
+    state_file.write_text('{"synthetic": true}', encoding="utf-8")
+    db_file.write_bytes(b"synthetic-db")
+    env_file.write_text("SYNTHETIC=1\n", encoding="utf-8")
+
+    (safe_dir / "test.db").write_bytes(b"temp-db")
+    (safe_dir / "temp.txt").write_text("temp\n", encoding="utf-8")
+
+    repo_fd = os.open(fake_repo, os.O_RDONLY)
+    data_fd = os.open(fake_data, os.O_RDONLY)
+    tests_fd = os.open(fake_tests, os.O_RDONLY)
+    safe_fd = os.open(safe_dir, os.O_RDONLY)
+    pipe_r, pipe_w = os.pipe()
+    closed_fd = os.open(safe_dir, os.O_RDONLY)
+    os.close(closed_fd)
+
+    try:
+        # Redirect REPO_ROOT after opening stand-in directory descriptors (never touches real data/).
+        with monkeypatch.context() as mp:
+            mp.setattr(conftest, "REPO_ROOT", fake_repo)
+
+            # Positive real dir_fd operations on test-owned safe_scratch succeed.
+            opened_fd = os.open("test.db", os.O_RDONLY, dir_fd=safe_fd)
+            os.close(opened_fd)
+            os.rename("temp.txt", "renamed.txt", src_dir_fd=safe_fd, dst_dir_fd=safe_fd)
+            assert (safe_dir / "renamed.txt").exists()
+            os.unlink("test.db", dir_fd=safe_fd)
+            assert not (safe_dir / "test.db").exists()
+            os.rmdir("sub_empty", dir_fd=safe_fd)
+            assert not safe_empty_sub.exists()
+
+            # Negative real dir_fd operations targeting synthetic stand-in operational paths fail closed.
+            with pytest.raises(HermeticGuardrailError):
+                os.open("state.json", os.O_RDONLY, dir_fd=data_fd)
+            with pytest.raises(HermeticGuardrailError):
+                os.unlink("state.json", dir_fd=data_fd)
+            with pytest.raises(HermeticGuardrailError):
+                os.remove("radar.db", dir_fd=data_fd)
+            with pytest.raises(HermeticGuardrailError):
+                os.rename("state.json", "stolen.json", src_dir_fd=data_fd, dst_dir_fd=safe_fd)
+            with pytest.raises(HermeticGuardrailError):
+                os.replace("renamed.txt", "state.json", src_dir_fd=safe_fd, dst_dir_fd=data_fd)
+            with pytest.raises(HermeticGuardrailError):
+                os.open("../data/state.json", os.O_RDONLY, dir_fd=tests_fd)
+            with pytest.raises(HermeticGuardrailError):
+                os.unlink("../.env", dir_fd=tests_fd)
+            with pytest.raises(HermeticGuardrailError):
+                shutil.rmtree("data", dir_fd=repo_fd)
+            with pytest.raises(HermeticGuardrailError):
+                os.rmdir("data", dir_fd=repo_fd)
+
+            # Real closed fd and real pipe fd fail closed.
+            with pytest.raises(HermeticGuardrailError):
+                os.unlink("renamed.txt", dir_fd=closed_fd)
+            with pytest.raises(HermeticGuardrailError):
+                os.open("renamed.txt", os.O_RDONLY, dir_fd=pipe_r)
+
+        assert state_file.read_text(encoding="utf-8") == '{"synthetic": true}'
+        assert db_file.read_bytes() == b"synthetic-db"
+        assert env_file.read_text(encoding="utf-8") == "SYNTHETIC=1\n"
+    finally:
+        for fd in (repo_fd, data_fd, tests_fd, safe_fd, pipe_r, pipe_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass

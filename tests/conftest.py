@@ -41,11 +41,14 @@ RESIDUAL_LIMITATIONS: tuple[str, ...] = (
     "Child Python or shell subprocesses (subprocess.run / subprocess.Popen) start fresh "
     "interpreters and do not inherit in-process Python monkeypatches.",
     "Direct C-level syscalls or raw integer file descriptors (open(fd)) bypass Python-level "
-    "path wrappers.",
+    "path wrappers; fd-relative dir_fd calls validate effective paths via /proc/self/fd "
+    "(or fcntl.F_GETPATH where supported) and fail closed when resolution is unavailable.",
     "Path.exists() and Path.stat() metadata probes are intentionally not blocked because "
     "existing untouched Phase 5B.3C/5B.3D/5B.3G tests assert operational file mtime/size "
     "invariants; therefore an isolated clean worktree (no .env, only tracked data/.gitkeep) "
     "remains mandatory for CI and agent verification.",
+    "Blocking socket.socket.connect also blocks Windows asyncio ProactorEventLoop self-pipe "
+    "initialization inside guarded tests unless asyncio event loops are created outside the guard.",
 )
 
 # Capture original functions once at module import so nested or restored contexts
@@ -55,6 +58,7 @@ _ORIG_IO_OPEN = io.open
 _ORIG_OS_OPEN = os.open
 _ORIG_OS_UNLINK = os.unlink
 _ORIG_OS_REMOVE = os.remove
+_ORIG_OS_RMDIR = os.rmdir
 _ORIG_OS_REPLACE = os.replace
 _ORIG_OS_RENAME = os.rename
 _ORIG_SHUTIL_RMTREE = shutil.rmtree
@@ -124,17 +128,27 @@ def _decode_sqlite_uri_path(raw_str: str) -> str:
     return unquoted
 
 
-def _is_blocked_normalized_path(norm_target: str, norm_repo_root: str) -> bool:
-    prefix = norm_repo_root.rstrip("\\/") + os.sep
+def _is_blocked_normalized_path(
+    norm_target: str,
+    norm_repo_root: str,
+    *,
+    block_repo_root: bool = False,
+) -> bool:
+    clean_repo = norm_repo_root.rstrip("\\/")
+    clean_target = norm_target.rstrip("\\/")
+    if clean_target == clean_repo:
+        return block_repo_root
+
+    prefix = clean_repo + os.sep
     if not norm_target.startswith(prefix):
         return False
 
     rel = norm_target[len(prefix):]
     if not rel:
-        return False
+        return block_repo_root
     parts = [p.lower() for p in rel.split(os.sep) if p]
     if not parts:
-        return False
+        return block_repo_root
 
     top = parts[0]
     if top in _ALLOWED_REPO_TOP_DIRS:
@@ -159,7 +173,50 @@ def _is_blocked_normalized_path(norm_target: str, norm_repo_root: str) -> bool:
     return False
 
 
-def check_not_operational_path(raw_path: Any, operation: str, *, is_sqlite: bool = False) -> None:
+def _resolve_dir_fd(dir_fd: Any, operation: str) -> str:
+    """Resolve an integer directory file descriptor to its filesystem path, failing closed."""
+    if isinstance(dir_fd, bool) or not isinstance(dir_fd, int) or dir_fd < 0:
+        raise HermeticGuardrailError(
+            f"Hermetic guardrail blocked {operation}: invalid dir_fd={dir_fd!r} (fail closed)"
+        )
+
+    resolved: str | None = None
+    proc_fd = f"/proc/self/fd/{dir_fd}"
+    try:
+        resolved = os.readlink(proc_fd)
+    except OSError:
+        resolved = None
+
+    if resolved is None:
+        try:
+            import fcntl  # noqa: PLC0415
+
+            if hasattr(fcntl, "F_GETPATH"):
+                raw = fcntl.fcntl(dir_fd, fcntl.F_GETPATH, b"\0" * 1024)
+                resolved = os.fsdecode(raw.split(b"\0", 1)[0])
+        except Exception:
+            resolved = None
+
+    if (
+        not resolved
+        or not os.path.isabs(resolved)
+        or resolved.endswith(" (deleted)")
+        or resolved.startswith(("pipe:[", "socket:[", "anon_inode:"))
+    ):
+        raise HermeticGuardrailError(
+            f"Hermetic guardrail blocked {operation}: cannot safely resolve dir_fd={dir_fd!r} (fail closed)"
+        )
+    return resolved
+
+
+def check_not_operational_path(
+    raw_path: Any,
+    operation: str,
+    *,
+    dir_fd: Any = None,
+    is_sqlite: bool = False,
+    block_repo_root: bool = False,
+) -> None:
     """Raise HermeticGuardrailError if `raw_path` targets an operational path under `REPO_ROOT`."""
     if raw_path is None or isinstance(raw_path, int):
         return
@@ -179,12 +236,20 @@ def check_not_operational_path(raw_path: Any, operation: str, *, is_sqlite: bool
         if path_str.lower().startswith("file:"):
             path_str = _decode_sqlite_uri_path(path_str)
 
+    if dir_fd is not None and (not path_str or not os.path.isabs(path_str)):
+        base_dir = _resolve_dir_fd(dir_fd, operation)
+        path_str = os.path.join(base_dir, path_str) if path_str else base_dir
+
     if not path_str:
         return
 
     norm_repo_abs = os.path.normcase(os.path.abspath(os.fspath(REPO_ROOT)))
     norm_target_abs = os.path.normcase(os.path.abspath(path_str))
-    if _is_blocked_normalized_path(norm_target_abs, norm_repo_abs):
+    if _is_blocked_normalized_path(
+        norm_target_abs,
+        norm_repo_abs,
+        block_repo_root=block_repo_root,
+    ):
         raise HermeticGuardrailError(
             f"Hermetic guardrail blocked {operation} on operational path: {path_str!r}"
         )
@@ -192,7 +257,11 @@ def check_not_operational_path(raw_path: Any, operation: str, *, is_sqlite: bool
     # Also check realpath to defeat symlinks inside temp dirs pointing back to REPO_ROOT.
     norm_repo_real = os.path.normcase(os.path.realpath(os.fspath(REPO_ROOT)))
     norm_target_real = os.path.normcase(os.path.realpath(path_str))
-    if _is_blocked_normalized_path(norm_target_real, norm_repo_real):
+    if _is_blocked_normalized_path(
+        norm_target_real,
+        norm_repo_real,
+        block_repo_root=block_repo_root,
+    ):
         raise HermeticGuardrailError(
             f"Hermetic guardrail blocked {operation} via symlink to operational path: {path_str!r}"
         )
@@ -204,34 +273,79 @@ def _guarded_open(file: Any, *args: Any, **kwargs: Any) -> Any:
 
 
 def _guarded_os_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
-    check_not_operational_path(path, "os.open")
+    check_not_operational_path(path, "os.open", dir_fd=kwargs.get("dir_fd"))
     return _ORIG_OS_OPEN(path, flags, *args, **kwargs)
 
 
 def _guarded_unlink(path: Any, *args: Any, **kwargs: Any) -> None:
-    check_not_operational_path(path, "os.unlink")
+    check_not_operational_path(
+        path,
+        "os.unlink",
+        dir_fd=kwargs.get("dir_fd"),
+        block_repo_root=True,
+    )
     _ORIG_OS_UNLINK(path, *args, **kwargs)
 
 
 def _guarded_remove(path: Any, *args: Any, **kwargs: Any) -> None:
-    check_not_operational_path(path, "os.remove")
+    check_not_operational_path(
+        path,
+        "os.remove",
+        dir_fd=kwargs.get("dir_fd"),
+        block_repo_root=True,
+    )
     _ORIG_OS_REMOVE(path, *args, **kwargs)
 
 
+def _guarded_rmdir(path: Any, *args: Any, **kwargs: Any) -> None:
+    check_not_operational_path(
+        path,
+        "os.rmdir",
+        dir_fd=kwargs.get("dir_fd"),
+        block_repo_root=True,
+    )
+    _ORIG_OS_RMDIR(path, *args, **kwargs)
+
+
 def _guarded_replace(src: Any, dst: Any, *args: Any, **kwargs: Any) -> None:
-    check_not_operational_path(src, "os.replace(src)")
-    check_not_operational_path(dst, "os.replace(dst)")
+    check_not_operational_path(
+        src,
+        "os.replace(src)",
+        dir_fd=kwargs.get("src_dir_fd"),
+        block_repo_root=True,
+    )
+    check_not_operational_path(
+        dst,
+        "os.replace(dst)",
+        dir_fd=kwargs.get("dst_dir_fd"),
+        block_repo_root=True,
+    )
     _ORIG_OS_REPLACE(src, dst, *args, **kwargs)
 
 
 def _guarded_rename(src: Any, dst: Any, *args: Any, **kwargs: Any) -> None:
-    check_not_operational_path(src, "os.rename(src)")
-    check_not_operational_path(dst, "os.rename(dst)")
+    check_not_operational_path(
+        src,
+        "os.rename(src)",
+        dir_fd=kwargs.get("src_dir_fd"),
+        block_repo_root=True,
+    )
+    check_not_operational_path(
+        dst,
+        "os.rename(dst)",
+        dir_fd=kwargs.get("dst_dir_fd"),
+        block_repo_root=True,
+    )
     _ORIG_OS_RENAME(src, dst, *args, **kwargs)
 
 
 def _guarded_rmtree(path: Any, *args: Any, **kwargs: Any) -> None:
-    check_not_operational_path(path, "shutil.rmtree")
+    check_not_operational_path(
+        path,
+        "shutil.rmtree",
+        dir_fd=kwargs.get("dir_fd"),
+        block_repo_root=True,
+    )
     _ORIG_SHUTIL_RMTREE(path, *args, **kwargs)
 
 
@@ -303,6 +417,7 @@ def hermetic_guardrails_context() -> Iterator[None]:
     prev_os_open = os.open
     prev_os_unlink = os.unlink
     prev_os_remove = os.remove
+    prev_os_rmdir = os.rmdir
     prev_os_replace = os.replace
     prev_os_rename = os.rename
     prev_shutil_rmtree = shutil.rmtree
@@ -322,6 +437,7 @@ def hermetic_guardrails_context() -> Iterator[None]:
     os.open = _guarded_os_open
     os.unlink = _guarded_unlink
     os.remove = _guarded_remove
+    os.rmdir = _guarded_rmdir
     os.replace = _guarded_replace
     os.rename = _guarded_rename
     shutil.rmtree = _guarded_rmtree
@@ -344,6 +460,7 @@ def hermetic_guardrails_context() -> Iterator[None]:
         os.open = prev_os_open
         os.unlink = prev_os_unlink
         os.remove = prev_os_remove
+        os.rmdir = prev_os_rmdir
         os.replace = prev_os_replace
         os.rename = prev_os_rename
         shutil.rmtree = prev_shutil_rmtree
