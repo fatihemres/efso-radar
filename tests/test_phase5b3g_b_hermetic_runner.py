@@ -23,6 +23,7 @@ Validates:
 """
 from __future__ import annotations
 
+import builtins
 import hashlib
 import io
 import json
@@ -33,6 +34,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from typing import Any
 from unittest.mock import patch, MagicMock
 
 import httpx
@@ -847,24 +849,92 @@ class TestOfflineCLIAndSafety(unittest.TestCase):
                 mock_sock.assert_not_called()
 
     def test_operational_files_untouched(self):
-        """Prove data/radar.db, data/state.json, and .env are never opened."""
-        prod_db = Path("data/radar.db")
-        prod_state = Path("data/state.json")
-        prod_env = Path(".env")
+        """Prove synthetic stand-in data/radar.db, data/state.json, and .env are never opened or mutated."""
+        with tempfile.TemporaryDirectory(prefix="efso_t1c_runner_iso_") as td:
+            tmp_root = Path(td)
+            data_dir = tmp_root / "data"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            standin_db = data_dir / "radar.db"
+            standin_state = data_dir / "state.json"
+            standin_env = tmp_root / ".env"
 
-        original_mtime_db = prod_db.stat().st_mtime if prod_db.exists() else None
-        original_mtime_state = prod_state.stat().st_mtime if prod_state.exists() else None
-        original_mtime_env = prod_env.stat().st_mtime if prod_env.exists() else None
+            db_bytes = b"SYNTHETIC_RADAR_DB_SENTINEL"
+            state_bytes = b'{"synthetic_sentinel": true}'
+            env_bytes = (
+                b"TURSO_DATABASE_URL=libsql://forbidden.example.invalid\n"
+                b"TURSO_AUTH_TOKEN=synth-forbidden\n"
+            )
+            standin_db.write_bytes(db_bytes)
+            standin_state.write_bytes(state_bytes)
+            standin_env.write_bytes(env_bytes)
 
-        exit_code = main(["--dry-run"])
-        self.assertEqual(exit_code, 0)
+            standin_db_res = standin_db.resolve()
+            standin_state_res = standin_state.resolve()
+            standin_env_res = standin_env.resolve()
+            data_dir_res = data_dir.resolve()
+            repo_root_res = Path(__file__).resolve().parent.parent
+            repo_data_res = (repo_root_res / "data").resolve()
+            forbidden_resolved = {standin_db_res, standin_state_res, standin_env_res}
 
-        if original_mtime_db is not None:
-            self.assertEqual(prod_db.stat().st_mtime, original_mtime_db)
-        if original_mtime_state is not None:
-            self.assertEqual(prod_state.stat().st_mtime, original_mtime_state)
-        if original_mtime_env is not None:
-            self.assertEqual(prod_env.stat().st_mtime, original_mtime_env)
+            observed_sqlite_targets: list[str] = []
+            prev_sqlite_connect = sqlite3.connect
+            prev_builtins_open = builtins.open
+            prev_os_open = os.open
+
+            def _check_open_target(raw_path: Any, op_name: str) -> None:
+                if raw_path is None or isinstance(raw_path, int):
+                    return
+                if isinstance(raw_path, bytes):
+                    path_str = os.fsdecode(raw_path)
+                elif isinstance(raw_path, os.PathLike):
+                    path_str = os.fsdecode(raw_path)
+                elif isinstance(raw_path, str):
+                    path_str = raw_path
+                else:
+                    return
+                resolved = Path(path_str).resolve()
+                if (
+                    resolved in forbidden_resolved
+                    or resolved.parent == data_dir_res
+                    or resolved.parent == repo_data_res
+                    or (resolved.name.startswith(".env") and resolved.name != ".env.example")
+                ):
+                    raise AssertionError(
+                        f"Runner unexpectedly accessed operational/stand-in path via {op_name}: {resolved}"
+                    )
+
+            def _spy_sqlite_connect(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+                observed_sqlite_targets.append(str(database))
+                return prev_sqlite_connect(database, *args, **kwargs)
+
+            def _spy_builtins_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+                _check_open_target(file, "builtins.open")
+                return prev_builtins_open(file, *args, **kwargs)
+
+            def _spy_os_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+                _check_open_target(path, "os.open")
+                return prev_os_open(path, flags, *args, **kwargs)
+
+            stdout_capture = io.StringIO()
+            orig_cwd = os.getcwd()
+            try:
+                os.chdir(tmp_root)
+                with (
+                    patch("sys.stdout", stdout_capture),
+                    patch("sqlite3.connect", side_effect=_spy_sqlite_connect),
+                    patch("builtins.open", side_effect=_spy_builtins_open),
+                    patch("os.open", side_effect=_spy_os_open),
+                ):
+                    exit_code = main(["--dry-run"])
+            finally:
+                os.chdir(orig_cwd)
+
+            self.assertEqual(exit_code, 0)
+            self.assertGreaterEqual(len(observed_sqlite_targets), 1)
+            self.assertTrue(all(target == ":memory:" for target in observed_sqlite_targets))
+            self.assertEqual(standin_db.read_bytes(), db_bytes)
+            self.assertEqual(standin_state.read_bytes(), state_bytes)
+            self.assertEqual(standin_env.read_bytes(), env_bytes)
 
     # -------------------------------------------------------------------------
     # Regression Check: Clean runpy execution without eager import warnings

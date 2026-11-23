@@ -21,6 +21,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -141,12 +142,66 @@ def create_mock_hrana_transport(conn: sqlite3.Connection) -> httpx.BaseTransport
     return MockHranaTransport()
 
 
+def _resolve_sqlite_connect_target(database: Any) -> Optional[Path]:
+    """Resolve non-memory sqlite3.connect targets to an absolute Path, or None for memory targets."""
+    if isinstance(database, os.PathLike):
+        raw_str = os.fsdecode(database)
+    elif isinstance(database, bytes):
+        raw_str = os.fsdecode(database)
+    elif isinstance(database, str):
+        raw_str = database
+    else:
+        return None
+    stripped = raw_str.strip()
+    lower = stripped.lower()
+    if stripped in ("", ":memory:") or lower.startswith("file::memory:") or (
+        lower.startswith("file:") and "mode=memory" in lower
+    ):
+        return None
+    if lower.startswith("file:"):
+        without_scheme = stripped[5:]
+        path_part = urllib.parse.unquote(without_scheme.split("?", 1)[0].split("#", 1)[0])
+        if path_part.startswith("///"):
+            tail = path_part[3:]
+            path_part = tail if (len(tail) >= 2 and tail[1] == ":") else "/" + tail
+        elif path_part.startswith("//localhost/"):
+            tail = path_part[len("//localhost/"):]
+            path_part = tail if (len(tail) >= 2 and tail[1] == ":") else "/" + tail
+        stripped = path_part
+    return Path(stripped).resolve()
+
+
 class TestPhase5B3CCloudPersistenceIntegration(unittest.TestCase):
     """Hermetic integration suite for persistent cloud-state architecture."""
+
+    def _assert_sqlite_target_isolated(self, database: Any) -> None:
+        resolved = _resolve_sqlite_connect_target(database)
+        if resolved is None:
+            self._observed_sqlite_targets.append(":memory:")
+            return
+        try:
+            resolved.relative_to(self._tmp_root_resolved)
+        except ValueError as exc:
+            raise AssertionError(
+                f"SQLite connection escaped test temporary root: {resolved}"
+            ) from exc
+        self._observed_sqlite_targets.append(str(resolved))
 
     def setUp(self):
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.tmp_path = Path(self.tmp_dir.name)
+        self._tmp_root_resolved = self.tmp_path.resolve()
+        self._observed_sqlite_targets: list[str] = []
+
+        prev_sqlite_connect = sqlite3.connect
+
+        def _guarded_spy_sqlite_connect(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+            self._assert_sqlite_target_isolated(database)
+            return prev_sqlite_connect(database, *args, **kwargs)
+
+        self._sqlite_patcher = patch("sqlite3.connect", side_effect=_guarded_spy_sqlite_connect)
+        self._sqlite_patcher.start()
+        self.addCleanup(self._sqlite_patcher.stop)
 
         # Isolated SQLite database acting as the synthetic Turso backend
         self.backend_db_path = self.tmp_path / "synthetic_turso_backend.db"
@@ -157,12 +212,13 @@ class TestPhase5B3CCloudPersistenceIntegration(unittest.TestCase):
         # Mock Hrana transport
         self.mock_transport = create_mock_hrana_transport(self.backend_conn)
 
-        # Base test settings
+        # Base test settings (no local DB should ever be touched or created)
+        self.synthetic_unused_db_path = self.tmp_path / "unused_local.db"
         self.test_settings = Settings(
             storage_mode="turso",
             turso_database_url="libsql://synthetic-cloud.turso.io",
             turso_auth_token="mock-synthetic-bearer-token-12345",
-            sqlite_db_path=self.tmp_path / "unused_local.db",
+            sqlite_db_path=self.synthetic_unused_db_path,
             telegram_chat_id="1111111111",
             telegram_primary_editor_chat_id="2222222222",
             telegram_allowed_chat_ids=["1111111111", "2222222222"],
@@ -171,34 +227,23 @@ class TestPhase5B3CCloudPersistenceIntegration(unittest.TestCase):
             ai_evaluation_enabled=False,
         )
 
-        # Operational DB snapshot check
-        self.op_db_path = Path("data/radar.db")
-        self.op_db_existed = self.op_db_path.exists()
-        if self.op_db_existed:
-            self.op_db_initial_stat = self.op_db_path.stat()
-
     def tearDown(self):
         self.backend_conn.close()
         import gc
         gc.collect()
         try:
-            self.tmp_dir.cleanup()
-        except Exception:
-            pass
-
-        # Verify operational DB was never modified
-        if self.op_db_existed:
-            final_stat = self.op_db_path.stat()
-            self.assertEqual(
-                self.op_db_initial_stat.st_mtime,
-                final_stat.st_mtime,
-                "Operational database data/radar.db mtime changed during integration tests! Isolation breached.",
+            self.assertFalse(
+                self.synthetic_unused_db_path.exists(),
+                "Unused synthetic local SQLite file was unexpectedly created during cloud persistence test.",
             )
-            self.assertEqual(
-                self.op_db_initial_stat.st_size,
-                final_stat.st_size,
-                "Operational database data/radar.db size changed during integration tests! Isolation breached.",
-            )
+            for target in self._observed_sqlite_targets:
+                if target != ":memory:":
+                    Path(target).resolve().relative_to(self._tmp_root_resolved)
+        finally:
+            try:
+                self.tmp_dir.cleanup()
+            except Exception:
+                pass
 
     def _create_turso_repo(self) -> TursoStateRepository:
         """Helper to create a TursoStateRepository instance connected to synthetic Hrana backend."""
@@ -604,17 +649,31 @@ class TestPhase5B3CCloudPersistenceIntegration(unittest.TestCase):
 
     # --- Test 9: Complete Zero-Network and Operational DB Isolation ---
     def test_09_complete_zero_network_and_zero_operational_db_isolation(self):
-        """Verify that all tests in this suite operate strictly offline with zero live sockets."""
+        """Verify that all tests in this suite operate strictly offline with zero live sockets or stand-in DB opens."""
+        standin_dir = self.tmp_path / "synthetic_data"
+        standin_dir.mkdir(parents=True, exist_ok=True)
+        standin_db = standin_dir / "radar.db"
+        sentinel_bytes = b"SYNTHETIC_RADAR_DB_SENTINEL_UNTOUCHED"
+        standin_db.write_bytes(sentinel_bytes)
+
+        isolated_settings = self.test_settings.model_copy(update={"sqlite_db_path": standin_db})
+        prior_connect_count = len(self._observed_sqlite_targets)
+
         # Assert socket connect attempts raise an exception if any were made
         with patch("socket.socket.connect", side_effect=AssertionError("Live network socket attempted!")):
             # Instantiate orchestrator and execute synthetic offline run
             repo = self._create_turso_repo()
             orchestrator = RadarOrchestrator(
-                settings=self.test_settings,
+                settings=isolated_settings,
                 repository=repo,
             )
             self.assertIsNotNone(orchestrator)
             self.assertIsInstance(orchestrator.repository, TursoStateRepository)
+
+        new_targets = self._observed_sqlite_targets[prior_connect_count:]
+        self.assertNotIn(str(standin_db.resolve()), new_targets)
+        self.assertNotIn(str(self.synthetic_unused_db_path.resolve()), new_targets)
+        self.assertEqual(standin_db.read_bytes(), sentinel_bytes)
 
 
     # --- Test 10: Durable Pre-Send Claim & Competing Worker Isolation ---

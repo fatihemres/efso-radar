@@ -13,12 +13,15 @@ Verifies:
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
+from unittest.mock import patch
 
 import httpx
 
@@ -151,12 +154,76 @@ def create_mock_hrana_transport(conn: sqlite3.Connection) -> httpx.BaseTransport
     return MockHranaTransport()
 
 
+def _resolve_sqlite_connect_target(database: Any) -> Optional[Path]:
+    """Resolve non-memory sqlite3.connect targets to an absolute Path, or None for memory targets."""
+    if isinstance(database, os.PathLike):
+        raw_str = os.fsdecode(database)
+    elif isinstance(database, bytes):
+        raw_str = os.fsdecode(database)
+    elif isinstance(database, str):
+        raw_str = database
+    else:
+        return None
+    stripped = raw_str.strip()
+    lower = stripped.lower()
+    if stripped in ("", ":memory:") or lower.startswith("file::memory:") or (
+        lower.startswith("file:") and "mode=memory" in lower
+    ):
+        return None
+    if lower.startswith("file:"):
+        without_scheme = stripped[5:]
+        path_part = urllib.parse.unquote(without_scheme.split("?", 1)[0].split("#", 1)[0])
+        if path_part.startswith("///"):
+            tail = path_part[3:]
+            path_part = tail if (len(tail) >= 2 and tail[1] == ":") else "/" + tail
+        elif path_part.startswith("//localhost/"):
+            tail = path_part[len("//localhost/"):]
+            path_part = tail if (len(tail) >= 2 and tail[1] == ":") else "/" + tail
+        stripped = path_part
+    return Path(stripped).resolve()
+
+
 class TestPhase5B3C2StagingPreflight(unittest.TestCase):
     """Test suite for cloud staging preflight, recovery inspection, and cutover readiness."""
+
+    def _assert_sqlite_target_isolated(self, database: Any) -> None:
+        resolved = _resolve_sqlite_connect_target(database)
+        if resolved is None:
+            self._observed_sqlite_targets.append(":memory:")
+            return
+        if resolved == self._synthetic_standin_resolved:
+            raise AssertionError(f"SQLite connection targeted synthetic stand-in DB: {resolved}")
+        try:
+            resolved.relative_to(self._tmp_root_resolved)
+        except ValueError as exc:
+            raise AssertionError(
+                f"SQLite connection escaped test temporary root: {resolved}"
+            ) from exc
+        self._observed_sqlite_targets.append(str(resolved))
 
     def setUp(self):
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.tmp_path = Path(self.tmp_dir.name)
+        self._tmp_root_resolved = self.tmp_path.resolve()
+        self._observed_sqlite_targets: list[str] = []
+
+        # Synthetic operational DB stand-in with sentinel bytes (must remain untouched)
+        standin_dir = self.tmp_path / "synthetic_standin_data"
+        standin_dir.mkdir(parents=True, exist_ok=True)
+        self.synthetic_standin_db_path = standin_dir / "radar.db"
+        self.synthetic_standin_initial_bytes = b"SYNTHETIC_OPERATIONAL_STANDIN_UNTOUCHED"
+        self.synthetic_standin_db_path.write_bytes(self.synthetic_standin_initial_bytes)
+        self._synthetic_standin_resolved = self.synthetic_standin_db_path.resolve()
+
+        prev_sqlite_connect = sqlite3.connect
+
+        def _guarded_spy_sqlite_connect(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+            self._assert_sqlite_target_isolated(database)
+            return prev_sqlite_connect(database, *args, **kwargs)
+
+        self._sqlite_patcher = patch("sqlite3.connect", side_effect=_guarded_spy_sqlite_connect)
+        self._sqlite_patcher.start()
+        self.addCleanup(self._sqlite_patcher.stop)
 
         # 1. SQLite synthetic repository
         self.sqlite_db_path = self.tmp_path / "test_staging_sqlite.db"
@@ -176,7 +243,7 @@ class TestPhase5B3C2StagingPreflight(unittest.TestCase):
             init_schema=True,
         )
 
-               # Normalize synthetic migration metadata for exact parity tests.
+        # Normalize synthetic migration metadata for exact parity tests.
         fixture_applied_at = "2026-10-20T10:00:00+00:00"
         fixture_description = "Synthetic schema v6 initialization"
 
@@ -198,34 +265,23 @@ class TestPhase5B3C2StagingPreflight(unittest.TestCase):
             """,
             (fixture_applied_at, fixture_description, CURRENT_SCHEMA_VERSION),
         )
-        # Operational DB snapshot check
-        self.op_db_path = Path("data/radar.db")
-        self.op_db_existed = self.op_db_path.exists()
-        if self.op_db_existed:
-            self.op_db_initial_stat = self.op_db_path.stat()
 
     def tearDown(self):
         self.turso_conn.close()
         import gc
         gc.collect()
         try:
-            self.tmp_dir.cleanup()
-        except Exception:
-            pass
-
-        # Enforce operational DB untouched invariant
-        if self.op_db_existed:
-            current_stat = self.op_db_path.stat()
             self.assertEqual(
-                self.op_db_initial_stat.st_mtime,
-                current_stat.st_mtime,
-                "CRITICAL: data/radar.db mtime changed during test execution!",
+                self.synthetic_standin_db_path.read_bytes(),
+                self.synthetic_standin_initial_bytes,
+                "CRITICAL: synthetic stand-in operational database bytes changed during test execution!",
             )
-            self.assertEqual(
-                self.op_db_initial_stat.st_size,
-                current_stat.st_size,
-                "CRITICAL: data/radar.db size changed during test execution!",
-            )
+            self.assertGreaterEqual(len(self._observed_sqlite_targets), 1)
+        finally:
+            try:
+                self.tmp_dir.cleanup()
+            except Exception:
+                pass
 
     # =========================================================================
     # Part 1: Read-Only Cloud Preflight Tests
@@ -418,14 +474,23 @@ class TestPhase5B3C2StagingPreflight(unittest.TestCase):
             execute_read_query(self.sqlite_repo, "DROP TABLE stories")
 
     def test_12_preflight_fails_closed_on_operational_radar_db(self):
-        """CloudPreflightValidator raises PermissionError if initialized with operational data/radar.db."""
-        # Test inert mock pointing to real path
+        """CloudPreflightValidator raises PermissionError if initialized with operational data/radar.db paths."""
+        # Test inert mock pointing to synthetic stand-in operational paths in isolated CWD
         class InertProdRepo(SqliteStateRepository):
-            def __init__(self):
-                self.db_path = Path("data/radar.db")
+            def __init__(self, target_path: Path):
+                self.db_path = target_path
 
-        with self.assertRaises(PermissionError):
-            CloudPreflightValidator(InertProdRepo())
+        nested_synth = self.tmp_path / "nested" / "data" / "radar.db"
+        prior_connect_count = len(self._observed_sqlite_targets)
+        orig_cwd = os.getcwd()
+        try:
+            os.chdir(self.tmp_path)
+            for candidate_path in (Path("data/radar.db"), nested_synth):
+                with self.assertRaises(PermissionError):
+                    CloudPreflightValidator(InertProdRepo(candidate_path))
+        finally:
+            os.chdir(orig_cwd)
+        self.assertEqual(len(self._observed_sqlite_targets), prior_connect_count)
 
     # =========================================================================
     # Part 2: Delivery Recovery Inspection Tests
@@ -711,13 +776,22 @@ class TestPhase5B3C2StagingPreflight(unittest.TestCase):
         self.assertIn("ERR_COST_INVARIANT_VIOLATION", codes)
 
     def test_25_cutover_reconciler_fails_closed_on_operational_radar_db(self):
-        """StagingCutoverReconciler raises PermissionError if initialized with operational data/radar.db."""
+        """StagingCutoverReconciler raises PermissionError if initialized with operational data/radar.db paths."""
         class InertProdRepo(SqliteStateRepository):
-            def __init__(self):
-                self.db_path = Path("data/radar.db")
+            def __init__(self, target_path: Path):
+                self.db_path = target_path
 
-        with self.assertRaises(PermissionError):
-            StagingCutoverReconciler(InertProdRepo(), self.turso_repo)
+        nested_synth = self.tmp_path / "nested" / "data" / "radar.db"
+        prior_connect_count = len(self._observed_sqlite_targets)
+        orig_cwd = os.getcwd()
+        try:
+            os.chdir(self.tmp_path)
+            for candidate_path in (Path("data/radar.db"), nested_synth):
+                with self.assertRaises(PermissionError):
+                    StagingCutoverReconciler(InertProdRepo(candidate_path), self.turso_repo)
+        finally:
+            os.chdir(orig_cwd)
+        self.assertEqual(len(self._observed_sqlite_targets), prior_connect_count)
 
     # =========================================================================
     # Part 4: Read-only SQL validation regression tests

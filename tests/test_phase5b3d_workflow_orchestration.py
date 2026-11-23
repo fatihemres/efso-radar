@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import re
 import socket
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, time, timedelta, timezone
@@ -321,32 +322,70 @@ class TestWorkflowOfflinePreviewIsolation(unittest.TestCase):
             self.assertEqual(mock_connect.call_count, 0)
 
     def test_11_no_operational_database_or_ledger_modified_by_preview_execution(self) -> None:
-        """Requirement 11: Operational data/radar.db and state files remain completely untouched."""
-        op_db = Path("data/radar.db")
-        op_state = Path("data/state.json")
+        """Requirement 11: Preview contracts only touch ephemeral tempdir storage, leaving stand-in DB and ledger untouched."""
+        with tempfile.TemporaryDirectory(prefix="efso_t1c_workflow_iso_") as td:
+            tmp_root = Path(td)
+            synth_data_dir = tmp_root / "data"
+            synth_data_dir.mkdir(parents=True, exist_ok=True)
+            synth_db = synth_data_dir / "radar.db"
+            synth_state = synth_data_dir / "state.json"
 
-        initial_db_exists = op_db.exists()
-        initial_db_mtime = op_db.stat().st_mtime if initial_db_exists else None
-        initial_state_exists = op_state.exists()
-        initial_state_mtime = op_state.stat().st_mtime if initial_state_exists else None
+            db_sentinel = b"SYNTHETIC_RADAR_DB_SENTINEL"
+            state_sentinel = b'{"synthetic_sentinel": true}'
+            synth_db.write_bytes(db_sentinel)
+            synth_state.write_bytes(state_sentinel)
 
-        dt = datetime(2026, 10, 24, 9, 30, tzinfo=ISTANBUL_TZ)
-        settings = Settings()
+            settings = Settings(
+                sqlite_db_path=synth_db,
+                legacy_state_json_path=synth_state,
+            )
 
-        ScanOnlyTaskContract(settings).run_preview(dt)
-        EditorialDigestTaskContract(settings).run_preview(dt)
-        AdminHealthReportTaskContract(settings).run_preview(dt)
-        EncryptedBackupTaskContract(settings).run_preview(dt)
+            observed_sqlite_targets: list[Path] = []
+            prev_sqlite_connect = sqlite3.connect
 
-        if initial_db_exists:
-            self.assertEqual(op_db.stat().st_mtime, initial_db_mtime)
-        else:
-            self.assertFalse(op_db.exists())
+            def _spy_sqlite_connect(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+                target_path = Path(os.fsdecode(database)).resolve()
+                observed_sqlite_targets.append(target_path)
+                return prev_sqlite_connect(database, *args, **kwargs)
 
-        if initial_state_exists:
-            self.assertEqual(op_state.stat().st_mtime, initial_state_mtime)
-        else:
-            self.assertFalse(op_state.exists())
+            orig_cwd = os.getcwd()
+            try:
+                os.chdir(tmp_root)
+                with patch("sqlite3.connect", side_effect=_spy_sqlite_connect):
+                    scan_res = ScanOnlyTaskContract(settings).run_preview(
+                        datetime(2026, 10, 24, 9, 30, tzinfo=ISTANBUL_TZ)
+                    )
+                    digest_res = EditorialDigestTaskContract(settings).run_preview(
+                        datetime(2026, 10, 24, 9, 30, tzinfo=ISTANBUL_TZ)
+                    )
+                    admin_res = AdminHealthReportTaskContract(settings).run_preview(
+                        datetime(2026, 10, 24, 22, 0, tzinfo=ISTANBUL_TZ)
+                    )
+                    backup_res = EncryptedBackupTaskContract(settings).run_preview(
+                        datetime(2026, 10, 24, 2, 15, tzinfo=ISTANBUL_TZ)
+                    )
+            finally:
+                os.chdir(orig_cwd)
+
+            self.assertEqual(scan_res.status, "SUCCESS")
+            self.assertEqual(digest_res.status, "SUCCESS")
+            self.assertEqual(admin_res.status, "SUCCESS")
+            self.assertEqual(backup_res.status, "SUCCESS")
+
+            self.assertGreaterEqual(len(observed_sqlite_targets), 1)
+            synth_data_resolved = synth_data_dir.resolve()
+            repo_data_resolved = (Path(__file__).resolve().parent.parent / "data").resolve()
+            for target_path in observed_sqlite_targets:
+                self.assertNotEqual(target_path, synth_db.resolve())
+                self.assertNotEqual(target_path.parent, synth_data_resolved)
+                self.assertNotEqual(target_path.parent, repo_data_resolved)
+                self.assertTrue(
+                    target_path.parent.name.startswith("efso_preview_scan_"),
+                    f"Unexpected non-ephemeral SQLite connect target: {target_path}",
+                )
+
+            self.assertEqual(synth_db.read_bytes(), db_sentinel)
+            self.assertEqual(synth_state.read_bytes(), state_sentinel)
 
     def test_12_backup_previews_never_upload_delete_rotate_or_alter_recovery_points(self) -> None:
         """Requirement 12: Backup previews strictly produce planning metadata without remote mutations."""

@@ -6,10 +6,30 @@ and provides explicit defaults for budgets, quiet hours, and timeouts.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+_DEFAULT_ENV_FILE: Any = object()
+
+
+def _parse_dotenv_file(env_path: Path) -> dict[str, str]:
+    """Parse key=value pairs from a dotenv file without mutating os.environ."""
+    parsed: dict[str, str] = {}
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            k = k.strip()
+            if not k:
+                continue
+            v = v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                v = v[1:-1]
+            parsed[k] = v
+    return parsed
 
 
 class Settings(BaseModel):
@@ -301,76 +321,138 @@ class Settings(BaseModel):
         return self.get_editorial_recipients()
 
     @classmethod
-    def from_env(cls) -> Settings:
-        """Load settings from environment variables."""
-        # Simple optional .env parser for standalone zero-dependency execution
-        env_file = Path(".env")
-        if env_file.exists():
-            for line in env_file.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    k = k.strip()
-                    v = v.strip().strip("'\"")
-                    if k not in os.environ:
-                        os.environ[k] = v
+    def from_env(
+        cls,
+        *,
+        env_file: Path | str | None = _DEFAULT_ENV_FILE,
+        load_dotenv: Optional[bool] = None,
+        environ: Optional[Mapping[str, str]] = None,
+    ) -> Settings:
+        """Load settings from environment variables and an optional dotenv file.
 
-        raw_allowed = os.getenv("TELEGRAM_ALLOWED_CHAT_IDS", "")
+        Args:
+            env_file: Optional dotenv file path (defaults to ``Path(".env")`` when
+                loading dotenv). Pass ``None`` to skip probing/reading any dotenv file.
+            load_dotenv: Explicit override controlling dotenv loading. When ``False``,
+                no dotenv file is probed or read even if ``env_file`` is supplied.
+                When ``environ`` is supplied without explicit ``load_dotenv=True`` or
+                ``env_file``, dotenv loading defaults to disabled for hermetic safety.
+            environ: Optional mapping used in place of ``os.environ`` (keys/values
+                must be strings). Neither OS environment nor supplied mappings are
+                mutated. Precedence remains: ``environ`` (or ``os.environ``) overrides
+                dotenv values, which override field defaults.
+        """
+        if load_dotenv is not None and not isinstance(load_dotenv, bool):
+            raise TypeError("load_dotenv must be a bool or None")
+
+        if environ is not None:
+            if not isinstance(environ, Mapping):
+                raise TypeError("environ must be a Mapping[str, str] or None")
+            base_env: dict[str, str] = {}
+            for k, v in environ.items():
+                if not isinstance(k, str) or not isinstance(v, str):
+                    raise TypeError("environ keys and values must be strings")
+                base_env[k] = v
+        else:
+            base_env = dict(os.environ)
+
+        explicit_env_path: Optional[Path] = None
+        if env_file is not _DEFAULT_ENV_FILE and env_file is not None:
+            if isinstance(env_file, str):
+                if not env_file.strip():
+                    raise ValueError("env_file must be a non-empty path or None")
+                explicit_env_path = Path(env_file)
+            elif isinstance(env_file, os.PathLike):
+                raw_env_path = os.fspath(env_file)
+                if not isinstance(raw_env_path, str) or not raw_env_path.strip():
+                    raise ValueError("env_file must be a non-empty string PathLike or None")
+                explicit_env_path = Path(raw_env_path)
+            else:
+                raise TypeError("env_file must be a Path, str, or None")
+
+        if load_dotenv is True and env_file is None:
+            raise ValueError("Cannot set load_dotenv=True when env_file is None")
+
+        if load_dotenv is False or env_file is None:
+            should_load = False
+        elif load_dotenv is True or env_file is not _DEFAULT_ENV_FILE:
+            should_load = True
+        elif environ is not None:
+            # Hermetic-by-default: explicit environ without explicit dotenv opt-in
+            # never implicitly probes CWD .env.
+            should_load = False
+        else:
+            should_load = True
+
+        dotenv_values: dict[str, str] = {}
+        if should_load:
+            target_env_file = Path(".env") if env_file is _DEFAULT_ENV_FILE else explicit_env_path
+            assert target_env_file is not None
+            if target_env_file.exists():
+                if not target_env_file.is_file():
+                    raise ValueError(f"Configured env_file is not a regular file: {target_env_file}")
+                dotenv_values = _parse_dotenv_file(target_env_file)
+
+        # Preserve OS/supplied env > dotenv precedence without mutating os.environ.
+        env_values: dict[str, str] = dict(dotenv_values)
+        env_values.update(base_env)
+
+        raw_allowed = env_values.get("TELEGRAM_ALLOWED_CHAT_IDS", "")
         allowed_list = [cid.strip() for cid in raw_allowed.split(",") if cid.strip()]
 
         primary_editor_id = (
-            os.getenv("TELEGRAM_PRIMARY_EDITOR_CHAT_ID", "")
-            or os.getenv("TELEGRAM_SECONDARY_CHAT_ID", "")
+            env_values.get("TELEGRAM_PRIMARY_EDITOR_CHAT_ID", "")
+            or env_values.get("TELEGRAM_SECONDARY_CHAT_ID", "")
         ).strip()
 
         if primary_editor_id and not primary_editor_id.startswith("-") and primary_editor_id not in allowed_list:
             allowed_list.append(primary_editor_id)
 
         settings = cls(
-            gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
-            gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
-            telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
-            telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
+            gemini_api_key=env_values.get("GEMINI_API_KEY", ""),
+            gemini_model=env_values.get("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+            telegram_bot_token=env_values.get("TELEGRAM_BOT_TOKEN", ""),
+            telegram_chat_id=env_values.get("TELEGRAM_CHAT_ID", ""),
             telegram_primary_editor_chat_id=primary_editor_id,
             telegram_allowed_chat_ids=allowed_list,
-            telegram_delivery_enabled=os.getenv("TELEGRAM_DELIVERY_ENABLED", "false").lower() in ("true", "1", "yes"),
-            telegram_max_retries=int(os.getenv("TELEGRAM_MAX_RETRIES", "3")),
-            telegram_retry_backoff_base=float(os.getenv("TELEGRAM_RETRY_BACKOFF_BASE", "0.5")),
-            legacy_editorial_fallback=os.getenv("LEGACY_EDITORIAL_FALLBACK", "false").lower() in ("true", "1", "yes"),
-            instagram_publishing_enabled=os.getenv("INSTAGRAM_PUBLISHING_ENABLED", "false").lower() in ("true", "1", "yes"),
-            min_score=int(os.getenv("MIN_SCORE", "82")),
-            max_per_run=int(os.getenv("MAX_PER_RUN", "3")),
-            max_age_hours=int(os.getenv("MAX_AGE_HOURS", "16")),
-            max_candidates=int(os.getenv("MAX_CANDIDATES", "55")),
-            sqlite_db_path=Path(os.getenv("SQLITE_DB_PATH", "data/radar.db")),
-            legacy_state_json_path=Path(os.getenv("STATE_PATH", "data/state.json")),
-            storage_mode=os.getenv("EFSO_STORAGE_MODE", "auto").lower(),  # type: ignore
-            turso_database_url=os.getenv("TURSO_DATABASE_URL", ""),
-            turso_auth_token=os.getenv("TURSO_AUTH_TOKEN", ""),
-            quiet_hours_enabled=os.getenv("QUIET_HOURS_ENABLED", "false").lower() in ("true", "1", "yes"),
-            quiet_hours_start_utc=os.getenv("QUIET_HOURS_START_UTC", "21:00"),
-            quiet_hours_end_utc=os.getenv("QUIET_HOURS_END_UTC", "05:30"),
-            quiet_hours_behavior=os.getenv("QUIET_HOURS_BEHAVIOR", "HOLD"),  # type: ignore
-            max_quiet_hours_hold_age_hours=int(os.getenv("MAX_QUIET_HOURS_HOLD_AGE_HOURS", "12")),
-            notification_strategy=os.getenv("NOTIFICATION_STRATEGY", "HYBRID"),  # type: ignore
-            scan_interval_minutes=int(os.getenv("SCAN_INTERVAL_MINUTES", "180")),
-            breaking_alert_min_score=int(os.getenv("BREAKING_ALERT_MIN_SCORE", "92")),
-            digest_min_score=int(os.getenv("DIGEST_MIN_SCORE", "78")),
-            digest_interval_minutes=int(os.getenv("DIGEST_INTERVAL_MINUTES", "360")),
-            target_daily_telegram_messages=int(os.getenv("TARGET_DAILY_TELEGRAM_MESSAGES", "6")),
-            max_items_per_digest=int(os.getenv("MAX_ITEMS_PER_DIGEST", "5")),
-            cap_overflow_behavior=os.getenv("CAP_OVERFLOW_BEHAVIOR", "DEFER_TO_NEXT_DIGEST"),  # type: ignore
-            ai_evaluation_enabled=os.getenv("AI_EVALUATION_ENABLED", "false").lower() in ("true", "1", "yes"),
-            min_discovery_priority_for_ai=float(os.getenv("MIN_DISCOVERY_PRIORITY_FOR_AI", "5.5")),
-            ai_batch_size=int(os.getenv("AI_BATCH_SIZE", "10")),
-            max_output_tokens=int(os.getenv("MAX_OUTPUT_TOKENS", "3200")),
-            max_estimated_run_cost_usd=float(os.getenv("MAX_ESTIMATED_RUN_COST_USD", "0.00")),
-            max_monthly_ai_cost_usd=float(os.getenv("MAX_MONTHLY_AI_COST_USD", "0.00")),
-            max_monthly_ai_calls=int(os.getenv("MAX_MONTHLY_AI_CALLS", "300")),
-            max_shadow_eval_budget_usd=float(os.getenv("MAX_SHADOW_EVAL_BUDGET_USD", "0.00")),
-            usd_to_try_rate=float(os.getenv("USD_TO_TRY_RATE", "36.0")),
-            enable_search_grounding=os.getenv("ENABLE_SEARCH_GROUNDING", "false").lower() in ("true", "1"),
-            http_timeout_seconds=float(os.getenv("HTTP_TIMEOUT_SECONDS", "18.0")),
+            telegram_delivery_enabled=env_values.get("TELEGRAM_DELIVERY_ENABLED", "false").lower() in ("true", "1", "yes"),
+            telegram_max_retries=int(env_values.get("TELEGRAM_MAX_RETRIES", "3")),
+            telegram_retry_backoff_base=float(env_values.get("TELEGRAM_RETRY_BACKOFF_BASE", "0.5")),
+            legacy_editorial_fallback=env_values.get("LEGACY_EDITORIAL_FALLBACK", "false").lower() in ("true", "1", "yes"),
+            instagram_publishing_enabled=env_values.get("INSTAGRAM_PUBLISHING_ENABLED", "false").lower() in ("true", "1", "yes"),
+            min_score=int(env_values.get("MIN_SCORE", "82")),
+            max_per_run=int(env_values.get("MAX_PER_RUN", "3")),
+            max_age_hours=int(env_values.get("MAX_AGE_HOURS", "16")),
+            max_candidates=int(env_values.get("MAX_CANDIDATES", "55")),
+            sqlite_db_path=Path(env_values.get("SQLITE_DB_PATH", "data/radar.db")),
+            legacy_state_json_path=Path(env_values.get("STATE_PATH", "data/state.json")),
+            storage_mode=env_values.get("EFSO_STORAGE_MODE", "auto").lower(),  # type: ignore
+            turso_database_url=env_values.get("TURSO_DATABASE_URL", ""),
+            turso_auth_token=env_values.get("TURSO_AUTH_TOKEN", ""),
+            quiet_hours_enabled=env_values.get("QUIET_HOURS_ENABLED", "false").lower() in ("true", "1", "yes"),
+            quiet_hours_start_utc=env_values.get("QUIET_HOURS_START_UTC", "21:00"),
+            quiet_hours_end_utc=env_values.get("QUIET_HOURS_END_UTC", "05:30"),
+            quiet_hours_behavior=env_values.get("QUIET_HOURS_BEHAVIOR", "HOLD"),  # type: ignore
+            max_quiet_hours_hold_age_hours=int(env_values.get("MAX_QUIET_HOURS_HOLD_AGE_HOURS", "12")),
+            notification_strategy=env_values.get("NOTIFICATION_STRATEGY", "HYBRID"),  # type: ignore
+            scan_interval_minutes=int(env_values.get("SCAN_INTERVAL_MINUTES", "180")),
+            breaking_alert_min_score=int(env_values.get("BREAKING_ALERT_MIN_SCORE", "92")),
+            digest_min_score=int(env_values.get("DIGEST_MIN_SCORE", "78")),
+            digest_interval_minutes=int(env_values.get("DIGEST_INTERVAL_MINUTES", "360")),
+            target_daily_telegram_messages=int(env_values.get("TARGET_DAILY_TELEGRAM_MESSAGES", "6")),
+            max_items_per_digest=int(env_values.get("MAX_ITEMS_PER_DIGEST", "5")),
+            cap_overflow_behavior=env_values.get("CAP_OVERFLOW_BEHAVIOR", "DEFER_TO_NEXT_DIGEST"),  # type: ignore
+            ai_evaluation_enabled=env_values.get("AI_EVALUATION_ENABLED", "false").lower() in ("true", "1", "yes"),
+            min_discovery_priority_for_ai=float(env_values.get("MIN_DISCOVERY_PRIORITY_FOR_AI", "5.5")),
+            ai_batch_size=int(env_values.get("AI_BATCH_SIZE", "10")),
+            max_output_tokens=int(env_values.get("MAX_OUTPUT_TOKENS", "3200")),
+            max_estimated_run_cost_usd=float(env_values.get("MAX_ESTIMATED_RUN_COST_USD", "0.00")),
+            max_monthly_ai_cost_usd=float(env_values.get("MAX_MONTHLY_AI_COST_USD", "0.00")),
+            max_monthly_ai_calls=int(env_values.get("MAX_MONTHLY_AI_CALLS", "300")),
+            max_shadow_eval_budget_usd=float(env_values.get("MAX_SHADOW_EVAL_BUDGET_USD", "0.00")),
+            usd_to_try_rate=float(env_values.get("USD_TO_TRY_RATE", "36.0")),
+            enable_search_grounding=env_values.get("ENABLE_SEARCH_GROUNDING", "false").lower() in ("true", "1"),
+            http_timeout_seconds=float(env_values.get("HTTP_TIMEOUT_SECONDS", "18.0")),
         )
         # Reject historical positive spending allowances from operational config.
         if any(getattr(settings, key) > 0 for key in (
