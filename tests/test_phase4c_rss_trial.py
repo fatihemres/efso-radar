@@ -15,13 +15,13 @@ Verifies:
 """
 from __future__ import annotations
 
-import json
+import html
 import unittest
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 
+from efso_radar.ai.client import detect_sensitive_tragedy_content
 from efso_radar.domain import (
-    Article,
     EditorialAssessment,
     EditorialDisposition,
     EditorialKind,
@@ -38,8 +38,14 @@ from efso_radar.notifications.formatters import (
     is_redundant_cover_title,
     truncate_word_boundary,
 )
+from efso_radar.sources.models import SourceDefinition
+from efso_radar.sources.parsers import FeedParser
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+HISTORICAL_DATA_SKIP_REASON = (
+    "Historical authentic Phase 4C live RSS trial evidence in operational data/ is "
+    "intentionally excluded from hermetic offline tests (Issue #104 / T1B); see labeled "
+    "synthetic RSS parser/screening regressions in TestPhase4CRssTrial."
+)
 
 
 class TestPhase4CRssTrial(unittest.TestCase):
@@ -150,31 +156,127 @@ class TestPhase4CRssTrial(unittest.TestCase):
         # Must be accepted
         self.assertTrue(is_meaningful_update(real_update, base))
 
+    @unittest.skip(HISTORICAL_DATA_SKIP_REASON)
     def test_trial_evidence_file_integrity(self) -> None:
         """Verify that the trial evidence file contains the exact bounded 12 articles and sensitivity flags."""
-        evidence_file = REPO_ROOT / "data" / "trial_live_rss_evidence.json"
-        if not evidence_file.exists():
-            self.skipTest("Trial evidence file not found (run trial_live_rss_discovery.py first).")
+        raise AssertionError("Skipped unconditionally under Issue #104 / T1B")
 
-        with open(evidence_file, encoding="utf-8") as f:
-            data = json.load(f)
+    def _build_synthetic_rss_items_and_parse(self):
+        now = datetime(2026, 10, 18, 18, 0, tzinfo=timezone.utc)
+        source_def = SourceDefinition(
+            source_id="synthetic_magazin_tr",
+            name="Sentetik Magazin TR",
+            url="https://synthetic.example.invalid/rss/magazin.xml",
+            market=Market.TR,
+            category="MAGAZIN_TR",
+            source_type="rss",
+        )
+        raw_entries = [
+            ("Sentetik Oyuncu A Yeni Dizi Projesiyle Dönüyor", "Oyuncu A yeni sezon dijital dizi çekimlerine başladı."),
+            ("Sentetik Şarkıcı B Konser Turnesini Duyurdu", "Ünlü şarkıcı yaz konserleri için tarihleri açıkladı."),
+            ("Sentetik Sanatçı C Kardeşini Kaybetti: Cenaze Yarın", "Sanatçı C'nin kardeşi vefat etti, cenaze töreni ikindi vakti yapılacak."),
+            ("Sentetik Çift D Gala Gecesinde Boy Gösterdi", "Kırmızı halı davetine ünlü isimler yoğun ilgi gösterdi."),
+            ("Sentetik Usta Ressam E Vefat Etti", "Usta sanatçı tedavi gördüğü hastanede yaşamını yitirdi."),
+            ("Sentetik Sunucu F Podcast Serisine Başladı", "Yeni kültür ve sohbet programı ilk bölümüyle yayında."),
+            ("Sentetik Müzisyen G Annesinin Vefatı Sonrası Paylaşım Yaptı", "Ünlü şarkıcı annesinin trajik intihar kaybı sonrası duygusal mesaj paylaştı."),
+            ("Sentetik Yönetmen H Festival Ödülünü Kazandı", "Film festivalinde en iyi yönetmen ödülü sahibini buldu."),
+            ("Sentetik Oyuncu I Reklam Yüzü Oldu", "Yeni sezon kampanyası için kamera karşısına geçti."),
+            ("Sentetik Grup J Albüm Kapağını Paylaştı", "Beklenen pop albümünün yayın tarihi netleşti."),
+            ("Sentetik Tiyatro K Oyunu Prömiyer Yaptı", "Sezon açılışı davetinde salon tamamen doldu."),
+            ("Sentetik Moda L Defilesi Büyük Beğeni Topladı", "Tasarımcının yeni koleksiyonu moda haftasında sergilendi."),
+            ("Sentetik Bonus 13 Sınır Dışı Kalmalı", "12 öğe sınırı nedeniyle kesilecek ekstra sentetik haber."),
+            ("Sentetik Bonus 14 Sınır Dışı Kalmalı", "12 öğe sınırı nedeniyle kesilecek ikinci ekstra haber."),
+        ]
+        items_xml = []
+        for idx, (title, desc) in enumerate(raw_entries):
+            pub = format_datetime(now - timedelta(minutes=idx * 20))
+            items_xml.append(
+                f"<item><title>{html.escape(title)}</title>"
+                f"<link>https://synthetic.example.invalid/magazin/{idx + 1}</link>"
+                f"<description>{html.escape(desc)}</description>"
+                f"<pubDate>{pub}</pubDate></item>"
+            )
+        stale_pub = format_datetime(now - timedelta(hours=96))
+        items_xml.append(
+            "<item><title>Sentetik Bayat Haber 96 Saat Önce</title>"
+            "<link>https://synthetic.example.invalid/magazin/stale</link>"
+            "<description>Eski tarihli haber yaş filtresinden elenmelidir.</description>"
+            f"<pubDate>{stale_pub}</pubDate></item>"
+        )
+        xml_bytes = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<rss version="2.0"><channel><title>Sentetik Magazin</title>'
+            + "".join(items_xml)
+            + "</channel></rss>"
+        ).encode("utf-8")
 
-        self.assertEqual(data["source_id"], "haberturk_magazin")
-        self.assertEqual(data["source_name"], "Habertürk Magazin")
-        self.assertEqual(data["source_url"], "https://www.haberturk.com/rss/magazin.xml")
-        self.assertEqual(data["accepted_items_count"], 12)
-        self.assertGreaterEqual(data["raw_items_count"], 12)
+        parse_result = FeedParser.parse_feed(
+            xml_bytes=xml_bytes,
+            source_def=source_def,
+            now=now,
+            max_age_hours=72,
+        )
+        return now, parse_result
 
-        # 3 sensitive tragedy items identified (Soner Olgun, Süleyman Saim Tekcan, Can Bonomo)
-        self.assertEqual(data["sensitive_items_count"], 3)
+    def test_synthetic_rss_feed_parse_bounded_intake_and_sensitivity_screening(self) -> None:
+        """Synthetic regression: FeedParser enforces age filter, bounded [:12] intake, and tragedy screening."""
+        _, parse_result = self._build_synthetic_rss_items_and_parse()
+        self.assertGreaterEqual(parse_result.raw_seen, 14)
+        self.assertEqual(len(parse_result.articles), 14)
 
-        articles = data["articles"]
-        self.assertEqual(len(articles), 12)
+        bounded = parse_result.articles[:12]
+        self.assertEqual(len(bounded), 12)
+        sensitive = [
+            art for art in bounded if detect_sensitive_tragedy_content(art.title, art.snippet or "")
+        ]
+        self.assertEqual(len(sensitive), 3)
+        for art in bounded:
+            self.assertTrue(art.url.startswith("https://synthetic.example.invalid/magazin/"))
+            self.assertIn("TSİ", format_turkey_timestamp(art.published_at))
 
-        for art in articles:
-            self.assertTrue(art["title"])
-            self.assertTrue(art["url"].startswith("https://www.haberturk.com/magazin/"))
-            self.assertIn("TSİ", art["published_at_tsi"])
+    def test_synthetic_rss_digest_preview_excludes_sensitive_and_formats_cleanly(self) -> None:
+        """Synthetic regression: filtered RSS digest preview omits sensitive items and formats cleanly."""
+        now, parse_result = self._build_synthetic_rss_items_and_parse()
+        bounded = parse_result.articles[:12]
+        safe_articles = [
+            art for art in bounded if not detect_sensitive_tragedy_content(art.title, art.snippet or "")
+        ]
+        self.assertEqual(len(safe_articles), 9)
+
+        assessments = [
+            EditorialAssessment(
+                article_ids=[art.id],
+                score=85 - idx,
+                kind=EditorialKind.NEW,
+                headline_tr=art.title,
+                cover_title_tr=truncate_word_boundary(art.title, 65),
+                caption_idea_tr=art.snippet or art.title,
+                why_efso_tr="Sentetik RSS deneme seçkisi.",
+                suggested_format=SuggestedFormat.POST,
+                category=StoryCategory.YERLI,
+                verification_status=VerificationStatus.REPUTABLE_REPORTING,
+                source_urls=[art.url],
+                supporting_articles=[art],
+                is_publishable=True,
+                disposition=EditorialDisposition.DIGEST,
+            )
+            for idx, art in enumerate(safe_articles[:5])
+        ]
+        rendered = format_telegram_digest(
+            assessments,
+            window_label=f"[SENTETİK RSS DENEME SEÇKİSİ] ({format_turkey_timestamp(now)})",
+            deduplicate=True,
+        )
+        self.assertIn("5 haber önerisi", rendered)
+        self.assertNotIn("Vefat", rendered)
+        self.assertNotIn("Cenaze", rendered)
+        self.assertNotIn("intihar", rendered.lower())
+
+    def test_historical_rss_trial_evidence_test_skips_unconditionally(self) -> None:
+        """Historical live RSS trial evidence test must skip unconditionally without probing data/."""
+        method = self.test_trial_evidence_file_integrity
+        self.assertTrue(getattr(method, "__unittest_skip__", False))
+        self.assertEqual(getattr(method, "__unittest_skip_why__", ""), HISTORICAL_DATA_SKIP_REASON)
 
 
 if __name__ == "__main__":

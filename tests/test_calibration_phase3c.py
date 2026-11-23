@@ -13,8 +13,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from efso_radar.ai.calibration import (
-    DEFAULT_CALIBRATION_ANALYSIS_MD,
-    DEFAULT_FILLED_CALIBRATION_CSV,
     INDEPENDENT_HOLDOUT_SET,
     REQUIRED_CSV_COLUMNS,
     BlindShadowEvaluationRunner,
@@ -30,7 +28,7 @@ from efso_radar.ai.calibration import (
     simulate_monitoring_schedules,
 )
 from efso_radar.ai.client import AIEvaluationError
-from efso_radar.ai.cost import check_monthly_budget_guard
+from efso_radar.ai.cost import ExperimentBudgetGuard, check_monthly_budget_guard
 from efso_radar.ai.prompts import build_editorial_prompt
 from efso_radar.config import Settings
 from efso_radar.domain import (
@@ -47,6 +45,13 @@ from efso_radar.domain import (
 from efso_radar.repositories.sqlite import SqliteStateRepository
 from efso_radar.repositories.turso import TursoStateRepository
 from tests.test_repository_parity import create_mock_hrana_transport
+
+
+HISTORICAL_DATA_SKIP_REASON = (
+    "Historical authentic Phase 3C owner calibration CSV/Markdown in operational data/ is "
+    "intentionally excluded from hermetic offline tests (Issue #104 / T1B); see labeled "
+    "synthetic counterparts in TestCalibrationPhase3C."
+)
 
 
 def _write_synthetic_50_calibration_csv(target_path: Path) -> None:
@@ -108,9 +113,16 @@ class TestCalibrationPhase3C(unittest.TestCase):
 
     def test_csv_validation_and_idempotent_import_sqlite_and_turso(self):
         """Verify 50-row CSV validation and idempotent import across both SQLite and Turso."""
+        synthetic_md = self.tmp_path / "synthetic_calibration_analysis.md"
+
         # 1. SQLite Repository
         sqlite_repo = SqliteStateRepository(self.tmp_path / "test_calib.db")
-        summary1 = import_calibration_feedback(sqlite_repo, csv_path=self.csv_path)
+        summary1 = import_calibration_feedback(
+            sqlite_repo,
+            csv_path=self.csv_path,
+            analysis_md_path=synthetic_md,
+        )
+        self.assertFalse(summary1.secondary_md_exists)
         self.assertEqual(summary1.total_verified_rows, 50)
         self.assertEqual(summary1.imported_count, 50)
         self.assertEqual(summary1.repository_stored_count, 50)
@@ -120,8 +132,14 @@ class TestCalibrationPhase3C(unittest.TestCase):
         self.assertEqual(summary1.decision_counts["REJECT"], 10)
         self.assertEqual(summary1.decision_counts["TOO_WEAK"], 6)
 
-        # Re-importing must be 100% idempotent
-        summary2 = import_calibration_feedback(sqlite_repo, csv_path=self.csv_path)
+        # Re-importing must be 100% idempotent (verify secondary_md_exists flag with synthetic MD)
+        synthetic_md.write_text("# Synthetic Calibration Analysis\n", encoding="utf-8")
+        summary2 = import_calibration_feedback(
+            sqlite_repo,
+            csv_path=self.csv_path,
+            analysis_md_path=synthetic_md,
+        )
+        self.assertTrue(summary2.secondary_md_exists)
         self.assertEqual(summary2.repository_stored_count, 50)
 
         # 2. Turso Repository (via Hrana v2 mock transport)
@@ -133,10 +151,18 @@ class TestCalibrationPhase3C(unittest.TestCase):
                 auth_token="test-token",
                 transport=transport,
                 init_schema=True,
-        )
-            t_summary1 = import_calibration_feedback(turso_repo, csv_path=self.csv_path)
+            )
+            t_summary1 = import_calibration_feedback(
+                turso_repo,
+                csv_path=self.csv_path,
+                analysis_md_path=synthetic_md,
+            )
             self.assertEqual(t_summary1.repository_stored_count, 50)
-            t_summary2 = import_calibration_feedback(turso_repo, csv_path=self.csv_path)
+            t_summary2 = import_calibration_feedback(
+                turso_repo,
+                csv_path=self.csv_path,
+                analysis_md_path=synthetic_md,
+            )
             self.assertEqual(t_summary2.repository_stored_count, 50)
         finally:
             mem_conn.close()
@@ -151,108 +177,26 @@ class TestCalibrationPhase3C(unittest.TestCase):
         with self.assertRaises(ValueError):
             load_and_verify_calibration_csv(bad_csv, expected_count=49)
 
-    @unittest.skipUnless(
-        DEFAULT_FILLED_CALIBRATION_CSV.exists(),
-        "Authoritative owner calibration CSV is gitignored and only present locally",
-    )
+        missing_col_csv = self.tmp_path / "missing_col.csv"
+        missing_col_csv.write_text("review_id,headline\nCALIB-01,Test\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "missing required columns"):
+            load_and_verify_calibration_csv(missing_col_csv)
+
+        invalid_dec_csv = self.tmp_path / "invalid_dec.csv"
+        with open(bad_csv, "r", encoding="utf-8-sig", newline="") as src_f:
+            rows = list(csv.DictReader(src_f))
+        rows[0]["owner_decision"] = "INVALID_DECISION"
+        with open(invalid_dec_csv, "w", encoding="utf-8-sig", newline="") as dst_f:
+            writer = csv.DictWriter(dst_f, fieldnames=list(REQUIRED_CSV_COLUMNS))
+            writer.writeheader()
+            writer.writerows(rows)
+        with self.assertRaisesRegex(ValueError, "invalid owner_decision"):
+            load_and_verify_calibration_csv(invalid_dec_csv)
+
+    @unittest.skip(HISTORICAL_DATA_SKIP_REASON)
     def test_authoritative_local_owner_calibration_files(self):
         """Verify the actual local 50-item owner CSV and analysis Markdown."""
-        self.assertTrue(DEFAULT_FILLED_CALIBRATION_CSV.exists())
-        self.assertTrue(DEFAULT_CALIBRATION_ANALYSIS_MD.exists())
-
-        # 1. Verify SHA-256 fingerprint matches authoritative reference file exactly
-        import hashlib
-        csv_bytes = DEFAULT_FILLED_CALIBRATION_CSV.read_bytes()
-        csv_sha256 = hashlib.sha256(csv_bytes).hexdigest()
-        self.assertEqual(
-            csv_sha256,
-            "108799c19f513327cb04872cec5dbcfb97107f2bd8bf2353acf28e3111ab2305",
-            "Authoritative calibration CSV SHA-256 fingerprint mismatch!",
-        )
-
-        items = load_and_verify_calibration_csv(DEFAULT_FILLED_CALIBRATION_CSV)
-        self.assertEqual(len(items), 50)
-
-        # 2. Focused regression assertions confirming canonical event pairs reference correct people & events
-        by_id = {item.review_id: item for item in items}
-
-        # PAIR-01: CALIB-01 and CALIB-31 must reference Cagatay Ulusoy and his village/hometown visit
-        text_01 = f"{by_id['CALIB-01'].headline} {by_id['CALIB-01'].factual_summary}".lower()
-        text_31 = f"{by_id['CALIB-31'].headline} {by_id['CALIB-31'].factual_summary}".lower()
-        self.assertTrue("cagatay" in text_01 or "çağatay" in text_01)
-        self.assertIn("ulusoy", text_01)
-        self.assertTrue("bulgaristan" in text_01 or "köy" in text_01)
-        self.assertTrue("cagatay" in text_31 or "çağatay" in text_31)
-        self.assertIn("ulusoy", text_31)
-
-        # PAIR-02: CALIB-30 and CALIB-32 must reference Lvbel C5 court decision and reading requirement
-        text_30 = f"{by_id['CALIB-30'].headline} {by_id['CALIB-30'].factual_summary}".lower()
-        text_32 = f"{by_id['CALIB-32'].headline} {by_id['CALIB-32'].factual_summary}".lower()
-        self.assertIn("lvbel", text_30)
-        self.assertIn("lvbel", text_32)
-        self.assertTrue("kitap" in text_30 or "edebiyat" in text_30)
-        self.assertIn("kitap", text_32)
-
-        # PAIR-03: CALIB-07 and CALIB-40 must reference Olivia Culpo & Christian McCaffrey second child birth
-        text_07 = f"{by_id['CALIB-07'].headline} {by_id['CALIB-07'].factual_summary}".lower()
-        text_40 = f"{by_id['CALIB-40'].headline} {by_id['CALIB-40'].factual_summary}".lower()
-        self.assertIn("olivia culpo", text_07)
-        self.assertIn("olivia culpo", text_40)
-        self.assertTrue("ikinci" in text_07 or "çocuk" in text_07)
-        self.assertTrue("second" in text_40 or "baby" in text_40)
-
-        # PAIR-04: CALIB-03 and CALIB-44 must reference Sezen Tas tragedy
-        text_03 = f"{by_id['CALIB-03'].headline} {by_id['CALIB-03'].factual_summary}".lower()
-        text_44 = f"{by_id['CALIB-44'].headline} {by_id['CALIB-44'].factual_summary}".lower()
-        self.assertTrue("sezen" in text_03)
-        self.assertTrue("sezen" in text_44)
-        self.assertIn("14. kat", text_03)
-
-        # CALIB-28: Taylor Swift insider claims about referencing former partners in her songs
-        text_28 = f"{by_id['CALIB-28'].headline} {by_id['CALIB-28'].factual_summary}".lower()
-        self.assertIn("taylor swift", text_28)
-        self.assertIn("exes", text_28)
-
-        analyzer = CalibrationAnalyzer(items)
-        comp = analyzer.compare_owner_preferences_with_priority()
-        self.assertEqual(comp["total_items"], 50)
-        self.assertEqual(comp["total_positive_owner_labels"], 34)  # 32 APPROVE + 2 IMPORTANT_UPDATE
-        self.assertEqual(comp["total_negative_owner_labels"], 16)  # 10 REJECT + 6 TOO_WEAK
-        self.assertEqual(comp["top_55_total"], 32)
-        self.assertEqual(comp["top_55_positive"], 23)
-        self.assertEqual(comp["top_55_negative_false_positives"], 9)
-        self.assertEqual(comp["backlog_total"], 18)
-        self.assertEqual(comp["backlog_positive_missed"], 11)
-        self.assertEqual(
-            comp["backlog_positive_ids"],
-            [
-                "CALIB-34", "CALIB-35", "CALIB-37", "CALIB-38", "CALIB-40",
-                "CALIB-42", "CALIB-43", "CALIB-46", "CALIB-47", "CALIB-49", "CALIB-50",
-            ],
-        )
-
-        # Verify the 11 backlog diagnostics
-        backlog_diags = analyzer.analyze_backlog_positives()
-        self.assertEqual(len(backlog_diags), 11)
-
-        # Verify the 4 duplicate/inconsistent pair audits preserve human labels without mutation
-        pairs = analyzer.audit_duplicate_and_inconsistent_pairs()
-        self.assertEqual(len(pairs), 4)
-        self.assertEqual(pairs[0].first_decision, "APPROVE")
-        self.assertEqual(pairs[0].second_decision, "IMPORTANT_UPDATE")
-        self.assertEqual(pairs[2].first_decision, "TOO_WEAK")
-        self.assertEqual(pairs[2].second_decision, "APPROVE")
-
-        # Verify factual-safety preservation on CALIB-28 and CALIB-47
-        safety_items = {s.review_id: s for s in analyzer.evaluate_factual_safety_on_calibration()}
-        self.assertIn("CALIB-28", safety_items)
-        self.assertIn("CALIB-47", safety_items)
-        self.assertEqual(safety_items["CALIB-28"].owner_decision, "APPROVE")
-        self.assertTrue(safety_items["CALIB-28"].requires_verification_hold)
-        self.assertFalse(safety_items["CALIB-28"].can_trigger_immediate_alert)
-        self.assertEqual(safety_items["CALIB-47"].owner_decision, "APPROVE")
-        self.assertTrue(safety_items["CALIB-47"].requires_verification_hold)
-        self.assertFalse(safety_items["CALIB-47"].can_trigger_immediate_alert)
+        raise AssertionError("Skipped unconditionally under Issue #104 / T1B")
 
     def test_hybrid_notification_planner_distinguishes_urgency_and_preserves_overflow(self):
         """HybridNotificationPlanner separates breaking alerts, 2h digests, verification holds, and never drops overflow."""
@@ -379,55 +323,10 @@ class TestCalibrationPhase3C(unittest.TestCase):
         self.assertTrue(design.requires_explicit_owner_approval)
         self.assertEqual(len(design.validation_criteria), 6)
 
-    @unittest.skipUnless(
-        DEFAULT_FILLED_CALIBRATION_CSV.exists(),
-        "Requires authentic calibration dataset data/Efso_Radar_Kalibrasyon_Doldurulmus.csv",
-    )
+    @unittest.skip(HISTORICAL_DATA_SKIP_REASON)
     def test_phase3c2b_untuned_baseline_vs_calibrated_ranking_improvement(self):
         """Phase 3C-2B ranking resolves priority inversion, improves positive recall, and clusters duplicate pairs."""
-        target_csv = DEFAULT_FILLED_CALIBRATION_CSV if DEFAULT_FILLED_CALIBRATION_CSV.exists() else self.csv_path
-        items = load_and_verify_calibration_csv(target_csv)
-        cmp = evaluate_discovery_ranking_comparison(items, cutoff_k=32)
-
-        # 1. Untuned baseline matches recorded Phase 3C-2A numbers
-        self.assertEqual(cmp.untuned_baseline.total_positive, 34)
-        self.assertEqual(cmp.untuned_baseline.positive_in_cutoff, 23)
-        self.assertEqual(cmp.untuned_baseline.negative_in_cutoff, 9)
-
-        # 2. Calibrated ranking improves positive recall and drastically cuts false positives
-        self.assertGreaterEqual(cmp.calibrated_raw_top32.positive_in_cutoff, 28)
-        self.assertLessEqual(cmp.calibrated_raw_top32.negative_in_cutoff, 3)
-        self.assertEqual(cmp.calibrated_raw_top32.reject_in_cutoff, 0)
-        self.assertGreater(
-            cmp.calibrated_raw_top32.mean_positive_priority,
-            cmp.calibrated_raw_top32.mean_negative_priority + 4.0,
-        )
-
-        # 3. Clustered unique positive event recall reaches >= 90%
-        self.assertGreaterEqual(cmp.calibrated_clustered_unique_positive_recall, 0.90)
-
-        # 4. Duplicate pairs cluster together and select clear subject+event canonical headlines
-        pair_map = {p.pair_id: p for p in cmp.pair_comparisons}
-        self.assertIn("PAIR-01", pair_map)
-        self.assertIn("PAIR-02", pair_map)
-        self.assertIn("PAIR-03", pair_map)
-        self.assertIn("PAIR-04", pair_map)
-        self.assertTrue(pair_map["PAIR-01"].clustered_together_after)
-        self.assertTrue(pair_map["PAIR-02"].clustered_together_after)
-        self.assertTrue(pair_map["PAIR-03"].clustered_together_after)
-        self.assertTrue(pair_map["PAIR-04"].clustered_together_after)
-        if DEFAULT_FILLED_CALIBRATION_CSV.exists():
-            self.assertEqual(pair_map["PAIR-01"].canonical_representative_id, "CALIB-31")
-            self.assertEqual(pair_map["PAIR-02"].canonical_representative_id, "CALIB-30")
-            self.assertEqual(pair_map["PAIR-03"].canonical_representative_id, "CALIB-40")
-
-        # 5. Baseline comparability metadata is explicitly documented
-        self.assertEqual(cmp.sample_size, 50)
-        self.assertEqual(cmp.original_cutoff55_sampled_count, 32)
-        self.assertEqual(cmp.original_backlog_sampled_count, 18)
-        self.assertFalse(cmp.full_historical_pool_available)
-        self.assertIn("stratified", cmp.comparability_limitation_note)
-        self.assertGreaterEqual(cmp.calibrated_positives_above_baseline_cutoff_score, 32)
+        raise AssertionError("Skipped unconditionally under Issue #104 / T1B")
 
     def test_phase3c2b_independent_holdout_set_anti_overfitting(self):
         """Constructed 20-scenario regression suite is explicitly classified as non-independent regression coverage."""
@@ -444,12 +343,22 @@ class TestCalibrationPhase3C(unittest.TestCase):
 
     def test_phase3c2b_blind_shadow_runner_hygiene_batching_cache_and_budget(self):
         """BlindShadowEvaluationRunner enforces blind hygiene, bounded batches, caching, and $0.05 budget ceiling."""
-        target_csv = DEFAULT_FILLED_CALIBRATION_CSV if DEFAULT_FILLED_CALIBRATION_CSV.exists() else self.csv_path
-        items = load_and_verify_calibration_csv(target_csv)
+        items = load_and_verify_calibration_csv(self.csv_path)
         db_path = self.tmp_path / "shadow_eval_test.db"
         repo = SqliteStateRepository(db_path)
         settings = Settings(max_shadow_eval_budget_usd=0.05)
-        runner = BlindShadowEvaluationRunner(settings=settings, repository=repo, batch_size=8)
+        budget_guard = ExperimentBudgetGuard(
+            ledger_path=self.tmp_path / "shadow_ledger.json",
+            budget_ceiling_usd=0.05,
+            canary1_db_path=self.tmp_path / "no_c1.db",
+            canary2_db_path=self.tmp_path / "no_c2.db",
+        )
+        runner = BlindShadowEvaluationRunner(
+            settings=settings,
+            repository=repo,
+            batch_size=8,
+            budget_guard=budget_guard,
+        )
 
         # 1. Verify blind articles strip all human labels and calibration hints
         blind_arts = runner.to_blind_articles(items)
@@ -486,11 +395,6 @@ class TestCalibrationPhase3C(unittest.TestCase):
         self.assertTrue(metrics1.blind_hygiene_verified)
         self.assertTrue(metrics1.all_referenced_ids_valid)
         self.assertTrue(metrics1.within_budget_ceiling)
-        if DEFAULT_FILLED_CALIBRATION_CSV.exists():
-            self.assertTrue(metrics1.safety_hold_calib_28_respected)
-            self.assertTrue(metrics1.safety_hold_calib_47_respected)
-            self.assertTrue(metrics1.duplicate_pairs_suppressed)
-            self.assertEqual(metrics1.reject_false_positive_count, 0)
 
         # 4. Execute second pass -> all 7 batches reused from cache with 0 new API calls / 0 cost
         preds2, metrics2 = runner.run_blind_evaluation(items)
@@ -509,24 +413,10 @@ class TestCalibrationPhase3C(unittest.TestCase):
         with self.assertRaises(AIEvaluationError):
             tiny_budget_runner.run_blind_evaluation(items)
 
-    @unittest.skipUnless(
-        DEFAULT_FILLED_CALIBRATION_CSV.exists(),
-        "Requires authentic calibration dataset data/Efso_Radar_Kalibrasyon_Doldurulmus.csv",
-    )
+    @unittest.skip(HISTORICAL_DATA_SKIP_REASON)
     def test_phase3c2b_notification_quality_on_calibration_dataset(self):
         """Notification threshold evaluation against genuine 50-story calibration decisions."""
-        items = load_and_verify_calibration_csv(DEFAULT_FILLED_CALIBRATION_CSV)
-        runner = BlindShadowEvaluationRunner()
-        preds, _ = runner.run_blind_evaluation(items)
-
-        notif_scenarios = evaluate_notification_quality(items, preds)
-        self.assertEqual(len(notif_scenarios), 3)
-        balanced = notif_scenarios[0]
-        self.assertEqual(balanced.digest_min_score, 78)
-        self.assertEqual(balanced.min_score, 82)
-        self.assertEqual(balanced.breaking_min_score, 92)
-        self.assertGreaterEqual(balanced.positive_recall_total, 0.85)
-        self.assertGreaterEqual(balanced.verification_hold_count, 2)
+        raise AssertionError("Skipped unconditionally under Issue #104 / T1B")
 
     def test_phase3c2b_monitoring_schedule_simulations_and_cost_models(self):
         """Schedule simulation across 2h/3h/4h and monthly operating cost models (100% portable)."""
@@ -591,8 +481,7 @@ class TestCalibrationPhase3C(unittest.TestCase):
         """Calling run_live_gemini_evaluation without API key or authorization raises AIEvaluationError."""
         import os
         import unittest.mock
-        target_csv = DEFAULT_FILLED_CALIBRATION_CSV if DEFAULT_FILLED_CALIBRATION_CSV.exists() else self.csv_path
-        items = load_and_verify_calibration_csv(target_csv)
+        items = load_and_verify_calibration_csv(self.csv_path)
         runner = BlindShadowEvaluationRunner(settings=Settings(gemini_api_key=""))
         with unittest.mock.patch.dict(os.environ, {"GEMINI_API_KEY": ""}):
             with self.assertRaises(AIEvaluationError) as ctx:
@@ -603,10 +492,8 @@ class TestCalibrationPhase3C(unittest.TestCase):
     def test_phase3c2c_live_shadow_evaluation_mock_client_and_resume_and_confusion_matrix(self):
         """run_live_gemini_evaluation with mock_client enforces per-batch output tokens, records ledger, and resumes."""
         from unittest.mock import MagicMock
-        from efso_radar.ai.schemas import EditorialDecisionBatch, EditorialPickSchema
 
-        target_csv = DEFAULT_FILLED_CALIBRATION_CSV if DEFAULT_FILLED_CALIBRATION_CSV.exists() else self.csv_path
-        items = load_and_verify_calibration_csv(target_csv)
+        items = load_and_verify_calibration_csv(self.csv_path)
         db_path = self.tmp_path / "live_shadow_test.db"
         repo = SqliteStateRepository(db_path)
         settings = Settings(
@@ -614,7 +501,18 @@ class TestCalibrationPhase3C(unittest.TestCase):
             gemini_model="gemini-3.5-flash-lite",
             max_shadow_eval_budget_usd=0.05,
         )
-        runner = BlindShadowEvaluationRunner(settings=settings, repository=repo, batch_size=8)
+        budget_guard = ExperimentBudgetGuard(
+            ledger_path=self.tmp_path / "live_shadow_ledger.json",
+            budget_ceiling_usd=0.05,
+            canary1_db_path=self.tmp_path / "no_c1.db",
+            canary2_db_path=self.tmp_path / "no_c2.db",
+        )
+        runner = BlindShadowEvaluationRunner(
+            settings=settings,
+            repository=repo,
+            batch_size=8,
+            budget_guard=budget_guard,
+        )
 
         # Setup mock Google GenAI Client
         mock_client = MagicMock()
@@ -680,8 +578,7 @@ class TestCalibrationPhase3C(unittest.TestCase):
         """run_phase3c_preflight_dry_run executes cleanly in an isolated sandbox with 0 live API calls."""
         from efso_radar.ai.calibration import run_phase3c_preflight_dry_run
 
-        target_csv = DEFAULT_FILLED_CALIBRATION_CSV if DEFAULT_FILLED_CALIBRATION_CSV.exists() else self.csv_path
-        result = run_phase3c_preflight_dry_run(csv_path=target_csv)
+        result = run_phase3c_preflight_dry_run(csv_path=self.csv_path)
 
         self.assertEqual(result["status"], "PREFLIGHT_SUCCESS")
         self.assertEqual(result["total_items"], 50)
@@ -697,6 +594,313 @@ class TestCalibrationPhase3C(unittest.TestCase):
         self.assertTrue(result["resume_verified"])
         self.assertEqual(result["evaluation_mode"], "OFFLINE_PREFLIGHT_DRY_RUN")
         self.assertFalse(result["is_measured_gemini_accuracy"])
+
+    def test_calibration_analyzer_backlog_pairs_and_factual_safety_synthetic(self):
+        """Synthetic regression: CalibrationAnalyzer preserves counts, backlog diagnostics, pair audits, and safety holds."""
+        items = load_and_verify_calibration_csv(self.csv_path)
+        analyzer = CalibrationAnalyzer(items)
+        comp = analyzer.compare_owner_preferences_with_priority()
+
+        self.assertEqual(comp["total_items"], 50)
+        self.assertEqual(comp["total_positive_owner_labels"], 34)
+        self.assertEqual(comp["total_negative_owner_labels"], 16)
+        self.assertEqual(comp["top_55_total"], 32)
+        self.assertEqual(comp["top_55_positive"], 23)
+        self.assertEqual(comp["top_55_negative_false_positives"], 9)
+        self.assertEqual(comp["backlog_total"], 18)
+        self.assertEqual(comp["backlog_positive_missed"], 11)
+        self.assertEqual(
+            comp["backlog_positive_ids"],
+            [
+                "CALIB-34", "CALIB-35", "CALIB-37", "CALIB-38", "CALIB-40",
+                "CALIB-42", "CALIB-43", "CALIB-46", "CALIB-47", "CALIB-49", "CALIB-50",
+            ],
+        )
+
+        backlog_diags = analyzer.analyze_backlog_positives()
+        self.assertEqual(len(backlog_diags), 11)
+
+        pairs = analyzer.audit_duplicate_and_inconsistent_pairs()
+        self.assertEqual(len(pairs), 4)
+        self.assertEqual(pairs[0].first_decision, "APPROVE")
+        self.assertEqual(pairs[0].second_decision, "IMPORTANT_UPDATE")
+        self.assertEqual(pairs[2].first_decision, "TOO_WEAK")
+        self.assertEqual(pairs[2].second_decision, "APPROVE")
+
+        safety_items = {s.review_id: s for s in analyzer.evaluate_factual_safety_on_calibration()}
+        self.assertIn("CALIB-28", safety_items)
+        self.assertIn("CALIB-47", safety_items)
+        self.assertEqual(safety_items["CALIB-28"].owner_decision, "APPROVE")
+        self.assertTrue(safety_items["CALIB-28"].requires_verification_hold)
+        self.assertFalse(safety_items["CALIB-28"].can_trigger_immediate_alert)
+        self.assertEqual(safety_items["CALIB-47"].owner_decision, "APPROVE")
+        self.assertTrue(safety_items["CALIB-47"].requires_verification_hold)
+        self.assertFalse(safety_items["CALIB-47"].can_trigger_immediate_alert)
+
+    def test_phase3c2b_discovery_ranking_comparison_synthetic(self):
+        """Synthetic regression: calibrated discovery ranking separates synthetic positives from negatives and clusters pairs."""
+        syn_ranking_csv = self.tmp_path / "synthetic_ranking_50.csv"
+        pair_overrides = {
+            1: (
+                "Sentetik Oyuncu A Memleket Ziyaretini Paylaştı",
+                "Oyuncu A tatil için memleketi kasabasına yaptığı ziyaretten fotoğraflar paylaştı.",
+                "https://synthetic.example.invalid/pair1-a",
+                "Habertürk Magazin",
+            ),
+            31: (
+                "Sentetik Oyuncu A Ata Topraklarında Ailesiyle Buluştu",
+                "Oyuncu A memleketi kasabasında ailesiyle buluştuğu ziyaret görüntülerini paylaştı.",
+                "https://synthetic.example.invalid/pair1-b",
+                "Sabah",
+            ),
+            30: (
+                "Sentetik Şarkıcı B Konser Turnesi Takvimini Açıkladı",
+                "Şarkıcı B yaz konser turnesi için beş şehirdeki stadyum tarihlerini duyurdu.",
+                "https://synthetic.example.invalid/pair2-a",
+                "Gazete Kritik",
+            ),
+            32: (
+                "Sentetik Şarkıcı B Yaz Konser Turnesi Tarihlerini Duyurdu",
+                "Şarkıcı B yaz konser turnesi kapsamında sahne alacağı şehirleri ve tarihleri açıkladı.",
+                "https://synthetic.example.invalid/pair2-b",
+                "TRHaber",
+            ),
+            7: (
+                "İkinci sürpriz proje duyuruldu",
+                "Sentetik Çift C ve D ikinci ortak sahne projesini resmen açıkladı.",
+                "https://synthetic.example.invalid/pair3-a",
+                "Habertürk Magazin",
+            ),
+            40: (
+                "Sentetik Çift C ve D İkinci Ortak Projelerini Resmen Açıkladı",
+                "Sentetik Çift C ve D ikinci ortak sahne projesinin prömiyer tarihini paylaştı.",
+                "https://news.google.com/rss/articles/synthetic-pair3-b",
+                "Variety",
+            ),
+            3: (
+                "Vergi mevzuatı ve belediye bütçe toplantısı kararları",
+                "Ekonomi yönetimi yeni çeyrek enflasyon raporu ve vergi düzenlemesini yayımladı.",
+                "https://synthetic.example.invalid/pair4-a",
+                "Ekonomi Haber",
+            ),
+            44: (
+                "Merkez bankası faiz kararı ve bütçe toplantısı özeti",
+                "Ekonomi yönetimi yeni vergi düzenlemesi ve bütçe toplantısı kararlarını açıkladı.",
+                "https://synthetic.example.invalid/pair4-b",
+                "Ekonomi Haber",
+            ),
+        }
+        negative_ids = {3, 4, 6, 7, 14, 15, 16, 22, 27, 33, 36, 39, 41, 44, 45, 48}
+        with open(syn_ranking_csv, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(REQUIRED_CSV_COLUMNS))
+            writer.writeheader()
+            for i in range(1, 51):
+                review_id = f"CALIB-{i:02d}"
+                enters_yn = "Y" if i <= 32 else "N"
+                priority = round(13.0 - (i * 0.18), 2)
+                if i in (31, 32):
+                    decision = "IMPORTANT_UPDATE"
+                elif i in (3, 6, 14, 16, 22, 36, 39, 41, 44, 45):
+                    decision = "REJECT"
+                elif i in (4, 7, 15, 27, 33, 48):
+                    decision = "TOO_WEAK"
+                else:
+                    decision = "APPROVE"
+
+                if i in pair_overrides:
+                    headline, summary, url, pub = pair_overrides[i]
+                elif i in negative_ids:
+                    headline = f"Sentetik Gündem Ekonomi Vergi Toplantısı {i}"
+                    summary = f"Resmi gazete belediye meclisi vergi ve enflasyon toplantısı haberi {i}."
+                    url = f"https://synthetic.example.invalid/neg-{i}"
+                    pub = "Ekonomi Haber"
+                else:
+                    headline = f"Sentetik Pop Yıldız {i} Yeni Albüm ve Konser Turnesini Duyurdu"
+                    summary = f"Sentetik sanatçı {i} resmi albüm çıkış tarihini ve festival konserini açıkladı."
+                    url = f"https://news.google.com/rss/articles/synth-pos-{i}" if i > 32 else f"https://synthetic.example.invalid/pos-{i}"
+                    pub = "Habertürk Magazin" if i % 2 == 0 else "Variety"
+
+                writer.writerow(
+                    {
+                        "review_id": review_id,
+                        "headline": headline,
+                        "publisher": pub,
+                        "source_url": url,
+                        "published_at": f"2026-10-11 {(10 + (i % 12)):02d}:00:00+00:00",
+                        "discovered_at": "2026-10-11 22:30:00+00:00",
+                        "category": "OUT_OF_SCOPE" if i in negative_ids else ("MUSIC_GLOBAL" if i % 2 else "MAGAZIN_TR"),
+                        "factual_summary": summary,
+                        "supporting_sources": pub,
+                        "verification_uncertainty_notes": "Sentetik test fikstürü.",
+                        "discovery_priority": str(priority),
+                        "enters_ai_cutoff_yn": enters_yn,
+                        "owner_decision": decision,
+                        "owner_notes": "",
+                    }
+                )
+
+        items = load_and_verify_calibration_csv(syn_ranking_csv)
+        cmp = evaluate_discovery_ranking_comparison(items, cutoff_k=32)
+
+        self.assertEqual(cmp.untuned_baseline.total_positive, 34)
+        self.assertEqual(cmp.untuned_baseline.positive_in_cutoff, 23)
+        self.assertEqual(cmp.untuned_baseline.negative_in_cutoff, 9)
+
+        self.assertGreaterEqual(cmp.calibrated_raw_top32.positive_in_cutoff, 30)
+        self.assertLessEqual(cmp.calibrated_raw_top32.negative_in_cutoff, 2)
+        self.assertGreater(
+            cmp.calibrated_raw_top32.mean_positive_priority,
+            cmp.calibrated_raw_top32.mean_negative_priority + 4.0,
+        )
+        self.assertGreaterEqual(cmp.calibrated_clustered_unique_positive_recall, 0.90)
+
+        pair_map = {p.pair_id: p for p in cmp.pair_comparisons}
+        for pid in ("PAIR-01", "PAIR-02", "PAIR-03", "PAIR-04"):
+            self.assertIn(pid, pair_map)
+        self.assertTrue(pair_map["PAIR-01"].clustered_together_after)
+        self.assertTrue(pair_map["PAIR-02"].clustered_together_after)
+        self.assertTrue(pair_map["PAIR-03"].clustered_together_after)
+        self.assertTrue(pair_map["PAIR-04"].clustered_together_after)
+        self.assertEqual(pair_map["PAIR-03"].canonical_representative_id, "CALIB-40")
+
+        self.assertEqual(cmp.sample_size, 50)
+        self.assertEqual(cmp.original_cutoff55_sampled_count, 32)
+        self.assertEqual(cmp.original_backlog_sampled_count, 18)
+        self.assertFalse(cmp.full_historical_pool_available)
+        self.assertIn("stratified", cmp.comparability_limitation_note)
+
+    def test_phase3c2b_notification_quality_synthetic(self):
+        """Synthetic regression: evaluate_notification_quality produces threshold scenarios and holds rumors."""
+        items = load_and_verify_calibration_csv(self.csv_path)
+        runner = BlindShadowEvaluationRunner(
+            settings=Settings(max_shadow_eval_budget_usd=0.05),
+            repository=None,
+            batch_size=8,
+        )
+        preds, _ = runner.run_blind_evaluation(items)
+
+        # Build deterministic synthetic predictions (breaking, digest, holds, duplicate, ignore)
+        # over the synthetic 50 items to exercise threshold tiers & verification holds without
+        # relying on heuristic headline matches.
+        synthetic_preds = []
+        for idx, p in enumerate(preds):
+            item = items[idx]
+            if idx in (0, 1):
+                synthetic_preds.append(
+                    type(p)(
+                        article_id=p.article_id,
+                        batch_index=p.batch_index,
+                        batch_hash=p.batch_hash,
+                        editorial_relevant=False,
+                        kind=EditorialKind.NEW,
+                        score=86,
+                        verification_status=(
+                            VerificationStatus.ATTRIBUTED_CLAIM
+                            if idx == 0
+                            else VerificationStatus.UNVERIFIED_RUMOR
+                        ),
+                        urgency_tier=NotificationUrgencyTier.HOLD_FOR_VERIFICATION,
+                        headline_tr=p.headline_tr,
+                        rationale_tr="Sentetik teyit bekletmesi.",
+                        uncertainties_tr="Sentetik teyit bekletmesi.",
+                        grounded_article_ids=p.grounded_article_ids,
+                        from_cache=False,
+                        disposition="HOLD",
+                        is_directly_observed=True,
+                    )
+                )
+            elif idx == 2:
+                synthetic_preds.append(
+                    type(p)(
+                        article_id=p.article_id,
+                        batch_index=p.batch_index,
+                        batch_hash=p.batch_hash,
+                        editorial_relevant=False,
+                        kind=EditorialKind.DUPLICATE,
+                        score=50,
+                        verification_status=VerificationStatus.REPUTABLE_REPORTING,
+                        urgency_tier=NotificationUrgencyTier.SUPPRESSED,
+                        headline_tr=p.headline_tr,
+                        rationale_tr="Sentetik mükerrer.",
+                        uncertainties_tr="",
+                        grounded_article_ids=p.grounded_article_ids,
+                        from_cache=False,
+                        disposition="IGNORE",
+                        is_directly_observed=True,
+                    )
+                )
+            elif item.is_editorially_positive:
+                # Item idx=4 -> breaking (94); item idx=9 -> borderline digest (80)
+                # so Balanced (Digest>=78) retains it while Strict (Digest>=82) drops it.
+                item_score = 94 if idx == 4 else (80 if idx == 9 else 85)
+                synthetic_preds.append(
+                    type(p)(
+                        article_id=p.article_id,
+                        batch_index=p.batch_index,
+                        batch_hash=p.batch_hash,
+                        editorial_relevant=True,
+                        kind=EditorialKind.NEW,
+                        score=item_score,
+                        verification_status=VerificationStatus.REPUTABLE_REPORTING,
+                        urgency_tier=(
+                            NotificationUrgencyTier.BREAKING_IMMEDIATE
+                            if idx == 4
+                            else NotificationUrgencyTier.PERIODIC_DIGEST
+                        ),
+                        headline_tr=p.headline_tr,
+                        rationale_tr="Sentetik pozitif karar.",
+                        uncertainties_tr="",
+                        grounded_article_ids=p.grounded_article_ids,
+                        from_cache=False,
+                        disposition="DIGEST",
+                        is_directly_observed=True,
+                    )
+                )
+            else:
+                synthetic_preds.append(
+                    type(p)(
+                        article_id=p.article_id,
+                        batch_index=p.batch_index,
+                        batch_hash=p.batch_hash,
+                        editorial_relevant=False,
+                        kind=EditorialKind.IGNORE,
+                        score=40,
+                        verification_status=VerificationStatus.REPUTABLE_REPORTING,
+                        urgency_tier=NotificationUrgencyTier.SUPPRESSED,
+                        headline_tr=p.headline_tr,
+                        rationale_tr="Sentetik kapsam dışı.",
+                        uncertainties_tr="",
+                        grounded_article_ids=p.grounded_article_ids,
+                        from_cache=False,
+                        disposition="IGNORE",
+                        is_directly_observed=True,
+                    )
+                )
+
+        notif_scenarios = evaluate_notification_quality(items, synthetic_preds)
+        self.assertEqual(len(notif_scenarios), 3)
+        balanced, strict, loose = notif_scenarios
+        self.assertEqual(balanced.digest_min_score, 78)
+        self.assertEqual(balanced.min_score, 82)
+        self.assertEqual(balanced.breaking_min_score, 92)
+        self.assertEqual(balanced.verification_hold_count, 2)
+        self.assertGreaterEqual(balanced.positive_recall_total, 0.85)
+        self.assertGreaterEqual(balanced.immediate_breaking_count, 1)
+        self.assertEqual(balanced.duplicate_notifications_prevented, 1)
+        # Strict scenario (Digest>=82) drops the score=80 item that balanced (Digest>=78) keeps.
+        self.assertGreater(balanced.periodic_digest_count, strict.periodic_digest_count)
+        self.assertEqual(loose.digest_min_score, 75)
+
+    def test_historical_calibration_tests_skip_unconditionally(self):
+        """Historical authentic-data calibration tests must skip unconditionally without reading data/."""
+        for method_name in (
+            "test_authoritative_local_owner_calibration_files",
+            "test_phase3c2b_untuned_baseline_vs_calibrated_ranking_improvement",
+            "test_phase3c2b_notification_quality_on_calibration_dataset",
+        ):
+            method = getattr(self, method_name)
+            self.assertTrue(getattr(method, "__unittest_skip__", False), f"{method_name} must skip")
+            self.assertEqual(getattr(method, "__unittest_skip_why__", ""), HISTORICAL_DATA_SKIP_REASON)
 
 
 if __name__ == "__main__":
