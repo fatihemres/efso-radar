@@ -29,17 +29,30 @@ import io
 import json
 import os
 from pathlib import Path
-import re
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
-import urllib.parse
 from typing import Any, Optional
 from unittest.mock import patch, MagicMock
 
 import httpx
+
+try:
+    from tests._sqlite_guard_policy import (  # type: ignore[import-not-found]
+        ParsedSqliteConnectTarget,
+        SqliteGuardPolicyError,
+        parse_sqlite_connect_call,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name not in ("tests", "tests._sqlite_guard_policy"):
+        raise
+    from _sqlite_guard_policy import (  # type: ignore[import-not-found,no-redef]
+        ParsedSqliteConnectTarget,
+        SqliteGuardPolicyError,
+        parse_sqlite_connect_call,
+    )
 
 from efso_radar.repositories.schema import get_all_init_statements
 from efso_radar.repositories.turso_client import (
@@ -82,160 +95,6 @@ def create_schema_v6_conn() -> sqlite3.Connection:
     )
     conn.commit()
     return conn
-
-
-def _extract_sqlite_connect_args(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, bool]:
-    """Extract (database, uri) strictly matching sqlite3.connect's signature."""
-    if args and "database" in kwargs:
-        raise AssertionError("Ambiguous duplicate 'database' argument to sqlite3.connect")
-    if "uri" in kwargs and len(args) >= 8:
-        raise AssertionError("Ambiguous duplicate 'uri' argument to sqlite3.connect")
-    if args:
-        database = args[0]
-    elif "database" in kwargs:
-        database = kwargs["database"]
-    else:
-        raise AssertionError("sqlite3.connect invoked without a database argument")
-    uri_raw = kwargs["uri"] if "uri" in kwargs else (args[7] if len(args) >= 8 else False)
-    if not isinstance(uri_raw, bool):
-        raise AssertionError(f"Ambiguous non-boolean uri={uri_raw!r} passed to sqlite3.connect")
-    return database, uri_raw
-
-
-_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
-
-_CANONICAL_MEMORY_URIS = frozenset({
-    "file::memory:",
-    "file::memory:?cache=shared",
-    "file::memory:?cache=private",
-    "file::memory:?mode=memory",
-    "file::memory:?mode=memory&cache=shared",
-    "file::memory:?cache=shared&mode=memory",
-    "file::memory:?mode=memory&cache=private",
-    "file::memory:?cache=private&mode=memory",
-})
-
-_CANONICAL_NAMED_MEMORY_URI_RE = re.compile(
-    r"\Afile:[A-Za-z0-9_-]+\?(?:mode=memory|mode=memory&cache=(?:shared|private)|cache=(?:shared|private)&mode=memory)\Z"
-)
-
-_ALLOWED_DISK_URI_QUERY_VALUES: dict[str, frozenset[str]] = {
-    "mode": frozenset({"ro", "rw", "rwc"}),
-    "cache": frozenset({"shared", "private"}),
-    "immutable": frozenset({"0", "1"}),
-}
-
-
-def _strict_unquote_no_nul(component: str, *, full_uri: str, label: str) -> str:
-    """Strictly percent-decode a UTF-8 URI component, rejecting malformed escapes or decoded NUL."""
-    i = 0
-    n = len(component)
-    while i < n:
-        if component[i] == "%":
-            if i + 2 >= n or component[i + 1] not in _HEX_DIGITS or component[i + 2] not in _HEX_DIGITS:
-                raise AssertionError(f"Malformed percent-encoding in SQLite URI {label}: {full_uri!r}")
-            i += 3
-        else:
-            i += 1
-    raw_bytes = urllib.parse.unquote_to_bytes(component)
-    if b"\x00" in raw_bytes:
-        raise AssertionError(f"Decoded NUL byte in SQLite URI {label} rejected: {full_uri!r}")
-    try:
-        decoded = raw_bytes.decode("utf-8", errors="strict")
-    except UnicodeDecodeError as exc:
-        raise AssertionError(f"Invalid UTF-8 percent-encoding in SQLite URI {label}: {full_uri!r}") from exc
-    if "\x00" in decoded:
-        raise AssertionError(f"Decoded NUL character in SQLite URI {label} rejected: {full_uri!r}")
-    return decoded
-
-
-def _classify_sqlite_connect_target(database: Any, *, uri: bool = False) -> tuple[str, Optional[Path]]:
-    """Fail-closed classifier distinguishing canonical memory targets from disk-backed SQLite targets."""
-    if isinstance(database, os.PathLike):
-        raw_obj = os.fspath(database)
-    else:
-        raw_obj = database
-
-    if isinstance(raw_obj, bytes):
-        try:
-            raw_str = os.fsdecode(raw_obj)
-        except Exception as exc:
-            raise AssertionError(f"Non-decodable SQLite database bytes rejected: {database!r}") from exc
-    elif isinstance(raw_obj, str):
-        raw_str = raw_obj
-    else:
-        raise AssertionError(f"Unsupported SQLite database target type: {type(database).__name__}")
-
-    if "\x00" in raw_str or not raw_str or not raw_str.strip():
-        raise AssertionError(f"Empty or null-byte SQLite target rejected: {raw_str!r}")
-
-    if raw_str == ":memory:":
-        return ("memory", None)
-    if raw_str.strip() == ":memory:":
-        raise AssertionError(f"Whitespace-padded :memory: SQLite target rejected: {raw_str!r}")
-
-    if not uri:
-        if raw_str.lower().startswith("file:"):
-            raise AssertionError(
-                f"SQLite file: string with uri=False opens literal disk file; rejected: {raw_str!r}"
-            )
-        return ("disk", Path(raw_str).resolve())
-
-    if not raw_str.startswith("file:"):
-        if raw_str.lower().startswith("file:"):
-            raise AssertionError(f"Non-lowercase SQLite file: URI scheme rejected: {raw_str!r}")
-        return ("disk", Path(raw_str).resolve())
-
-    if raw_str in _CANONICAL_MEMORY_URIS or _CANONICAL_NAMED_MEMORY_URI_RE.fullmatch(raw_str):
-        return ("memory", None)
-
-    if "#" in raw_str:
-        raise AssertionError(f"SQLite URI fragment rejected fail-closed: {raw_str!r}")
-
-    raw_path_part, has_query, raw_query = raw_str[5:].partition("?")
-    if has_query:
-        if raw_query == "":
-            raise AssertionError(f"Empty trailing query in SQLite URI rejected: {raw_str!r}")
-        seen_keys: set[str] = set()
-        for segment in raw_query.split("&"):
-            if not segment or "=" not in segment:
-                raise AssertionError(f"Malformed SQLite URI query parameter rejected: {raw_str!r}")
-            k_raw, v_raw = segment.split("=", 1)
-            k = _strict_unquote_no_nul(k_raw, full_uri=raw_str, label="query key")
-            v = _strict_unquote_no_nul(v_raw, full_uri=raw_str, label="query value")
-            if k in seen_keys:
-                raise AssertionError(f"Duplicate SQLite URI query key {k!r} rejected: {raw_str!r}")
-            seen_keys.add(k)
-            allowed_vals = _ALLOWED_DISK_URI_QUERY_VALUES.get(k)
-            if allowed_vals is None or v not in allowed_vals:
-                raise AssertionError(
-                    f"Unsupported or ambiguous SQLite URI query parameter {k}={v!r} rejected: {raw_str!r}"
-                )
-
-    if raw_path_part.startswith("//"):
-        after_slashes = raw_path_part[2:]
-        if "/" not in after_slashes:
-            raise AssertionError(f"Malformed SQLite URI authority rejected: {raw_str!r}")
-        authority, rest = after_slashes.split("/", 1)
-        if authority.lower() not in ("", "localhost"):
-            raise AssertionError(f"Unsupported SQLite URI authority {authority!r} rejected: {raw_str!r}")
-        decoded_rest = _strict_unquote_no_nul(rest, full_uri=raw_str, label="path")
-        if not decoded_rest:
-            raise AssertionError(f"Empty path in SQLite authority URI rejected: {raw_str!r}")
-        if os.name == "nt" and len(decoded_rest) >= 2 and decoded_rest[0].isalpha() and decoded_rest[1] == ":":
-            disk_path_str = decoded_rest
-        else:
-            disk_path_str = "/" + decoded_rest
-    else:
-        disk_path_str = _strict_unquote_no_nul(raw_path_part, full_uri=raw_str, label="path")
-
-    if disk_path_str.startswith(":memory:"):
-        raise AssertionError(f"Non-canonical :memory: SQLite URI rejected: {raw_str!r}")
-
-    if not disk_path_str.strip():
-        raise AssertionError(f"Empty disk path in SQLite URI rejected: {raw_str!r}")
-
-    return ("disk", Path(disk_path_str).resolve())
 
 
 def _resolve_dir_fd_fail_closed(dir_fd: Any, op_name: str) -> str:
@@ -289,22 +148,35 @@ def _build_runner_isolation_guards(
     os_open_delegate: Any,
 ) -> tuple[Any, Any, Any, Any, Any]:
     """Construct pre-delegation memory-only SQLite and file-open guards for hermetic runner isolation."""
+    data_dir_abs = Path(os.path.abspath(data_dir))
     data_dir_res = data_dir.resolve()
+    repo_data_abs = Path(os.path.abspath(repo_data_dir))
     repo_data_res = repo_data_dir.resolve()
     forbidden_resolved = {
         standin_db.resolve(),
         standin_state.resolve(),
         standin_env.resolve(),
     }
+    forbidden_lexical = {
+        Path(os.path.abspath(standin_db)),
+        Path(os.path.abspath(standin_state)),
+        Path(os.path.abspath(standin_env)),
+        *forbidden_resolved,
+    }
 
-    def _validate_sqlite_before_delegate(args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
-        database, uri = _extract_sqlite_connect_args(args, kwargs)
-        kind, resolved = _classify_sqlite_connect_target(database, uri=uri)
-        if kind != "memory" or resolved is not None:
+    def _validate_sqlite_before_delegate(
+        args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> ParsedSqliteConnectTarget:
+        try:
+            parsed = parse_sqlite_connect_call(args, kwargs)
+        except SqliteGuardPolicyError as exc:
+            raise AssertionError(str(exc)) from exc
+        if parsed.kind != "memory" or parsed.lexical_path is not None:
             raise AssertionError(
-                f"Runner unexpectedly attempted non-memory SQLite connect: target={database!r}, resolved={resolved!r}"
+                f"Runner unexpectedly attempted non-memory SQLite connect: target={parsed.raw_database_str!r}, lexical_path={parsed.lexical_path!r}"
             )
         observed_sqlite_targets.append(":memory:")
+        return parsed
 
     def _validate_open_target(raw_path: Any, op_name: str, *, dir_fd: Any = None, allow_int_fd: bool) -> None:
         if isinstance(raw_path, int):
@@ -329,6 +201,19 @@ def _build_runner_isolation_guards(
         if dir_fd is not None and not os.path.isabs(path_str):
             base_dir = _resolve_dir_fd_fail_closed(dir_fd, op_name)
             path_str = os.path.join(base_dir, path_str)
+        lexical_abs = Path(os.path.abspath(path_str))
+        lexical_lower_name = lexical_abs.name.lower()
+        if (
+            lexical_abs in forbidden_lexical
+            or _is_within_dir(lexical_abs, data_dir_abs)
+            or _is_within_dir(lexical_abs, data_dir_res)
+            or _is_within_dir(lexical_abs, repo_data_abs)
+            or _is_within_dir(lexical_abs, repo_data_res)
+            or ((lexical_lower_name == ".env" or lexical_lower_name.startswith(".env.")) and lexical_lower_name != ".env.example")
+        ):
+            raise AssertionError(
+                f"Runner unexpectedly accessed operational/stand-in path via {op_name}: {lexical_abs}"
+            )
         resolved = Path(path_str).resolve()
         lower_name = resolved.name.lower()
         if (
@@ -342,8 +227,8 @@ def _build_runner_isolation_guards(
             )
 
     def _guarded_sqlite_connect(*args: Any, **kwargs: Any) -> Any:
-        _validate_sqlite_before_delegate(args, kwargs)
-        return sqlite_delegate(*args, **kwargs)
+        parsed = _validate_sqlite_before_delegate(args, kwargs)
+        return sqlite_delegate(*parsed.safe_args, **parsed.safe_kwargs)
 
     def _guarded_builtins_open(file: Any, *args: Any, **kwargs: Any) -> Any:
         _validate_open_target(file, "builtins.open", allow_int_fd=True)
@@ -1302,11 +1187,14 @@ class TestOfflineCLIAndSafety(unittest.TestCase):
                         sqlite3.connect(*bad_args, **bad_kwargs)
                     mock_sqlite.assert_not_called()
 
-                # Verify classifier resolves temp disk URIs accurately (while runner guard remains memory-only)
+                # Verify shared policy resolves temp disk URIs accurately (while runner guard remains memory-only)
                 temp_ro_uri = f"file:{(tmp_root / 'allowed_ro.db').resolve().as_posix()}?mode=ro"
+                parsed_temp_ro = parse_sqlite_connect_call((temp_ro_uri,), {"uri": True})
+                self.assertEqual(parsed_temp_ro.kind, "disk")
+                assert parsed_temp_ro.lexical_path is not None
                 self.assertEqual(
-                    _classify_sqlite_connect_target(temp_ro_uri, uri=True),
-                    ("disk", (tmp_root / "allowed_ro.db").resolve()),
+                    Path(parsed_temp_ro.lexical_path).resolve(),
+                    (tmp_root / "allowed_ro.db").resolve(),
                 )
 
                 # 3. Legitimate exact memory URIs and non-operational file positive controls delegate cleanly

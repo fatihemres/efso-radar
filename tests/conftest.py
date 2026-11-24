@@ -1,4 +1,4 @@
-"""Pytest hermetic test guardrails (Issue #104 / T1B).
+"""Pytest hermetic test guardrails (Issue #104 / T1B; hardened Issue #108 / T1D).
 
 Provides an autouse function-scoped guardrail fixture that fails closed on:
 1. Unintended real outbound network connections (`socket`, `urllib.request`,
@@ -6,12 +6,14 @@ Provides an autouse function-scoped guardrail fixture that fails closed on:
 2. Unintended opens, SQLite connections, or destructive operations targeting
    owner operational paths under `REPO_ROOT` (`data/`, `.env*` other than
    `.env.example`, `backups/` / `backup/`, and root-level operational
-   databases / encrypted archives / recovery manifests).
+   databases / encrypted archives / recovery manifests), or ambiguous/malformed
+   SQLite targets via shared `tests._sqlite_guard_policy`.
 3. Unrestored CWD or `os.environ` mutations across tests.
 
-Legitimate in-memory SQLite (`:memory:`, `file::memory:...`), `httpx.MockTransport`,
-tracked repository fixtures (`tests/fixtures/`, `.env.example`), and test-owned
-temporary paths (`tmp_path`, `tempfile.TemporaryDirectory`) remain permitted.
+Legitimate canonical in-memory SQLite (`:memory:`, canonical `file::memory:`
+and `file:<name>?mode=memory` forms), `httpx.MockTransport`, tracked repository
+fixtures (`tests/fixtures/`, `.env.example`), and test-owned temporary paths
+(`tmp_path`, `tempfile.TemporaryDirectory`) remain permitted.
 """
 from __future__ import annotations
 
@@ -22,7 +24,6 @@ import os
 import shutil
 import socket
 import sqlite3
-import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
@@ -30,6 +31,19 @@ from typing import Any, Iterator
 
 import httpx
 import pytest
+
+try:
+    from tests._sqlite_guard_policy import (  # type: ignore[import-not-found]
+        SqliteGuardPolicyError,
+        parse_sqlite_connect_call,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name not in ("tests", "tests._sqlite_guard_policy"):
+        raise
+    from _sqlite_guard_policy import (  # type: ignore[import-not-found,no-redef]
+        SqliteGuardPolicyError,
+        parse_sqlite_connect_call,
+    )
 
 REPO_ROOT: Path = Path(__file__).resolve().parent.parent
 
@@ -43,9 +57,10 @@ RESIDUAL_LIMITATIONS: tuple[str, ...] = (
     "Direct C-level syscalls or raw integer file descriptors (open(fd)) bypass Python-level "
     "path wrappers; fd-relative dir_fd calls validate effective paths via /proc/self/fd "
     "(or fcntl.F_GETPATH where supported) and fail closed when resolution is unavailable.",
-    "Path.exists() and Path.stat() metadata probes are intentionally not blocked because "
-    "existing untouched Phase 5B.3C/5B.3D/5B.3G tests assert operational file mtime/size "
-    "invariants; therefore an isolated clean worktree (no .env, only tracked data/.gitkeep) "
+    "These Python-level monkeypatches are NOT an OS-level sandbox. "
+    "Path.exists(), Path.stat(), and os.stat() metadata probes remain unblocked (and "
+    "zero-arg Settings.from_env() still probes CWD .env unless overridden), so running "
+    "tests only inside an isolated clean worktree (no .env, only tracked data/.gitkeep) "
     "remains mandatory for CI and agent verification.",
     "Blocking socket.socket.connect also blocks Windows asyncio ProactorEventLoop self-pipe "
     "initialization inside guarded tests unless asyncio event loops are created outside the guard.",
@@ -95,37 +110,6 @@ _OPERATIONAL_ROOT_EXTENSIONS = frozenset({
 
 class HermeticGuardrailError(RuntimeError):
     """Raised fail-closed when a test attempts real network or operational-file I/O."""
-
-
-def _is_sqlite_memory_target(raw_str: str) -> bool:
-    stripped = raw_str.strip()
-    if stripped in ("", ":memory:"):
-        return True
-    lower = stripped.lower()
-    if lower.startswith("file::memory:"):
-        return True
-    if lower.startswith("file:") and "mode=memory" in lower:
-        return True
-    return False
-
-
-def _decode_sqlite_uri_path(raw_str: str) -> str:
-    """Extract filesystem path from a SQLite `file:` URI."""
-    without_scheme = raw_str[5:]
-    path_part = without_scheme.split("?", 1)[0].split("#", 1)[0]
-    unquoted = urllib.parse.unquote(path_part)
-    # Windows file:///C:/foo -> C:/foo
-    if unquoted.startswith("///"):
-        tail = unquoted[3:]
-        if len(tail) >= 2 and tail[1] == ":":
-            return tail
-        return "/" + tail
-    if unquoted.startswith("//localhost/"):
-        tail = unquoted[len("//localhost/"):]
-        if len(tail) >= 2 and tail[1] == ":":
-            return tail
-        return "/" + tail
-    return unquoted
 
 
 def _is_blocked_normalized_path(
@@ -209,37 +193,13 @@ def _resolve_dir_fd(dir_fd: Any, operation: str) -> str:
     return resolved
 
 
-def check_not_operational_path(
-    raw_path: Any,
+def _check_disk_path_not_operational(
+    path_str: str,
     operation: str,
     *,
-    dir_fd: Any = None,
-    is_sqlite: bool = False,
     block_repo_root: bool = False,
 ) -> None:
-    """Raise HermeticGuardrailError if `raw_path` targets an operational path under `REPO_ROOT`."""
-    if raw_path is None or isinstance(raw_path, int):
-        return
-
-    if isinstance(raw_path, bytes):
-        path_str = os.fsdecode(raw_path)
-    elif isinstance(raw_path, os.PathLike):
-        path_str = os.fsdecode(raw_path)
-    elif isinstance(raw_path, str):
-        path_str = raw_path
-    else:
-        return
-
-    if is_sqlite:
-        if _is_sqlite_memory_target(path_str):
-            return
-        if path_str.lower().startswith("file:"):
-            path_str = _decode_sqlite_uri_path(path_str)
-
-    if dir_fd is not None and (not path_str or not os.path.isabs(path_str)):
-        base_dir = _resolve_dir_fd(dir_fd, operation)
-        path_str = os.path.join(base_dir, path_str) if path_str else base_dir
-
+    """Reject obvious lexical operational targets before calling realpath, then check resolved symlinks."""
     if not path_str:
         return
 
@@ -254,17 +214,84 @@ def check_not_operational_path(
             f"Hermetic guardrail blocked {operation} on operational path: {path_str!r}"
         )
 
-    # Also check realpath to defeat symlinks inside temp dirs pointing back to REPO_ROOT.
     norm_repo_real = os.path.normcase(os.path.realpath(os.fspath(REPO_ROOT)))
-    norm_target_real = os.path.normcase(os.path.realpath(path_str))
-    if _is_blocked_normalized_path(
-        norm_target_real,
+    if norm_repo_real != norm_repo_abs and _is_blocked_normalized_path(
+        norm_target_abs,
         norm_repo_real,
         block_repo_root=block_repo_root,
     ):
         raise HermeticGuardrailError(
-            f"Hermetic guardrail blocked {operation} via symlink to operational path: {path_str!r}"
+            f"Hermetic guardrail blocked {operation} on operational path: {path_str!r}"
         )
+
+    # Only resolve the candidate target after lexical checks pass, defeating symlinks back to REPO_ROOT.
+    norm_target_real = os.path.normcase(os.path.realpath(path_str))
+    repo_candidates = (norm_repo_abs,) if norm_repo_real == norm_repo_abs else (norm_repo_abs, norm_repo_real)
+    for repo_cand in repo_candidates:
+        if _is_blocked_normalized_path(
+            norm_target_real,
+            repo_cand,
+            block_repo_root=block_repo_root,
+        ):
+            raise HermeticGuardrailError(
+                f"Hermetic guardrail blocked {operation} via symlink to operational path: {path_str!r}"
+            )
+
+
+def check_not_operational_path(
+    raw_path: Any,
+    operation: str,
+    *,
+    dir_fd: Any = None,
+    is_sqlite: bool = False,
+    uri: bool = False,
+    block_repo_root: bool = False,
+) -> None:
+    """Raise HermeticGuardrailError if `raw_path` targets an operational path under `REPO_ROOT`."""
+    if is_sqlite:
+        if dir_fd is not None:
+            raise HermeticGuardrailError(
+                f"Hermetic guardrail blocked {operation}: unexpected dir_fd={dir_fd!r} for SQLite target"
+            )
+        try:
+            parsed = parse_sqlite_connect_call((raw_path,), {"uri": uri})
+        except SqliteGuardPolicyError as exc:
+            raise HermeticGuardrailError(
+                f"Hermetic guardrail blocked {operation}: {exc}"
+            ) from exc
+        if parsed.kind == "memory" or parsed.lexical_path is None:
+            return
+        _check_disk_path_not_operational(
+            parsed.lexical_path,
+            operation,
+            block_repo_root=block_repo_root,
+        )
+        return
+
+    if raw_path is None or isinstance(raw_path, int):
+        return
+
+    if isinstance(raw_path, bytes):
+        path_str = os.fsdecode(raw_path)
+    elif isinstance(raw_path, os.PathLike):
+        path_str = os.fsdecode(raw_path)
+    elif isinstance(raw_path, str):
+        path_str = raw_path
+    else:
+        return
+
+    if dir_fd is not None and (not path_str or not os.path.isabs(path_str)):
+        base_dir = _resolve_dir_fd(dir_fd, operation)
+        path_str = os.path.join(base_dir, path_str) if path_str else base_dir
+
+    if not path_str:
+        return
+
+    _check_disk_path_not_operational(
+        path_str,
+        operation,
+        block_repo_root=block_repo_root,
+    )
 
 
 def _guarded_open(file: Any, *args: Any, **kwargs: Any) -> Any:
@@ -349,9 +376,14 @@ def _guarded_rmtree(path: Any, *args: Any, **kwargs: Any) -> None:
     _ORIG_SHUTIL_RMTREE(path, *args, **kwargs)
 
 
-def _guarded_sqlite_connect(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
-    check_not_operational_path(database, "sqlite3.connect", is_sqlite=True)
-    return _ORIG_SQLITE_CONNECT(database, *args, **kwargs)
+def _guarded_sqlite_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+    try:
+        parsed = parse_sqlite_connect_call(args, kwargs)
+    except SqliteGuardPolicyError as exc:
+        raise HermeticGuardrailError(f"Hermetic guardrail blocked sqlite3.connect: {exc}") from exc
+    if parsed.kind == "disk" and parsed.lexical_path is not None:
+        _check_disk_path_not_operational(parsed.lexical_path, "sqlite3.connect")
+    return _ORIG_SQLITE_CONNECT(*parsed.safe_args, **parsed.safe_kwargs)
 
 
 def _blocked_socket_connect(self: Any, address: Any) -> Any:
