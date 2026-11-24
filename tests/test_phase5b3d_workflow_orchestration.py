@@ -19,15 +19,18 @@ Verifies the 15 required contract specifications:
 """
 from __future__ import annotations
 
+import builtins
+import io
 import os
 import re
 import socket
 import sqlite3
 import tempfile
 import unittest
+import urllib.parse
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from unittest.mock import MagicMock, patch
 
 from efso_radar.config import Settings
@@ -288,6 +291,248 @@ class TestWorkflowSchedulingContract(unittest.TestCase):
             contract.execute(mode=TaskExecutionMode.LIVE_PRODUCTION, timestamp=aware_dt)
 
 
+def _extract_sqlite_connect_args(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, bool]:
+    """Extract (database, uri) strictly matching sqlite3.connect's signature."""
+    if args and "database" in kwargs:
+        raise AssertionError("Ambiguous duplicate 'database' argument to sqlite3.connect")
+    if "uri" in kwargs and len(args) >= 8:
+        raise AssertionError("Ambiguous duplicate 'uri' argument to sqlite3.connect")
+    if args:
+        database = args[0]
+    elif "database" in kwargs:
+        database = kwargs["database"]
+    else:
+        raise AssertionError("sqlite3.connect invoked without a database argument")
+    uri_raw = kwargs["uri"] if "uri" in kwargs else (args[7] if len(args) >= 8 else False)
+    if not isinstance(uri_raw, bool):
+        raise AssertionError(f"Ambiguous non-boolean uri={uri_raw!r} passed to sqlite3.connect")
+    return database, uri_raw
+
+
+def _classify_sqlite_connect_target(database: Any, *, uri: bool = False) -> tuple[str, Optional[Path]]:
+    """Fail-closed classifier distinguishing genuine memory targets from disk-backed SQLite targets."""
+    if isinstance(database, os.PathLike):
+        raw_obj = os.fspath(database)
+    else:
+        raw_obj = database
+
+    if isinstance(raw_obj, bytes):
+        try:
+            raw_str = os.fsdecode(raw_obj)
+        except Exception as exc:
+            raise AssertionError(f"Non-decodable SQLite database bytes rejected: {database!r}") from exc
+    elif isinstance(raw_obj, str):
+        raw_str = raw_obj
+    else:
+        raise AssertionError(f"Unsupported SQLite database target type: {type(database).__name__}")
+
+    if "\x00" in raw_str or not raw_str or not raw_str.strip():
+        raise AssertionError(f"Empty or null-byte SQLite target rejected: {raw_str!r}")
+
+    if raw_str == ":memory:":
+        return ("memory", None)
+    if raw_str.strip() == ":memory:":
+        raise AssertionError(f"Whitespace-padded :memory: SQLite target rejected: {raw_str!r}")
+
+    if not uri:
+        if raw_str.lower().startswith("file:"):
+            raise AssertionError(
+                f"SQLite file: string with uri=False opens literal disk file; rejected: {raw_str!r}"
+            )
+        return ("disk", Path(raw_str).resolve())
+
+    if not raw_str.startswith("file:"):
+        if raw_str.lower().startswith("file:"):
+            raise AssertionError(f"Non-lowercase SQLite file: URI scheme rejected: {raw_str!r}")
+        return ("disk", Path(raw_str).resolve())
+
+    uri_body = raw_str[5:].split("#", 1)[0]
+    raw_path_part, has_query, raw_query = uri_body.partition("?")
+
+    mode_values: list[str] = []
+    if has_query and raw_query != "":
+        for segment in raw_query.split("&"):
+            if not segment or "=" not in segment:
+                raise AssertionError(f"Malformed SQLite URI query parameter rejected: {raw_str!r}")
+            k_raw, v_raw = segment.split("=", 1)
+            k = urllib.parse.unquote(k_raw)
+            v = urllib.parse.unquote(v_raw)
+            if k == "mode":
+                mode_values.append(v)
+            elif k.lower() == "mode":
+                raise AssertionError(f"Ambiguous SQLite URI mode casing rejected: {raw_str!r}")
+
+    if len(set(mode_values)) > 1:
+        raise AssertionError(f"Conflicting SQLite URI mode parameters rejected: {raw_str!r}")
+
+    if raw_path_part.startswith("//"):
+        after_slashes = raw_path_part[2:]
+        if "/" not in after_slashes:
+            raise AssertionError(f"Malformed SQLite URI authority rejected: {raw_str!r}")
+        authority, rest = after_slashes.split("/", 1)
+        if authority.lower() not in ("", "localhost"):
+            raise AssertionError(f"Unsupported SQLite URI authority {authority!r} rejected: {raw_str!r}")
+        decoded_rest = urllib.parse.unquote(rest)
+        if len(decoded_rest) >= 2 and decoded_rest[1] == ":":
+            disk_path_str = decoded_rest
+        else:
+            disk_path_str = "/" + decoded_rest
+        is_authority_path = True
+    else:
+        disk_path_str = urllib.parse.unquote(raw_path_part)
+        is_authority_path = False
+
+    if "\x00" in disk_path_str:
+        raise AssertionError(f"Null byte in decoded SQLite URI path rejected: {raw_str!r}")
+
+    if disk_path_str.startswith(":memory:") and disk_path_str != ":memory:":
+        raise AssertionError(f"Ambiguous :memory:-prefixed SQLite URI target rejected: {raw_str!r}")
+
+    if not is_authority_path and disk_path_str == ":memory:":
+        if mode_values and mode_values[0] != "memory":
+            raise AssertionError(f"Non-memory mode on file::memory: URI rejected: {raw_str!r}")
+        return ("memory", None)
+
+    if mode_values and mode_values[0] == "memory":
+        if (
+            not is_authority_path
+            and disk_path_str not in ("", ".", "..")
+            and "/" not in disk_path_str
+            and "\\" not in disk_path_str
+            and ":" not in disk_path_str
+            and "." not in disk_path_str
+        ):
+            return ("memory", None)
+
+    if not disk_path_str.strip():
+        raise AssertionError(f"Empty disk path in SQLite URI rejected: {raw_str!r}")
+
+    return ("disk", Path(disk_path_str).resolve())
+
+
+def _resolve_dir_fd_fail_closed(dir_fd: Any, op_name: str) -> str:
+    """Resolve dir_fd on os.open fail-closed when non-None."""
+    if isinstance(dir_fd, bool) or not isinstance(dir_fd, int) or dir_fd < 0:
+        raise AssertionError(f"Invalid dir_fd={dir_fd!r} passed to {op_name}")
+    resolved: Optional[str] = None
+    try:
+        resolved = os.readlink(f"/proc/self/fd/{dir_fd}")
+    except OSError:
+        resolved = None
+    if resolved is None:
+        try:
+            import fcntl  # noqa: PLC0415
+
+            if hasattr(fcntl, "F_GETPATH"):
+                raw = fcntl.fcntl(dir_fd, fcntl.F_GETPATH, b"\0" * 1024)
+                resolved = os.fsdecode(raw.split(b"\0", 1)[0])
+        except Exception:
+            resolved = None
+    if (
+        not resolved
+        or not os.path.isabs(resolved)
+        or resolved.endswith(" (deleted)")
+        or resolved.startswith(("pipe:[", "socket:[", "anon_inode:"))
+    ):
+        raise AssertionError(f"Cannot safely resolve dir_fd={dir_fd!r} in {op_name} (fail closed)")
+    return resolved
+
+
+def _is_within_dir(target: Path, parent_dir: Path) -> bool:
+    try:
+        target.relative_to(parent_dir)
+        return True
+    except ValueError:
+        return False
+
+
+def _build_workflow_isolation_guards(
+    *,
+    synth_db: Path,
+    synth_state: Path,
+    synth_data_dir: Path,
+    repo_data_dir: Path,
+    observed_sqlite_targets: list[Path],
+    sqlite_delegate: Any,
+    builtins_open_delegate: Any,
+    io_open_delegate: Any,
+    path_open_delegate: Any,
+    os_open_delegate: Any,
+) -> tuple[Any, Any, Any, Any, Any]:
+    """Construct pre-delegation SQLite and file-open guards rejecting forbidden paths before delegation."""
+    synth_db_res = synth_db.resolve()
+    synth_data_res = synth_data_dir.resolve()
+    repo_data_res = repo_data_dir.resolve()
+    forbidden_resolved = {synth_db_res, synth_state.resolve()}
+    system_temp_res = Path(tempfile.gettempdir()).resolve()
+
+    def _validate_sqlite_before_delegate(args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+        database, uri = _extract_sqlite_connect_args(args, kwargs)
+        kind, resolved = _classify_sqlite_connect_target(database, uri=uri)
+        if kind != "disk" or resolved is None:
+            raise AssertionError(f"Unexpected non-ephemeral SQLite target during preview: {database!r}")
+        if resolved == synth_db_res or _is_within_dir(resolved, synth_data_res) or _is_within_dir(resolved, repo_data_res):
+            raise AssertionError(f"SQLite connect targeted forbidden stand-in/operational data path: {resolved}")
+        if not resolved.parent.name.startswith("efso_preview_scan_") or not _is_within_dir(resolved, system_temp_res):
+            raise AssertionError(f"SQLite connect targeted non-ephemeral location outside preview tempdir: {resolved}")
+        observed_sqlite_targets.append(resolved)
+
+    def _validate_open_target(raw_path: Any, op_name: str, *, dir_fd: Any = None, allow_int_fd: bool) -> None:
+        if isinstance(raw_path, int):
+            if allow_int_fd:
+                return
+            raise AssertionError(f"Integer fd unexpected as path in {op_name}")
+        if isinstance(raw_path, os.PathLike):
+            raw_obj = os.fspath(raw_path)
+        else:
+            raw_obj = raw_path
+        if isinstance(raw_obj, bytes):
+            try:
+                path_str = os.fsdecode(raw_obj)
+            except Exception as exc:
+                raise AssertionError(f"Non-decodable path bytes in {op_name}") from exc
+        elif isinstance(raw_obj, str):
+            path_str = raw_obj
+        else:
+            raise AssertionError(f"Unsupported path type {type(raw_path).__name__} in {op_name}")
+        if "\x00" in path_str or not path_str:
+            raise AssertionError(f"Empty or null-byte path in {op_name}")
+        if dir_fd is not None and not os.path.isabs(path_str):
+            base_dir = _resolve_dir_fd_fail_closed(dir_fd, op_name)
+            path_str = os.path.join(base_dir, path_str)
+        resolved = Path(path_str).resolve()
+        lower_name = resolved.name.lower()
+        if (
+            resolved in forbidden_resolved
+            or _is_within_dir(resolved, synth_data_res)
+            or _is_within_dir(resolved, repo_data_res)
+            or ((lower_name == ".env" or lower_name.startswith(".env.")) and lower_name != ".env.example")
+        ):
+            raise AssertionError(f"Preview path unexpectedly opened forbidden/operational target via {op_name}: {resolved}")
+
+    def _guarded_sqlite_connect(*args: Any, **kwargs: Any) -> Any:
+        _validate_sqlite_before_delegate(args, kwargs)
+        return sqlite_delegate(*args, **kwargs)
+
+    def _guarded_builtins_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        _validate_open_target(file, "builtins.open", allow_int_fd=True)
+        return builtins_open_delegate(file, *args, **kwargs)
+
+    def _guarded_io_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        _validate_open_target(file, "io.open", allow_int_fd=True)
+        return io_open_delegate(file, *args, **kwargs)
+
+    def _guarded_path_open(path_self: Path, *args: Any, **kwargs: Any) -> Any:
+        _validate_open_target(path_self, "Path.open", allow_int_fd=False)
+        return path_open_delegate(path_self, *args, **kwargs)
+
+    def _guarded_os_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> Any:
+        _validate_open_target(path, "os.open", dir_fd=kwargs.get("dir_fd"), allow_int_fd=False)
+        return os_open_delegate(path, flags, *args, **kwargs)
+
+    return _guarded_sqlite_connect, _guarded_builtins_open, _guarded_io_open, _guarded_path_open, _guarded_os_open
+
+
 class TestWorkflowOfflinePreviewIsolation(unittest.TestCase):
     """Scope B: Hermetic offline previews, zero-network, zero-spend guarantees."""
 
@@ -341,17 +586,30 @@ class TestWorkflowOfflinePreviewIsolation(unittest.TestCase):
             )
 
             observed_sqlite_targets: list[Path] = []
-            prev_sqlite_connect = sqlite3.connect
-
-            def _spy_sqlite_connect(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
-                target_path = Path(os.fsdecode(database)).resolve()
-                observed_sqlite_targets.append(target_path)
-                return prev_sqlite_connect(database, *args, **kwargs)
+            repo_data_dir = Path(__file__).resolve().parent.parent / "data"
+            g_sqlite, g_builtins_open, g_io_open, g_path_open, g_os_open = _build_workflow_isolation_guards(
+                synth_db=synth_db,
+                synth_state=synth_state,
+                synth_data_dir=synth_data_dir,
+                repo_data_dir=repo_data_dir,
+                observed_sqlite_targets=observed_sqlite_targets,
+                sqlite_delegate=sqlite3.connect,
+                builtins_open_delegate=builtins.open,
+                io_open_delegate=io.open,
+                path_open_delegate=Path.open,
+                os_open_delegate=os.open,
+            )
 
             orig_cwd = os.getcwd()
             try:
                 os.chdir(tmp_root)
-                with patch("sqlite3.connect", side_effect=_spy_sqlite_connect):
+                with (
+                    patch("sqlite3.connect", side_effect=g_sqlite),
+                    patch("builtins.open", side_effect=g_builtins_open),
+                    patch("io.open", side_effect=g_io_open),
+                    patch.object(Path, "open", g_path_open),
+                    patch("os.open", side_effect=g_os_open),
+                ):
                     scan_res = ScanOnlyTaskContract(settings).run_preview(
                         datetime(2026, 10, 24, 9, 30, tzinfo=ISTANBUL_TZ)
                     )
@@ -371,18 +629,116 @@ class TestWorkflowOfflinePreviewIsolation(unittest.TestCase):
             self.assertEqual(digest_res.status, "SUCCESS")
             self.assertEqual(admin_res.status, "SUCCESS")
             self.assertEqual(backup_res.status, "SUCCESS")
-
             self.assertGreaterEqual(len(observed_sqlite_targets), 1)
-            synth_data_resolved = synth_data_dir.resolve()
-            repo_data_resolved = (Path(__file__).resolve().parent.parent / "data").resolve()
-            for target_path in observed_sqlite_targets:
-                self.assertNotEqual(target_path, synth_db.resolve())
-                self.assertNotEqual(target_path.parent, synth_data_resolved)
-                self.assertNotEqual(target_path.parent, repo_data_resolved)
-                self.assertTrue(
-                    target_path.parent.name.startswith("efso_preview_scan_"),
-                    f"Unexpected non-ephemeral SQLite connect target: {target_path}",
-                )
+            self.assertEqual(synth_db.read_bytes(), db_sentinel)
+            self.assertEqual(synth_state.read_bytes(), state_sentinel)
+
+    def test_11b_preview_isolation_guards_reject_forbidden_sqlite_and_readonly_opens_before_delegate(self) -> None:
+        """Adversarial regression: pre-delegation guards block SQLite masquerades and read-only stand-in opens."""
+        with tempfile.TemporaryDirectory(prefix="efso_t1c_workflow_guard_neg_") as td:
+            tmp_root = Path(td)
+            synth_data_dir = tmp_root / "data"
+            synth_data_dir.mkdir(parents=True, exist_ok=True)
+            synth_db = synth_data_dir / "radar.db"
+            synth_state = synth_data_dir / "state.json"
+            db_sentinel = b"SYNTHETIC_RADAR_DB_SENTINEL"
+            state_sentinel = b'{"synthetic_sentinel": true}'
+            synth_db.write_bytes(db_sentinel)
+            synth_state.write_bytes(state_sentinel)
+
+            allowed_file = tmp_root / "allowed_preview_note.txt"
+            allowed_file.write_text("allowed-synthetic-content", encoding="utf-8")
+
+            observed_targets: list[Path] = []
+            mock_sqlite = MagicMock()
+            mock_builtins_open = MagicMock(side_effect=lambda *a, **kw: io.StringIO("ok"))
+            mock_io_open = MagicMock(side_effect=lambda *a, **kw: io.StringIO("ok"))
+            mock_path_open = MagicMock(side_effect=lambda *a, **kw: io.StringIO("ok"))
+            mock_os_open = MagicMock(return_value=99)
+
+            repo_data_dir = Path(__file__).resolve().parent.parent / "data"
+            g_sqlite, g_builtins_open, g_io_open, g_path_open, g_os_open = _build_workflow_isolation_guards(
+                synth_db=synth_db,
+                synth_state=synth_state,
+                synth_data_dir=synth_data_dir,
+                repo_data_dir=repo_data_dir,
+                observed_sqlite_targets=observed_targets,
+                sqlite_delegate=mock_sqlite,
+                builtins_open_delegate=mock_builtins_open,
+                io_open_delegate=mock_io_open,
+                path_open_delegate=mock_path_open,
+                os_open_delegate=mock_os_open,
+            )
+
+            outside_non_ephemeral = tmp_root / "non_ephemeral.db"
+            outside_uri = f"file:{outside_non_ephemeral.resolve().as_posix()}"
+            if not outside_uri.startswith("file:///"):
+                outside_uri = f"file:///{outside_non_ephemeral.resolve().as_posix().lstrip('/')}"
+
+            with (
+                patch("sqlite3.connect", side_effect=g_sqlite),
+                patch("builtins.open", side_effect=g_builtins_open),
+                patch("io.open", side_effect=g_io_open),
+                patch.object(Path, "open", g_path_open),
+                patch("os.open", side_effect=g_os_open),
+            ):
+                # 1. Adversarial SQLite targets fail closed before delegate invocation
+                for bad_args, bad_kwargs in [
+                    ((synth_db,), {}),
+                    ((outside_non_ephemeral,), {}),
+                    ((f"{outside_uri}?note=mode=memory",), {"uri": True}),
+                    ((f"{outside_uri}?mode=memory&mode=rwc",), {"uri": True}),
+                    ((f"{outside_uri}#?mode=memory",), {"uri": True}),
+                    ((":memory:",), {}),
+                    (("file::memory:?cache=shared",), {"uri": True}),
+                    (("file::memory:?cache=shared",), {"uri": False}),
+                    (("",), {}),
+                    ((None,), {}),
+                ]:
+                    with self.assertRaises(AssertionError):
+                        sqlite3.connect(*bad_args, **bad_kwargs)
+                    mock_sqlite.assert_not_called()
+
+                # 2. Read-only open attempts across Path.read_text, Path.open, io.open, builtins.open, os.open fail closed
+                with self.assertRaises(AssertionError):
+                    synth_state.read_text(encoding="utf-8")
+                with self.assertRaises(AssertionError):
+                    synth_state.open("r", encoding="utf-8")
+                with self.assertRaises(AssertionError):
+                    io.open(synth_state, "r", encoding="utf-8")
+                with self.assertRaises(AssertionError):
+                    builtins.open(synth_state, "r", encoding="utf-8")
+                with self.assertRaises(AssertionError):
+                    os.open(synth_state, os.O_RDONLY)
+
+                with self.assertRaises(AssertionError):
+                    synth_db.read_bytes()
+                with self.assertRaises(AssertionError):
+                    io.open(synth_db, "rb")
+                with self.assertRaises(AssertionError):
+                    builtins.open(synth_db, "rb")
+                with self.assertRaises(AssertionError):
+                    os.open(synth_db, os.O_RDONLY)
+
+                mock_path_open.assert_not_called()
+                mock_io_open.assert_not_called()
+                mock_builtins_open.assert_not_called()
+                mock_os_open.assert_not_called()
+
+                # 3. Positive controls delegate cleanly
+                ephemeral_db = Path(tempfile.gettempdir()) / "efso_preview_scan_pos_ctrl" / "preview_radar.db"
+                sqlite3.connect(ephemeral_db)
+                mock_sqlite.assert_called_once()
+                self.assertEqual(len(observed_targets), 1)
+
+                self.assertEqual(allowed_file.read_text(encoding="utf-8"), "ok")
+                mock_path_open.assert_called_once()
+                io.open(allowed_file, "r")
+                mock_io_open.assert_called_once()
+                builtins.open(allowed_file, "r")
+                mock_builtins_open.assert_called_once()
+                os.open(allowed_file, os.O_RDONLY)
+                mock_os_open.assert_called_once()
 
             self.assertEqual(synth_db.read_bytes(), db_sentinel)
             self.assertEqual(synth_state.read_bytes(), state_sentinel)

@@ -2,6 +2,7 @@
 import os
 import tempfile
 import unittest
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -276,6 +277,247 @@ class TestConfig(unittest.TestCase):
                     Settings.from_env(environ={"EFSO_STORAGE_MODE": "postgres"})
 
                 self.assertEqual(dict(os.environ), original_env)
+
+    def test_from_env_dotenv_duplicate_keys_preserve_first_occurrence_precedence(self):
+        with tempfile.TemporaryDirectory(prefix="efso_t1c_cfg_dupkeys_") as td:
+            tmp_path = Path(td)
+            ordinary_env = tmp_path / "ordinary_dups.env"
+            ordinary_env.write_text(
+                "\n".join([
+                    "MIN_SCORE=77",
+                    "MIN_SCORE=91",
+                    "GEMINI_MODEL=first-synth",
+                    "GEMINI_MODEL=second-synth",
+                ]),
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"PREEXISTING": "keep"}, clear=True):
+                original_env = dict(os.environ)
+
+                s_ordinary = Settings.from_env(env_file=ordinary_env, environ={})
+                self.assertEqual(s_ordinary.min_score, 77)
+                self.assertEqual(s_ordinary.gemini_model, "first-synth")
+
+                for key in (
+                    "MAX_ESTIMATED_RUN_COST_USD",
+                    "MAX_MONTHLY_AI_COST_USD",
+                    "MAX_SHADOW_EVAL_BUDGET_USD",
+                ):
+                    # Order A: positive first, zero second -> must fail closed (first wins)
+                    pos_first_env = tmp_path / f"{key.lower()}_pos_first.env"
+                    pos_first_env.write_text(
+                        f"{key}=0.05\n{key}=0.00\n",
+                        encoding="utf-8",
+                    )
+                    with self.subTest(order="positive_first", key=key):
+                        with self.assertRaisesRegex(ValueError, "Positive AI monetary budgets"):
+                            Settings.from_env(env_file=pos_first_env)
+                        with self.assertRaisesRegex(ValueError, "Positive AI monetary budgets"):
+                            Settings.from_env(env_file=pos_first_env, environ={})
+
+                    # Order B: zero first, positive second -> legacy first-wins accepts zero
+                    zero_first_env = tmp_path / f"{key.lower()}_zero_first.env"
+                    zero_first_env.write_text(
+                        f"{key}=0.00\n{key}=0.05\n",
+                        encoding="utf-8",
+                    )
+                    with self.subTest(order="zero_first", key=key):
+                        s_zero = Settings.from_env(env_file=zero_first_env, environ={})
+                        self.assertEqual(s_zero.max_monthly_ai_cost_usd, 0.0)
+                        self.assertEqual(s_zero.max_estimated_run_cost_usd, 0.0)
+                        self.assertEqual(s_zero.max_shadow_eval_budget_usd, 0.0)
+
+                    # Explicit OS and injected overrides win over positive-first dotenv
+                    s_override_env = Settings.from_env(env_file=pos_first_env, environ={key: "0.00"})
+                    self.assertEqual(s_override_env.max_monthly_ai_cost_usd, 0.0)
+                    with patch.dict(os.environ, {key: "0.00"}, clear=True):
+                        s_override_os = Settings.from_env(env_file=pos_first_env)
+                        self.assertEqual(s_override_os.max_monthly_ai_cost_usd, 0.0)
+
+                # Empty-string OS and supplied overrides override duplicate dotenv values
+                turso_dup_env = tmp_path / "turso_dup.env"
+                turso_dup_env.write_text(
+                    "\n".join([
+                        "TURSO_DATABASE_URL=libsql://first.example.invalid",
+                        "TURSO_DATABASE_URL=libsql://second.example.invalid",
+                        "TURSO_AUTH_TOKEN=synth-token",
+                    ]),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(ValueError, "Partial Turso configuration detected"):
+                    Settings.from_env(env_file=turso_dup_env, environ={"TURSO_DATABASE_URL": ""})
+                with patch.dict(os.environ, {"TURSO_DATABASE_URL": ""}, clear=True):
+                    with self.assertRaisesRegex(ValueError, "Partial Turso configuration detected"):
+                        Settings.from_env(env_file=turso_dup_env)
+
+                self.assertEqual(dict(os.environ), original_env)
+
+    def test_from_env_windows_case_insensitive_normalization_semantics(self):
+        contexts = [patch("efso_radar.config._is_case_insensitive_env", return_value=True)]
+        if os.name == "nt":
+            contexts.append(nullcontext())
+
+        with tempfile.TemporaryDirectory(prefix="efso_t1c_cfg_win_") as td:
+            tmp_path = Path(td)
+            lower_env = tmp_path / "lower.env"
+            lower_env.write_text(
+                "\n".join([
+                    "min_score=79",
+                    "MIN_SCORE=93",
+                    "Gemini_Model=gemini-synth-win",
+                    "ai_evaluation_enabled=false",
+                    "telegram_chat_id=123456789",
+                ]),
+                encoding="utf-8",
+            )
+            turso_partial_lower = tmp_path / "turso_partial_lower.env"
+            turso_partial_lower.write_text(
+                "turso_database_url=libsql://synthetic-win.example.invalid\n",
+                encoding="utf-8",
+            )
+            turso_mode_lower = tmp_path / "turso_mode_lower.env"
+            turso_mode_lower.write_text(
+                "efso_storage_mode=turso\n",
+                encoding="utf-8",
+            )
+            turso_full_lower = tmp_path / "turso_full_lower.env"
+            turso_full_lower.write_text(
+                "turso_database_url=libsql://synthetic-win.example.invalid\n"
+                "turso_auth_token=synthetic-win-token\n",
+                encoding="utf-8",
+            )
+            upper_env = tmp_path / "upper.env"
+            upper_env.write_text(
+                "MIN_SCORE=70\nTURSO_DATABASE_URL=libsql://upper.example.invalid\nTURSO_AUTH_TOKEN=upper-tok\n",
+                encoding="utf-8",
+            )
+
+            for ctx in contexts:
+                with ctx:
+                    with patch.dict(os.environ, {}, clear=True):
+                        original_env = dict(os.environ)
+
+                        # Lowercase/mixed-case dotenv keys and case-insensitive first-wins duplicate
+                        s = Settings.from_env(env_file=lower_env)
+                        self.assertEqual(s.min_score, 79)
+                        self.assertEqual(s.gemini_model, "gemini-synth-win")
+                        self.assertFalse(s.ai_evaluation_enabled)
+                        self.assertEqual(s.telegram_chat_id, "123456789")
+
+                        # Lowercase / mixed-case positive budgets rejected
+                        for idx, bad_budget in enumerate((
+                            "max_monthly_ai_cost_usd=0.05\n",
+                            "Max_Estimated_Run_Cost_Usd=0.01\n",
+                            "max_shadow_eval_budget_usd=0.02\n",
+                        )):
+                            bad_file = tmp_path / f"bad_{idx}.env"
+                            bad_file.write_text(bad_budget, encoding="utf-8")
+                            with self.assertRaisesRegex(ValueError, "Positive AI monetary budgets"):
+                                Settings.from_env(env_file=bad_file)
+
+                        # Case-variant duplicates in both orders
+                        var_pos_first = tmp_path / "var_pos_first.env"
+                        var_pos_first.write_text(
+                            "max_monthly_ai_cost_usd=0.05\nMAX_MONTHLY_AI_COST_USD=0.00\n",
+                            encoding="utf-8",
+                        )
+                        with self.assertRaisesRegex(ValueError, "Positive AI monetary budgets"):
+                            Settings.from_env(env_file=var_pos_first)
+
+                        var_zero_first = tmp_path / "var_zero_first.env"
+                        var_zero_first.write_text(
+                            "Max_Monthly_Ai_Cost_Usd=0.00\nmax_monthly_ai_cost_usd=0.05\n",
+                            encoding="utf-8",
+                        )
+                        s_var_zero = Settings.from_env(env_file=var_zero_first)
+                        self.assertEqual(s_var_zero.max_monthly_ai_cost_usd, 0.0)
+
+                        # Lowercase partial & turso storage mode fail closed
+                        with self.assertRaisesRegex(ValueError, "Partial Turso configuration detected"):
+                            Settings.from_env(env_file=turso_partial_lower)
+                        with self.assertRaisesRegex(ValueError, "Cloud storage mode enabled"):
+                            Settings.from_env(env_file=turso_mode_lower)
+
+                        # OS overrides (including empty string) override lowercase dotenv
+                        with patch.dict(os.environ, {"MIN_SCORE": "94"}, clear=True):
+                            s_os = Settings.from_env(env_file=lower_env)
+                            self.assertEqual(s_os.min_score, 94)
+
+                        with patch.dict(os.environ, {"TURSO_DATABASE_URL": ""}, clear=True):
+                            with self.assertRaisesRegex(ValueError, "Partial Turso configuration detected"):
+                                Settings.from_env(env_file=turso_full_lower)
+
+                        # Injected mixed-case environ overrides uppercase dotenv
+                        with self.assertRaisesRegex(ValueError, "Partial Turso configuration detected"):
+                            Settings.from_env(
+                                env_file=upper_env,
+                                environ={"min_score": "91", "turso_database_url": ""},
+                            )
+                        s_inj = Settings.from_env(
+                            env_file=upper_env,
+                            environ={"min_score": "91"},
+                        )
+                        self.assertEqual(s_inj.min_score, 91)
+
+                        # Conflicting case-variant keys inside injected environ fail closed
+                        with self.assertRaisesRegex(ValueError, "Conflicting case-variant duplicate key"):
+                            Settings.from_env(
+                                environ={
+                                    "MAX_MONTHLY_AI_COST_USD": "0.00",
+                                    "max_monthly_ai_cost_usd": "0.05",
+                                }
+                            )
+                        with self.assertRaisesRegex(ValueError, "Conflicting case-variant duplicate key"):
+                            Settings.from_env(environ={"MIN_SCORE": "90", "min_score": "70"})
+
+                        self.assertEqual(dict(os.environ), original_env)
+
+    def test_from_env_posix_case_sensitive_semantics(self):
+        contexts = [patch("efso_radar.config._is_case_insensitive_env", return_value=False)]
+        if os.name != "nt":
+            contexts.append(nullcontext())
+
+        with tempfile.TemporaryDirectory(prefix="efso_t1c_cfg_posix_") as td:
+            tmp_path = Path(td)
+            lower_only = tmp_path / "lower_only.env"
+            lower_only.write_text(
+                "min_score=74\nmax_monthly_ai_cost_usd=0.05\n",
+                encoding="utf-8",
+            )
+            mixed_with_upper = tmp_path / "mixed_upper.env"
+            mixed_with_upper.write_text(
+                "min_score=74\nMIN_SCORE=91\n",
+                encoding="utf-8",
+            )
+            upper_dup_budget = tmp_path / "upper_dup_budget.env"
+            upper_dup_budget.write_text(
+                "MAX_MONTHLY_AI_COST_USD=0.05\nMAX_MONTHLY_AI_COST_USD=0.00\n",
+                encoding="utf-8",
+            )
+
+            for ctx in contexts:
+                with ctx:
+                    with patch.dict(os.environ, {}, clear=True):
+                        original_env = dict(os.environ)
+
+                        # Case-sensitive POSIX ignores lowercase keys just like legacy os.getenv("UPPER")
+                        s_lower = Settings.from_env(env_file=lower_only)
+                        self.assertEqual(s_lower.min_score, 82)
+                        self.assertEqual(s_lower.max_monthly_ai_cost_usd, 0.0)
+
+                        s_mixed = Settings.from_env(env_file=mixed_with_upper)
+                        self.assertEqual(s_mixed.min_score, 91)
+
+                        # Exact-case duplicate budget still preserves first-occurrence rejection
+                        with self.assertRaisesRegex(ValueError, "Positive AI monetary budgets"):
+                            Settings.from_env(env_file=upper_dup_budget)
+
+                        # Injected environ remains case-sensitive (distinct keys allowed)
+                        s_inj = Settings.from_env(environ={"min_score": "70", "MIN_SCORE": "91"})
+                        self.assertEqual(s_inj.min_score, 91)
+
+                        self.assertEqual(dict(os.environ), original_env)
 
     def test_quiet_hours_cross_midnight(self):
         s = Settings(

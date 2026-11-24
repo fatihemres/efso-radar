@@ -15,8 +15,17 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 _DEFAULT_ENV_FILE: Any = object()
 
 
-def _parse_dotenv_file(env_path: Path) -> dict[str, str]:
-    """Parse key=value pairs from a dotenv file without mutating os.environ."""
+def _is_case_insensitive_env() -> bool:
+    """Return True on platforms with case-insensitive OS environment keys (Windows)."""
+    return os.name == "nt"
+
+
+def _parse_dotenv_file(env_path: Path, *, case_insensitive: bool = False) -> dict[str, str]:
+    """Parse key=value pairs from a dotenv file without mutating os.environ.
+
+    Preserves legacy first-occurrence-wins precedence when duplicate keys appear
+    (normalizing keys case-insensitively on Windows when ``case_insensitive=True``).
+    """
     parsed: dict[str, str] = {}
     for line in env_path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -28,7 +37,9 @@ def _parse_dotenv_file(env_path: Path) -> dict[str, str]:
             v = v.strip()
             if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
                 v = v[1:-1]
-            parsed[k] = v
+            norm_k = k.upper() if case_insensitive else k
+            if norm_k not in parsed:
+                parsed[norm_k] = v
     return parsed
 
 
@@ -339,12 +350,23 @@ class Settings(BaseModel):
                 ``env_file``, dotenv loading defaults to disabled for hermetic safety.
             environ: Optional mapping used in place of ``os.environ`` (keys/values
                 must be strings). Neither OS environment nor supplied mappings are
-                mutated. Precedence remains: ``environ`` (or ``os.environ``) overrides
-                dotenv values, which override field defaults.
+                mutated.
+
+        Precedence & normalization semantics:
+            - Duplicate keys in a dotenv file preserve legacy first-occurrence-wins
+              behavior.
+            - Environment keys follow host platform semantics: case-insensitive
+              (normalized to uppercase on Windows ``os.name == "nt"``) and
+              case-sensitive on POSIX/Linux.
+            - When ``environ`` is explicitly supplied on a case-insensitive host,
+              conflicting case-variant duplicate keys fail closed with ``ValueError``.
+            - ``environ`` / ``os.environ`` entries (including empty string ``""``)
+              always override dotenv values, which override field defaults.
         """
         if load_dotenv is not None and not isinstance(load_dotenv, bool):
             raise TypeError("load_dotenv must be a bool or None")
 
+        case_insensitive = _is_case_insensitive_env()
         if environ is not None:
             if not isinstance(environ, Mapping):
                 raise TypeError("environ must be a Mapping[str, str] or None")
@@ -352,9 +374,15 @@ class Settings(BaseModel):
             for k, v in environ.items():
                 if not isinstance(k, str) or not isinstance(v, str):
                     raise TypeError("environ keys and values must be strings")
-                base_env[k] = v
+                norm_k = k.upper() if case_insensitive else k
+                if case_insensitive and norm_k in base_env:
+                    raise ValueError(f"Conflicting case-variant duplicate key in environ: {k!r}")
+                base_env[norm_k] = v
         else:
-            base_env = dict(os.environ)
+            base_env = {}
+            for k, v in os.environ.items():
+                norm_k = k.upper() if case_insensitive else k
+                base_env.setdefault(norm_k, v)
 
         explicit_env_path: Optional[Path] = None
         if env_file is not _DEFAULT_ENV_FILE and env_file is not None:
@@ -391,7 +419,10 @@ class Settings(BaseModel):
             if target_env_file.exists():
                 if not target_env_file.is_file():
                     raise ValueError(f"Configured env_file is not a regular file: {target_env_file}")
-                dotenv_values = _parse_dotenv_file(target_env_file)
+                dotenv_values = _parse_dotenv_file(
+                    target_env_file,
+                    case_insensitive=case_insensitive,
+                )
 
         # Preserve OS/supplied env > dotenv precedence without mutating os.environ.
         env_values: dict[str, str] = dict(dotenv_values)
