@@ -13,12 +13,16 @@ Verifies:
 from __future__ import annotations
 
 import json
+import os
+import re
 import sqlite3
 import tempfile
 import unittest
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
+from unittest.mock import MagicMock, patch
 
 import httpx
 
@@ -151,12 +155,205 @@ def create_mock_hrana_transport(conn: sqlite3.Connection) -> httpx.BaseTransport
     return MockHranaTransport()
 
 
+def _extract_sqlite_connect_args(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, bool]:
+    """Extract (database, uri) strictly matching sqlite3.connect's signature."""
+    if args and "database" in kwargs:
+        raise AssertionError("Ambiguous duplicate 'database' argument to sqlite3.connect")
+    if "uri" in kwargs and len(args) >= 8:
+        raise AssertionError("Ambiguous duplicate 'uri' argument to sqlite3.connect")
+    if args:
+        database = args[0]
+    elif "database" in kwargs:
+        database = kwargs["database"]
+    else:
+        raise AssertionError("sqlite3.connect invoked without a database argument")
+    uri_raw = kwargs["uri"] if "uri" in kwargs else (args[7] if len(args) >= 8 else False)
+    if not isinstance(uri_raw, bool):
+        raise AssertionError(f"Ambiguous non-boolean uri={uri_raw!r} passed to sqlite3.connect")
+    return database, uri_raw
+
+
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+_CANONICAL_MEMORY_URIS = frozenset({
+    "file::memory:",
+    "file::memory:?cache=shared",
+    "file::memory:?cache=private",
+    "file::memory:?mode=memory",
+    "file::memory:?mode=memory&cache=shared",
+    "file::memory:?cache=shared&mode=memory",
+    "file::memory:?mode=memory&cache=private",
+    "file::memory:?cache=private&mode=memory",
+})
+
+_CANONICAL_NAMED_MEMORY_URI_RE = re.compile(
+    r"\Afile:[A-Za-z0-9_-]+\?(?:mode=memory|mode=memory&cache=(?:shared|private)|cache=(?:shared|private)&mode=memory)\Z"
+)
+
+_ALLOWED_DISK_URI_QUERY_VALUES: dict[str, frozenset[str]] = {
+    "mode": frozenset({"ro", "rw", "rwc"}),
+    "cache": frozenset({"shared", "private"}),
+    "immutable": frozenset({"0", "1"}),
+}
+
+
+def _strict_unquote_no_nul(component: str, *, full_uri: str, label: str) -> str:
+    """Strictly percent-decode a UTF-8 URI component, rejecting malformed escapes or decoded NUL."""
+    i = 0
+    n = len(component)
+    while i < n:
+        if component[i] == "%":
+            if i + 2 >= n or component[i + 1] not in _HEX_DIGITS or component[i + 2] not in _HEX_DIGITS:
+                raise AssertionError(f"Malformed percent-encoding in SQLite URI {label}: {full_uri!r}")
+            i += 3
+        else:
+            i += 1
+    raw_bytes = urllib.parse.unquote_to_bytes(component)
+    if b"\x00" in raw_bytes:
+        raise AssertionError(f"Decoded NUL byte in SQLite URI {label} rejected: {full_uri!r}")
+    try:
+        decoded = raw_bytes.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise AssertionError(f"Invalid UTF-8 percent-encoding in SQLite URI {label}: {full_uri!r}") from exc
+    if "\x00" in decoded:
+        raise AssertionError(f"Decoded NUL character in SQLite URI {label} rejected: {full_uri!r}")
+    return decoded
+
+
+def _classify_sqlite_connect_target(database: Any, *, uri: bool = False) -> tuple[str, Optional[Path]]:
+    """Fail-closed classifier for sqlite3.connect targets."""
+    if isinstance(database, os.PathLike):
+        raw_obj = os.fspath(database)
+    else:
+        raw_obj = database
+
+    if isinstance(raw_obj, bytes):
+        try:
+            raw_str = os.fsdecode(raw_obj)
+        except Exception as exc:
+            raise AssertionError(f"Non-decodable SQLite database bytes rejected: {database!r}") from exc
+    elif isinstance(raw_obj, str):
+        raw_str = raw_obj
+    else:
+        raise AssertionError(f"Unsupported SQLite database target type: {type(database).__name__}")
+
+    if "\x00" in raw_str or not raw_str or not raw_str.strip():
+        raise AssertionError(f"Empty or null-byte SQLite target rejected: {raw_str!r}")
+
+    if raw_str == ":memory:":
+        return ("memory", None)
+    if raw_str.strip() == ":memory:":
+        raise AssertionError(f"Whitespace-padded :memory: SQLite target rejected: {raw_str!r}")
+
+    if not uri:
+        if raw_str.lower().startswith("file:"):
+            raise AssertionError(
+                f"SQLite file: string with uri=False opens literal disk file; rejected: {raw_str!r}"
+            )
+        return ("disk", Path(raw_str).resolve())
+
+    if not raw_str.startswith("file:"):
+        if raw_str.lower().startswith("file:"):
+            raise AssertionError(f"Non-lowercase SQLite file: URI scheme rejected: {raw_str!r}")
+        return ("disk", Path(raw_str).resolve())
+
+    if raw_str in _CANONICAL_MEMORY_URIS or _CANONICAL_NAMED_MEMORY_URI_RE.fullmatch(raw_str):
+        return ("memory", None)
+
+    if "#" in raw_str:
+        raise AssertionError(f"SQLite URI fragment rejected fail-closed: {raw_str!r}")
+
+    raw_path_part, has_query, raw_query = raw_str[5:].partition("?")
+    if has_query:
+        if raw_query == "":
+            raise AssertionError(f"Empty trailing query in SQLite URI rejected: {raw_str!r}")
+        seen_keys: set[str] = set()
+        for segment in raw_query.split("&"):
+            if not segment or "=" not in segment:
+                raise AssertionError(f"Malformed SQLite URI query parameter rejected: {raw_str!r}")
+            k_raw, v_raw = segment.split("=", 1)
+            k = _strict_unquote_no_nul(k_raw, full_uri=raw_str, label="query key")
+            v = _strict_unquote_no_nul(v_raw, full_uri=raw_str, label="query value")
+            if k in seen_keys:
+                raise AssertionError(f"Duplicate SQLite URI query key {k!r} rejected: {raw_str!r}")
+            seen_keys.add(k)
+            allowed_vals = _ALLOWED_DISK_URI_QUERY_VALUES.get(k)
+            if allowed_vals is None or v not in allowed_vals:
+                raise AssertionError(
+                    f"Unsupported or ambiguous SQLite URI query parameter {k}={v!r} rejected: {raw_str!r}"
+                )
+
+    if raw_path_part.startswith("//"):
+        after_slashes = raw_path_part[2:]
+        if "/" not in after_slashes:
+            raise AssertionError(f"Malformed SQLite URI authority rejected: {raw_str!r}")
+        authority, rest = after_slashes.split("/", 1)
+        if authority.lower() not in ("", "localhost"):
+            raise AssertionError(f"Unsupported SQLite URI authority {authority!r} rejected: {raw_str!r}")
+        decoded_rest = _strict_unquote_no_nul(rest, full_uri=raw_str, label="path")
+        if not decoded_rest:
+            raise AssertionError(f"Empty path in SQLite authority URI rejected: {raw_str!r}")
+        if os.name == "nt" and len(decoded_rest) >= 2 and decoded_rest[0].isalpha() and decoded_rest[1] == ":":
+            disk_path_str = decoded_rest
+        else:
+            disk_path_str = "/" + decoded_rest
+    else:
+        disk_path_str = _strict_unquote_no_nul(raw_path_part, full_uri=raw_str, label="path")
+
+    if disk_path_str.startswith(":memory:"):
+        raise AssertionError(f"Non-canonical :memory: SQLite URI rejected: {raw_str!r}")
+
+    if not disk_path_str.strip():
+        raise AssertionError(f"Empty disk path in SQLite URI rejected: {raw_str!r}")
+
+    return ("disk", Path(disk_path_str).resolve())
+
+
 class TestPhase5B3C2StagingPreflight(unittest.TestCase):
     """Test suite for cloud staging preflight, recovery inspection, and cutover readiness."""
+
+    def _assert_sqlite_target_isolated(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+        database, uri = _extract_sqlite_connect_args(args, kwargs)
+        kind, resolved = _classify_sqlite_connect_target(database, uri=uri)
+        if kind == "memory":
+            self._observed_sqlite_targets.append(":memory:")
+            return
+        assert resolved is not None
+        if resolved == self._synthetic_standin_resolved:
+            raise AssertionError(f"SQLite connection targeted synthetic stand-in DB: {resolved}")
+        try:
+            resolved.relative_to(self._tmp_root_resolved)
+        except ValueError as exc:
+            raise AssertionError(
+                f"SQLite connection escaped test temporary root: {resolved}"
+            ) from exc
+        self._observed_sqlite_targets.append(str(resolved))
+
+    def _build_sqlite_guard(self, delegate: Any) -> Any:
+        def _guarded_spy_sqlite_connect(*args: Any, **kwargs: Any) -> Any:
+            self._assert_sqlite_target_isolated(args, kwargs)
+            return delegate(*args, **kwargs)
+
+        return _guarded_spy_sqlite_connect
 
     def setUp(self):
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.tmp_path = Path(self.tmp_dir.name)
+        self._tmp_root_resolved = self.tmp_path.resolve()
+        self._observed_sqlite_targets: list[str] = []
+
+        # Synthetic operational DB stand-in with sentinel bytes (must remain untouched)
+        standin_dir = self.tmp_path / "synthetic_standin_data"
+        standin_dir.mkdir(parents=True, exist_ok=True)
+        self.synthetic_standin_db_path = standin_dir / "radar.db"
+        self.synthetic_standin_initial_bytes = b"SYNTHETIC_OPERATIONAL_STANDIN_UNTOUCHED"
+        self.synthetic_standin_db_path.write_bytes(self.synthetic_standin_initial_bytes)
+        self._synthetic_standin_resolved = self.synthetic_standin_db_path.resolve()
+
+        prev_sqlite_connect = sqlite3.connect
+        self._sqlite_patcher = patch("sqlite3.connect", side_effect=self._build_sqlite_guard(prev_sqlite_connect))
+        self._sqlite_patcher.start()
+        self.addCleanup(self._sqlite_patcher.stop)
 
         # 1. SQLite synthetic repository
         self.sqlite_db_path = self.tmp_path / "test_staging_sqlite.db"
@@ -176,7 +373,7 @@ class TestPhase5B3C2StagingPreflight(unittest.TestCase):
             init_schema=True,
         )
 
-               # Normalize synthetic migration metadata for exact parity tests.
+        # Normalize synthetic migration metadata for exact parity tests.
         fixture_applied_at = "2026-10-20T10:00:00+00:00"
         fixture_description = "Synthetic schema v6 initialization"
 
@@ -198,34 +395,23 @@ class TestPhase5B3C2StagingPreflight(unittest.TestCase):
             """,
             (fixture_applied_at, fixture_description, CURRENT_SCHEMA_VERSION),
         )
-        # Operational DB snapshot check
-        self.op_db_path = Path("data/radar.db")
-        self.op_db_existed = self.op_db_path.exists()
-        if self.op_db_existed:
-            self.op_db_initial_stat = self.op_db_path.stat()
 
     def tearDown(self):
         self.turso_conn.close()
         import gc
         gc.collect()
         try:
-            self.tmp_dir.cleanup()
-        except Exception:
-            pass
-
-        # Enforce operational DB untouched invariant
-        if self.op_db_existed:
-            current_stat = self.op_db_path.stat()
             self.assertEqual(
-                self.op_db_initial_stat.st_mtime,
-                current_stat.st_mtime,
-                "CRITICAL: data/radar.db mtime changed during test execution!",
+                self.synthetic_standin_db_path.read_bytes(),
+                self.synthetic_standin_initial_bytes,
+                "CRITICAL: synthetic stand-in operational database bytes changed during test execution!",
             )
-            self.assertEqual(
-                self.op_db_initial_stat.st_size,
-                current_stat.st_size,
-                "CRITICAL: data/radar.db size changed during test execution!",
-            )
+            self.assertGreaterEqual(len(self._observed_sqlite_targets), 1)
+        finally:
+            try:
+                self.tmp_dir.cleanup()
+            except Exception:
+                pass
 
     # =========================================================================
     # Part 1: Read-Only Cloud Preflight Tests
@@ -418,14 +604,23 @@ class TestPhase5B3C2StagingPreflight(unittest.TestCase):
             execute_read_query(self.sqlite_repo, "DROP TABLE stories")
 
     def test_12_preflight_fails_closed_on_operational_radar_db(self):
-        """CloudPreflightValidator raises PermissionError if initialized with operational data/radar.db."""
-        # Test inert mock pointing to real path
+        """CloudPreflightValidator raises PermissionError if initialized with operational data/radar.db paths."""
+        # Test inert mock pointing to synthetic stand-in operational paths in isolated CWD
         class InertProdRepo(SqliteStateRepository):
-            def __init__(self):
-                self.db_path = Path("data/radar.db")
+            def __init__(self, target_path: Path):
+                self.db_path = target_path
 
-        with self.assertRaises(PermissionError):
-            CloudPreflightValidator(InertProdRepo())
+        nested_synth = self.tmp_path / "nested" / "data" / "radar.db"
+        prior_connect_count = len(self._observed_sqlite_targets)
+        orig_cwd = os.getcwd()
+        try:
+            os.chdir(self.tmp_path)
+            for candidate_path in (Path("data/radar.db"), nested_synth):
+                with self.assertRaises(PermissionError):
+                    CloudPreflightValidator(InertProdRepo(candidate_path))
+        finally:
+            os.chdir(orig_cwd)
+        self.assertEqual(len(self._observed_sqlite_targets), prior_connect_count)
 
     # =========================================================================
     # Part 2: Delivery Recovery Inspection Tests
@@ -711,13 +906,22 @@ class TestPhase5B3C2StagingPreflight(unittest.TestCase):
         self.assertIn("ERR_COST_INVARIANT_VIOLATION", codes)
 
     def test_25_cutover_reconciler_fails_closed_on_operational_radar_db(self):
-        """StagingCutoverReconciler raises PermissionError if initialized with operational data/radar.db."""
+        """StagingCutoverReconciler raises PermissionError if initialized with operational data/radar.db paths."""
         class InertProdRepo(SqliteStateRepository):
-            def __init__(self):
-                self.db_path = Path("data/radar.db")
+            def __init__(self, target_path: Path):
+                self.db_path = target_path
 
-        with self.assertRaises(PermissionError):
-            StagingCutoverReconciler(InertProdRepo(), self.turso_repo)
+        nested_synth = self.tmp_path / "nested" / "data" / "radar.db"
+        prior_connect_count = len(self._observed_sqlite_targets)
+        orig_cwd = os.getcwd()
+        try:
+            os.chdir(self.tmp_path)
+            for candidate_path in (Path("data/radar.db"), nested_synth):
+                with self.assertRaises(PermissionError):
+                    StagingCutoverReconciler(InertProdRepo(candidate_path), self.turso_repo)
+        finally:
+            os.chdir(orig_cwd)
+        self.assertEqual(len(self._observed_sqlite_targets), prior_connect_count)
 
     # =========================================================================
     # Part 4: Read-only SQL validation regression tests
@@ -1343,6 +1547,95 @@ class TestPhase5B3C2StagingPreflight(unittest.TestCase):
             self.assertNotIn(arbitrary_exc_secret, err)
             self.assertNotIn(arbitrary_db_secret, err)
             self.assertTrue(err.endswith(": RuntimeError"), err)
+
+    def test_51_sqlite_guard_rejects_masqueraded_memory_uris_and_ambiguous_targets_before_delegate(self):
+        """Adversarial regression: disk-backed URIs spoofing memory parameters reject before delegating."""
+        with tempfile.TemporaryDirectory(prefix="efso_t1c_5b3c2_outside_") as outside_td:
+            outside_db = (Path(outside_td) / "synthetic_outside.db").resolve()
+            outside_uri = f"file:{outside_db.as_posix()}"
+            if not outside_uri.startswith("file:///"):
+                outside_uri = f"file:///{outside_db.as_posix().lstrip('/')}"
+
+            standin_uri = f"file:{self._synthetic_standin_resolved.as_posix()}"
+            if not standin_uri.startswith("file:///"):
+                standin_uri = f"file:///{self._synthetic_standin_resolved.as_posix().lstrip('/')}"
+
+            mock_delegate = MagicMock()
+            guarded_connect = self._build_sqlite_guard(mock_delegate)
+
+            with patch("sqlite3.connect", side_effect=guarded_connect):
+                # 1. Stand-in DB and outside DB with masqueraded ?note=mode=memory reject before delegate
+                for target_uri in (standin_uri, outside_uri):
+                    with self.assertRaises(AssertionError):
+                        sqlite3.connect(f"{target_uri}?note=mode=memory", uri=True)
+                    mock_delegate.assert_not_called()
+
+                    with self.assertRaises(AssertionError):
+                        sqlite3.connect(f"{target_uri}?note=mode=memory", 5.0, 0, "", True, sqlite3.Connection, 128, True)
+                    mock_delegate.assert_not_called()
+
+                    with self.assertRaises(AssertionError):
+                        sqlite3.connect(database=f"{target_uri}?note=mode=memory", uri=True)
+                    mock_delegate.assert_not_called()
+
+                # 2. Ambiguous, conflicting, encoded-NUL, malformed percent-encoding, and unsupported targets
+                adversarial_calls = [
+                    # Reviewer #2 exact NUL query-key reproducers
+                    (("file:synth?mode=memory&mode%00=rwc",), {"uri": True}),
+                    (("file:synth2?mode=memory&mode%00junk=rwc",), {"uri": True}),
+                    (("file:synth3?mode=memory&mo%64e%00=rwc",), {"uri": True}),
+                    # Encoded NUL in query values & paths
+                    (("file:synth4?mode=memory%00",), {"uri": True}),
+                    (("file:synth5?mode=memory&cache=shared%00",), {"uri": True}),
+                    (("file:synth6?mode=ro%00",), {"uri": True}),
+                    ((f"{outside_uri}%00?mode=ro",), {"uri": True}),
+                    # Malformed & invalid UTF-8 percent-encodings across key, value, path
+                    (("file:synth7?mode=memory&bad=%zz",), {"uri": True}),
+                    (("file:synth8?mode=%2",), {"uri": True}),
+                    (("file:synth9?%zz=1",), {"uri": True}),
+                    (("file:synth%zz.db?mode=ro",), {"uri": True}),
+                    (("file:synth%ff.db?mode=ro",), {"uri": True}),
+                    # Non-canonical / trailing whitespace / masqueraded URIs
+                    (("file:radar.db?mode=memory",), {"uri": True}),
+                    (("file:legit?mode=memory\n",), {"uri": True}),
+                    (("file:synth.db?",), {"uri": True}),
+                    ((f"{outside_uri}?mode=memory&mode=rwc",), {"uri": True}),
+                    ((f"{outside_uri}#?mode=memory",), {"uri": True}),
+                    ((f"{outside_uri}?mode=memory",), {"uri": True}),
+                    ((f"{standin_uri}?mode=ro",), {"uri": True}),
+                    (("file::memory:masquerade",), {"uri": True}),
+                    (("file::memory:?cache=shared",), {"uri": False}),
+                    (("FILE:memdb?mode=memory",), {"uri": True}),
+                    (("file://evilhost.example/x.db?mode=ro",), {"uri": True}),
+                    ((" :memory: ",), {}),
+                    (("",), {}),
+                    ((None,), {}),
+                    ((123,), {}),
+                ]
+                for call_args, call_kwargs in adversarial_calls:
+                    with self.subTest(call_args=call_args, call_kwargs=call_kwargs):
+                        mock_delegate.reset_mock()
+                        with self.assertRaises(AssertionError):
+                            sqlite3.connect(*call_args, **call_kwargs)
+                        mock_delegate.assert_not_called()
+
+                self.assertFalse(outside_db.exists())
+
+                # 3. Legitimate exact memory and sandboxed temp-disk positive controls delegate cleanly
+                inside_uri = f"file:{self.sqlite_db_path.resolve().as_posix()}?mode=ro"
+                for pos_args, pos_kwargs in [
+                    ((":memory:",), {}),
+                    ((":memory:",), {"uri": True}),
+                    (("file::memory:",), {"uri": True}),
+                    (("file::memory:?cache=shared",), {"uri": True}),
+                    (("file:legit?mode=memory",), {"uri": True}),
+                    (("file:synth_mem?mode=memory&cache=shared",), {"uri": True}),
+                    ((inside_uri,), {"uri": True}),
+                ]:
+                    with self.subTest(positive_args=pos_args, positive_kwargs=pos_kwargs):
+                        mock_delegate.reset_mock()
+                        sqlite3.connect(*pos_args, **pos_kwargs)
+                        mock_delegate.assert_called_once()
 
 
 if __name__ == "__main__":
