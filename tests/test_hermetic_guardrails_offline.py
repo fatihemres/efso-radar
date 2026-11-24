@@ -665,6 +665,55 @@ def test_sqlite_policy_windows_and_posix_path_semantics_without_remote_probes(
         (r"C:\tmp\data.\radar.db", False),
         (r"C:\tmp\radar.db.", False),
         (r"C:\tmp\data \radar.db", False),
+        # Review #1 P1: Windows superscript COM/LPT aliases & pre-extension spaces (raw + percent-encoded)
+        (r"C:\synthetic\COM¹.db", False),
+        (r"C:\synthetic\COM².db", False),
+        (r"C:\synthetic\COM³.db", False),
+        (r"C:\synthetic\LPT¹.db", False),
+        (r"C:\synthetic\LPT².db", False),
+        (r"C:\synthetic\LPT³.db", False),
+        ("com¹", False),
+        ("lpt².db", False),
+        ("COM¹ .db", False),
+        ("LPT³ .db", False),
+        (r"C:\synthetic\NUL .db", False),
+        (r"C:\synthetic\CON .db", False),
+        (r"C:\synthetic\PRN  .sqlite", False),
+        (r"C:\synthetic\AUX .db", False),
+        (r"C:\synthetic\CONIN$ .db", False),
+        (r"C:\synthetic\CONOUT$ .db", False),
+        (r"C:\synthetic\COM1 .db", False),
+        (r"C:\synthetic\LPT9 .db", False),
+        ("file:C:/synthetic/COM%C2%B9.db?mode=ro", True),
+        ("file:C:/synthetic/COM%C2%B2.db?mode=ro", True),
+        ("file:C:/synthetic/COM%C2%B3.db?mode=ro", True),
+        ("file:C:/synthetic/LPT%C2%B9.db?mode=ro", True),
+        ("file:C:/synthetic/LPT%C2%B2.db?mode=ro", True),
+        ("file:C:/synthetic/LPT%C2%B3.db?mode=ro", True),
+        ("file:C:/synthetic/NUL%20.db?mode=ro", True),
+        ("file:C:/synthetic/CON%20%20.db?mode=ro", True),
+        ("file:///C:/synthetic/LPT%C2%B2%20.db?mode=ro", True),
+        # Review #1 P1: Windows reserved & ASCII control chars (raw + percent-encoded)
+        (r"C:\synthetic\bad<name>.db", False),
+        (r"C:\synthetic\bad>name.db", False),
+        (r"C:\synthetic\bad|pipe.db", False),
+        (r'C:\synthetic\bad"quote.db', False),
+        (r"C:\synthetic\bad*star.db", False),
+        (r"C:\synthetic\bad?q.db", False),
+        ("C:\\synthetic\\bad\x01ctrl.db", False),
+        ("C:\\synthetic\\bad\t.db", False),
+        ("C:\\synthetic\\bad\n.db", False),
+        ("C:\\synthetic\\bad\x1f.db", False),
+        ("C:\\synthetic\\bad\x7f.db", False),
+        ("file:C:/synthetic/bad%3Cname%3E.db?mode=ro", True),
+        ("file:C:/synthetic/bad%7C.db?mode=ro", True),
+        ("file:C:/synthetic/bad%2A.db?mode=ro", True),
+        ("file:C:/synthetic/bad%3F.db?mode=ro", True),
+        ("file:C:/synthetic/bad%22.db?mode=ro", True),
+        ("file:C:/synthetic/bad%09.db?mode=ro", True),
+        ("file:C:/synthetic/bad%0A.db?mode=ro", True),
+        ("file:C:/synthetic/bad%1F.db?mode=ro", True),
+        ("file:C:/synthetic/bad%7F.db?mode=ro", True),
     ]
 
     def _forbid_fs_resolution(*_args: object, **_kwargs: object) -> str:
@@ -686,6 +735,11 @@ def test_sqlite_policy_windows_and_posix_path_semantics_without_remote_probes(
         ("file://localhost/C:/tmp/test.db?mode=ro", True, "C:/tmp/test.db"),
         ("sub/test.db", False, "sub/test.db"),
         ("file:sub/test.db?mode=ro", True, "sub/test.db"),
+        (r"C:\synthetic\normal.db", False, r"C:\synthetic\normal.db"),
+        (r"C:\synthetic\console.db", False, r"C:\synthetic\console.db"),
+        (r"C:\synthetic\my_com1.db", False, r"C:\synthetic\my_com1.db"),
+        ("file:C:/synthetic/normal.db?mode=ro", True, "C:/synthetic/normal.db"),
+        ("file:///C:/synthetic/normal%20copy.db?mode=ro", True, "C:/synthetic/normal copy.db"),
     ]
     for good_target, uri_flag, expected_path in win_good_cases:
         parsed = parse_sqlite_connect_call((good_target,), {"uri": uri_flag}, is_windows=True)
@@ -922,3 +976,111 @@ def test_sqlite_guard_real_memory_and_temp_disk_positive_controls_in_disposable_
             assert rw_db.exists()
         finally:
             os.chdir(orig_cwd)
+
+
+def test_lexical_forbidden_targets_reject_without_calling_realpath(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Obviously forbidden lexical operational paths reject BEFORE calling os.path.realpath or delegates."""
+    fake_repo = tmp_path / "synthetic_repo_lex"
+    fake_data = fake_repo / "data"
+    fake_tests = fake_repo / "tests"
+    fake_data.mkdir(parents=True)
+    fake_tests.mkdir(parents=True)
+
+    fake_db = fake_data / "radar.db"
+    fake_state = fake_data / "state.json"
+    fake_env = fake_repo / ".env"
+    fake_alias = fake_data / "alias.db"
+    traversal_db = fake_tests / ".." / "data" / "radar.db"
+    abs_db_uri = f"file:///{os.path.abspath(fake_db).replace(os.sep, '/').lstrip('/')}?mode=ro"
+
+    mock_sqlite = MagicMock()
+    mock_io_open = MagicMock()
+    mock_os_open = MagicMock()
+    mock_unlink = MagicMock()
+    mock_remove = MagicMock()
+    mock_rmtree = MagicMock()
+
+    realpath_calls: list[str] = []
+
+    def _forbid_realpath(path: object, *, strict: bool = False) -> str:
+        realpath_calls.append(os.fspath(path))  # type: ignore[arg-type]
+        raise AssertionError(f"os.path.realpath must not run for obvious lexical rejection: {path!r}")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(conftest, "REPO_ROOT", fake_repo)
+        mp.setattr(conftest, "_ORIG_SQLITE_CONNECT", mock_sqlite)
+        mp.setattr(conftest, "_ORIG_IO_OPEN", mock_io_open)
+        mp.setattr(conftest, "_ORIG_OS_OPEN", mock_os_open)
+        mp.setattr(conftest, "_ORIG_OS_UNLINK", mock_unlink)
+        mp.setattr(conftest, "_ORIG_OS_REMOVE", mock_remove)
+        mp.setattr(conftest, "_ORIG_SHUTIL_RMTREE", mock_rmtree)
+        mp.chdir(fake_repo)
+        mp.setattr(os.path, "realpath", _forbid_realpath)
+
+        # Shared SQLite lexical rejections (direct, traversal, URI, relative, lexical alias in data/)
+        for bad_target, uri_flag in (
+            (fake_db, False),
+            (traversal_db, False),
+            (abs_db_uri, True),
+            ("data/radar.db", False),
+            ("file:data/radar.db?mode=ro", True),
+            (fake_alias, False),
+        ):
+            mock_sqlite.reset_mock()
+            with pytest.raises(HermeticGuardrailError):
+                sqlite3.connect(bad_target, uri=uri_flag)
+            mock_sqlite.assert_not_called()
+
+        # Shared non-SQLite file & destructive lexical rejections
+        with pytest.raises(HermeticGuardrailError):
+            open(fake_state, "r", encoding="utf-8")
+        with pytest.raises(HermeticGuardrailError):
+            open(fake_env, "r", encoding="utf-8")
+        with pytest.raises(HermeticGuardrailError):
+            io.open(fake_db, "rb")
+        with pytest.raises(HermeticGuardrailError):
+            os.open(fake_env, os.O_RDONLY)
+        with pytest.raises(HermeticGuardrailError):
+            os.unlink(fake_state)
+        with pytest.raises(HermeticGuardrailError):
+            os.remove(fake_env)
+        with pytest.raises(HermeticGuardrailError):
+            shutil.rmtree(fake_data)
+
+        assert realpath_calls == []
+        mock_sqlite.assert_not_called()
+        mock_io_open.assert_not_called()
+        mock_os_open.assert_not_called()
+        mock_unlink.assert_not_called()
+        mock_remove.assert_not_called()
+        mock_rmtree.assert_not_called()
+
+    # Stage 2 verification: if REPO_ROOT itself is a symlink alias, only REPO_ROOT is resolved —
+    # never the candidate pointing inside real_repo/data/.
+    repo_link = tmp_path / "repo_link"
+    real_repo = tmp_path / "real_repo"
+    (real_repo / "data").mkdir(parents=True)
+    real_repo_db = real_repo / "data" / "radar.db"
+    norm_repo_link = os.path.normcase(os.path.abspath(os.fspath(repo_link)))
+    stage2_realpath_calls: list[str] = []
+
+    def _spy_repo_only_realpath(path: object, *, strict: bool = False) -> str:
+        norm_p = os.path.normcase(os.path.abspath(os.fspath(path)))  # type: ignore[arg-type]
+        stage2_realpath_calls.append(norm_p)
+        if norm_p == norm_repo_link:
+            return os.path.abspath(os.fspath(real_repo))
+        raise AssertionError(f"Candidate path must not be passed to os.path.realpath: {path!r}")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(conftest, "REPO_ROOT", repo_link)
+        mp.setattr(conftest, "_ORIG_SQLITE_CONNECT", mock_sqlite)
+        mp.setattr(os.path, "realpath", _spy_repo_only_realpath)
+
+        mock_sqlite.reset_mock()
+        with pytest.raises(HermeticGuardrailError):
+            sqlite3.connect(real_repo_db)
+        mock_sqlite.assert_not_called()
+        assert stage2_realpath_calls == [norm_repo_link]

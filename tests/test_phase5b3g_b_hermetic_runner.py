@@ -148,12 +148,20 @@ def _build_runner_isolation_guards(
     os_open_delegate: Any,
 ) -> tuple[Any, Any, Any, Any, Any]:
     """Construct pre-delegation memory-only SQLite and file-open guards for hermetic runner isolation."""
+    data_dir_abs = Path(os.path.abspath(data_dir))
     data_dir_res = data_dir.resolve()
+    repo_data_abs = Path(os.path.abspath(repo_data_dir))
     repo_data_res = repo_data_dir.resolve()
     forbidden_resolved = {
         standin_db.resolve(),
         standin_state.resolve(),
         standin_env.resolve(),
+    }
+    forbidden_lexical = {
+        Path(os.path.abspath(standin_db)),
+        Path(os.path.abspath(standin_state)),
+        Path(os.path.abspath(standin_env)),
+        *forbidden_resolved,
     }
 
     def _validate_sqlite_before_delegate(
@@ -193,6 +201,19 @@ def _build_runner_isolation_guards(
         if dir_fd is not None and not os.path.isabs(path_str):
             base_dir = _resolve_dir_fd_fail_closed(dir_fd, op_name)
             path_str = os.path.join(base_dir, path_str)
+        lexical_abs = Path(os.path.abspath(path_str))
+        lexical_lower_name = lexical_abs.name.lower()
+        if (
+            lexical_abs in forbidden_lexical
+            or _is_within_dir(lexical_abs, data_dir_abs)
+            or _is_within_dir(lexical_abs, data_dir_res)
+            or _is_within_dir(lexical_abs, repo_data_abs)
+            or _is_within_dir(lexical_abs, repo_data_res)
+            or ((lexical_lower_name == ".env" or lexical_lower_name.startswith(".env.")) and lexical_lower_name != ".env.example")
+        ):
+            raise AssertionError(
+                f"Runner unexpectedly accessed operational/stand-in path via {op_name}: {lexical_abs}"
+            )
         resolved = Path(path_str).resolve()
         lower_name = resolved.name.lower()
         if (

@@ -183,13 +183,8 @@ class TestPhase5B3C2StagingPreflight(unittest.TestCase):
             return parsed
         assert parsed.lexical_path is not None
         lexical_abs = Path(os.path.abspath(parsed.lexical_path))
-        resolved = Path(parsed.lexical_path).resolve()
-        if (
-            lexical_abs == self._synthetic_standin_abs
-            or lexical_abs == self._synthetic_standin_resolved
-            or resolved == self._synthetic_standin_resolved
-        ):
-            raise AssertionError(f"SQLite connection targeted synthetic stand-in DB: {resolved}")
+        if lexical_abs == self._synthetic_standin_abs or lexical_abs == self._synthetic_standin_resolved:
+            raise AssertionError(f"SQLite connection targeted synthetic stand-in DB: {lexical_abs}")
         if not (
             lexical_abs.is_relative_to(self._tmp_root_abs)
             or lexical_abs.is_relative_to(self._tmp_root_resolved)
@@ -197,6 +192,9 @@ class TestPhase5B3C2StagingPreflight(unittest.TestCase):
             raise AssertionError(
                 f"SQLite connection lexically outside test temporary root: {lexical_abs}"
             )
+        resolved = Path(parsed.lexical_path).resolve()
+        if resolved == self._synthetic_standin_resolved:
+            raise AssertionError(f"SQLite connection targeted synthetic stand-in DB: {resolved}")
         try:
             resolved.relative_to(self._tmp_root_resolved)
         except ValueError as exc:
@@ -1499,6 +1497,24 @@ class TestPhase5B3C2StagingPreflight(unittest.TestCase):
                         mock_delegate.assert_not_called()
 
                 self.assertFalse(outside_db.exists())
+
+                # Lexical-before-resolve guarantee: stand-in & outside lexical targets reject before resolve/realpath
+                def _forbid_resolve(*_args: Any, **_kwargs: Any) -> Any:
+                    raise AssertionError("Resolution must not run for obvious lexical boundary rejections")
+
+                with patch.object(Path, "resolve", _forbid_resolve), patch(
+                    "os.path.realpath", side_effect=_forbid_resolve
+                ):
+                    for bad_args, bad_kwargs in (
+                        ((self.synthetic_standin_db_path,), {}),
+                        ((f"{standin_uri}?mode=ro",), {"uri": True}),
+                        ((outside_db,), {}),
+                        ((f"{outside_uri}?mode=ro",), {"uri": True}),
+                    ):
+                        mock_delegate.reset_mock()
+                        with self.assertRaises(AssertionError):
+                            sqlite3.connect(*bad_args, **bad_kwargs)
+                        mock_delegate.assert_not_called()
 
                 # 3. Legitimate exact memory and sandboxed temp-disk positive controls delegate cleanly
                 inside_uri = f"file:{self.sqlite_db_path.resolve().as_posix()}?mode=ro"

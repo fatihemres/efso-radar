@@ -199,35 +199,37 @@ def _check_disk_path_not_operational(
     *,
     block_repo_root: bool = False,
 ) -> None:
-    """Reject operational targets under both lexical abspath and resolved realpath."""
+    """Reject obvious lexical operational targets before calling realpath, then check resolved symlinks."""
     if not path_str:
         return
 
     norm_repo_abs = os.path.normcase(os.path.abspath(os.fspath(REPO_ROOT)))
-    norm_repo_real = os.path.normcase(os.path.realpath(os.fspath(REPO_ROOT)))
     norm_target_abs = os.path.normcase(os.path.abspath(path_str))
+    if _is_blocked_normalized_path(
+        norm_target_abs,
+        norm_repo_abs,
+        block_repo_root=block_repo_root,
+    ):
+        raise HermeticGuardrailError(
+            f"Hermetic guardrail blocked {operation} on operational path: {path_str!r}"
+        )
+
+    norm_repo_real = os.path.normcase(os.path.realpath(os.fspath(REPO_ROOT)))
+    if norm_repo_real != norm_repo_abs and _is_blocked_normalized_path(
+        norm_target_abs,
+        norm_repo_real,
+        block_repo_root=block_repo_root,
+    ):
+        raise HermeticGuardrailError(
+            f"Hermetic guardrail blocked {operation} on operational path: {path_str!r}"
+        )
+
+    # Only resolve the candidate target after lexical checks pass, defeating symlinks back to REPO_ROOT.
     norm_target_real = os.path.normcase(os.path.realpath(path_str))
-
-    for target_cand, repo_cand in (
-        (norm_target_abs, norm_repo_abs),
-        (norm_target_abs, norm_repo_real),
-    ):
+    repo_candidates = (norm_repo_abs,) if norm_repo_real == norm_repo_abs else (norm_repo_abs, norm_repo_real)
+    for repo_cand in repo_candidates:
         if _is_blocked_normalized_path(
-            target_cand,
-            repo_cand,
-            block_repo_root=block_repo_root,
-        ):
-            raise HermeticGuardrailError(
-                f"Hermetic guardrail blocked {operation} on operational path: {path_str!r}"
-            )
-
-    # Also check realpath to defeat symlinks inside temp dirs pointing back to REPO_ROOT.
-    for target_cand, repo_cand in (
-        (norm_target_real, norm_repo_abs),
-        (norm_target_real, norm_repo_real),
-    ):
-        if _is_blocked_normalized_path(
-            target_cand,
+            norm_target_real,
             repo_cand,
             block_repo_root=block_repo_root,
         ):

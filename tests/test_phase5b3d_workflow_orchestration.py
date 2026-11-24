@@ -357,12 +357,16 @@ def _build_workflow_isolation_guards(
     """Construct pre-delegation SQLite and file-open guards rejecting forbidden paths before delegation."""
     synth_db_abs = Path(os.path.abspath(synth_db))
     synth_db_res = synth_db.resolve()
+    synth_state_abs = Path(os.path.abspath(synth_state))
+    synth_state_res = synth_state.resolve()
     synth_data_abs = Path(os.path.abspath(synth_data_dir))
     synth_data_res = synth_data_dir.resolve()
     repo_data_abs = Path(os.path.abspath(repo_data_dir))
     repo_data_res = repo_data_dir.resolve()
-    forbidden_resolved = {synth_db_res, synth_state.resolve()}
+    forbidden_resolved = {synth_db_res, synth_state_res}
     forbidden_lexical_db = {synth_db_abs, synth_db_res}
+    forbidden_lexical_open = {synth_db_abs, synth_db_res, synth_state_abs, synth_state_res}
+    system_temp_abs = Path(os.path.abspath(tempfile.gettempdir()))
     system_temp_res = Path(tempfile.gettempdir()).resolve()
 
     def _validate_sqlite_before_delegate(
@@ -377,15 +381,22 @@ def _build_workflow_isolation_guards(
                 f"Unexpected non-ephemeral SQLite target during preview: {parsed.raw_database_str!r}"
             )
         lexical_abs = Path(os.path.abspath(parsed.lexical_path))
-        resolved = Path(parsed.lexical_path).resolve()
         if (
             lexical_abs in forbidden_lexical_db
-            or resolved == synth_db_res
             or _is_within_dir(lexical_abs, synth_data_abs)
             or _is_within_dir(lexical_abs, synth_data_res)
-            or _is_within_dir(resolved, synth_data_res)
             or _is_within_dir(lexical_abs, repo_data_abs)
             or _is_within_dir(lexical_abs, repo_data_res)
+        ):
+            raise AssertionError(f"SQLite connect targeted forbidden stand-in/operational data path: {lexical_abs}")
+        if not lexical_abs.parent.name.startswith("efso_preview_scan_") or not (
+            _is_within_dir(lexical_abs, system_temp_abs) or _is_within_dir(lexical_abs, system_temp_res)
+        ):
+            raise AssertionError(f"SQLite connect targeted non-ephemeral location outside preview tempdir: {lexical_abs}")
+        resolved = Path(parsed.lexical_path).resolve()
+        if (
+            resolved == synth_db_res
+            or _is_within_dir(resolved, synth_data_res)
             or _is_within_dir(resolved, repo_data_res)
         ):
             raise AssertionError(f"SQLite connect targeted forbidden stand-in/operational data path: {resolved}")
@@ -417,6 +428,17 @@ def _build_workflow_isolation_guards(
         if dir_fd is not None and not os.path.isabs(path_str):
             base_dir = _resolve_dir_fd_fail_closed(dir_fd, op_name)
             path_str = os.path.join(base_dir, path_str)
+        lexical_abs = Path(os.path.abspath(path_str))
+        lexical_lower_name = lexical_abs.name.lower()
+        if (
+            lexical_abs in forbidden_lexical_open
+            or _is_within_dir(lexical_abs, synth_data_abs)
+            or _is_within_dir(lexical_abs, synth_data_res)
+            or _is_within_dir(lexical_abs, repo_data_abs)
+            or _is_within_dir(lexical_abs, repo_data_res)
+            or ((lexical_lower_name == ".env" or lexical_lower_name.startswith(".env.")) and lexical_lower_name != ".env.example")
+        ):
+            raise AssertionError(f"Preview path unexpectedly opened forbidden/operational target via {op_name}: {lexical_abs}")
         resolved = Path(path_str).resolve()
         lower_name = resolved.name.lower()
         if (
@@ -680,6 +702,28 @@ class TestWorkflowOfflinePreviewIsolation(unittest.TestCase):
                 mock_io_open.assert_not_called()
                 mock_builtins_open.assert_not_called()
                 mock_os_open.assert_not_called()
+
+                # Lexical-before-resolve guarantee: obvious stand-in/non-ephemeral paths reject before resolve/realpath
+                def _forbid_resolve(*_args: Any, **_kwargs: Any) -> Any:
+                    raise AssertionError("Resolution must not run for obvious lexical boundary rejections")
+
+                with patch.object(Path, "resolve", _forbid_resolve), patch(
+                    "os.path.realpath", side_effect=_forbid_resolve
+                ):
+                    for bad_args, bad_kwargs in (
+                        ((synth_db,), {}),
+                        ((outside_non_ephemeral,), {}),
+                        ((f"{outside_uri}?mode=ro",), {"uri": True}),
+                    ):
+                        mock_sqlite.reset_mock()
+                        with self.assertRaises(AssertionError):
+                            sqlite3.connect(*bad_args, **bad_kwargs)
+                        mock_sqlite.assert_not_called()
+
+                    mock_builtins_open.reset_mock()
+                    with self.assertRaises(AssertionError):
+                        builtins.open(synth_state, "r", encoding="utf-8")
+                    mock_builtins_open.assert_not_called()
 
                 # 3. Ephemeral preview disk (direct + URI) and legitimate file positive controls delegate cleanly
                 sqlite3.connect(ephemeral_db)

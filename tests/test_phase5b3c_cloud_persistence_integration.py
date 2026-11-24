@@ -171,7 +171,6 @@ class TestPhase5B3CCloudPersistenceIntegration(unittest.TestCase):
             return parsed
         assert parsed.lexical_path is not None
         lexical_abs = Path(os.path.abspath(parsed.lexical_path))
-        resolved = Path(parsed.lexical_path).resolve()
         if not (
             lexical_abs.is_relative_to(self._tmp_root_abs)
             or lexical_abs.is_relative_to(self._tmp_root_resolved)
@@ -179,6 +178,7 @@ class TestPhase5B3CCloudPersistenceIntegration(unittest.TestCase):
             raise AssertionError(
                 f"SQLite connection lexically outside test temporary root: {lexical_abs}"
             )
+        resolved = Path(parsed.lexical_path).resolve()
         try:
             resolved.relative_to(self._tmp_root_resolved)
         except ValueError as exc:
@@ -785,6 +785,22 @@ class TestPhase5B3CCloudPersistenceIntegration(unittest.TestCase):
                     sqlite3.connect(flip_bad)
                 self.assertEqual(flip_bad.calls, 1)
                 mock_delegate.assert_not_called()
+
+                # Lexical-before-resolve guarantee: outside lexical path rejects without Path.resolve/realpath
+                def _forbid_resolve(*_args: Any, **_kwargs: Any) -> Any:
+                    raise AssertionError("Resolution must not run for obvious lexical outside-root targets")
+
+                with patch.object(Path, "resolve", _forbid_resolve), patch(
+                    "os.path.realpath", side_effect=_forbid_resolve
+                ):
+                    for bad_args, bad_kwargs in (
+                        ((outside_db,), {}),
+                        ((f"{outside_uri}?mode=ro",), {"uri": True}),
+                    ):
+                        mock_delegate.reset_mock()
+                        with self.assertRaises(AssertionError):
+                            sqlite3.connect(*bad_args, **bad_kwargs)
+                        mock_delegate.assert_not_called()
 
             # 4. Disposable-directory confirmation with real SQLite via the active test guard
             with tempfile.TemporaryDirectory(prefix="efso_t1c_5b3c_real_sqlite_") as disp_td:

@@ -85,6 +85,9 @@ _WINDOWS_RESERVED_DEVICE_NAMES: frozenset[str] = frozenset({
     "COM7",
     "COM8",
     "COM9",
+    "COM\u00b9",
+    "COM\u00b2",
+    "COM\u00b3",
     "LPT1",
     "LPT2",
     "LPT3",
@@ -94,7 +97,14 @@ _WINDOWS_RESERVED_DEVICE_NAMES: frozenset[str] = frozenset({
     "LPT7",
     "LPT8",
     "LPT9",
+    "LPT\u00b9",
+    "LPT\u00b2",
+    "LPT\u00b3",
 })
+
+_WINDOWS_RESERVED_CHARS: frozenset[str] = frozenset(
+    '<>:"|?*\x7f' + "".join(chr(code) for code in range(32))
+)
 
 
 def extract_sqlite_connect_args(
@@ -265,7 +275,11 @@ def _validate_disk_path_syntax(path_str: str, *, full_target: str, is_windows: b
             raise SqliteGuardPolicyError(
                 f"Trailing dot or space in Windows SQLite path segment {segment!r} rejected: {full_target!r}"
             )
-        stem = segment.split(".", 1)[0].upper()
+        if any(ch in _WINDOWS_RESERVED_CHARS for ch in segment):
+            raise SqliteGuardPolicyError(
+                f"Windows reserved or control character in SQLite path segment {segment!r} rejected: {full_target!r}"
+            )
+        stem = segment.partition(".")[0].rstrip(" ").upper()
         if stem in _WINDOWS_RESERVED_DEVICE_NAMES:
             raise SqliteGuardPolicyError(
                 f"Windows reserved device name {stem!r} in SQLite path rejected: {full_target!r}"
